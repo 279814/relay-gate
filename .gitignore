@@ -1,0 +1,21 @@
+# M0 探测输入：含真实 key，绝不入库
+scripts/upstreams.tsv
+scripts/*.local.tsv
+
+# M0 输出：含站点地址
+docs/02-上游能力矩阵.md
+
+# 运行时数据
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 构建产物
+relay-gate
+relay-gate.exe
+dist/
+
+# 环境
+.env
+.env.local

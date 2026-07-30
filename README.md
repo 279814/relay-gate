@@ -1,0 +1,75 @@
+# relay-gate
+
+面向多个异构 LLM 中转站的**主动探活 + 优先级路由**透传网关。
+
+解决的问题：手里有多个可用性时好时坏的中转站，客户端（Claude Code 等）撞上死站
+才知道它死了，白等一次超时。本服务常驻探活，请求到达时目标渠道的健康状态**已经是已知的**，
+直接投递到当前存活且优先级最高的渠道。
+
+## 三条主线
+
+1. **主动探活** —— 两级探测（传输层零 token + 模型层真实调用），状态在请求到达前已知
+2. **严格透传** —— 除鉴权 key 与 `model` 外，请求一个字节都不改；响应完全不碰
+3. **样本留档** —— 每次转发的入站请求、出站请求、上游响应全部存下来，
+   既验证第 2 条真做到了，也让探活请求长得和真实请求一样
+
+## 状态
+
+开发中。当前进度见 [需求与设计文档](docs/01-需求与设计.md) 的里程碑一节。
+
+- [x] M0 实测上游能力
+- [ ] M1 骨架 + SQLite + 配置 CRUD
+- [ ] M2 透传核心 + 选路 + 样本记录
+- [ ] M3 探活 + 健康状态机
+- [ ] M4 其余端点
+- [ ] M5 Web UI + 一键启停
+- [ ] M6 请求内重试 + 日志
+- [ ] M7 Docker Compose 部署
+
+## 设计要点
+
+| 主题 | 结论 |
+|---|---|
+| 协议 | Anthropic Messages / OpenAI Responses / OpenAI Chat Completions，入站路径 = 出站路径，**不做协议转换** |
+| 改写范围 | 仅鉴权头（必改）+ body 顶层 `model`（配了映射才改）。字节级切片替换，不做 JSON round-trip |
+| 数据模型 | 三层：Upstream（站）/ ModelName（逻辑模型）/ Route（绑定，含优先级与映射）。Route 是健康状态的最小单位 |
+| 首 Token 超时 | 默认 20 分钟，**硬下限 5 分钟**。探活超时独立配置，因此「容忍长思考」与「快速判死」可以同时成立 |
+| 死站恢复 | 固定短周期（L1 20s / L2 30s）+ L1 转通即触发 L2 + 半开放行，不用指数退避 |
+| 假活检测 | HTTP 200 不算活。必须收到首个**非空内容 delta** 才算，否则是公益站最常见的假活 |
+
+## 目录
+
+```
+docs/     需求与设计文档
+scripts/  M0 上游能力探测脚本
+```
+
+## M0：探测上游能力
+
+写代码前先实测各站到底支持什么。复制模板填入自己的站点：
+
+```bash
+cp scripts/upstreams.example.tsv scripts/upstreams.tsv
+# 编辑 upstreams.tsv（Tab 分隔，含真实 key，已在 .gitignore 中）
+bash scripts/probe-all.sh scripts/upstreams.tsv
+```
+
+输出能力矩阵到 `docs/02-上游能力矩阵.md`（同样已 gitignore，含站点地址）。
+单站约消耗 100 token。
+
+探测项：`/v1/models` 可用性、鉴权头风格（`x-api-key` / `Bearer`）、模型名原名是否可用、
+流式真活/假活、首 Token 延迟、`count_tokens` 支持情况、`/v1/responses` 支持情况、
+长思考首 Token 延迟（用于校准超时）。
+
+## 安全
+
+- `scripts/upstreams.tsv`、`*.local.tsv`、`docs/02-上游能力矩阵.md`、`data/`、`.env`
+  已全部 gitignore。**不要**把真实 key 或站点地址提交上来
+- 上游 key 在数据库中 AES-GCM 加密存储
+- 服务暴露到公网 = 一个无鉴权的免费 API 池。必须设置 relay key，
+  并且只监听内网 + 反向代理，或加 IP 白名单
+
+## 技术栈
+
+Go 1.24+ / `net/http` + `httputil.ReverseProxy` / SQLite（`modernc.org/sqlite`，无 CGO）/
+单页 HTML + Alpine.js（`go:embed`）/ Docker Compose 单容器部署。

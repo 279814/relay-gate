@@ -1,0 +1,18 @@
+# 默认按文本处理，行尾交给各平台
+* text=auto
+
+# 这些必须是 LF：目标运行环境是 Linux + Docker，
+# CRLF 会让 shell 直接报 "bash: \r: command not found"
+*.sh   text eol=lf
+*.py   text eol=lf
+*.tsv  text eol=lf
+Dockerfile      text eol=lf
+docker-compose.yml text eol=lf
+*.go   text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+
+# SQLite 库与二进制产物不做行尾转换
+*.db   binary
+*.png  binary
+*.ico  binary
