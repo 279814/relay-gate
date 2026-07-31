@@ -3,7 +3,12 @@
 -- 时间戳统一存 Unix 毫秒（INTEGER），不用 SQLite 的日期字符串：
 -- 全链路要算 TTFT 这类毫秒级差值，存字符串每次都要解析，且时区是隐患。
 
+-- journal_mode 是**库级持久**的：设一次就写进文件头，之后每条连接都是 WAL。
 PRAGMA journal_mode = WAL;      -- 探活与样本写入并发，WAL 避免读写互锁
+
+-- 下面两条是**连接级**的，写在这里只对执行本文件的那条连接生效。
+-- 真正的生效点是 store.go 的 connPragmas（DSN 里带上，每条新连接都有）。
+-- 这里保留是为了让手工 `sqlite3` 打开时行为一致，**不是**程序的依赖。
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 

@@ -1,8 +1,10 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -361,14 +363,89 @@ func TestEmptyListsAreNotNil(t *testing.T) {
 	}
 }
 
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		func() bool {
-			for i := 0; i+len(sub) <= len(s); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}())
+func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// 回归测试：foreign_keys 必须在**每一条**连接上生效，不能只在跑过 schema.sql
+// 的那条上生效。
+//
+// 曾经的隐患：pragma 写在 schema.sql 里，而 pragma 是连接级的。今天没出事
+// 完全靠 MaxOpenConns(1) 恰好只有一条连接 —— 一旦 database/sql 判定连接坏了
+// 并重建，外键就静默变成装饰：坏数据能插进去，ON DELETE CASCADE 也不再清理
+// 子行。这类失效不报错，只能靠测试锁住。
+//
+// 用新开的 sql.DB 检验，等价于「连接池重建了一条没跑过 schema.sql 的连接」。
+func TestForeignKeysOnEveryConn(t *testing.T) {
+	dir := t.TempDir()
+	dsn := filepath.Join(dir, "fk.db")
+
+	c, err := NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(dsn, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fresh, err := sql.Open("sqlite", dsn+connPragmas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+
+	var fk int
+	if err := fresh.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Fatalf("新连接的 foreign_keys 应为 1，得到 %d —— "+
+			"pragma 必须写在 DSN 里，写在 schema.sql 里只对首条连接有效", fk)
+	}
+
+	// 行为验证：光看 pragma 值不够，要确认约束真的拦得住
+	_, err = fresh.Exec(`INSERT INTO route
+		(model_name_id, upstream_id, priority, weight, upstream_model,
+		 max_concurrency, enabled, created_at, updated_at)
+		VALUES (99999, 88888, 1, 100, '', 0, 1, 0, 0)`)
+	if err == nil {
+		t.Error("指向不存在 ModelName/Upstream 的 Route 竟然插入成功了")
+	}
+
+	// WAL 是库级持久的，新连接不跑 schema.sql 也该是 wal
+	var jm string
+	if err := fresh.QueryRow("PRAGMA journal_mode").Scan(&jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm != "wal" {
+		t.Errorf("journal_mode 应为 wal（库级持久），得到 %q", jm)
+	}
+}
+
+// ON DELETE CASCADE 必须真的生效：删 ModelName 要连带清掉它的 Route。
+// 这是上一条的另一面 —— 外键失效时级联也失效，而级联失效的症状是
+// 「删了模型，选路里还留着一堆悬挂 Route」。
+func TestDeleteModelNameCascadesRoutes(t *testing.T) {
+	st := testStore(t)
+	up := mkUpstream(t, st, "s1")
+	mn := mkModelName(t, st, "m1", model.ProtoAnthropic)
+
+	r := &model.Route{ModelNameID: mn.ID, UpstreamID: up.ID}
+	r.Defaults()
+	if err := st.CreateRoute(r); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.DeleteModelName(mn.ID); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := st.ListRoutes(0) // 0 = 不筛 ModelName，列全部
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range rs {
+		if got.ID == r.ID {
+			t.Fatal("删除 ModelName 后它的 Route 仍在（ON DELETE CASCADE 未生效）")
+		}
+	}
 }

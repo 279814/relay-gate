@@ -18,11 +18,26 @@ type Store struct {
 	cipher *Cipher
 }
 
+// connPragmas 是必须写在 DSN 里的**连接级** pragma。
+//
+// 关键点：pragma 的作用域是「连接」，不是「数据库文件」。写在 schema.sql 里
+// 只对执行那条 SQL 的连接生效，连接池后来新建的连接一概没有 —— 而
+// database/sql 会在连接出错时静默丢弃并重建。
+//
+// foreign_keys 丢失不会报错，只会让约束变成装饰：指向已删除 ModelName 的
+// Route 能插进去，删 ModelName 时 ON DELETE CASCADE 也不再清理它的 Route，
+// 于是选路时读到一堆悬挂 Route。选路虽然容忍了悬挂（会跳过），但那是
+// 兜底，不该让脏数据先进库。
+//
+// 对比：journal_mode=WAL 是**库级持久**的，写一次就留在文件头里，
+// 所以它留在 schema.sql 里没问题。busy_timeout 同样是连接级，一并放这里。
+const connPragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
+
 // Open 打开（或创建）数据库并建表。
 func Open(dsn string, c *Cipher) (*Store, error) {
 	// _txlock=immediate：写事务一开始就取写锁，避免 SQLite 在事务中途升级锁时
 	// 报 SQLITE_BUSY（读事务升级为写事务是死锁的经典来源）。
-	db, err := sql.Open("sqlite", dsn+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+	db, err := sql.Open("sqlite", dsn+connPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库: %w", err)
 	}
