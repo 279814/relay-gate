@@ -161,12 +161,31 @@ type harness struct {
 	relayPW string
 }
 
+// capturedRequest 记录 mock 上游收到的最后一个请求。
+//
+// 写入必须加锁：mock 上游的每个连接都在自己的 goroutine 里跑，
+// 并发测试（TestHandler_ConcurrentRequests）会同时写这几个字段。
+//
+// 读取直接访问字段是安全的，不需要加锁 —— 顺序测试里 hs.serve() 返回时
+// HTTP 往返已经完成，那本身就是一条 happens-before 边。并发测试不读这些
+// 字段（它只关心状态码与 Transport 复用）。
 type capturedRequest struct {
+	mu      sync.Mutex
 	method  string
 	path    string
 	query   string
 	headers http.Header
 	body    []byte
+}
+
+func (c *capturedRequest) record(r *http.Request, body []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.method = r.Method
+	c.path = r.URL.Path
+	c.query = r.URL.RawQuery
+	c.headers = r.Header.Clone()
+	c.body = body
 }
 
 // newHarness 起一个 mock 上游并配好 1 个 ModelName / 1 个 Upstream / 1 条 Route。
@@ -179,11 +198,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 
 	hs.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		hs.gotReq.method = r.Method
-		hs.gotReq.path = r.URL.Path
-		hs.gotReq.query = r.URL.RawQuery
-		hs.gotReq.headers = r.Header.Clone()
-		hs.gotReq.body = body
+		hs.gotReq.record(r, body)
 
 		if respond != nil {
 			respond(w, r)
