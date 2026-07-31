@@ -148,6 +148,42 @@ func TestClassifyHTTP_AuthErrorIsFatalEvenWithQuotaWording(t *testing.T) {
 	}
 }
 
+// 流读取过程中被取消（服务暂停、进程关闭）应判 Ignore，不算上游故障。
+//
+// 这条路径在 prober.go L2() 的 scanErr 分支里，决定「暂停时进行中的探活
+// 会不会把好站判死」。与 L1 的取消测试配对：两级探活都得正确处理取消。
+func TestL2_CanceledDuringBodyReadDoesNotCountAsUpstreamFailure(t *testing.T) {
+	// 让服务器先把响应头发回去，然后一直卡在那里不吐内容。
+	// 客户端等一小会儿就取消 —— 这时候读操作正在进行，但还没读到有效 delta。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		// 卡住，直到被取消或超时
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond) // 等响应头回来后立即取消，读流还没完成
+		cancel()
+	}()
+
+	out := testProber().L2(ctx, upstreamFor(srv.URL),
+		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
+
+	if out.Verdict != health.VerdictIgnore {
+		t.Errorf("被取消的探活不该算上游故障，得到 %s（err=%v）", out.Verdict, out.Err)
+	}
+}
+
 // 但 429 与 5xx 里的限流关键词仍然要判限流，不能被上一条改坏。
 func TestClassifyHTTP_RateLimitStillDetectedOutsideAuthErrors(t *testing.T) {
 	cases := []struct {
