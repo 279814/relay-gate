@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 	"unicode"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1）。
@@ -59,9 +61,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 // proxyCountTokens 把 count_tokens 转发给上游。
 //
-// 返回空字符串表示成功（响应已写出）；返回非空的原因字符串表示调用方
-// 应当降级到本地粗算。用原因字符串而不是 error：这里的每一种「失败」都是
-// 预期内的（站不支持这个端点是常态），日志里要的是可读的原因而不是错误链。
+// 返回空字符串表示**调用方无需再作答**（响应已写出，或客户端已经走了）；
+// 返回非空的原因字符串表示应当降级到本地粗算。用原因字符串而不是 error：
+// 这里的每一种「失败」都是预期内的（站不支持这个端点是常态），
+// 日志里要的是可读的原因而不是错误链。
 //
 // **不得**在写出响应后再返回非空原因 —— 那会让调用方把兜底结果追加到
 // 已经写出的响应后面，客户端拿到两个拼在一起的 JSON。
@@ -120,9 +123,15 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 404（没这个端点）、400（参数要求不同）、401（这个端点单独鉴权）
 	// 对客户端而言结果相同 —— 拿不到准确值，用估算值。
 	// 而这些失败**不回写健康状态**，所以也不需要按 §4.3 分类。
+	//
+	// 原文进日志前**必须**脱敏：上游的鉴权错误经常把收到的 key 回显在消息里
+	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），而 401 恰好是这里
+	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
+	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
+		safe := sample.RedactBodyKeys(respBody, h.logRedactKeys(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
-			collapseSpaces(string(respBody), maxCountTokensLogBody))
+			collapseSpaces(string(safe), maxCountTokensLogBody))
 	}
 
 	// 成功。原样回传上游响应体。
@@ -139,6 +148,16 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 	return ""
+}
+
+// logRedactKeys 收齐这次请求里所有需要从日志中扫掉的凭据。
+//
+// 两处来源与样本记录完全一致（recordSample）：出站的上游 key 与入站的
+// relay key。位置清单走 inboundCredentials（其内部读 model.AuthHeaders，
+// 是唯一来源）—— 各列一份的话，新增一个鉴权位置时必然漏掉这里。
+func (h *Handler) logRedactKeys(r *http.Request, cand *router.Candidate) []string {
+	keys := []string{cand.Upstream.APIKey}
+	return append(keys, inboundCredentials(r.Header)...)
 }
 
 const (
@@ -284,22 +303,13 @@ func estimateTokens(text string) int {
 }
 
 // collapseSpaces 把连续空白压成单个空格并限长，让上游错误原文在单行日志里可读。
+//
+// 按 rune 而不是 byte 截断：中转站的错误信息常是中文，按字节切会把一个
+// 汉字劈成两半，日志里出现乱码。
 func collapseSpaces(s string, limit int) string {
-	out := make([]rune, 0, limit)
-	prevSpace := false
-	for _, r := range s {
-		if unicode.IsSpace(r) {
-			prevSpace = true
-			continue
-		}
-		if prevSpace && len(out) > 0 {
-			out = append(out, ' ')
-		}
-		prevSpace = false
-		if len(out) >= limit {
-			return string(out) + "…"
-		}
-		out = append(out, r)
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > limit {
+		return string(r[:limit]) + "…"
 	}
-	return string(out)
+	return s
 }

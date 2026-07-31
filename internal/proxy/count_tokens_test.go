@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -220,7 +222,58 @@ func TestCountTokens_FallsBackWhenAllRoutesDead(t *testing.T) {
 	}
 }
 
-// ── 与健康状态的关系 ──────────────────────────────────────
+// 上游把 key 回显在错误消息里时，日志里**不能**出现明文 key。
+//
+// `{"error":"Invalid API key: sk-xxx"}` 是公益站 401 的常见格式，而 401 正是
+// 降级路径最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 ——
+// §3.6.3b 对样本库的要求是无条件的，日志没有理由比它宽松。
+//
+// 这条测试要真去读日志输出，不能只看响应：问题恰恰在于它对响应毫无影响。
+func TestCountTokens_UpstreamErrorBodyRedactedInLog(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		// 上游把它收到的 key 原样回显 —— 这里是出站的上游 key
+		w.Write([]byte(`{"error":{"message":"Invalid API key: sk-upstream-secret"}}`))
+	})
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+
+	// 仍应正常兜底，脱敏不改变行为
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+
+	if strings.Contains(logs.String(), "sk-upstream-secret") {
+		t.Errorf("日志里出现了明文上游 key:\n%s", logs.String())
+	}
+	// 确认脱敏没有把整段原文吞掉 —— 降级原因仍要可诊断，
+	// 否则「为什么走了兜底」就无从查起。
+	if !strings.Contains(logs.String(), "401") {
+		t.Errorf("日志里应保留上游状态码以便诊断:\n%s", logs.String())
+	}
+}
+
+// 入站 relay key 同样不能进日志。上游可能回显的是它收到的任意凭据，
+// 而 auth_style=auto 时我们两个头都发，回显哪一个都有可能。
+func TestCountTokens_InboundKeyRedactedInLog(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":"unexpected credential rk-client-key"}`)
+	})
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	if strings.Contains(logs.String(), hs.relayPW) {
+		t.Errorf("日志里出现了明文 relay key:\n%s", logs.String())
+	}
+}
 
 // §3.1 / §10.3：count_tokens 的失败**不得**计入健康状态。
 // 这是刻意的 —— 它每轮对话都被调用，噪声会淹没真实请求给出的信号，
