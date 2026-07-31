@@ -12,6 +12,10 @@ docker-compose.yml text eol=lf
 go.mod text eol=lf
 go.sum text eol=lf
 
+# PowerShell 脚本只在 Windows 上跑，CRLF 是它的原生行尾。
+# 显式写出来，免得以后误以为是漏了一条 eol=lf。
+*.ps1  text eol=crlf
+
 # SQLite 库与二进制产物不做行尾转换
 *.db   binary
 *.png  binary
