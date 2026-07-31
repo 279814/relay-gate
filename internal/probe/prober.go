@@ -167,6 +167,35 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		out.Status = resp.StatusCode
 		return out
 
+	// 读流出错：必须在假活之前判。两者的表征相同（都是「没读到有效内容」），
+	// 但原因完全不同 —— 假活是站回了 200 却不生成，读错误是超时或连接断了。
+	// 报错原因指错方向的话，排查会从「站为什么不吐内容」开始，
+	// 而真正该看的是「连接为什么断了」。
+	case sr.scanErr != nil:
+		// 探活被取消（服务暂停、进程关闭）不算上游的账。
+		if out, ok := ctxOutcome(ctx, sr.scanErr); ok {
+			out.TTFT = ttft
+			out.Status = resp.StatusCode
+			return out
+		}
+		// headerCtx 到期但外层 ctx 还没到 —— 首 Token 超时。
+		// 响应头虽然回来了，但流内迟迟不出内容，本质上还是首 Token 没等到。
+		if headerCtx.Err() != nil {
+			return Outcome{
+				Verdict: health.VerdictUnavailable,
+				Err: fmt.Errorf("%w: 响应头已返回但 %ds 内无有效内容",
+					proxy.ErrFirstTokenTimeout, s.L2FirstTokenSec),
+				TTFT:   ttft,
+				Status: resp.StatusCode,
+			}
+		}
+		return Outcome{
+			Verdict: health.VerdictUnavailable,
+			Err:     fmt.Errorf("%w: %v", proxy.ErrStreamBroke, sr.scanErr),
+			TTFT:    ttft,
+			Status:  resp.StatusCode,
+		}
+
 	default:
 		// 200 但没有任何有效 delta —— 另一种假活。
 		return Outcome{

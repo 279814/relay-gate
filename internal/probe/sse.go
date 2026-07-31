@@ -52,6 +52,13 @@ type streamResult struct {
 	errPayload []byte
 	// bytesRead 是已读取的字节数，用于区分「一个字节都没有」与「有内容但无效」。
 	bytesRead int64
+	// scanErr 是读流时的 I/O 错误（连接被切断、首 Token 超时导致的 ctx 取消）。
+	//
+	// 必须带出来：不带的话「读到 EOF 但没有有效内容」与「读的过程中出错了」
+	// 两种情况在调用方看起来完全一样，于是都被报成「假活」。前者确实是假活，
+	// 后者是超时或断流 —— 报错原因指错了方向，排查就会从「站为什么不吐内容」
+	// 开始，而真正该看的是「连接为什么断了」。
+	scanErr error
 }
 
 // maxStreamScan 是扫描上限。
@@ -117,6 +124,9 @@ func scanStream(r io.Reader, onFirstByte func()) streamResult {
 			return res
 		}
 	}
+	// Scanner 把读错误藏在 Err() 里：Scan() 只返回 false，与正常 EOF 无法区分。
+	// 不取出来的话超时与断流都会被当成「读完了但没内容」。
+	res.scanErr = sc.Err()
 	return res
 }
 

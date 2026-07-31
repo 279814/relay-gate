@@ -84,6 +84,20 @@ func ClassifyHTTP(status int, header http.Header, body []byte) Outcome {
 			Status:     status,
 		}
 
+	// 鉴权错误。重试无意义，立即判死并在 UI 标「鉴权错误」。
+	//
+	// 必须排在下面的限流关键词之前：中转站的 401/403 响应体里很常见
+	// 「insufficient_quota」「额度不足」这类措辞，而 quota 是限流特征词。
+	// 顺序反了的话，一个余额耗尽的 key 会被判成限流 —— 冷却 60 秒后再试，
+	// 永远攒不够失败次数，于是永远不判死。而余额耗尽只能靠人去充值或换
+	// key，等它自愈是等不到的，UI 上还会显示成「限流」把人引向错误的方向。
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		return Outcome{
+			Verdict: health.VerdictFatal,
+			Err:     errFromBody(status, body),
+			Status:  status,
+		}
+
 	// 429 之外的限流：靠响应体特征识别。放在 5xx 判定之前，
 	// 否则 529 overloaded 会被当成「服务不可用」而累计判死。
 	case containsAny(lower, rateLimitMarkers) && status >= 400:
@@ -92,14 +106,6 @@ func ClassifyHTTP(status int, header http.Header, body []byte) Outcome {
 			Err:        errFromBody(status, body),
 			RetryAfter: parseRetryAfter(header),
 			Status:     status,
-		}
-
-	case status == http.StatusUnauthorized, status == http.StatusForbidden:
-		// 鉴权错误。重试无意义，立即判死并在 UI 标「鉴权错误」。
-		return Outcome{
-			Verdict: health.VerdictFatal,
-			Err:     errFromBody(status, body),
-			Status:  status,
 		}
 
 	case status >= 400 && status < 500 && containsAny(lower, modelNotFoundMarkers):
