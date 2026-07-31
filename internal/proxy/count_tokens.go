@@ -15,7 +15,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1）。
@@ -130,7 +129,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
-		safe := redactForLog(respBody, h.logRedactKeys(r, cand))
+		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
 			collapseSpaces(string(safe), maxCountTokensLogBody))
 	}
@@ -150,52 +149,6 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	_, _ = w.Write(respBody)
 	return ""
 }
-
-// logRedactKeys 收齐这次请求里所有需要从日志中扫掉的凭据。
-//
-// 两处来源与样本记录完全一致（recordSample）：出站的上游 key 与入站的
-// relay key。位置清单走 inboundCredentials（其内部读 model.AuthHeaders，
-// 是唯一来源）—— 各列一份的话，新增一个鉴权位置时必然漏掉这里。
-func (h *Handler) logRedactKeys(r *http.Request, cand *router.Candidate) []string {
-	keys := []string{cand.Upstream.APIKey}
-	return append(keys, inboundCredentials(r.Header)...)
-}
-
-// redactForLog 脱敏一段准备进日志的上游原文。
-//
-// 为什么不直接用 sample.RedactBodyKeys：它有 minRedactableKey（12 字符）
-// 的下限，短于此的 key 不脱敏。那个下限对**样本**是对的 —— 样本存的是完整
-// 对话原文，一个 4 字符的 key 会偶然命中无数次，把原文打得千疮百孔，
-// 反而毁掉诊断价值。
-//
-// 但日志这条路径没有那个顾虑：进来的只是 200 字符的错误原文，被多打几个码
-// 也无所谓，而漏一个 key 是实实在在的泄露。而 RELAY_KEYS 只校验非空、
-// 没有长度下限（config.validate），所以短 key 是真实可达的配置。
-// 两种代价不对称，这里就该按「宁可多打码」取舍。
-//
-// 先走一遍 RedactBodyKeys（它对长 key 做了 MaskKey 的部分保留形式，
-// 便于辨认是哪个 key），再兜住它跳过的短 key。
-func redactForLog(body []byte, keys []string) []byte {
-	out := sample.RedactBodyKeys(body, keys)
-	for _, k := range keys {
-		// 长 key 已由上面处理；这里只补它按长度跳过的那些。
-		//
-		// 空 key 显式跳过。当前它其实无害（MaskKey("") 返回空串，于是
-		// ReplaceAll 等于原地不动），但那依赖 MaskKey 的实现细节 ——
-		// 若它日后改成返回固定掩码，空串替换会在**每个字节之间**插入掩码，
-		// 把一段错误原文变成几倍长的乱码。写死这个跳过，不押在别处的行为上。
-		if k == "" || len(k) >= minLogRedactableKey {
-			continue
-		}
-		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
-	}
-	return out
-}
-
-// minLogRedactableKey 与 sample.minRedactableKey 是同一个值，但含义相反：
-// 那边是「短于此不脱敏」，这边是「短于此由本函数补脱敏」。
-// 写成常量而不是内联 12，是为了让两者的关联在改动时能被搜到。
-const minLogRedactableKey = 12
 
 const (
 	// maxCountTokensResp 是 count_tokens 响应体的读取上限。
