@@ -34,6 +34,11 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/state", s.getState)
 	mux.HandleFunc("POST /admin/api/state", s.setState)
 
+	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
+	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
+	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)
+	mux.HandleFunc("DELETE /admin/api/samples", s.clearSamples)
+
 	return s.requireAdmin(adminPW, mux)
 }
 

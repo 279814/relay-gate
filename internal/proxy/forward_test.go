@@ -225,8 +225,38 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	if res.FirstByteAt.IsZero() {
 		t.Error("应记录首字节时刻")
 	}
-	if res.TTFT() <= 0 {
-		t.Error("TTFT 应可计算")
+	// 不断言 TTFT > 0：环回连接上上游立刻回写，两次 time.Now() 可能
+	// 落在同一个时钟刻度里（Windows 单调时钟粒度约 0.5–1ms），
+	// 差值为 0 是正常的。TTFT 的契约由 TestResult_TTFT 覆盖。
+	if res.TTFT() < 0 {
+		t.Errorf("TTFT 不该为负，得到 %v", res.TTFT())
+	}
+}
+
+// TTFT 的契约：两个时间戳都有才算得出来，缺任何一个返回 0。
+//
+// 返回 0 而不是负数或 panic 是刻意的：调用方（健康状态机、样本记录）
+// 用 0 表示「没测到」，而首 Token 超时的样本正是 FirstByteAt 为零的那种。
+func TestResult_TTFT(t *testing.T) {
+	base := time.Now()
+	cases := []struct {
+		name        string
+		sent, first time.Time
+		want        time.Duration
+	}{
+		{"正常", base, base.Add(3200 * time.Millisecond), 3200 * time.Millisecond},
+		{"同一刻度", base, base, 0},
+		{"没收到首字节", base, time.Time{}, 0},
+		{"没发出去", time.Time{}, base, 0},
+		{"两个都没有", time.Time{}, time.Time{}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &Result{SentAt: c.sent, FirstByteAt: c.first}
+			if got := r.TTFT(); got != c.want {
+				t.Errorf("want %v got %v", c.want, got)
+			}
+		})
 	}
 }
 

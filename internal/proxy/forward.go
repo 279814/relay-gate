@@ -129,6 +129,13 @@ type Forwarder struct {
 	Timeouts  Timeouts
 	// OnFirstByte 在收到首字节时回调（用于记录 TTFT、结束探活等）。可为 nil。
 	OnFirstByte func()
+
+	// RespTee 收一份响应体副本，供样本记录用（§3.6.3a）。可为 nil。
+	//
+	// 写入发生在「已写给客户端并 flush 之后」，所以它既不改变字节，
+	// 也不改变 flush 时序 —— 采集是旁路，不是管线的一环。
+	// 它的写入错误一律忽略：丢一份样本远好过中断一次真实转发。
+	RespTee io.Writer
 }
 
 // Forward 把请求投递到 cand 指定的上游，响应流式写回 w。
@@ -250,6 +257,11 @@ func (f *Forwarder) streamBody(ctx context.Context, w http.ResponseWriter,
 			total += int64(wn)
 			if canFlush {
 				flusher.Flush()
+			}
+			// 采集放在 flush 之后：放前面会把「攒副本」的耗时插进
+			// 客户端可感知的延迟里，违反「不改变 flush 时序」。
+			if f.RespTee != nil {
+				_, _ = f.RespTee.Write(buf[:n])
 			}
 			if werr != nil {
 				// 客户端断开。不是上游的问题，不该计入健康失败。

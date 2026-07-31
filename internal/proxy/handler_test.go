@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -102,12 +104,44 @@ func testSettings() model.Settings {
 }
 
 // harness 组装一个指向 mock 上游的完整 Handler。
+// recordingSink 收下样本供断言。Record 必须非阻塞（与生产实现的契约一致）。
+type recordingSink struct {
+	mu   sync.Mutex
+	got  []*model.Sample
+	hook func(*model.Sample) // 可选：投递时同步执行，用于测阻塞行为
+}
+
+func (s *recordingSink) Record(smp *model.Sample) {
+	s.mu.Lock()
+	s.got = append(s.got, smp)
+	s.mu.Unlock()
+	if s.hook != nil {
+		s.hook(smp)
+	}
+}
+
+func (s *recordingSink) all() []*model.Sample {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*model.Sample(nil), s.got...)
+}
+
+func (s *recordingSink) one(t *testing.T) *model.Sample {
+	t.Helper()
+	got := s.all()
+	if len(got) != 1 {
+		t.Fatalf("应恰好记录 1 条样本，得到 %d 条", len(got))
+	}
+	return got[0]
+}
+
 type harness struct {
 	h       *Handler
 	cfg     *fakeConfig
 	up      *httptest.Server
 	gotReq  *capturedRequest
 	tracker *countingTracker
+	sink    *recordingSink
 	relayPW string
 }
 
@@ -125,7 +159,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 	t.Helper()
 
 	hs := &harness{gotReq: &capturedRequest{}, tracker: &countingTracker{},
-		relayPW: "rk-client-key"}
+		sink: &recordingSink{}, relayPW: "rk-client-key"}
 
 	hs.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -157,7 +191,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 		state:    store.StateRunning,
 	}
 	hs.h = NewHandler(hs.cfg, allAliveHealth{dead: map[int64]bool{}}, hs.tracker,
-		[]string{hs.relayPW}, discardLog())
+		hs.sink, []string{hs.relayPW}, discardLog())
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
 }
@@ -319,7 +353,7 @@ func TestHandler_AcceptsKeyInAllThreePlaces(t *testing.T) {
 // 未配置任何 relay key 时必须全拒。「没配就放开」是最危险的默认值。
 func TestHandler_NoRelayKeysConfiguredRejectsAll(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h = NewHandler(hs.cfg, allAliveHealth{}, hs.tracker, nil, discardLog())
+	hs.h = NewHandler(hs.cfg, allAliveHealth{}, hs.tracker, hs.sink, nil, discardLog())
 
 	r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
 	if rec := hs.serve(r); rec.Code != 401 {
@@ -689,6 +723,362 @@ func TestHandler_InFlightReleasedOnUpstreamError(t *testing.T) {
 
 	if _, open, _ := hs.tracker.stats(); open != 0 {
 		t.Errorf("上游出错后在途也应归零，得到 %d", open)
+	}
+}
+
+// ── 样本记录（§9.4）────────────────────────────────────────
+//
+// 样本功能的失败方式是**悄无声息的** —— 记漏了、记错了、或拖慢了转发，
+// 都不会报错。所以下面每一条都对应 §9.4 表格里的一行。
+
+// 不映射时 in_body 与 out_body 必须**完全**逐字节相同。
+// 这是「只改了两处」在生产环境的持续验证（§3.6.1）。
+func TestSample_UnmappedBodiesAreIdentical(t *testing.T) {
+	hs := newHarness(t, nil)
+	body := `{"model":"claude-opus-5","max_tokens":1,"temperature":1.0,"system":"A & B"}`
+
+	hs.serve(hs.anthropicRequest(body))
+
+	smp := hs.sink.one(t)
+	if !bytes.Equal(smp.InBody, smp.OutBody) {
+		t.Errorf("不映射时两份 body 应完全一致\nin  %s\nout %s", smp.InBody, smp.OutBody)
+	}
+	if string(smp.InBody) != body {
+		t.Errorf("样本应留档原始字节\nwant %s\ngot  %s", body, smp.InBody)
+	}
+	if smp.ModelIn != "claude-opus-5" || smp.ModelOut != "claude-opus-5" {
+		t.Errorf("未映射时 model_in/out 应相同：%q / %q", smp.ModelIn, smp.ModelOut)
+	}
+}
+
+// 映射时两份 body 只应在 model 处不同。
+func TestSample_MappedBodiesDifferOnlyInModel(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.cfg.snap.RoutesByModelName[1][0].UpstreamModel = "claude-opus-4-20250514"
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+
+	smp := hs.sink.one(t)
+	if string(smp.InBody) != `{"model":"claude-opus-5","max_tokens":1}` {
+		t.Errorf("in_body 应是入站原文，得到 %s", smp.InBody)
+	}
+	if string(smp.OutBody) != `{"model":"claude-opus-4-20250514","max_tokens":1}` {
+		t.Errorf("out_body 应是改写后的字节，得到 %s", smp.OutBody)
+	}
+	if smp.ModelIn != "claude-opus-5" || smp.ModelOut != "claude-opus-4-20250514" {
+		t.Errorf("model_in/out 应分别记录：%q / %q", smp.ModelIn, smp.ModelOut)
+	}
+}
+
+// §9.4 的验收标准：用真 key 字符串全表 grep，断言 0 命中。
+// 不脱敏的话，样本库就是一份明文 key 库，比配置表更容易被整体导出。
+func TestSample_NoPlaintextKeysAnywhere(t *testing.T) {
+	hs := newHarness(t, nil)
+	const upKey = "sk-upstream-secret"
+
+	// key 出现在所有可能的位置：入站头、出站头、以及 body 里
+	r := hs.anthropicRequest(`{"model":"claude-opus-5","api_key":"` + hs.relayPW + `"}`)
+	r.Header.Set("Authorization", "Bearer "+hs.relayPW)
+	r.Header.Set("Api-Key", hs.relayPW)
+	hs.serve(r)
+
+	smp := hs.sink.one(t)
+
+	// 把整条样本序列化后整体搜 —— 逐字段检查会漏掉将来新增的字段
+	blob, err := json.Marshal(smp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{hs.relayPW, upKey} {
+		if bytes.Contains(blob, []byte(secret)) {
+			t.Errorf("样本里出现了完整 key %q —— 样本库不能是明文 key 库", secret)
+		}
+	}
+
+	// 脱敏必须保留结构：调探活时要知道 key 放在哪个头、什么格式（§3.6.3b）
+	if got := smp.OutHeaders.Get("Authorization"); !strings.HasPrefix(got, "Bearer ") {
+		t.Errorf("应保留 Bearer 前缀（探活模板要用），得到 %q", got)
+	}
+	if smp.OutHeaders.Get("X-Api-Key") == "" {
+		t.Error("应保留 X-Api-Key 头名，只脱敏值")
+	}
+}
+
+// body 超限时截断并标记，但**转发的 body 仍是完整的**。
+// 这条最容易写错成「截断后再转发」，那会直接破坏请求。
+func TestSample_TruncatesBodyButForwardsFull(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.cfg.settings.SampleMaxBodyBytes = 1024
+
+	filler := strings.Repeat("x", 4096)
+	body := `{"model":"claude-opus-5","system":"` + filler + `"}`
+	hs.serve(hs.anthropicRequest(body))
+
+	// 转发出去的必须是完整的原文
+	if string(hs.gotReq.body) != body {
+		t.Errorf("转发的 body 必须完整（%d 字节），实际发出 %d 字节",
+			len(body), len(hs.gotReq.body))
+	}
+
+	smp := hs.sink.one(t)
+	if len(smp.InBody) >= len(body) {
+		t.Errorf("样本里的 body 应被截断，得到 %d 字节", len(smp.InBody))
+	}
+	if !smp.Truncated.Has(model.TruncInBody) {
+		t.Error("应标记 in_body 被截断 —— 不标记的话无法判断是恰好这么大还是被砍过")
+	}
+	if !smp.Truncated.Has(model.TruncOutBody) {
+		t.Error("应标记 out_body 被截断")
+	}
+}
+
+// 大 SSE 响应存头 + 尾，转发给客户端的仍是完整流。
+func TestSample_LargeSSEKeepsHeadAndTail(t *testing.T) {
+	const chunks = 400
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		w.Write([]byte("event: message_start\ndata: {\"head\":true}\n\n"))
+		fl.Flush()
+		for i := 0; i < chunks; i++ {
+			w.Write([]byte("data: " + strings.Repeat("m", 200) + "\n\n"))
+		}
+		w.Write([]byte("event: message_stop\ndata: {\"usage\":{\"output_tokens\":42}}\n\n"))
+		fl.Flush()
+	})
+	hs.cfg.settings.SampleRespHeadBytes = 512
+	hs.cfg.settings.SampleRespTailBytes = 256
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+
+	// 客户端必须收到完整流
+	if n := strings.Count(rec.Body.String(), "data: "); n != chunks+2 {
+		t.Errorf("客户端应收到全部 %d 个事件，得到 %d", chunks+2, n)
+	}
+
+	smp := hs.sink.one(t)
+	if len(smp.RespBody) > 1024 {
+		t.Errorf("样本响应体应被封顶，得到 %d 字节", len(smp.RespBody))
+	}
+	// 头部含错误信息与首个 delta
+	if !bytes.Contains(smp.RespBody, []byte("message_start")) {
+		t.Error("应保留头部（含首个 delta 与错误信息）")
+	}
+	// 尾部含 message_stop 与 usage —— 公益站配额排查最需要的正是这个
+	if !bytes.Contains(smp.RespBody, []byte("output_tokens")) {
+		t.Error("应保留尾部的 usage —— 「这次花了多少 token」只能从这里看到")
+	}
+	if !smp.Truncated.Has(model.TruncRespBody) {
+		t.Error("应标记 resp_body 被截断")
+	}
+}
+
+// 上游 500 的样本必须完整落库。恰恰是失败的那次，
+// 才需要知道「我到底发了什么头过去」。
+func TestSample_RecordsUpstreamFailure(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"error":"internal"}`))
+	})
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	smp := hs.sink.one(t)
+	if smp.Outcome != model.OutcomeUpstreamError {
+		t.Errorf("outcome 应为 upstream_error，得到 %q", smp.Outcome)
+	}
+	if smp.RespStatus != 500 {
+		t.Errorf("应记录状态码 500，得到 %d", smp.RespStatus)
+	}
+	if len(smp.OutHeaders) == 0 {
+		t.Error("失败样本更要留下出站头 —— 那正是排查时要看的")
+	}
+	if !bytes.Contains(smp.RespBody, []byte("internal")) {
+		t.Error("应留下上游的错误响应体")
+	}
+}
+
+// 关掉开关时零写入，转发不受影响。
+func TestSample_DisabledRecordsNothing(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.cfg.settings.SampleEnabled = false
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if rec.Code != 200 {
+		t.Errorf("关掉样本不该影响转发，得到 %d", rec.Code)
+	}
+	if got := hs.sink.all(); len(got) != 0 {
+		t.Errorf("开关关闭时不该有任何写入，得到 %d 条", len(got))
+	}
+}
+
+// 四个时间戳都要记，且顺序合理 —— 它们的差值就是排队时长、TTFT、总时长。
+func TestSample_Timestamps(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	smp := hs.sink.one(t)
+	if smp.TSRecv == 0 || smp.TSSent == 0 || smp.TSFirstByte == 0 || smp.TSDone == 0 {
+		t.Fatalf("四个时间戳都应填充：recv=%d sent=%d first=%d done=%d",
+			smp.TSRecv, smp.TSSent, smp.TSFirstByte, smp.TSDone)
+	}
+	if smp.TSRecv > smp.TSSent || smp.TSSent > smp.TSFirstByte || smp.TSFirstByte > smp.TSDone {
+		t.Errorf("时间戳顺序应为 recv ≤ sent ≤ first_byte ≤ done，得到 %d %d %d %d",
+			smp.TSRecv, smp.TSSent, smp.TSFirstByte, smp.TSDone)
+	}
+}
+
+// 选路结果要留档，否则无法回溯「为什么走了这个站」。
+func TestSample_RecordsRoutingDecision(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	smp := hs.sink.one(t)
+	if smp.RouteID != 100 || smp.UpstreamID != 10 || smp.ModelNameID != 1 {
+		t.Errorf("选路结果应完整留档：route=%d upstream=%d model_name=%d",
+			smp.RouteID, smp.UpstreamID, smp.ModelNameID)
+	}
+	if smp.Endpoint != "/v1/messages" {
+		t.Errorf("endpoint 应记录，得到 %q", smp.Endpoint)
+	}
+	// query 丢了会改变上游行为，必须留档
+	if smp.InQuery != "beta=true" {
+		t.Errorf("in_query 应留档，得到 %q", smp.InQuery)
+	}
+	if !strings.HasPrefix(smp.OutURL, hs.up.URL) {
+		t.Errorf("out_url 应记录实际发往的地址，得到 %q", smp.OutURL)
+	}
+}
+
+// 200 但一个字节都没吐的站要单独分类 —— 它最容易被误判成好站。
+func TestSample_FakeAliveOutcome(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200) // 头回了，body 一个字节都没有
+	})
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if smp := hs.sink.one(t); smp.Outcome != model.OutcomeFakeAlive {
+		t.Errorf("200 但零字节应归类为 fake_alive，得到 %q", smp.Outcome)
+	}
+}
+
+// 选路失败时不记样本 —— 那时还没选中任何站，没有「发往公益站的请求」可记。
+func TestSample_NotRecordedWhenSelectFails(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.h.health = allAliveHealth{dead: map[int64]bool{100: true}}
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if got := hs.sink.all(); len(got) != 0 {
+		t.Errorf("选路失败不该记样本，得到 %d 条", len(got))
+	}
+}
+
+// 回归测试：响应体与响应头里的 key 也必须脱敏。
+//
+// 曾经的 bug：只扫了 in_body/out_body，漏掉 resp_body 与 resp_headers。
+// 真实中转站的鉴权错误经常把 key 回显在消息里
+// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
+// 漏这一处，样本库里就躺着明文 key —— 而 §3.6.3b 的要求是无条件的。
+func TestSample_RedactsKeysInResponseToo(t *testing.T) {
+	const upKey = "sk-upstream-secret"
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		// 上游把收到的 key 原样回显（错误消息里带 key 的真实写法）
+		w.Header().Set("X-Api-Key", upKey)
+		w.Header().Set("Set-Cookie", "session="+upKey)
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":{"message":"Invalid API key: ` + upKey + ` provided"}}`))
+	})
+
+	r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
+	hs.serve(r)
+
+	smp := hs.sink.one(t)
+	blob, err := json.Marshal(smp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{upKey, hs.relayPW} {
+		if bytes.Contains(blob, []byte(secret)) {
+			t.Errorf("响应里回显的 key %q 未脱敏 —— 样本库不能是明文 key 库", secret)
+		}
+	}
+	// 但错误信息的其余部分必须留下：那正是排查时要看的
+	if !bytes.Contains(smp.RespBody, []byte("Invalid API key")) {
+		t.Errorf("脱敏不该毁掉错误信息本身，得到 %s", smp.RespBody)
+	}
+}
+
+// signalWriter 在第一次 Write 时发信号，让测试能等到
+// 「网关确实已把数据交给客户端」这个确定的时刻。
+type signalWriter struct {
+	*httptest.ResponseRecorder
+	once  sync.Once
+	wrote chan struct{}
+}
+
+func (s *signalWriter) Write(p []byte) (int, error) {
+	n, err := s.ResponseRecorder.Write(p)
+	s.once.Do(func() { close(s.wrote) })
+	return n, err
+}
+
+func (s *signalWriter) Flush() { s.ResponseRecorder.Flush() }
+
+// §9.4 最后一行，文档特别强调的一条：客户端中途断开时
+// outcome=client_abort，且**已收到的部分照常留档**。
+//
+// 「失败请求的样本不能丢」—— 恰恰是失败的那次，才需要知道
+// 「我到底发了什么头过去」。
+func TestSample_ClientAbortStillRecorded(t *testing.T) {
+	release := make(chan struct{})
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\ndata: {\"partial\":true}\n\n"))
+		w.(http.Flusher).Flush()
+		<-release // 客户端取消后才收工
+	})
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`).WithContext(ctx)
+
+	// 等网关把首块写给客户端之后再取消。
+	// 直接在上游 flush 后就 cancel 是不行的：那时网关的读循环可能还没
+	// 把这块数据从 socket 读出来，ctx 看门狗就先关了连接 ——
+	// 于是「已收到的部分」真的是空的，测试会随机失败。
+	rec := &signalWriter{ResponseRecorder: httptest.NewRecorder(),
+		wrote: make(chan struct{})}
+	go func() {
+		select {
+		case <-rec.wrote:
+		case <-time.After(3 * time.Second):
+		}
+		cancel()
+	}()
+
+	mux := http.NewServeMux()
+	hs.h.Routes(mux)
+	mux.ServeHTTP(rec, r)
+
+	smp := hs.sink.one(t)
+	if smp.Outcome != model.OutcomeClientAbort {
+		t.Errorf("客户端断开应归类为 client_abort，得到 %q（error=%q）",
+			smp.Outcome, smp.Error)
+	}
+	// 已收到的部分必须留档
+	if !bytes.Contains(smp.RespBody, []byte("message_start")) {
+		t.Errorf("已收到的响应片段应留档，得到 %q", smp.RespBody)
+	}
+	// 出站头是排查时最需要的东西
+	if smp.OutHeaders.Get("User-Agent") == "" {
+		t.Error("失败样本更要留下出站头")
+	}
+	if smp.RouteID == 0 {
+		t.Error("选路结果应留档")
 	}
 }
 

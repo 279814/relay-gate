@@ -18,6 +18,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/proxy"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -61,7 +62,18 @@ func run() error {
 
 	cfgSrc := livecfg.New(st, log)
 	tracker := health.NewTracker()
-	fwd := proxy.NewHandler(cfgSrc, tracker, tracker, cfg.RelayKeys, log)
+
+	// 样本记录（§3.6）。开关在 Settings 里，可热改；这里只按启动时的
+	// 队列大小建 Recorder —— 改队列大小要重启，改开关不用。
+	settings, err := cfgSrc.Settings()
+	if err != nil {
+		return fmt.Errorf("读取设置: %w", err)
+	}
+	recorder := sample.NewRecorder(st, settings, log)
+	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
+	defer recorder.Close()
+
+	fwd := proxy.NewHandler(cfgSrc, tracker, tracker, recorder, cfg.RelayKeys, log)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer fwd.CloseIdleConnections()
 

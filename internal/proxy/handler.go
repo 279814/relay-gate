@@ -12,6 +12,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -38,11 +39,20 @@ type InFlightTracker interface {
 	Begin(routeID int64) (done func())
 }
 
+// SampleSink 接收样本。由 sample.Recorder 实现，可为 nil（关闭样本记录）。
+//
+// Record 必须是**非阻塞**的：它在转发路径上被调用，阻塞就等于让
+// 「记日志」拖慢真实请求（§3.6.3a）。
+type SampleSink interface {
+	Record(*model.Sample)
+}
+
 // Handler 处理三个透传端点。
 type Handler struct {
 	cfg      ConfigSource
 	health   router.HealthView
 	inFlight InFlightTracker
+	samples  SampleSink
 	log      *slog.Logger
 
 	// relayKeys 是入站合法凭据集合。
@@ -56,8 +66,10 @@ type Handler struct {
 
 // NewHandler 组装透传处理器。health 与 inFlight 通常是同一个 *health.Tracker，
 // 分成两个参数是因为它们的职责不同（读状态 vs 记在途），也便于测试各自替换。
+//
+// samples 可为 nil，表示不记录样本。
 func NewHandler(cfg ConfigSource, health router.HealthView, inFlight InFlightTracker,
-	relayKeys []string, log *slog.Logger) *Handler {
+	samples SampleSink, relayKeys []string, log *slog.Logger) *Handler {
 
 	keys := make(map[string]bool, len(relayKeys))
 	for _, k := range relayKeys {
@@ -66,7 +78,7 @@ func NewHandler(cfg ConfigSource, health router.HealthView, inFlight InFlightTra
 		}
 	}
 	return &Handler{
-		cfg: cfg, health: health, inFlight: inFlight, log: log,
+		cfg: cfg, health: health, inFlight: inFlight, samples: samples, log: log,
 		relayKeys:  keys,
 		transports: map[int64]*http.Transport{},
 	}
@@ -86,6 +98,8 @@ func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
 }
 
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Protocol) {
+	recvAt := time.Now()
+
 	// 1. 入站鉴权。服务暴露公网时这是唯一屏障 —— 缺了它等于把所有
 	//    上游 key 免费公开（§5.2f）。
 	if !h.authOK(r) {
@@ -176,9 +190,139 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	}
 	fwd := &Forwarder{Transport: tr, Timeouts: RealTimeouts(settings)}
 
+	// 8. 挂上样本采集的 tee。只有开关打开时才有开销 ——
+	//    关掉时 RespTee 为 nil，读循环里连一次判空之外的成本都没有。
+	var respTee *sample.HeadTail
+	if h.samples != nil && settings.SampleEnabled {
+		respTee = sample.NewHeadTail(settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
+		fwd.RespTee = respTee
+	}
+
 	res := fwd.Forward(r.Context(), w, r.Method, outURL, outHeader, outBody)
 
 	h.logResult(cand, inModel, outURL, res)
+
+	if respTee != nil {
+		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
+			outHeader, outURL, respTee, res)
+	}
+}
+
+// recordSample 组装并投递一条样本（§3.6）。
+//
+// 全程只读转发路径产生的数据，绝不回写；投递是非阻塞的，
+// 队列满就丢。任何在这里发生的问题都不该影响已经完成的转发。
+func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
+	cand *router.Candidate, recvAt time.Time, inModel string,
+	inBody, outBody []byte, outHeader http.Header, outURL string,
+	respTee *sample.HeadTail, res *Result) {
+
+	settings, err := h.cfg.Settings()
+	if err != nil {
+		return // 配置读不到就不记样本，绝不因此影响任何东西
+	}
+
+	// 落库的 key 只有两处来源：入站的 relay key 与出站的上游 key。
+	// 两者都要从 body 里扫掉（§9.4 要求真 key 全表 grep 零命中）。
+	keys := []string{cand.Upstream.APIKey}
+	for _, k := range []string{
+		r.Header.Get("X-Api-Key"),
+		strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "),
+		r.Header.Get("Api-Key"),
+	} {
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
+		}
+	}
+
+	inSafe := sample.RedactBodyKeys(inBody, keys)
+	outSafe := sample.RedactBodyKeys(outBody, keys)
+	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
+	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
+	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
+	respSafe := sample.RedactBodyKeys(respTee.Bytes(), keys)
+
+	inTrunc, inCut := sample.TruncateBody(inSafe, settings.SampleMaxBodyBytes)
+	outTrunc, outCut := sample.TruncateBody(outSafe, settings.SampleMaxBodyBytes)
+
+	var flags model.TruncFlags
+	if inCut {
+		flags |= model.TruncInBody
+	}
+	if outCut {
+		flags |= model.TruncOutBody
+	}
+	if respTee.Truncated() {
+		flags |= model.TruncRespBody
+	}
+
+	modelOut := inModel
+	if cand.Route.UpstreamModel != "" {
+		modelOut = cand.Route.UpstreamModel
+	}
+
+	smp := &model.Sample{
+		TSRecv:      recvAt.UnixMilli(),
+		TSSent:      msOrZero(res.SentAt),
+		TSFirstByte: msOrZero(res.FirstByteAt),
+		TSDone:      msOrZero(res.DoneAt),
+
+		Endpoint:    proto.Path(),
+		ModelIn:     inModel,
+		ModelOut:    modelOut,
+		ModelNameID: cand.ModelName.ID,
+		RouteID:     cand.Route.ID,
+		UpstreamID:  cand.Upstream.ID,
+
+		InMethod:  r.Method,
+		InPath:    r.URL.Path,
+		InQuery:   r.URL.RawQuery,
+		InHeaders: sample.RedactHeaders(r.Header),
+		InBody:    inTrunc,
+
+		OutURL:     outURL,
+		OutHeaders: sample.RedactHeaders(outHeader),
+		OutBody:    outTrunc,
+
+		RespStatus: res.Status,
+		// 响应头也要过脱敏：上游可能回 Set-Cookie，也可能把 key 回显在
+		// 自定义头里。三组头走同一条规则，不留例外。
+		RespHeaders: sample.RedactHeaders(res.RespHeaders),
+		RespBody:    respSafe,
+
+		Outcome:   classifyOutcome(res),
+		Truncated: flags,
+	}
+	if res.Err != nil {
+		smp.Error = res.Err.Error()
+	}
+	h.samples.Record(smp)
+}
+
+func msOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+// classifyOutcome 把转发结果映射到 §3.6.2 的 outcome 分类。
+func classifyOutcome(res *Result) model.Outcome {
+	switch {
+	case errors.Is(res.Err, ErrFirstTokenTimeout), errors.Is(res.Err, ErrStreamStalled):
+		return model.OutcomeTimeout
+	case errors.Is(res.Err, ErrClientGone), errors.Is(res.Err, ErrCanceled):
+		return model.OutcomeClientAbort
+	case res.Err != nil:
+		return model.OutcomeUpstreamError
+	case res.Status >= 400:
+		return model.OutcomeUpstreamError
+	case res.BytesWritten == 0:
+		// 200 但一个字节都没吐。这种站最容易被误判成好站 ——
+		// 状态码正常，实际完全不可用（§4.3）。
+		return model.OutcomeFakeAlive
+	}
+	return model.OutcomeOK
 }
 
 // authOK 三个位置都认，因为不同协议的客户端习惯不同（§3.2）。

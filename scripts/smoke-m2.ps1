@@ -143,6 +143,76 @@ func main() {
         -Body '{"model":"never-configured"}' -SkipHttpErrorCheck
     Check '未配置的 model 回 404' ($r.StatusCode -eq 404) "得到 $($r.StatusCode)"
 
+    # ── 样本记录（§3.6 / §9.4）──
+    # 这是第一次让样本链路跑在真数据库上：脱敏漏了、字节被改了、
+    # 或者根本没落库，都只有这里能发现。
+    Write-Host "`n样本记录..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 1  # 等后台 writer 落库
+
+    $samples = Invoke-RestMethod 'http://127.0.0.1:18888/admin/api/samples' -Headers $admin
+    Check '样本已落库' ($samples.total -ge 1) "total=$($samples.total)"
+
+    if ($samples.total -ge 1) {
+        # 找那条成功转发的（列表按 id 倒序，最新的在前）
+        $okSample = $samples.samples | Where-Object { $_.outcome -eq 'ok' } | Select-Object -First 1
+        Check '记录了 outcome=ok 的样本' ($null -ne $okSample) '没找到成功样本'
+
+        if ($okSample) {
+            $detail = Invoke-RestMethod "http://127.0.0.1:18888/admin/api/samples/$($okSample.id)" -Headers $admin
+
+            # body 是 []byte，JSON 编码成 base64
+            $inBody = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($detail.in_body))
+            $outBody = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($detail.out_body))
+            Check 'in_body 是入站原文' ($inBody -ceq $body) "得到 $inBody"
+            Check '不映射时两份 body 完全一致' ($inBody -ceq $outBody) "in=$inBody out=$outBody"
+
+            Check '四个时间戳齐全' (
+                $detail.ts_recv -gt 0 -and $detail.ts_sent -gt 0 -and
+                $detail.ts_first_byte -gt 0 -and $detail.ts_done -gt 0
+            ) "recv=$($detail.ts_recv) sent=$($detail.ts_sent) first=$($detail.ts_first_byte) done=$($detail.ts_done)"
+
+            Check '选路结果已留档' (
+                $detail.route_id -gt 0 -and $detail.upstream_id -gt 0 -and $detail.model_name_id -gt 0
+            ) "route=$($detail.route_id) upstream=$($detail.upstream_id)"
+            Check 'in_query 已留档' ($detail.in_query -eq 'beta=true') "得到 $($detail.in_query)"
+
+            # 脱敏必须保留结构：调探活时要知道 key 放哪个头、什么格式
+            $auth = $detail.out_headers.Authorization
+            Check '出站头保留 Bearer 前缀' ($auth -and $auth[0].StartsWith('Bearer ')) "得到 $auth"
+            Check '出站头保留 UA' (
+                $detail.out_headers.'User-Agent'[0] -eq 'claude-cli/2.1.220 (external, sdk-cli)'
+            ) "得到 $($detail.out_headers.'User-Agent')"
+        }
+    }
+
+    # §9.4 的验收标准：拿真 key 到数据库文件里 grep，断言 0 命中。
+    # 这比查 API 更硬 —— API 可能只是没回显，而字节可能真的躺在库里。
+    Write-Host "`nkey 脱敏（直接扫库文件）..." -ForegroundColor Cyan
+    Invoke-RestMethod -Method Post 'http://127.0.0.1:18888/admin/api/state' -Headers $admin `
+        -ContentType 'application/json' -Body '{"state":"running"}' | Out-Null
+    Start-Sleep -Seconds 2  # 等 WAL 落盘
+
+    $dbFiles = Get-ChildItem -Path (Split-Path $env:RELAY_DB) -Filter 'smoke.db*'
+    $leaked = @()
+    foreach ($f in $dbFiles) {
+        # 必须用共享读打开：relay-gate 还开着这个文件，
+        # ReadAllBytes 会因独占访问失败。
+        $fs = [IO.File]::Open($f.FullName, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $raw = New-Object byte[] $fs.Length
+            $fs.Read($raw, 0, $raw.Length) | Out-Null
+        } finally { $fs.Dispose() }
+
+        $text = [Text.Encoding]::ASCII.GetString($raw)
+        foreach ($secret in @('rk-smoke-client', 'sk-fake-upstream-key')) {
+            if ($text.Contains($secret)) { $leaked += "$($f.Name) 含 $secret" }
+        }
+    }
+    # 上游 key 在 upstream 表里是 AES-GCM 密文，relay key 根本不落库，
+    # 所以整个库文件里都不该出现明文。
+    Check '库文件里搜不到任何明文 key' ($leaked.Count -eq 0) ($leaked -join '; ')
+
     # ── 总闸 ──
     Write-Host "`n总闸..." -ForegroundColor Cyan
     Invoke-RestMethod -Method Post 'http://127.0.0.1:18888/admin/api/state' -Headers $admin `

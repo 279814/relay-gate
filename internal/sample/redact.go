@@ -1,0 +1,106 @@
+// Package sample 记录每次转发的三份内容 + 四个时间戳（§3.6）。
+//
+// 全包的设计前提是**旁路**：记录失败、记录变慢、记录被丢弃，都绝不能影响转发。
+// 宁可丢样本，也不让「记日志」拖慢或拖垮转发 —— 这是主次关系，不能倒置。
+package sample
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/279814/relay-gate/internal/store"
+)
+
+// sensitiveHeaders 是可能携带 key 的头。值一律脱敏后落库（§3.6.3b）。
+//
+// 不脱敏的话，样本库就是一份明文 key 库，而它比配置表更容易被整体导出
+// （配置表的 key 是加密的，样本表的头是明文）。
+//
+// 脱敏不损害用途：调探活时需要知道的是「key 放在**哪个头**、什么**格式**」，
+// 头名与 Bearer 前缀都完整保留，值本身由配置提供。
+var sensitiveHeaders = map[string]bool{
+	"Authorization":       true,
+	"X-Api-Key":           true,
+	"Api-Key":             true,
+	"Proxy-Authorization": true,
+	"Cookie":              true,
+	"Set-Cookie":          true,
+}
+
+// RedactHeaders 返回脱敏后的头副本。原 header 不被修改 ——
+// 它可能还在被转发路径读，改它就违反了「绝不影响转发」。
+func RedactHeaders(h http.Header) http.Header {
+	if h == nil {
+		return http.Header{}
+	}
+	out := make(http.Header, len(h))
+	for k, vs := range h {
+		ck := http.CanonicalHeaderKey(k)
+		cp := make([]string, len(vs))
+		for i, v := range vs {
+			if sensitiveHeaders[ck] {
+				cp[i] = redactValue(v)
+			} else {
+				cp[i] = v
+			}
+		}
+		out[ck] = cp
+	}
+	return out
+}
+
+// redactValue 保留结构、只打码凭据本身。
+//
+// 保留 "Bearer " 前缀是刻意的：§3.6.4 要把样本导出成探活模板，
+// 那时需要知道的正是「这个站用的是 Bearer 还是裸 key」。
+func redactValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	// scheme 前缀（Bearer / Basic）保留，只脱敏后面的凭据
+	if i := strings.IndexByte(v, ' '); i > 0 {
+		scheme, cred := v[:i], strings.TrimSpace(v[i+1:])
+		if cred != "" {
+			return scheme + " " + store.MaskKey(cred)
+		}
+	}
+	return store.MaskKey(v)
+}
+
+// RedactBodyKeys 把 body 里出现的完整 key 替换成脱敏形式。
+//
+// 为什么 body 也要扫：OpenAI 兼容端点允许把 key 放在 body 里，
+// 少数中转站的自定义字段也会带上它。§9.4 的验收标准是
+// 「用真 key 字符串全表 grep 断言为 0 命中」—— 只清头满足不了。
+//
+// keys 通常只有 2 个（relay key 与该站的上游 key），所以逐个 Replace
+// 足够快，不必上 Aho-Corasick。
+func RedactBodyKeys(body []byte, keys []string) []byte {
+	// 先判断有没有真需要替换，避免为绝大多数样本白拷贝一份 body
+	var hit bool
+	for _, k := range keys {
+		if len(k) >= minRedactableKey && strings.Contains(string(body), k) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		return body
+	}
+
+	s := string(body)
+	for _, k := range keys {
+		if len(k) < minRedactableKey {
+			continue
+		}
+		s = strings.ReplaceAll(s, k, store.MaskKey(k))
+	}
+	return []byte(s)
+}
+
+// minRedactableKey 是参与 body 扫描的最短 key 长度。
+//
+// 太短的字符串在正常 body 里会大量偶然命中（想象一个 4 字符的 key
+// 恰好是对话内容的子串），把对话原文打得千疮百孔，反而毁掉样本的诊断价值。
+// 真实的 relay key 与上游 key 都远长于此。
+const minRedactableKey = 12
