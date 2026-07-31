@@ -18,7 +18,7 @@ func acquire(t *testing.T, tr *Tracker, routeID int64) func() {
 }
 
 func TestTracker_InFlightCounting(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 
 	if tr.InFlight(100) != 0 {
 		t.Error("初始在途应为 0")
@@ -46,7 +46,7 @@ func TestTracker_InFlightCounting(t *testing.T) {
 // done 重复调用不能把计数减穿 —— 否则一个 Route 的计数会变成负数，
 // 之后再也触发不了并发上限。
 func TestTracker_DoneIsIdempotent(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	doneA := acquire(t, tr, 100)
 	doneB := acquire(t, tr, 100)
 
@@ -62,9 +62,13 @@ func TestTracker_DoneIsIdempotent(t *testing.T) {
 	}
 }
 
-// 计数归零后应从 map 里删键，避免删掉的 Route 永久堆积。
+// 归零的 Route 不该出现在 Snapshot 里 —— 它是「谁正在被请求」的视图，
+// 混进一堆 0 会让管理界面失去意义。
+//
+// 注意内部 map 里的条目**不会**被删：那条记录还存着健康状态、失败计数、
+// 下次探活时刻。清理走 Forget/RetainOnly，由调度器按当前配置驱动。
 func TestTracker_ZeroCountsAreRemoved(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	done := acquire(t, tr, 100)
 	done()
 	if len(tr.Snapshot()) != 0 {
@@ -72,21 +76,25 @@ func TestTracker_ZeroCountsAreRemoved(t *testing.T) {
 	}
 }
 
-// M2 阶段所有 Route 视为可用（乐观）。M3 接入探活后才有 alive/dead。
-func TestTracker_OptimisticUntilProbing(t *testing.T) {
-	tr := NewTracker()
+// 没被探过的 Route 一律 unknown，且 unknown 视为**可用**（§2.4 乐观策略）。
+//
+// 这条断言等价于「重启后服务立刻可用」：重启会清空全部内存状态，
+// 若未知被当成不可用，重启瞬间就没有任何渠道可选，服务直接不可用 ——
+// 而可用性正是这个项目存在的理由。
+func TestTracker_UnprobedRouteIsOptimisticallyUnknown(t *testing.T) {
+	tr := NewTracker(nil)
 	if tr.State(100) != model.StateUnknown {
-		t.Error("M2 阶段应恒为 unknown（即视为可用）")
+		t.Error("未探过的 Route 应为 unknown（即视为可用）")
 	}
 	if tr.CoolingDown(100) {
-		t.Error("M2 阶段不该有冷却")
+		t.Error("未探过的 Route 不该在冷却中")
 	}
 }
 
 // 并发 Begin/done 必须精确配平。计数只增不减的话，配了 max_concurrency 的
 // Route 会被永久排除在选路之外 —— 隐蔽且不会自愈。
 func TestTracker_ConcurrentBeginDone(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	const goroutines = 50
 	const perRoute = 20
 
@@ -119,7 +127,7 @@ func TestTracker_ConcurrentBeginDone(t *testing.T) {
 
 // limit 是硬上限：占满后必须拒绝，释放一个才腾出一格。
 func TestTracker_TryAcquireEnforcesLimit(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 
 	r1, ok := tr.TryAcquire(100, 2)
 	if !ok {
@@ -145,9 +153,9 @@ func TestTracker_TryAcquireEnforcesLimit(t *testing.T) {
 // limit <= 0 表示不限。这是默认值，绝不能被当成「一个都不许」——
 // 那会让所有没配上限的 Route 直接不可用。
 func TestTracker_ZeroLimitMeansUnlimited(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	for _, limit := range []int{0, -1} {
-		tr = NewTracker()
+		tr = NewTracker(nil)
 		for i := 0; i < 100; i++ {
 			if _, ok := tr.TryAcquire(100, limit); !ok {
 				t.Fatalf("limit=%d 应视为不限，第 %d 个被拒", limit, i)
@@ -165,7 +173,7 @@ func TestTracker_TryAcquireNoOversubscribeUnderRace(t *testing.T) {
 	const limit = 4
 	const burst = 200
 
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	var mu sync.Mutex
 	var live, peak int
 
@@ -208,7 +216,7 @@ func TestTracker_TryAcquireNoOversubscribeUnderRace(t *testing.T) {
 
 // Snapshot 是副本，改它不能影响内部状态。
 func TestTracker_SnapshotIsCopy(t *testing.T) {
-	tr := NewTracker()
+	tr := NewTracker(nil)
 	defer acquire(t, tr, 100)()
 
 	snap := tr.Snapshot()

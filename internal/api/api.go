@@ -30,6 +30,12 @@ type Server struct {
 	// runtime 端点会据此把对应字段留空而不是崩。
 	inFlight InFlightView
 	samples  SampleStats
+
+	// 探活链路。同样可以为 nil —— 探活未启用时相关端点回 503，
+	// 而不是让整个管理接口不可用（管理端点必须始终可用，§4.8）。
+	healthView HealthView
+	gate       GateView
+	prober     Prober
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
