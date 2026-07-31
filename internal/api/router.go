@@ -35,6 +35,11 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("POST /admin/api/state", s.setState)
 	mux.HandleFunc("GET /admin/api/runtime", s.getRuntime)
 
+	// 探活（§4）。健康看板是排查「为什么这个模型不可用」的主入口，
+	// 手动探活对应 §4.5 的「UI 手动点测试」。
+	mux.HandleFunc("GET /admin/api/health", s.getHealth)
+	mux.HandleFunc("POST /admin/api/routes/{id}/probe", s.probeRoute)
+
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
 	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)

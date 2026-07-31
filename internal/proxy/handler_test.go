@@ -221,6 +221,8 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 		settings: testSettings(),
 		state:    store.StateRunning,
 	}
+	// 默认关掉半开，让旧测试不受影响。需要半开的测试自己开。
+	hs.cfg.settings.HalfOpenEnabled = false
 	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog())
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
@@ -643,11 +645,11 @@ func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
 	s := testSettings()
 	up := hs.cfg.snap.Upstreams[10]
 
-	tr1, err := hs.h.transportFor(up, s)
+	tr1, err := hs.h.TransportFor(up, s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr2, err := hs.h.transportFor(up, s)
+	tr2, err := hs.h.TransportFor(up, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +659,7 @@ func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
 
 	// 配置变更（尤其 proxy_url）后必须丢弃旧的，否则改了代理不生效
 	hs.h.InvalidateTransport(up.ID)
-	tr3, err := hs.h.transportFor(up, s)
+	tr3, err := hs.h.TransportFor(up, s)
 	if err != nil {
 		t.Fatal(err)
 	}

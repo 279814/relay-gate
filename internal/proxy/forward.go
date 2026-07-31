@@ -125,7 +125,24 @@ type Result struct {
 	// 要么盲目写（于是把错误 JSON 塞进已经开始的 SSE 流里）。
 	HeadersSent bool
 	Err         error
+
+	// ErrBody 是响应体的开头若干字节，**仅在 Status >= 400 时**填充。
+	//
+	// 健康判定需要它：401 与 500 都是「失败」，但一个要立即判死并提示用户
+	// 改配置，另一个等它自己恢复（§4.3）。而「模型不存在」与「参数不合法」
+	// 同为 400，区别只在 body 里的那几个关键词 —— 没有 body 就只能一律
+	// 按最保守的方式处理，等于放弃了致命类的快速判定。
+	//
+	// 只在错误时收集是刻意的：正常响应可能是几 MB 的 SSE 流，为了健康判定
+	// 攒一份副本纯属浪费；而错误响应通常只有几百字节。
+	ErrBody []byte
 }
+
+// maxErrBodyCapture 是 ErrBody 的上限。
+//
+// 错误响应通常几百字节，但公益站背后的 nginx 出错时会回整页 HTML。
+// 8KB 足够容纳任何结构化错误信息，又不会因为一个巨大的错误页而占住内存。
+const maxErrBodyCapture = 8 << 10
 
 // TTFT 返回首 Token 延迟。未收到首字节时返回 0。
 func (r *Result) TTFT() time.Duration {
@@ -258,6 +275,10 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 
+	// 只有错误响应才攒副本供健康判定用。正常响应可能是几 MB 的 SSE 流，
+	// 为了判定攒一份纯属浪费 —— 而正常响应的判定根本不需要看 body。
+	captureErr := res.Status >= 400
+
 	var total int64
 	// timer 回调写、主循环读，必须用原子操作（-race 会抓这个）
 	var timedOut atomic.Bool
@@ -302,6 +323,15 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 			// 客户端可感知的延迟里，违反「不改变 flush 时序」。
 			if f.RespTee != nil {
 				_, _ = f.RespTee.Write(buf[:n])
+			}
+			// 错误响应额外留一份给健康判定用（区分 401/model_not_found
+			// 这类致命错误与普通 5xx）。同样在 flush 之后，且只在错误时攒。
+			if captureErr && len(res.ErrBody) < maxErrBodyCapture {
+				room := maxErrBodyCapture - len(res.ErrBody)
+				if room > n {
+					room = n
+				}
+				res.ErrBody = append(res.ErrBody, buf[:room]...)
 			}
 			if werr != nil {
 				// 客户端断开。不是上游的问题，不该计入健康失败。

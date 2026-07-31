@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/279814/relay-gate/internal/config"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
@@ -61,7 +63,8 @@ func run() error {
 	}
 
 	cfgSrc := livecfg.New(st, log)
-	tracker := health.NewTracker()
+	tracker := health.NewTracker(cfgSrc)
+	gate := health.NewUpstreamGate()
 
 	// 样本记录（§3.6）。开关与保留策略都在 Settings 里、都可热改
 	// （前者每请求现读，后者每次清理现读）。只有队列大小是启动时定格的 ——
@@ -74,15 +77,37 @@ func run() error {
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
-	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log)
+	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
+	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
+	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
+		WithHealthReporter(probe.NewReporter(tracker))
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer fwd.CloseIdleConnections()
+
+	// 探活（§4）。Transport 由 fwd 提供，与转发共用连接池 ——
+	// 探活顺带把连接热着，真实请求就省掉一次 TLS 握手。
+	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log)
+	persister := health.NewPersister(tracker, st, log)
+
+	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：
+	// 关闭期间在途的真实请求仍会回写健康状态，Persister 还要把它刷进库。
+	bgCtx, stopBG := context.WithCancel(context.Background())
+	var bg sync.WaitGroup
+	bg.Add(2)
+	go func() { defer bg.Done(); sched.Run(bgCtx) }()
+	go func() { defer bg.Done(); persister.Run(bgCtx) }()
+	defer func() {
+		stopBG()
+		bg.Wait()
+	}()
 
 	mux := http.NewServeMux()
 	// WithRuntime 把在途计数与样本丢弃数接到 /admin/api/runtime ——
 	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
 	mux.Handle("/admin/api/", api.New(st, log).
-		WithRuntime(tracker, recorder).Routes(cfg.AdminPW))
+		WithRuntime(tracker, recorder).
+		WithHealth(tracker, gate, sched).
+		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 	// /healthz 报的是**进程活着**，不代表有可用上游 —— 那要看 /admin/api/state。
 	// 混在一起会让容器编排在所有上游都挂时重启进程，而重启治不了上游。

@@ -46,12 +46,15 @@ type Handler struct {
 	samples SampleSink
 	log     *slog.Logger
 
+	// reporter 接收真实请求的健康结论。可为 nil（不做健康回写）。
+	reporter HealthReporter
+
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
 
 	// transports 按 Upstream 缓存，避免每请求新建（那会丢掉连接复用，
 	// 每次都要重新 TLS 握手 —— 对高延迟的公益站代价很大）。
-	// 存 key 是为了在配置变更后能发现缓存已过期，见 transportFor。
+	// 存 key 是为了在配置变更后能发现缓存已过期，见 TransportFor。
 	mu         sync.RWMutex
 	transports map[int64]transportEntry
 }
@@ -79,6 +82,15 @@ func NewHandler(cfg ConfigSource, health router.HealthView,
 		relayKeys:  keys,
 		transports: map[int64]transportEntry{},
 	}
+}
+
+// WithHealthReporter 接上真实请求的健康回写（§3.5）。
+//
+// 分成单独的 setter 而不是加构造参数：健康回写是可选的（M2 的测试与
+// 冒烟脚本都不需要它），而 NewHandler 的参数已经有五个了。
+func (h *Handler) WithHealthReporter(r HealthReporter) *Handler {
+	h.reporter = r
+	return h
 }
 
 // Routes 注册透传端点。三个协议路径 1:1 对应上游同名路径（§3.1）。
@@ -154,8 +166,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	// 的在途计数就只增不减，之后永远选不到它。
 	cand, err := router.Select(snap, h.health, inModel, proto)
 	if err != nil {
-		h.writeSelectError(w, err, proto, inModel)
-		return
+		// 全部 dead 时半开放行一次（§4.4c），避免「全挂 → 只能干等探活」。
+		cand = h.halfOpen(snap, inModel, proto, settings, err)
+		if cand == nil {
+			h.writeSelectError(w, err, proto, inModel)
+			return
+		}
+		w.Header().Set("X-Relay-Half-Open", "1")
 	}
 	defer cand.Release()
 
@@ -178,7 +195,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	}
 
 	// 7. 转发
-	tr, err := h.transportFor(cand.Upstream, settings)
+	tr, err := h.TransportFor(cand.Upstream, settings)
 	if err != nil {
 		h.log.Error("构造 Transport 失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
@@ -198,6 +215,14 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	h.logResult(cand, inModel, outURL, res)
 
+	// 9. 健康回写。**这是最快的故障发现路径** —— 探活有周期（dead 状态
+	//    20 秒），真实请求没有延迟，站挂掉那一刻就有请求撞上去（§3.5）。
+	//    放在写错误响应之前：客户端已经在等了，先把状态记下来，
+	//    下一个请求就能绕开这个站。
+	if h.reporter != nil {
+		h.reporter.ReportResult(cand.Route.ID, viewOf(res))
+	}
+
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
 	// 不写的话 net/http 会在 handler 返回时补一个 HTTP 200 空 body ——
 	// 客户端拿到「成功但没内容」，既看不到原因也不会重试。
@@ -209,6 +234,46 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
 			outHeader, outURL, respTee, res, settings)
 	}
+}
+
+// halfOpen 在「全部 Route 都 dead」时放行一次试探（§4.4c）。
+//
+// 为什么需要它：所有站都被判死之后，若直接回 503，就只能干等下一轮探活
+// （dead 状态 L2 是 30 秒）。而站可能刚刚恢复 —— 那 30 秒里的每个请求都
+// 白白失败了。半开让真实流量自己去试，成功则立即转 unknown（可用）。
+//
+// 只在 ErrNoRouteAvailable 时尝试。模型没配（404）或协议不匹配（400）
+// 是配置错误，放行多少次都不会好，试探只是把一个明确的错误变成一次超时。
+//
+// 返回 nil 表示不该半开，调用方按原错误作答。
+func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
+	proto model.Protocol, settings model.Settings, selErr error) *router.Candidate {
+
+	if !settings.HalfOpenEnabled || !errors.Is(selErr, router.ErrNoRouteAvailable) {
+		return nil
+	}
+	mn, err := router.MatchModelName(snap, inModel, proto)
+	if err != nil || mn.Protocol != proto {
+		return nil
+	}
+
+	// DeadRoutesFor 已按优先级升序排好，取第一个能占到额度的。
+	// 它返回 *model.Route 而不是 Candidate，所以并发额度要自己占 ——
+	// 不占的话半开会绕过 max_concurrency，而一个刚恢复的站最不该被打爆。
+	for _, rt := range router.DeadRoutesFor(snap, h.health, mn) {
+		up := snap.Upstreams[rt.UpstreamID]
+		if up == nil {
+			continue
+		}
+		release, ok := h.health.TryAcquire(rt.ID, rt.MaxConcurrency)
+		if !ok {
+			continue
+		}
+		h.log.Info("全部 Route 均 dead，半开放行一次试探",
+			"model", inModel, "upstream", up.Name, "route", rt.ID)
+		return router.NewCandidate(rt, up, mn, release)
+	}
+	return nil
 }
 
 // writeForwardError 把转发失败翻译成客户端能理解的 HTTP 错误。
@@ -388,7 +453,12 @@ func (h *Handler) authOK(r *http.Request) bool {
 	return false
 }
 
-// transportFor 按 Upstream 缓存 Transport，保住连接复用。
+// TransportFor 按 Upstream 缓存 Transport，保住连接复用。
+//
+// 导出是为了让探活共用同一个连接池（probe.TransportSource）：探活顺带
+// 把连接热着，真实请求就省掉一次 TLS 握手 —— 对高延迟的公益站，
+// 握手占首字节的可观比例。各建一套连接池的话这份收益就没了，
+// 还会多出一倍空闲连接。
 //
 // 缓存键必须包含**所有影响 Transport 行为的配置**，不能只用 upstream ID：
 // 只按 ID 缓存的话，用户在管理界面改了 proxy_url，配置确实存进去了、
@@ -396,7 +466,7 @@ func (h *Handler) authOK(r *http.Request) bool {
 // 这类「看起来生效了其实没有」的问题排查成本极高。
 //
 // 旧 Transport 在被顶替时要关掉空闲连接，否则改一次配置就漏一批连接。
-func (h *Handler) transportFor(up *model.Upstream, s model.Settings) (*http.Transport, error) {
+func (h *Handler) TransportFor(up *model.Upstream, s model.Settings) (*http.Transport, error) {
 	key := transportKey(up, s)
 
 	h.mu.RLock()
@@ -441,7 +511,7 @@ func (h *Handler) CloseIdleConnections() {
 
 // InvalidateTransport 丢弃某个 Upstream 的 Transport。
 //
-// 常规的配置变更不需要调它 —— transportFor 的缓存键已经包含了
+// 常规的配置变更不需要调它 —— TransportFor 的缓存键已经包含了
 // proxy_url 与连接超时，改了会自动重建。这个方法留给「配置没变但连接池
 // 本身要重置」的场景（例如探活判定整站不可用后主动断开所有连接）。
 func (h *Handler) InvalidateTransport(upstreamID int64) {

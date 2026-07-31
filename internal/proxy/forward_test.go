@@ -510,7 +510,7 @@ func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
 	up := &model.Upstream{ID: 10, Name: "s", BaseURL: "https://x.com", Enabled: true}
 	s := testSettings()
 
-	tr1, err := hs.h.transportFor(up, s)
+	tr1, err := hs.h.TransportFor(up, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +520,7 @@ func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
 
 	// 同一个 ID，但换了代理地址
 	up.ProxyURL = "http://127.0.0.1:9999"
-	tr2, err := hs.h.transportFor(up, s)
+	tr2, err := hs.h.TransportFor(up, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,14 +540,14 @@ func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
 
 	// 配置没变时必须复用 —— 每请求新建会丢掉连接复用，
 	// 对高延迟的公益站等于每次重新 TLS 握手
-	tr3, _ := hs.h.transportFor(up, s)
+	tr3, _ := hs.h.TransportFor(up, s)
 	if tr3 != tr2 {
 		t.Error("配置未变时应复用缓存的 Transport")
 	}
 
 	// 连接超时同样影响 Transport 构造，也必须纳入缓存键
 	s.RealConnectSec = 7
-	if tr4, _ := hs.h.transportFor(up, s); tr4 == tr2 {
+	if tr4, _ := hs.h.TransportFor(up, s); tr4 == tr2 {
 		t.Error("改了连接超时后应重建 Transport")
 	}
 }

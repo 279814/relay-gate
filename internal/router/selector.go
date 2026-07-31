@@ -41,6 +41,22 @@ func (c *Candidate) Release() {
 	}
 }
 
+// NewCandidate 组装一个 Candidate，供半开放行使用（§4.4c）。
+//
+// 半开走的是 DeadRoutesFor 而不是 Select（它专挑 Select 排除掉的 dead
+// Route），但拿到之后要和正常候选**完全一样**地被处理 —— 同样占并发额度、
+// 同样 defer Release。
+//
+// 之所以要这个构造函数：release 是私有字段，而它必须私有 —— 公开的话
+// 调用方可能自己塞一个 nil 进去，那就等于悄悄绕过了并发额度的归还。
+// 让额度必须从 TryAcquire 来、且只能通过这个入口装进 Candidate，
+// 「占了就一定会还」这条不变量才守得住。
+func NewCandidate(rt *model.Route, up *model.Upstream,
+	mn *model.ModelName, release func()) *Candidate {
+
+	return &Candidate{Route: rt, Upstream: up, ModelName: mn, release: release}
+}
+
 // HealthView 提供选路所需的健康状态。由 health 包实现，
 // 这里只依赖接口，避免 router 与状态机循环依赖。
 type HealthView interface {
