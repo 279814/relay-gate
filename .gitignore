@@ -11,10 +11,12 @@ data/
 *.db-shm
 *.db-wal
 
-# 构建产物
-relay-gate
-relay-gate.exe
-dist/
+# 构建产物。必须用 / 锚定到根目录：
+# 无斜杠的 "relay-gate" 会匹配任意层级的同名目录，
+# 把源码目录 cmd/relay-gate/ 一并忽略掉。
+/relay-gate
+/relay-gate.exe
+/dist/
 
 # 环境
 .env

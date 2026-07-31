@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # 不用 gofmt -l . 直接判：它对 vendor 与生成代码也报，
+        # 而且没有非零退出码，漏格式化会静默通过。
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："; echo "$out"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race 只能在这里跑：竞态检测要 cgo，开发机（Windows，无 cgo）
+      # 起不来。而这个项目的核心恰恰是并发 —— 在途计数、样本队列、
+      # livecfg 的快照替换、SSE 流的三个超时看门狗，全是多协程共享状态。
+      # 功能断言只能证明「这次对了」，证不了「没有数据竞争」。
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # 第二轮不开 -race：竞态检测会把调度拉慢一个数量级，掩盖
+      # 时序敏感的偶发失败（超时、TTFT、后台 writer 的进度）。
+      # 这类 flaky 只有在正常速度下重复跑才现形。
+      - name: go test（重复一轮查 flaky）
+        run: go test -count=2 ./...
+
+      - name: go build
+        run: go build ./...
