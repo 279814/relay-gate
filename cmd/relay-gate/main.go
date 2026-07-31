@@ -133,7 +133,8 @@ func run() error {
 	go func() {
 		log.Info("relay-gate 已启动", "addr", cfg.Addr, "db", cfg.DBPath,
 			"state", runState, "relay_keys", len(cfg.RelayKeys),
-			"endpoints", "/v1/messages /v1/responses /v1/chat/completions")
+			"endpoints", "/v1/messages /v1/responses /v1/chat/completions "+
+				"/v1/messages/count_tokens /v1/models")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

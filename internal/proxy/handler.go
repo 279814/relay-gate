@@ -98,6 +98,10 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/messages", h.handle(model.ProtoAnthropic))
 	mux.HandleFunc("POST /v1/responses", h.handle(model.ProtoOpenAIResponses))
 	mux.HandleFunc("POST /v1/chat/completions", h.handle(model.ProtoOpenAIChat))
+
+	// M4: 附加端点（§3.1）
+	mux.HandleFunc("POST /v1/messages/count_tokens", h.handleCountTokens)
+	mux.HandleFunc("GET /v1/models", h.handleModels)
 }
 
 func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
@@ -106,15 +110,31 @@ func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
 	}
 }
 
-func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Protocol) {
-	recvAt := time.Now()
+// preambleResult 是 preamble 已经完成的那几步的产物。
+type preambleResult struct {
+	settings model.Settings
+	body     []byte
+	inModel  string
+	snapshot *router.Snapshot
+}
+
+// preamble 跑完所有端点共用的前半段：鉴权 → 总闸 → 设置 → 读 body →
+// 取 model → 读快照。任何一步失败都已经写好了错误响应，此时返回 ok=false，
+// 调用方直接 return 即可。
+//
+// 抽出来是给 count_tokens 用的（§10.3）：它与 serve 的前半段完全相同，
+// 但后半段差别很大（非流式、超时独立、失败不计健康、要本地兜底）。
+// 整个复用 serve 会让它长出一堆 if；各写一份则迟早在一边漏掉总闸或鉴权 ——
+// 而漏掉鉴权就是把所有上游 key 公开（§5.2f）。
+func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
+	proto model.Protocol) (*preambleResult, bool) {
 
 	// 1. 入站鉴权。服务暴露公网时这是唯一屏障 —— 缺了它等于把所有
 	//    上游 key 免费公开（§5.2f）。
 	if !h.authOK(r) {
 		writeAPIError(w, http.StatusUnauthorized, proto,
 			"authentication_error", "无效的 API key")
-		return
+		return nil, false
 	}
 
 	// 2. 服务总闸（§4.8）。暂停时拒绝新请求，但不影响已建立的流。
@@ -122,20 +142,20 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	if err != nil {
 		h.log.Error("读取运行状态失败", "err", err)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-		return
+		return nil, false
 	}
 	if state == store.StatePaused {
 		w.Header().Set("X-Relay-State", "paused")
 		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
 			"服务已暂停。在管理界面点「启动」后恢复")
-		return
+		return nil, false
 	}
 
 	settings, err := h.cfg.Settings()
 	if err != nil {
 		h.log.Error("读取设置失败", "err", err)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-		return
+		return nil, false
 	}
 
 	// 3. 读 body。必须整体读入：改 model 要定位偏移量，重试要能重放。
@@ -143,7 +163,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
 			fmt.Sprintf("读取请求体失败: %v", err))
-		return
+		return nil, false
 	}
 
 	// 4. 取出 model 值用于选路。只读不改。
@@ -151,16 +171,32 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
 			fmt.Sprintf("无法确定请求的 model: %v", err))
-		return
+		return nil, false
 	}
 
-	// 5. 选路
+	// 5. 读配置快照
 	snap, err := h.cfg.Snapshot()
 	if err != nil {
 		h.log.Error("读取配置快照失败", "err", err)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
+		return nil, false
+	}
+
+	return &preambleResult{
+		settings: settings, body: body, inModel: inModel, snapshot: snap,
+	}, true
+}
+
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Protocol) {
+	recvAt := time.Now()
+
+	pre, ok := h.preamble(w, r, proto)
+	if !ok {
 		return
 	}
+	settings, body, inModel, snap := pre.settings, pre.body, pre.inModel, pre.snapshot
+
+	// 6. 选路
 	// Select 在选中的同时就占下了并发额度（判定与占位原子完成），
 	// 所以这里必须 defer 释放，任何返回路径都不能漏 —— 漏了那个 Route
 	// 的在途计数就只增不减，之后永远选不到它。
