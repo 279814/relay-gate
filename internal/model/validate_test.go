@@ -46,6 +46,58 @@ func TestBaseURLRejectsPath(t *testing.T) {
 	}
 }
 
+// 回归测试：开了 full_url_mode 时，带路径的 base_url 必须能存进去。
+//
+// 曾经的 bug：校验无条件拒绝带路径的 base_url，而它自己的错误信息
+// 又推荐「请开启 full_url_mode」—— 开了也存不进去，那条逃生舱是句空话。
+// BuildOutboundURL 里的 FullURLMode 分支因此成了永远走不到的死代码，
+// 非标准路径的站根本没法接入。
+func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
+	good := []string{
+		"https://api.example.com/custom/chat",
+		"https://api.example.com/v1/messages",
+		"https://api.example.com/openai/deployments/gpt/chat/completions",
+	}
+	for _, u := range good {
+		t.Run(u, func(t *testing.T) {
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k", FullURLMode: true}
+			up.Defaults()
+			if err := up.Validate(); err != nil {
+				t.Fatalf("full_url_mode 下 %q 应被接受，却报错：%v", u, err)
+			}
+		})
+	}
+
+	// full_url_mode 放开的只是「路径」这一条，URL 本身仍必须合法 ——
+	// 否则错误会推迟到出站时才暴露，那时只看到一个没头没尾的转发失败。
+	bad := []string{
+		"api.example.com/custom",       // 缺 scheme
+		"ftp://api.example.com/custom", // 错误 scheme
+		"https:///custom",              // 缺 host
+		"",
+	}
+	for _, u := range bad {
+		t.Run("bad/"+u, func(t *testing.T) {
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k", FullURLMode: true}
+			up.Defaults()
+			if err := up.Validate(); err == nil {
+				t.Fatalf("full_url_mode 也不该放过 %q", u)
+			}
+		})
+	}
+
+	// 没开 full_url_mode 时仍要挡住带路径的，且错误信息要指向那个开关
+	up := &Upstream{Name: "t", BaseURL: "https://api.example.com/v1", APIKey: "k"}
+	up.Defaults()
+	err := up.Validate()
+	if err == nil {
+		t.Fatal("未开 full_url_mode 时带路径应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "full_url_mode") {
+		t.Errorf("错误信息应指出可用 full_url_mode，得到：%v", err)
+	}
+}
+
 // 探活头里混进鉴权头会造成「两个 key 来源」，出问题时无从排查。
 func TestProbeHeadersRejectAuth(t *testing.T) {
 	for _, h := range []string{"Authorization", "authorization", "x-api-key", "X-API-Key", "api-key"} {

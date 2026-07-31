@@ -37,10 +37,16 @@ CREATE TABLE IF NOT EXISTS model_name (
     updated_at       INTEGER NOT NULL
 );
 
--- 全局至多一个兜底 ModelName。用部分唯一索引在**存储层**保证，
+-- 每种协议至多一个兜底 ModelName。用部分唯一索引在**存储层**保证，
 -- 而不是靠应用层先查后写——后者在并发下会漏。
-CREATE UNIQUE INDEX IF NOT EXISTS idx_model_name_single_fallback
-    ON model_name (is_fallback) WHERE is_fallback = 1;
+--
+-- 粒度是「每协议」而不是「全局」：兜底要转发到具体端点，而端点与协议
+-- 一一对应（§3.1）。全局只allow一个的话，另外两个端点永远拿不到兜底 ——
+-- 那两个端点上任何未配置的模型都会收到一个「协议不一致」的 400，
+-- 而用户的意图明明是「都走兜底」。
+DROP INDEX IF EXISTS idx_model_name_single_fallback;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_name_fallback_per_protocol
+    ON model_name (protocol) WHERE is_fallback = 1;
 
 CREATE TABLE IF NOT EXISTS route (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

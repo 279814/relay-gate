@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -320,6 +321,97 @@ func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 	}
 }
 
+// 回归测试：响应头阶段的时限绝不能误伤「头回得快、body 吐得慢」的长流。
+//
+// 曾经的写法是给请求套一个 FirstToken 的 context，拿到响应头后再 cancel ——
+// 但请求是用那个 context 建的，cancel 会连带取消整个响应体读取，
+// 流当场断在第一块。真实的长思考正是这个形状：头秒回，body 慢慢吐。
+func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200) // 头立刻回
+		w.(http.Flusher).Flush()
+		// 之后每块都比 FirstToken(300ms) 晚，但都在 Idle(400ms) 之内
+		for i := 0; i < 6; i++ {
+			time.Sleep(200 * time.Millisecond)
+			w.Write([]byte("data: chunk\n\n"))
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer up.Close()
+
+	rec := httptest.NewRecorder()
+	f := testForwarder(t, fastTimeouts())
+	res := f.Forward(context.Background(), rec, "POST", up.URL, http.Header{}, []byte("{}"))
+
+	if res.Err != nil {
+		t.Fatalf("头快 body 慢的流不该出错，得到 %v", res.Err)
+	}
+	if n := strings.Count(rec.Body.String(), "data: chunk"); n != 6 {
+		t.Errorf("应完整收到 6 块，实际 %d —— 响应头时限误伤了 body 读取", n)
+	}
+}
+
+// 卡在响应头阶段的站要在 FirstToken 时限内识别，而不是等 Total。
+// 这类站在公益站里不罕见：连接建立、请求收下，然后就没有然后了。
+func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // 连响应头都不回
+	}))
+	defer up.Close()
+	defer close(release)
+
+	to := fastTimeouts()
+	to.FirstToken = 300 * time.Millisecond
+	to.Total = 10 * time.Second // 远大于 FirstToken，用来证明不是它兜的底
+
+	rec := httptest.NewRecorder()
+	f := testForwarder(t, to)
+	start := time.Now()
+	res := f.Forward(context.Background(), rec, "POST", up.URL, http.Header{}, []byte("{}"))
+	elapsed := time.Since(start)
+
+	if !errors.Is(res.Err, ErrFirstTokenTimeout) {
+		t.Errorf("应归类为首 Token 超时，得到 %v", res.Err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("应在 FirstToken(300ms) 后就放弃，实际等了 %v", elapsed)
+	}
+	// 关键：必须算上游的账，否则死站永远攒不够失败次数
+	if !IsUpstreamFault(res.Err) {
+		t.Error("响应头阶段超时是上游的问题，必须计入健康失败")
+	}
+	if res.HeadersSent {
+		t.Error("没拿到响应头就不该标记 HeadersSent")
+	}
+}
+
+// 我们自己的超时到期必须算上游的账。
+// 判成「非上游故障」的话，真死的站永远不会被标 dead —— 项目的核心价值就没了。
+func TestIsUpstreamFault_OurOwnTimeoutsCountAgainstUpstream(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+		why  string
+	}{
+		{ErrConnect, true, "连不上是上游的问题"},
+		{ErrFirstTokenTimeout, true, "站太慢也是站的问题"},
+		{ErrStreamStalled, true, "流中断是上游的问题"},
+		{ErrTotalTimeout, true, "拖过总时限还是上游的问题"},
+		{ErrUpstreamBroke, true, "上游断开"},
+		{ErrStreamBroke, true, "流中途断"},
+		{ErrClientGone, false, "客户端走了，与上游无关"},
+		{ErrCanceled, false, "客户端取消，与上游无关"},
+		{nil, false, "没错就没有故障"},
+	}
+	for _, c := range cases {
+		if got := IsUpstreamFault(c.err); got != c.want {
+			t.Errorf("IsUpstreamFault(%v) = %v，期望 %v —— %s", c.err, got, c.want, c.why)
+		}
+	}
+}
+
 // 上游 5xx 要原样传给客户端（含 body），由健康状态机决定后续动作。
 func TestForward_PassesUpstreamErrorThrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +497,58 @@ func TestIsUpstreamFault(t *testing.T) {
 		if got := IsUpstreamFault(c.err); got != c.want {
 			t.Errorf("IsUpstreamFault(%v) = %v, want %v", c.err, got, c.want)
 		}
+	}
+}
+
+// 回归测试：改了 proxy_url 必须立刻生效。
+//
+// 曾经的写法只用 upstream ID 做缓存键，于是用户在管理界面改了代理地址，
+// 配置确实存进去了、API 也回显了新值，但出站流量还在绕过代理 —— 直到重启。
+// livecfg 每 2 秒刷新配置，这种「看起来生效了其实没有」最难排查。
+func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
+	hs := newHarness(t, nil)
+	up := &model.Upstream{ID: 10, Name: "s", BaseURL: "https://x.com", Enabled: true}
+	s := testSettings()
+
+	tr1, err := hs.h.transportFor(up, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr1.Proxy != nil {
+		t.Fatal("未配代理时 Proxy 应为 nil")
+	}
+
+	// 同一个 ID，但换了代理地址
+	up.ProxyURL = "http://127.0.0.1:9999"
+	tr2, err := hs.h.transportFor(up, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr2 == tr1 {
+		t.Error("改了 proxy_url 后应重建 Transport，否则流量永远绕过代理")
+	}
+	if tr2.Proxy == nil {
+		t.Fatal("新 Transport 应带上代理")
+	}
+	proxyURL, err := tr2.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "x.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxyURL == nil || proxyURL.Host != "127.0.0.1:9999" {
+		t.Errorf("代理地址应为新值，得到 %v", proxyURL)
+	}
+
+	// 配置没变时必须复用 —— 每请求新建会丢掉连接复用，
+	// 对高延迟的公益站等于每次重新 TLS 握手
+	tr3, _ := hs.h.transportFor(up, s)
+	if tr3 != tr2 {
+		t.Error("配置未变时应复用缓存的 Transport")
+	}
+
+	// 连接超时同样影响 Transport 构造，也必须纳入缓存键
+	s.RealConnectSec = 7
+	if tr4, _ := hs.h.transportFor(up, s); tr4 == tr2 {
+		t.Error("改了连接超时后应重建 Transport")
 	}
 }
 

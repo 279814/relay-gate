@@ -25,6 +25,20 @@ type Candidate struct {
 	Route     *model.Route
 	Upstream  *model.Upstream
 	ModelName *model.ModelName
+
+	// release 是选中时占下的并发额度的释放函数，见 Release。
+	release func()
+}
+
+// Release 归还选路时占用的并发额度。调用方**必须**在请求收尾时调一次
+// （defer 即可），重复调用无害。
+//
+// 不释放的后果隐蔽且永久：该 Route 的在途计数只增不减，配了
+// max_concurrency 之后会被永远排除在选路之外，且不会自愈。
+func (c *Candidate) Release() {
+	if c.release != nil {
+		c.release()
+	}
 }
 
 // HealthView 提供选路所需的健康状态。由 health 包实现，
@@ -32,10 +46,17 @@ type Candidate struct {
 type HealthView interface {
 	// State 返回 Route 的健康状态。未知的 Route 返回 StateUnknown。
 	State(routeID int64) model.HealthState
-	// InFlight 返回该 Route 当前在途请求数，用于并发上限判定。
-	InFlight(routeID int64) int
 	// CoolingDown 表示该 Route 处于 429 冷却期，本轮不选它（但不算 dead）。
 	CoolingDown(routeID int64) bool
+	// TryAcquire 原子地「检查并发上限并占位」。limit <= 0 表示不限。
+	//
+	// 之所以不是「读计数 + 由调用方判断」，是因为那两步之间有窗口：
+	// 并发涌入时每个请求都读到涌入前的计数，于是全部通过检查。
+	// 判定与占位必须在同一个临界区内完成。
+	//
+	// ok 为 true 时 release 非 nil，且必须在请求结束时调用一次。
+	// 实现须保证 release 可重复调用（多调无副作用）。
+	TryAcquire(routeID int64, limit int) (release func(), ok bool)
 }
 
 // Snapshot 是选路依赖的配置快照。调用方从 store 读一次，避免每请求查库。
@@ -49,10 +70,16 @@ type Snapshot struct {
 // MatchModelName 按 §3.4 步骤 2 匹配 ModelName：
 // 精确 → 前缀（最长优先）→ 兜底 → 未找到。
 //
+// endpointProto 只用于挑兜底：精确与前缀匹配的协议校验留给 Select，
+// 那里能给出「端点是 X 但配置为 Y」这种可操作的错误。而兜底是**隐式**选中的，
+// 用户没有指名要它，报「你配错了」没有意义 —— 直接挑协议对得上的那个。
+//
 // 前缀按 name 长度降序是必须的：同时配了 "claude-opus" 与 "claude-opus-5" 时，
 // 入站 "claude-opus-5-thinking" 应命中更具体的那个。若按任意顺序遍历，
 // 结果取决于 map 迭代顺序，会变成随机行为。
-func MatchModelName(snap *Snapshot, inModel string) (*model.ModelName, error) {
+func MatchModelName(snap *Snapshot, inModel string,
+	endpointProto model.Protocol) (*model.ModelName, error) {
+
 	if inModel == "" {
 		return nil, fmt.Errorf("%w: 入站 model 为空", ErrModelNotFound)
 	}
@@ -70,7 +97,9 @@ func MatchModelName(snap *Snapshot, inModel string) (*model.ModelName, error) {
 		if mn.MatchMode == model.MatchPrefix && strings.HasPrefix(inModel, mn.Name) {
 			prefixes = append(prefixes, mn)
 		}
-		if mn.IsFallback {
+		// 只认协议对得上的兜底。schema 保证每协议至多一个，
+		// 所以这里不会有「挑哪个」的歧义。
+		if mn.IsFallback && mn.Protocol == endpointProto {
 			fallback = mn
 		}
 	}
@@ -98,7 +127,7 @@ func MatchModelName(snap *Snapshot, inModel string) (*model.ModelName, error) {
 func Select(snap *Snapshot, hv HealthView, inModel string,
 	endpointProto model.Protocol) (*Candidate, error) {
 
-	mn, err := MatchModelName(snap, inModel)
+	mn, err := MatchModelName(snap, inModel, endpointProto)
 	if err != nil {
 		return nil, err
 	}
@@ -114,27 +143,36 @@ func Select(snap *Snapshot, hv HealthView, inModel string,
 		return nil, fmt.Errorf("%w: ModelName %q %s", ErrNoRouteAvailable, mn.Name, reason)
 	}
 
-	// 按优先级升序取第一个有余量的桶。桶内已达并发上限的排除后若为空，
-	// 溢出到下一优先级（§3.4 步骤 7）。
+	// 按优先级升序找第一个能占到额度的 Route。
+	//
+	// 桶内挑中的那个若占不到（已达上限，或刚被并发请求抢先），就把它从
+	// 候选池里剔掉、在桶内重挑，而不是直接溢出到下一优先级 —— 后者会让
+	// 同桶里明明还有余量的站被白白跳过。整桶都占不到才溢出（§3.4 步骤 7）。
 	for _, prio := range sortedKeys(buckets) {
-		withRoom := make([]*model.Route, 0, len(buckets[prio]))
-		for _, r := range buckets[prio] {
-			if r.MaxConcurrency > 0 && hv.InFlight(r.ID) >= r.MaxConcurrency {
+		pool := buckets[prio]
+		for len(pool) > 0 {
+			i := weightedPick(pool)
+			chosen := pool[i]
+			// 交换删除。buckets 是 viableBuckets 每次现建的，改它不会
+			// 碰到配置快照；加权随机也不依赖元素顺序。
+			pool[i] = pool[len(pool)-1]
+			pool = pool[:len(pool)-1]
+
+			up := snap.Upstreams[chosen.UpstreamID]
+			if up == nil {
+				// 配置不一致（Route 指向已删除的 Upstream）。跳过而不是崩，
+				// 让其余 Route 仍能服务。
 				continue
 			}
-			withRoom = append(withRoom, r)
+			// 占位与判定在 TryAcquire 内部一次完成，中间没有让并发请求
+			// 挤进来的窗口。
+			release, ok := hv.TryAcquire(chosen.ID, chosen.MaxConcurrency)
+			if !ok {
+				continue
+			}
+			return &Candidate{Route: chosen, Upstream: up,
+				ModelName: mn, release: release}, nil
 		}
-		if len(withRoom) == 0 {
-			continue
-		}
-		chosen := weightedPick(withRoom)
-		up := snap.Upstreams[chosen.UpstreamID]
-		if up == nil {
-			// 配置不一致（Route 指向已删除的 Upstream）。跳过而不是崩，
-			// 让其余 Route 仍能服务。
-			continue
-		}
-		return &Candidate{Route: chosen, Upstream: up, ModelName: mn}, nil
 	}
 
 	return nil, fmt.Errorf("%w: ModelName %q 的所有 Route 都已达并发上限",
@@ -202,26 +240,28 @@ func DeadRoutesFor(snap *Snapshot, hv HealthView, mn *model.ModelName) []*model.
 	return out
 }
 
-// weightedPick 按 weight 加权随机。weight 已由 Validate 保证 ≥ 1。
-func weightedPick(rs []*model.Route) *model.Route {
+// weightedPick 按 weight 加权随机，返回**下标**。
+// 返回下标而不是元素，是为了让调用方能在占额度失败后把它剔出候选池重挑。
+// weight 已由 Validate 保证 ≥ 1。
+func weightedPick(rs []*model.Route) int {
 	if len(rs) == 1 {
-		return rs[0]
+		return 0
 	}
 	total := 0
 	for _, r := range rs {
 		total += r.Weight
 	}
 	if total <= 0 {
-		return rs[0] // 理论不可达（Validate 保证 weight ≥ 1），兜底防除零
+		return 0 // 理论不可达（Validate 保证 weight ≥ 1），兜底防除零
 	}
 	n := rand.IntN(total)
-	for _, r := range rs {
+	for i, r := range rs {
 		n -= r.Weight
 		if n < 0 {
-			return r
+			return i
 		}
 	}
-	return rs[len(rs)-1]
+	return len(rs) - 1
 }
 
 func sortedKeys(m map[int][]*model.Route) []int {

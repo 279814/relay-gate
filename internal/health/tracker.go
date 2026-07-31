@@ -34,22 +34,36 @@ func (t *Tracker) State(int64) model.HealthState { return model.StateUnknown }
 // CoolingDown 目前恒为 false。429 冷却在 M3 随状态机一起接入。
 func (t *Tracker) CoolingDown(int64) bool { return false }
 
+// InFlight 返回当前在途计数，供管理界面与日志展示。
+//
+// **不要**用它做并发上限判定：读完再决定要不要占用，两步之间有窗口。
+// 判定走 TryAcquire。
 func (t *Tracker) InFlight(routeID int64) int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.inFlight[routeID]
 }
 
-// Begin 登记一个在途请求，返回的函数必须在请求结束时调用。
+// TryAcquire 原子地「检查并占用」一个并发额度。limit <= 0 表示不限。
 //
-// 返回闭包而不是配对的 Begin/End：调用方 defer 一下就不可能记错 routeID，
-// 也不可能漏掉减一。漏掉的后果是隐蔽且永久的 —— 计数只增不减，
-// 配了 max_concurrency 的 Route 会被永久排除在选路之外。
-func (t *Tracker) Begin(routeID int64) (done func()) {
+// 检查与占用必须是同一个操作。拆成「先读 InFlight 判断、再登记」的话，
+// 两步之间有窗口：并发涌入时每个请求都读到涌入前的计数，于是全部通过检查，
+// max_concurrency=1 的 Route 会被同时打进去 N 个 —— 而这恰好是限流
+// 最需要生效的时刻（站点已经吃不消了）。
+//
+// 成功时返回的 release 必须在请求结束时调用，漏掉的后果隐蔽且永久：
+// 计数只增不减，该 Route 会被永远排除在选路之外。ok 为 false 时 release 为 nil。
+func (t *Tracker) TryAcquire(routeID int64, limit int) (release func(), ok bool) {
 	t.mu.Lock()
+	if limit > 0 && t.inFlight[routeID] >= limit {
+		t.mu.Unlock()
+		return nil, false
+	}
 	t.inFlight[routeID]++
 	t.mu.Unlock()
 
+	// 返回闭包而不是配对的 Acquire/Release：调用方 defer 一下就不可能
+	// 记错 routeID，也不可能重复释放（once 兜住）。
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -62,7 +76,7 @@ func (t *Tracker) Begin(routeID int64) (done func()) {
 				delete(t.inFlight, routeID)
 			}
 		})
-	}
+	}, true
 }
 
 // Snapshot 返回所有非零在途计数的副本，供管理界面展示。

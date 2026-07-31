@@ -23,7 +23,7 @@ func (u *Upstream) Validate() error {
 	if strings.TrimSpace(u.Name) == "" {
 		return invalid("name 不能为空")
 	}
-	if err := validateBaseURL(u.BaseURL); err != nil {
+	if err := validateBaseURL(u.BaseURL, u.FullURLMode); err != nil {
 		return err
 	}
 	if !u.AuthStyle.Valid() {
@@ -47,10 +47,16 @@ func (u *Upstream) Validate() error {
 	return nil
 }
 
-// validateBaseURL 强制 base_url 是「协议 + 主机」且不带路径。
-// 带了 /v1 会导致出站 URL 变成 /v1/v1/messages —— 这是配置时最容易犯的错，
-// 且症状是 404，很难一眼看出根因，所以在入口就挡掉。
-func validateBaseURL(raw string) error {
+// validateBaseURL 校验 base_url。
+//
+// 默认强制「协议 + 主机」且不带路径：带了 /v1 会让出站 URL 变成
+// /v1/v1/messages —— 这是配置时最容易犯的错，症状是 404 且很难看出根因，
+// 所以在入口就挡掉。
+//
+// fullURLMode 为 true 时**允许带路径**：那正是这个开关的用途（BuildOutboundURL
+// 会把 base_url 当成完整端点，不再拼路径）。不放行的话，上面那句
+// 「请开启 full_url_mode」的建议就是句空话 —— 开了也存不进去。
+func validateBaseURL(raw string, fullURLMode bool) error {
 	if strings.TrimSpace(raw) == "" {
 		return invalid("base_url 不能为空")
 	}
@@ -64,7 +70,7 @@ func validateBaseURL(raw string) error {
 	if u.Host == "" {
 		return invalid("base_url 缺少主机名")
 	}
-	if p := strings.Trim(u.Path, "/"); p != "" {
+	if p := strings.Trim(u.Path, "/"); p != "" && !fullURLMode {
 		return invalid("base_url 不能带路径（收到 %q）。填根地址即可，"+
 			"出站路径由入站请求决定；若该站确实用非标准路径，请开启 full_url_mode", raw)
 	}

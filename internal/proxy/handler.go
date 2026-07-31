@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,15 +31,6 @@ type ConfigSource interface {
 	RunState() (store.RunState, error)
 }
 
-// InFlightTracker 登记在途请求，供选路的并发上限判定使用。
-//
-// 返回闭包而不是配对的 Begin/End：调用方 defer 一下就不可能漏掉减一。
-// 漏掉的后果隐蔽且永久 —— 计数只增不减，配了 max_concurrency 的 Route
-// 会被永远排除在选路之外。
-type InFlightTracker interface {
-	Begin(routeID int64) (done func())
-}
-
 // SampleSink 接收样本。由 sample.Recorder 实现，可为 nil（关闭样本记录）。
 //
 // Record 必须是**非阻塞**的：它在转发路径上被调用，阻塞就等于让
@@ -49,26 +41,31 @@ type SampleSink interface {
 
 // Handler 处理三个透传端点。
 type Handler struct {
-	cfg      ConfigSource
-	health   router.HealthView
-	inFlight InFlightTracker
-	samples  SampleSink
-	log      *slog.Logger
+	cfg     ConfigSource
+	health  router.HealthView
+	samples SampleSink
+	log     *slog.Logger
 
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
 
 	// transports 按 Upstream 缓存，避免每请求新建（那会丢掉连接复用，
 	// 每次都要重新 TLS 握手 —— 对高延迟的公益站代价很大）。
+	// 存 key 是为了在配置变更后能发现缓存已过期，见 transportFor。
 	mu         sync.RWMutex
-	transports map[int64]*http.Transport
+	transports map[int64]transportEntry
 }
 
-// NewHandler 组装透传处理器。health 与 inFlight 通常是同一个 *health.Tracker，
-// 分成两个参数是因为它们的职责不同（读状态 vs 记在途），也便于测试各自替换。
+// transportEntry 是一个缓存的 Transport 及其对应的配置指纹。
+type transportEntry struct {
+	key string
+	tr  *http.Transport
+}
+
+// NewHandler 组装透传处理器。
 //
 // samples 可为 nil，表示不记录样本。
-func NewHandler(cfg ConfigSource, health router.HealthView, inFlight InFlightTracker,
+func NewHandler(cfg ConfigSource, health router.HealthView,
 	samples SampleSink, relayKeys []string, log *slog.Logger) *Handler {
 
 	keys := make(map[string]bool, len(relayKeys))
@@ -78,9 +75,9 @@ func NewHandler(cfg ConfigSource, health router.HealthView, inFlight InFlightTra
 		}
 	}
 	return &Handler{
-		cfg: cfg, health: health, inFlight: inFlight, samples: samples, log: log,
+		cfg: cfg, health: health, samples: samples, log: log,
 		relayKeys:  keys,
-		transports: map[int64]*http.Transport{},
+		transports: map[int64]transportEntry{},
 	}
 }
 
@@ -152,16 +149,15 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
 		return
 	}
+	// Select 在选中的同时就占下了并发额度（判定与占位原子完成），
+	// 所以这里必须 defer 释放，任何返回路径都不能漏 —— 漏了那个 Route
+	// 的在途计数就只增不减，之后永远选不到它。
 	cand, err := router.Select(snap, h.health, inModel, proto)
 	if err != nil {
 		h.writeSelectError(w, err, proto, inModel)
 		return
 	}
-
-	// 选中后立刻登记在途，defer 保证任何返回路径都会减一。
-	// 必须在这里而不是 Forward 内部：并发上限是选路的输入，
-	// 而选路已经发生了 —— 计数窗口要覆盖从选中到收尾的全过程。
-	defer h.inFlight.Begin(cand.Route.ID)()
+	defer cand.Release()
 
 	// 6. 改两处：body 顶层 model（配了映射才改）+ 鉴权头（必改）
 	outBody, err := ReplaceModel(body, cand.Route.UpstreamModel)
@@ -202,10 +198,47 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	h.logResult(cand, inModel, outURL, res)
 
+	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
+	// 不写的话 net/http 会在 handler 返回时补一个 HTTP 200 空 body ——
+	// 客户端拿到「成功但没内容」，既看不到原因也不会重试。
+	if res.Err != nil && !res.HeadersSent {
+		h.writeForwardError(w, res.Err, proto, cand)
+	}
+
 	if respTee != nil {
 		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
 			outHeader, outURL, respTee, res)
 	}
+}
+
+// writeForwardError 把转发失败翻译成客户端能理解的 HTTP 错误。
+//
+// 只在响应头尚未发出时可用 —— 已经发出后状态码就定死了，
+// 再往流里写错误结构只会破坏客户端的 SSE 解析。
+func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
+	proto model.Protocol, cand *router.Candidate) {
+
+	// 客户端自己走了就别再写了：连接多半已经没了，写也是白写。
+	if !IsUpstreamFault(err) {
+		return
+	}
+
+	// X-Relay-Reason 让 502/504 可诊断：不带它的话，客户端只看到
+	// 「网关错误」，分不清是站连不上、超时，还是我们自己配错了。
+	w.Header().Set("X-Relay-Reason", err.Error())
+	w.Header().Set("X-Relay-Upstream", cand.Upstream.Name)
+
+	code, msg := http.StatusBadGateway, "上游站点不可用"
+	switch {
+	case errors.Is(err, ErrFirstTokenTimeout):
+		code, msg = http.StatusGatewayTimeout, "上游站点未在时限内开始响应"
+	case errors.Is(err, ErrStreamStalled):
+		code, msg = http.StatusGatewayTimeout, "上游站点响应中断"
+	case errors.Is(err, ErrTotalTimeout):
+		code, msg = http.StatusGatewayTimeout, "请求超过总时限"
+	}
+	writeAPIError(w, code, proto, "api_error",
+		fmt.Sprintf("%s（%s）：%v", msg, cand.Upstream.Name, err))
 }
 
 // recordSample 组装并投递一条样本（§3.6）。
@@ -344,42 +377,66 @@ func (h *Handler) authOK(r *http.Request) bool {
 }
 
 // transportFor 按 Upstream 缓存 Transport，保住连接复用。
+//
+// 缓存键必须包含**所有影响 Transport 行为的配置**，不能只用 upstream ID：
+// 只按 ID 缓存的话，用户在管理界面改了 proxy_url，配置确实存进去了、
+// API 也回显了新值，但出站流量还是绕过代理 —— 直到重启为止。
+// 这类「看起来生效了其实没有」的问题排查成本极高。
+//
+// 旧 Transport 在被顶替时要关掉空闲连接，否则改一次配置就漏一批连接。
 func (h *Handler) transportFor(up *model.Upstream, s model.Settings) (*http.Transport, error) {
+	key := transportKey(up, s)
+
 	h.mu.RLock()
-	tr, ok := h.transports[up.ID]
+	ent, ok := h.transports[up.ID]
 	h.mu.RUnlock()
-	if ok {
-		return tr, nil
+	if ok && ent.key == key {
+		return ent.tr, nil
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if tr, ok := h.transports[up.ID]; ok {
-		return tr, nil // 双检：可能在等锁期间已被别的请求建好
+	if ent, ok := h.transports[up.ID]; ok {
+		if ent.key == key {
+			return ent.tr, nil // 双检：可能在等锁期间已被别的请求建好
+		}
+		// 配置变了。关掉旧的空闲连接再丢弃 —— 在途请求持有自己的引用，
+		// 不受影响；空闲连接不关就永远漏在那里。
+		ent.tr.CloseIdleConnections()
 	}
 	tr, err := NewTransport(up.ProxyURL, time.Duration(s.RealConnectSec)*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	h.transports[up.ID] = tr
+	h.transports[up.ID] = transportEntry{key: key, tr: tr}
 	return tr, nil
+}
+
+// transportKey 把影响 Transport 构造的配置拼成一个可比较的键。
+// 加字段到 NewTransport 时**必须**同步加到这里，否则该配置就是死的。
+func transportKey(up *model.Upstream, s model.Settings) string {
+	return up.ProxyURL + "\x00" + strconv.Itoa(s.RealConnectSec)
 }
 
 // CloseIdleConnections 关闭所有缓存 Transport 的空闲连接，供优雅关闭调用。
 func (h *Handler) CloseIdleConnections() {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for _, tr := range h.transports {
-		tr.CloseIdleConnections()
+	for _, ent := range h.transports {
+		ent.tr.CloseIdleConnections()
 	}
 }
 
-// InvalidateTransport 在 Upstream 配置变更（尤其改了 proxy_url）后丢弃旧 Transport。
+// InvalidateTransport 丢弃某个 Upstream 的 Transport。
+//
+// 常规的配置变更不需要调它 —— transportFor 的缓存键已经包含了
+// proxy_url 与连接超时，改了会自动重建。这个方法留给「配置没变但连接池
+// 本身要重置」的场景（例如探活判定整站不可用后主动断开所有连接）。
 func (h *Handler) InvalidateTransport(upstreamID int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if tr, ok := h.transports[upstreamID]; ok {
-		tr.CloseIdleConnections()
+	if ent, ok := h.transports[upstreamID]; ok {
+		ent.tr.CloseIdleConnections()
 		delete(h.transports, upstreamID)
 	}
 }

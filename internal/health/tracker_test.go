@@ -7,14 +7,24 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
+// acquire 是测试里的便捷包装：不关心上限，只要占位成功。
+func acquire(t *testing.T, tr *Tracker, routeID int64) func() {
+	t.Helper()
+	release, ok := tr.TryAcquire(routeID, 0)
+	if !ok {
+		t.Fatalf("不限并发时 TryAcquire(%d) 不该失败", routeID)
+	}
+	return release
+}
+
 func TestTracker_InFlightCounting(t *testing.T) {
 	tr := NewTracker()
 
 	if tr.InFlight(100) != 0 {
 		t.Error("初始在途应为 0")
 	}
-	done1 := tr.Begin(100)
-	done2 := tr.Begin(100)
+	done1 := acquire(t, tr, 100)
+	done2 := acquire(t, tr, 100)
 	if got := tr.InFlight(100); got != 2 {
 		t.Errorf("两个在途请求应计为 2，得到 %d", got)
 	}
@@ -37,8 +47,8 @@ func TestTracker_InFlightCounting(t *testing.T) {
 // 之后再也触发不了并发上限。
 func TestTracker_DoneIsIdempotent(t *testing.T) {
 	tr := NewTracker()
-	doneA := tr.Begin(100)
-	doneB := tr.Begin(100)
+	doneA := acquire(t, tr, 100)
+	doneB := acquire(t, tr, 100)
 
 	doneA()
 	doneA()
@@ -55,7 +65,7 @@ func TestTracker_DoneIsIdempotent(t *testing.T) {
 // 计数归零后应从 map 里删键，避免删掉的 Route 永久堆积。
 func TestTracker_ZeroCountsAreRemoved(t *testing.T) {
 	tr := NewTracker()
-	done := tr.Begin(100)
+	done := acquire(t, tr, 100)
 	done()
 	if len(tr.Snapshot()) != 0 {
 		t.Errorf("归零后不该在 Snapshot 里，得到 %v", tr.Snapshot())
@@ -87,7 +97,10 @@ func TestTracker_ConcurrentBeginDone(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perRoute; j++ {
-				done := tr.Begin(routeID)
+				done, ok := tr.TryAcquire(routeID, 0)
+				if !ok {
+					continue // 不限并发时不该发生，交给下面的配平断言暴露
+				}
 				done()
 			}
 		}()
@@ -104,10 +117,99 @@ func TestTracker_ConcurrentBeginDone(t *testing.T) {
 	}
 }
 
+// limit 是硬上限：占满后必须拒绝，释放一个才腾出一格。
+func TestTracker_TryAcquireEnforcesLimit(t *testing.T) {
+	tr := NewTracker()
+
+	r1, ok := tr.TryAcquire(100, 2)
+	if !ok {
+		t.Fatal("第 1 个应放行")
+	}
+	if _, ok = tr.TryAcquire(100, 2); !ok {
+		t.Fatal("第 2 个应放行")
+	}
+	if _, ok = tr.TryAcquire(100, 2); ok {
+		t.Fatal("第 3 个超过 limit=2，应被拒绝")
+	}
+	// 上限是 per-Route 的，别的 Route 不受影响
+	if _, ok = tr.TryAcquire(200, 2); !ok {
+		t.Error("另一个 Route 的额度不该被占用")
+	}
+
+	r1()
+	if _, ok = tr.TryAcquire(100, 2); !ok {
+		t.Error("释放一个后应腾出一格")
+	}
+}
+
+// limit <= 0 表示不限。这是默认值，绝不能被当成「一个都不许」——
+// 那会让所有没配上限的 Route 直接不可用。
+func TestTracker_ZeroLimitMeansUnlimited(t *testing.T) {
+	tr := NewTracker()
+	for _, limit := range []int{0, -1} {
+		tr = NewTracker()
+		for i := 0; i < 100; i++ {
+			if _, ok := tr.TryAcquire(100, limit); !ok {
+				t.Fatalf("limit=%d 应视为不限，第 %d 个被拒", limit, i)
+			}
+		}
+		if got := tr.InFlight(100); got != 100 {
+			t.Errorf("limit=%d 时应全部放行并计数，得到 %d", limit, got)
+		}
+	}
+}
+
+// 并发压上限时不得超发。这是 max_concurrency 唯一真正要防的场景：
+// 检查与占位若不在同一个临界区，一批同时到达的请求会全部通过检查。
+func TestTracker_TryAcquireNoOversubscribeUnderRace(t *testing.T) {
+	const limit = 4
+	const burst = 200
+
+	tr := NewTracker()
+	var mu sync.Mutex
+	var live, peak int
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start.Wait()
+
+			release, ok := tr.TryAcquire(100, limit)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			live++
+			if live > peak {
+				peak = live
+			}
+			mu.Unlock()
+
+			mu.Lock()
+			live--
+			mu.Unlock()
+			release()
+		}()
+	}
+	start.Done()
+	wg.Wait()
+
+	if peak > limit {
+		t.Errorf("同时持有额度的峰值 %d 超过 limit=%d", peak, limit)
+	}
+	if got := tr.InFlight(100); got != 0 {
+		t.Errorf("全部释放后应归零，得到 %d", got)
+	}
+}
+
 // Snapshot 是副本，改它不能影响内部状态。
 func TestTracker_SnapshotIsCopy(t *testing.T) {
 	tr := NewTracker()
-	defer tr.Begin(100)()
+	defer acquire(t, tr, 100)()
 
 	snap := tr.Snapshot()
 	snap[100] = 999

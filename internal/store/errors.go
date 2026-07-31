@@ -25,9 +25,10 @@ func wrapConstraint(err error, table string) error {
 		return fmt.Errorf("%w: 该 ModelName 名称已存在", model.ErrValidation)
 	case strings.Contains(msg, "upstream.name"):
 		return fmt.Errorf("%w: 该 Upstream 名称已存在", model.ErrValidation)
-	case strings.Contains(msg, "idx_model_name_single_fallback"):
-		return fmt.Errorf("%w: 已存在一个兜底 ModelName（is_fallback），全局只能有一个。"+
-			"请先取消原有的兜底设置", model.ErrValidation)
+	case strings.Contains(msg, "idx_model_name_fallback_per_protocol"),
+		strings.Contains(msg, "model_name.protocol"):
+		return fmt.Errorf("%w: 该协议已经有一个兜底 ModelName（is_fallback）了，"+
+			"每种协议只能有一个。请先取消原有的兜底设置", model.ErrValidation)
 	case strings.Contains(msg, "route.model_name_id") ||
 		strings.Contains(msg, "idx_route") ||
 		strings.Contains(msg, "route.upstream_id"):

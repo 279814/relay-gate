@@ -108,7 +108,14 @@ type Result struct {
 	DoneAt      time.Time
 	// BytesWritten 是已写给客户端的字节数。> 0 时禁止重试（§3.5）。
 	BytesWritten int64
-	Err          error
+	// HeadersSent 表示是否已经调用过 w.WriteHeader。
+	//
+	// 调用方**必须**据此决定失败时如何回应：为 false 时还能写一个正常的
+	// 错误响应；为 true 时状态码已经发出去了，只能断流。
+	// 不暴露这个标志的话，调用方要么不敢写（于是 net/http 补一个 200 空 body），
+	// 要么盲目写（于是把错误 JSON 塞进已经开始的 SSE 流里）。
+	HeadersSent bool
+	Err         error
 }
 
 // TTFT 返回首 Token 延迟。未收到首字节时返回 0。
@@ -147,6 +154,10 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 
 	res := &Result{}
 
+	// 保留客户端原始的 ctx。加了超时之后就分不清「客户端断开」与
+	// 「我们自己的超时到期」了，而这两者对健康状态的含义完全相反。
+	clientCtx := ctx
+
 	// 总超时是最外层的兜底。首 Token 与 Idle 在读循环里单独控制。
 	ctx, cancel := context.WithTimeout(ctx, f.Timeouts.Total)
 	defer cancel()
@@ -167,10 +178,29 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 
+	// 响应头阶段单独设一个时限。
+	//
+	// 没有它的话，一个卡在「收下请求但不回响应头」的站只能等 Total 兜底
+	// （默认 30 分钟），而首 Token 超时形同虚设 —— 它只在读 body 时才起作用。
+	// 这种站在公益站里并不罕见：连接建立、请求收下，然后就没有然后了。
+	//
+	// 用 timer 而不是给请求套一个更短的 context：请求的 context 一旦到期，
+	// 连带取消的是**整个响应体的读取** —— 长思考流会在首 Token 那一刻
+	// 被拦腰砍断，而那正是 5 分钟下限要保护的场景。timer 在拿到响应头后
+	// 立刻 Stop，之后的时限交给 streamBody 自己的 timer。
+	var headerTimedOut atomic.Bool
+	headerTimer := time.AfterFunc(f.Timeouts.FirstToken, func() {
+		headerTimedOut.Store(true)
+		cancel()
+	})
+	defer headerTimer.Stop()
+
 	res.SentAt = time.Now()
 	resp, err := f.Transport.RoundTrip(req)
+	headerTimer.Stop()
 	if err != nil {
-		res.Err = classifyTransportErr(err, ctx)
+		res.Err = classifyTransportErr(err, clientCtx, headerTimedOut.Load(), f.Timeouts.FirstToken)
+		res.DoneAt = time.Now()
 		return res
 	}
 	defer resp.Body.Close()
@@ -187,8 +217,9 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	}
 	StripHopByHopResponse(dst)
 	w.WriteHeader(resp.StatusCode)
+	res.HeadersSent = true
 
-	n, err := f.streamBody(ctx, w, resp.Body, resp.Body, res)
+	n, err := f.streamBody(ctx, clientCtx, w, resp.Body, resp.Body, res)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if err != nil && res.Err == nil {
@@ -212,7 +243,7 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 // select 两个 case 同时就绪时会随机挑一个，挑到 ctx 分支就会**关掉一个正常的流**
 // （Err 是 Canceled 而非 DeadlineExceeded，超时标志还不置位，于是被误判成上游断流）。
 // 表现为长 SSE 回复被随机截断在某个 chunk。timer 只在真到期时开火，没有这个歧义。
-func (f *Forwarder) streamBody(ctx context.Context, w http.ResponseWriter,
+func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWriter,
 	src io.Reader, closer io.Closer, res *Result) (int64, error) {
 
 	flusher, canFlush := w.(http.Flusher)
@@ -284,9 +315,15 @@ func (f *Forwarder) streamBody(ctx context.Context, w http.ResponseWriter,
 			case timedOut.Load():
 				return total, fmt.Errorf("%w: 流内静默超过 %v", ErrStreamStalled, f.Timeouts.Idle)
 			}
-			// 上游主动断开或客户端取消
-			if ctx.Err() != nil {
+			// 只有**客户端**取消才是非上游故障。必须先判 clientCtx：
+			// 客户端断开会连带取消 ctx，先判 ctx 会把两者混为一谈。
+			if clientCtx.Err() != nil {
 				return total, fmt.Errorf("%w: %v", ErrCanceled, err)
+			}
+			// 走到这里说明是我们自己的总超时到期 —— 上游拖过了 Total，
+			// 算上游的账（默认 30 分钟，正常长思考远到不了）。
+			if ctx.Err() != nil {
+				return total, fmt.Errorf("%w: 超过总时限 %v", ErrTotalTimeout, f.Timeouts.Total)
 			}
 			if total == 0 {
 				return total, fmt.Errorf("%w: %v", ErrUpstreamBroke, err)
@@ -305,6 +342,7 @@ var (
 	ErrConnect           = errors.New("连接上游失败")
 	ErrFirstTokenTimeout = errors.New("首 Token 超时")
 	ErrStreamStalled     = errors.New("流内静默超时")
+	ErrTotalTimeout      = errors.New("超过总时限")
 	ErrUpstreamBroke     = errors.New("上游未返回任何数据即断开")
 	ErrStreamBroke       = errors.New("流式传输中途断开")
 	ErrClientGone        = errors.New("客户端已断开")
@@ -312,7 +350,11 @@ var (
 )
 
 // IsUpstreamFault 判断该错误是否应计入上游的健康失败。
-// 客户端断开与主动取消不是上游的问题，绝不能因此把好站标成 dead。
+//
+// 只有客户端断开与客户端取消不算 —— 它们是客户端的行为，
+// 绝不能因此把好站标成 dead。其余一律算上游的账，**包括我们自己设的超时**：
+// 那些超时到期正是「这个站太慢/已死」的证据，不算进去的话
+// 一个真死的站永远攒不够失败次数，主动探活就失去了意义。
 func IsUpstreamFault(err error) bool {
 	if err == nil {
 		return false
@@ -323,9 +365,24 @@ func IsUpstreamFault(err error) bool {
 	return true
 }
 
-func classifyTransportErr(err error, ctx context.Context) error {
-	if ctx.Err() != nil {
+// classifyTransportErr 判断响应头阶段的失败该算谁的账。
+//
+// 关键在于分清**是谁的时限到期了**。只看 ctx.Err() != nil 就判 ErrCanceled
+// 是错的：Total 与响应头时限都是**我们自己**设的，是上游太慢的证据，
+// 却会被 IsUpstreamFault 判成「非上游故障」—— 于是一个真死的站永远攒不够
+// 失败次数，永远不会被标 dead，正好废掉这个项目的核心价值。
+//
+// clientCtx 是加超时之前的 ctx（客户端的）。
+func classifyTransportErr(err error, clientCtx context.Context,
+	headerTimedOut bool, firstToken time.Duration) error {
+
+	// 只有**客户端**取消才是非上游故障。这个判断必须在最前面：
+	// 客户端断开会连带取消内层 context，先判内层会误伤。
+	if clientCtx.Err() != nil {
 		return fmt.Errorf("%w: %v", ErrCanceled, err)
+	}
+	if headerTimedOut {
+		return fmt.Errorf("%w: 响应头超过 %v 未返回", ErrFirstTokenTimeout, firstToken)
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {

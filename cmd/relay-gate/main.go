@@ -73,7 +73,7 @@ func run() error {
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
-	fwd := proxy.NewHandler(cfgSrc, tracker, tracker, recorder, cfg.RelayKeys, log)
+	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer fwd.CloseIdleConnections()
 

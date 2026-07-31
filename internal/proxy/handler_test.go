@@ -47,49 +47,65 @@ func (f *fakeConfig) RunState() (store.RunState, error) {
 	return f.state, nil
 }
 
-// allAliveHealth 是最简健康视图：全部可用、无在途、不冷却。
-type allAliveHealth struct{ dead map[int64]bool }
+// countingHealth 是测试用的健康视图：默认全部可用、不冷却，
+// 同时记录 TryAcquire/release 的调用，用于验证并发额度的配平。
+//
+// 额度的「占」与「放」都在 router.Select / Candidate.Release 里，
+// 所以这两件事必须由同一个替身观察 —— 拆开就看不出计数窗口是否覆盖转发。
+type countingHealth struct {
+	dead map[int64]bool
 
-func (a allAliveHealth) State(id int64) model.HealthState {
-	if a.dead[id] {
+	mu       sync.Mutex
+	acquired []int64 // 按顺序记录占位的 routeID
+	open     int
+	peak     int // 峰值并发，验证额度窗口真的覆盖了转发过程
+	refused  int
+}
+
+func newCountingHealth() *countingHealth {
+	return &countingHealth{dead: map[int64]bool{}}
+}
+
+func (c *countingHealth) State(id int64) model.HealthState {
+	if c.dead[id] {
 		return model.StateDead
 	}
 	return model.StateAlive
 }
-func (a allAliveHealth) InFlight(int64) int     { return 0 }
-func (a allAliveHealth) CoolingDown(int64) bool { return false }
+func (c *countingHealth) CoolingDown(int64) bool { return false }
+
+func (c *countingHealth) TryAcquire(routeID int64, limit int) (func(), bool) {
+	c.mu.Lock()
+	if limit > 0 && c.open >= limit {
+		c.refused++
+		c.mu.Unlock()
+		return nil, false
+	}
+	c.acquired = append(c.acquired, routeID)
+	c.open++
+	if c.open > c.peak {
+		c.peak = c.open
+	}
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			c.open--
+			c.mu.Unlock()
+		})
+	}, true
+}
+
+func (c *countingHealth) stats() (acquired []int64, open, peak int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int64(nil), c.acquired...), c.open, c.peak
+}
 
 func discardLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-// countingTracker 记录 Begin/done 的调用，用于验证在途计数的配平。
-type countingTracker struct {
-	mu     sync.Mutex
-	begins []int64
-	open   int
-	maxOpe int // 峰值并发，验证计数窗口真的覆盖了转发过程
-}
-
-func (c *countingTracker) Begin(routeID int64) func() {
-	c.mu.Lock()
-	c.begins = append(c.begins, routeID)
-	c.open++
-	if c.open > c.maxOpe {
-		c.maxOpe = c.open
-	}
-	c.mu.Unlock()
-	return func() {
-		c.mu.Lock()
-		c.open--
-		c.mu.Unlock()
-	}
-}
-
-func (c *countingTracker) stats() (begins []int64, open, peak int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]int64(nil), c.begins...), c.open, c.maxOpe
 }
 
 // testSettings 用短超时，避免测试挂在生产的 300s 下限上。
@@ -140,7 +156,7 @@ type harness struct {
 	cfg     *fakeConfig
 	up      *httptest.Server
 	gotReq  *capturedRequest
-	tracker *countingTracker
+	health  *countingHealth
 	sink    *recordingSink
 	relayPW string
 }
@@ -158,7 +174,7 @@ type capturedRequest struct {
 func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 	t.Helper()
 
-	hs := &harness{gotReq: &capturedRequest{}, tracker: &countingTracker{},
+	hs := &harness{gotReq: &capturedRequest{}, health: newCountingHealth(),
 		sink: &recordingSink{}, relayPW: "rk-client-key"}
 
 	hs.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -190,8 +206,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 		settings: testSettings(),
 		state:    store.StateRunning,
 	}
-	hs.h = NewHandler(hs.cfg, allAliveHealth{dead: map[int64]bool{}}, hs.tracker,
-		hs.sink, []string{hs.relayPW}, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog())
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
 }
@@ -353,7 +368,7 @@ func TestHandler_AcceptsKeyInAllThreePlaces(t *testing.T) {
 // 未配置任何 relay key 时必须全拒。「没配就放开」是最危险的默认值。
 func TestHandler_NoRelayKeysConfiguredRejectsAll(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h = NewHandler(hs.cfg, allAliveHealth{}, hs.tracker, hs.sink, nil, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog())
 
 	r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
 	if rec := hs.serve(r); rec.Code != 401 {
@@ -397,7 +412,7 @@ func TestHandler_SelectErrors(t *testing.T) {
 		{
 			name:       "全部 dead → 503",
 			body:       `{"model":"claude-opus-5"}`,
-			setup:      func(hs *harness) { hs.h.health = allAliveHealth{dead: map[int64]bool{100: true}} },
+			setup:      func(hs *harness) { hs.health.dead[100] = true },
 			wantStatus: 503,
 			wantInBody: "overloaded_error",
 		},
@@ -444,7 +459,7 @@ func TestHandler_SelectErrors(t *testing.T) {
 // 分不清是配置错了还是所有站都挂了。
 func TestHandler_SelectErrorCarriesReason(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h.health = allAliveHealth{dead: map[int64]bool{100: true}}
+	hs.health.dead[100] = true
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 	reason := rec.Header().Get("X-Relay-Reason")
@@ -659,18 +674,18 @@ func TestHandler_ConcurrentRequests(t *testing.T) {
 	}
 }
 
-// ── 在途计数 ──────────────────────────────────────────────
+// ── 并发额度 ──────────────────────────────────────────────
 
-// 选中 Route 后必须登记在途，请求结束后必须减回去。
-// 只增不减的话，配了 max_concurrency 的 Route 会被永久排除在选路之外。
+// 选中 Route 即占下额度，请求结束后必须归还。
+// 只占不还的话，配了 max_concurrency 的 Route 会被永久排除在选路之外。
 func TestHandler_TracksInFlight(t *testing.T) {
 	hs := newHarness(t, nil)
 
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
-	begins, open, peak := hs.tracker.stats()
-	if len(begins) != 1 || begins[0] != 100 {
-		t.Errorf("应为选中的 Route 100 登记一次在途，得到 %v", begins)
+	acquired, open, peak := hs.health.stats()
+	if len(acquired) != 1 || acquired[0] != 100 {
+		t.Errorf("应为选中的 Route 100 占一次额度，得到 %v", acquired)
 	}
 	if open != 0 {
 		t.Errorf("请求结束后在途应归零，得到 %d", open)
@@ -680,13 +695,13 @@ func TestHandler_TracksInFlight(t *testing.T) {
 	}
 }
 
-// 计数窗口必须覆盖整个转发过程，而不是在 Forward 之前就减掉了 ——
+// 额度窗口必须覆盖整个转发过程，而不是在 Forward 之前就还回去了 ——
 // 否则并发上限永远看到 0，形同虚设。
 func TestHandler_InFlightCoversForwarding(t *testing.T) {
 	var duringForward int
 	hs := newHarness(t, nil)
 	hs.up.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, open, _ := hs.tracker.stats() // 上游正在处理时读一次
+		_, open, _ := hs.health.stats() // 上游正在处理时读一次
 		duringForward = open
 		w.Write([]byte(`{}`))
 	})
@@ -694,26 +709,26 @@ func TestHandler_InFlightCoversForwarding(t *testing.T) {
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
 	if duringForward != 1 {
-		t.Errorf("转发进行中在途应为 1，得到 %d —— 计数窗口没覆盖转发过程", duringForward)
+		t.Errorf("转发进行中在途应为 1，得到 %d —— 额度窗口没覆盖转发过程", duringForward)
 	}
-	if _, open, _ := hs.tracker.stats(); open != 0 {
+	if _, open, _ := hs.health.stats(); open != 0 {
 		t.Errorf("结束后应归零，得到 %d", open)
 	}
 }
 
-// 选路失败时不该登记在途 —— 那时还没有选中任何 Route。
+// 选路失败时不该占额度 —— 那时还没有选中任何 Route。
 func TestHandler_NoInFlightWhenSelectFails(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h.health = allAliveHealth{dead: map[int64]bool{100: true}}
+	hs.health.dead[100] = true
 
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
-	if begins, _, _ := hs.tracker.stats(); len(begins) != 0 {
-		t.Errorf("选路失败不该登记在途，得到 %v", begins)
+	if acquired, _, _ := hs.health.stats(); len(acquired) != 0 {
+		t.Errorf("选路失败不该占额度，得到 %v", acquired)
 	}
 }
 
-// 上游出错也要减回去，否则一次故障就会永久占住一个并发额度。
+// 上游出错也要归还，否则一次故障就会永久占住一个并发额度。
 func TestHandler_InFlightReleasedOnUpstreamError(t *testing.T) {
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
@@ -721,8 +736,81 @@ func TestHandler_InFlightReleasedOnUpstreamError(t *testing.T) {
 
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
-	if _, open, _ := hs.tracker.stats(); open != 0 {
+	if _, open, _ := hs.health.stats(); open != 0 {
 		t.Errorf("上游出错后在途也应归零，得到 %d", open)
+	}
+}
+
+// 端到端的并发上限：一批同时打进来的请求，实际到达上游的并发数
+// 不得超过 max_concurrency。
+//
+// 这里断言的是**上游侧**观察到的并发，而不是网关内部的计数 ——
+// 内部计数对得上但请求照样都发出去了，是这类 bug 最典型的表现。
+// 配 max_concurrency 的通常是「多开一路就限流甚至封号」的公益站，
+// 超发一次的代价是整个站不可用。
+func TestHandler_ConcurrencyLimitHoldsAtUpstream(t *testing.T) {
+	const limit = 2
+	const burst = 30
+
+	var mu sync.Mutex
+	var atUpstream, peakAtUpstream int
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		atUpstream++
+		if atUpstream > peakAtUpstream {
+			peakAtUpstream = atUpstream
+		}
+		mu.Unlock()
+
+		time.Sleep(20 * time.Millisecond) // 拉长重叠窗口
+
+		mu.Lock()
+		atUpstream--
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	})
+	hs.cfg.snap.RoutesByModelName[1][0].MaxConcurrency = limit
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var wg sync.WaitGroup
+	codes := make(chan int, burst)
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start.Wait()
+			codes <- hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`)).Code
+		}()
+	}
+	start.Done()
+	wg.Wait()
+	close(codes)
+
+	var ok, rejected int
+	for c := range codes {
+		switch c {
+		case 200:
+			ok++
+		case 503: // 达上限被拒是正确行为
+			rejected++
+		default:
+			t.Errorf("意外的状态码 %d", c)
+		}
+	}
+
+	mu.Lock()
+	peak := peakAtUpstream
+	mu.Unlock()
+	if peak > limit {
+		t.Errorf("上游同时收到 %d 个请求，超过 max_concurrency=%d", peak, limit)
+	}
+	if ok == 0 {
+		t.Error("一个都没成功，上限判定过严")
+	}
+	if _, open, _ := hs.health.stats(); open != 0 {
+		t.Errorf("全部结束后额度应归零，得到 %d", open)
 	}
 }
 
@@ -968,7 +1056,7 @@ func TestSample_FakeAliveOutcome(t *testing.T) {
 // 选路失败时不记样本 —— 那时还没选中任何站，没有「发往公益站的请求」可记。
 func TestSample_NotRecordedWhenSelectFails(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h.health = allAliveHealth{dead: map[int64]bool{100: true}}
+	hs.health.dead[100] = true
 
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
@@ -1079,6 +1167,86 @@ func TestSample_ClientAbortStillRecorded(t *testing.T) {
 	}
 	if smp.RouteID == 0 {
 		t.Error("选路结果应留档")
+	}
+}
+
+// ── 上游故障必须变成客户端可见的错误 ──────────────────────
+//
+// 这一组是整条链路最容易悄悄坏掉的地方：Forward 在拿到响应头之前失败时
+// 一个字节都没写给客户端，若 serve() 不管，net/http 会在 handler 返回时
+// 补一个 **HTTP 200 空 body** —— 客户端拿到的是「成功但没内容」，
+// 既看不到错误也不会重试。
+
+func TestHandler_ConnectFailureIsNot200(t *testing.T) {
+	hs := newHarness(t, nil)
+	// 指向一个不会有服务的地址
+	hs.cfg.snap.Upstreams[10].BaseURL = "http://127.0.0.1:1"
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if rec.Code == 200 {
+		t.Fatalf("连不上上游却回了 200 —— 客户端会把空响应当成成功。body=%q",
+			rec.Body.String())
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("连接失败应回 502，得到 %d", rec.Code)
+	}
+	// 必须是客户端能解析的协议错误结构
+	if !strings.Contains(rec.Body.String(), "api_error") {
+		t.Errorf("应回 Anthropic 格式的错误，得到 %q", rec.Body.String())
+	}
+	if rec.Header().Get("X-Relay-Reason") == "" {
+		t.Error("应带 X-Relay-Reason 说明是哪一步失败")
+	}
+}
+
+// 首 Token 超时同样发生在写响应头之前（上游连头都没回），也必须变成错误。
+func TestHandler_HeaderPhaseStallIsNot200(t *testing.T) {
+	release := make(chan struct{})
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		<-release // 连响应头都不回
+	})
+	defer close(release)
+	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealTotalSec = 30
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if rec.Code == 200 {
+		t.Fatalf("上游卡在响应头阶段却回了 200，body=%q", rec.Body.String())
+	}
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("超时应回 504，得到 %d", rec.Code)
+	}
+}
+
+// 响应头已经发出后再失败，就不能再改状态码了 ——
+// 那时客户端已经拿到 200，只能断流。
+func TestHandler_MidStreamFailureKeepsStatus(t *testing.T) {
+	release := make(chan struct{})
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		w.Write([]byte("data: partial\n\n"))
+		w.(http.Flusher).Flush()
+		<-release
+	})
+	defer close(release)
+	hs.cfg.settings.RealIdleSec = 1
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+
+	if rec.Code != 200 {
+		t.Errorf("响应头已发出后状态码不该改变，得到 %d", rec.Code)
+	}
+	// 已收到的部分必须留给客户端
+	if !strings.Contains(rec.Body.String(), "data: partial") {
+		t.Error("已收到的片段应已写给客户端")
+	}
+	// 但不能再往里塞错误 JSON —— 那会污染 SSE 流
+	if strings.Contains(rec.Body.String(), "api_error") {
+		t.Error("流已开始后不该再写错误结构，会破坏 SSE 解析")
 	}
 }
 
