@@ -33,6 +33,15 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// **刻意不走总闸**（§4.8），与 count_tokens 和三个透传端点都不同。
+	//
+	// 暂停的目的是「不用时不浪费额度」，而这个端点纯粹本地读配置，
+	// 零上游成本、零 token。暂停期间仍然回列表，用户才能在管理界面上
+	// 对照着「配了哪些模型」去调整配置 —— 那恰恰是暂停时最常做的事。
+	//
+	// 客户端不会因此误判服务可用：它一旦真的发请求，拿到的是
+	// 503 + X-Relay-State: paused，原因明确。
+
 	snap, err := h.cfg.Snapshot()
 	if err != nil {
 		h.log.Error("读取配置快照失败", "err", err)
@@ -48,24 +57,28 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	// 消失，客户端可能把它从自己的配置里也去掉，而它几十秒后就恢复了。
 	// 列表是「配了什么」，健康状态是「现在能不能用」，混在一起会让
 	// 一次短暂故障变成一次配置丢失。
-	items := make([]map[string]any, 0, len(snap.ModelNames))
+	names := make([]string, 0, len(snap.ModelNames))
 	for _, mn := range snap.ModelNames {
-		if !mn.Enabled {
-			continue
+		if mn.Enabled {
+			names = append(names, mn.Name)
 		}
+	}
+	// 定序输出。snap.ModelNames 的顺序来自库里的查询，稳定的列表
+	// 让客户端侧的 diff 与人工比对都不会因为顺序抖动而产生噪声。
+	sort.Strings(names)
+
+	// 必须是非 nil 的切片：空配置要序列化成 "data":[] 而不是 null，
+	// 客户端多半直接 for 循环，null 会让它崩在启动阶段。
+	items := make([]map[string]any, 0, len(names))
+	for _, n := range names {
 		items = append(items, map[string]any{
-			"id":       mn.Name,
+			"id":       n,
 			"object":   "model",
 			"owned_by": "relay-gate",
 			// 不给 created：ModelName.CreatedAt 是**本地配置**的时间，
 			// 不是模型发布时间，回显出去只会误导。
 		})
 	}
-	// 定序输出。snap.ModelNames 的顺序来自库里的查询，稳定的列表
-	// 让客户端侧的 diff 与人工比对都不会因为顺序抖动而产生噪声。
-	sort.Slice(items, func(i, j int) bool {
-		return items[i]["id"].(string) < items[j]["id"].(string)
-	})
 
 	resp := map[string]any{
 		"object": "list",

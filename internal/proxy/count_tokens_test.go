@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -220,7 +222,113 @@ func TestCountTokens_FallsBackWhenAllRoutesDead(t *testing.T) {
 	}
 }
 
-// ── 与健康状态的关系 ──────────────────────────────────────
+// 上游把 key 回显在错误消息里时，日志里**不能**出现明文 key。
+//
+// `{"error":"Invalid API key: sk-xxx"}` 是公益站 401 的常见格式，而 401 正是
+// 降级路径最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 ——
+// §3.6.3b 对样本库的要求是无条件的，日志没有理由比它宽松。
+//
+// 这条测试要真去读日志输出，不能只看响应：问题恰恰在于它对响应毫无影响。
+func TestCountTokens_UpstreamErrorBodyRedactedInLog(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		// 上游把它收到的 key 原样回显 —— 这里是出站的上游 key
+		w.Write([]byte(`{"error":{"message":"Invalid API key: sk-upstream-secret"}}`))
+	})
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+
+	// 仍应正常兜底，脱敏不改变行为
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+
+	if strings.Contains(logs.String(), "sk-upstream-secret") {
+		t.Errorf("日志里出现了明文上游 key:\n%s", logs.String())
+	}
+	// 确认脱敏没有把整段原文吞掉 —— 降级原因仍要可诊断，
+	// 否则「为什么走了兜底」就无从查起。
+	if !strings.Contains(logs.String(), "401") {
+		t.Errorf("日志里应保留上游状态码以便诊断:\n%s", logs.String())
+	}
+}
+
+// 入站 relay key 同样不能进日志。上游可能回显的是它收到的任意凭据，
+// 而 auth_style=auto 时我们两个头都发，回显哪一个都有可能。
+func TestCountTokens_InboundKeyRedactedInLog(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":"unexpected credential rk-client-key"}`)
+	})
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	if strings.Contains(logs.String(), hs.relayPW) {
+		t.Errorf("日志里出现了明文 relay key:\n%s", logs.String())
+	}
+}
+
+// 短 key 同样不能漏进日志。
+//
+// sample.RedactBodyKeys 有 12 字符的下限（短于此不脱敏），那对样本是对的 ——
+// 样本存的是完整对话原文，短 key 会偶然命中无数次，把原文打得千疮百孔。
+// 但日志这条路径进来的只是 200 字符的错误原文，多打几个码无所谓，
+// 漏一个 key 才是实实在在的泄露。
+//
+// 而这是**真实可达**的配置：RELAY_KEYS 只校验非空、没有长度下限
+// （config.validate），上游 api_key 同样没有。
+func TestCountTokens_ShortKeyRedactedInLog(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"bad credential sk-short99"}`))
+	})
+	for _, up := range hs.cfg.snap.Upstreams {
+		up.APIKey = "sk-short99" // 10 字符，短于 sample 包的 12 字符下限
+	}
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	if strings.Contains(logs.String(), "sk-short99") {
+		t.Errorf("短 key 未被脱敏:\n%s", logs.String())
+	}
+}
+
+// 上游未配 key 时日志原文要完好。
+//
+// 这条只钉住「不崩、不把原文吞掉」这个下限。原本我想测的是
+// 「ReplaceAll 用空串会在每个字节间插掩码」，但实测那不会发生 ——
+// MaskKey("") 返回空串，于是替换等于原地不动。所以代码里那个 k == ""
+// 的跳过是**防御性**的（防 MaskKey 日后改成返回固定掩码），
+// 而不是在修一个当前存在的 bug。这里如实写明，免得下一个人
+// 以为这条测试守着什么它其实守不住的东西。
+func TestCountTokens_EmptyKeyKeepsLogReadable(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"upstream exploded"}`))
+	})
+	for _, up := range hs.cfg.snap.Upstreams {
+		up.APIKey = ""
+	}
+
+	var logs bytes.Buffer
+	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	if !strings.Contains(logs.String(), "upstream exploded") {
+		t.Errorf("空 key 把日志原文破坏了:\n%s", logs.String())
+	}
+}
 
 // §3.1 / §10.3：count_tokens 的失败**不得**计入健康状态。
 // 这是刻意的 —— 它每轮对话都被调用，噪声会淹没真实请求给出的信号，
@@ -417,6 +525,44 @@ func TestCountTokens_ProxyPathDoesNotValidateBody(t *testing.T) {
 	}
 	if got := decodeInputTokens(t, rec.Body.String()); got != 9 {
 		t.Errorf("input_tokens = %d, want 9", got)
+	}
+}
+
+// 回归测试：无空白的长串（base64 图片）不能被算成 1 个 token。
+//
+// 这是 review 时实测抓到的真 bug。一张 1024×1024 的图 base64 后有几百 KB
+// 且完全没有空白，原实现把它当成「1 个词」→ 1 个 token，而它在 Anthropic
+// 侧约合 1400 个。低估上千倍。
+//
+// 方向尤其糟：低估会让 Claude Code 以为上下文还很空，然后发一个超出窗口的
+// 请求被上游 400 拒掉 —— 而「宁可估高」正是这个估算器的设计前提。
+func TestEstimateTokens_LongUnbrokenStringNotCountedAsOneWord(t *testing.T) {
+	// 模拟 base64：连续字母，无空白无标点
+	b64 := strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", 4096) // 128KB
+	got := estimateTokens(b64)
+
+	// 128KB base64 按 4 字符/token 算约 32k。允许量级内的偏差，
+	// 但绝不能是个位数 —— 那是 bug 的特征。
+	if got < 10_000 {
+		t.Errorf("128KB base64 估算 = %d，明显低估（应为万级）", got)
+	}
+
+	// 单调性：图更大，估值必须更大
+	bigger := estimateTokens(strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", 8192))
+	if bigger <= got {
+		t.Errorf("更大的 base64 估算 (%d) 应大于较小的 (%d)", bigger, got)
+	}
+}
+
+// 但正常英文不能因为上一条而被高估。折算只该对超长词生效。
+func TestEstimateTokens_NormalProseUnaffectedByLongWordRule(t *testing.T) {
+	prose := "The quick brown fox jumps over the lazy dog near the riverbank."
+	got := estimateTokens(prose)
+
+	// 12 个词 × 1.3 ≈ 15。真实 tokenizer 约 14。
+	// 若折算规则误伤了普通单词，这个值会明显偏大。
+	if got < 10 || got > 25 {
+		t.Errorf("普通英文估算 = %d，期望 10–25（折算规则不该误伤普通单词）", got)
 	}
 }
 

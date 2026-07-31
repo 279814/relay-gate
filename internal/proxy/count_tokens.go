@@ -8,11 +8,14 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 	"unicode"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1）。
@@ -59,9 +62,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 // proxyCountTokens 把 count_tokens 转发给上游。
 //
-// 返回空字符串表示成功（响应已写出）；返回非空的原因字符串表示调用方
-// 应当降级到本地粗算。用原因字符串而不是 error：这里的每一种「失败」都是
-// 预期内的（站不支持这个端点是常态），日志里要的是可读的原因而不是错误链。
+// 返回空字符串表示**调用方无需再作答**（响应已写出，或客户端已经走了）；
+// 返回非空的原因字符串表示应当降级到本地粗算。用原因字符串而不是 error：
+// 这里的每一种「失败」都是预期内的（站不支持这个端点是常态），
+// 日志里要的是可读的原因而不是错误链。
 //
 // **不得**在写出响应后再返回非空原因 —— 那会让调用方把兜底结果追加到
 // 已经写出的响应后面，客户端拿到两个拼在一起的 JSON。
@@ -120,9 +124,15 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 404（没这个端点）、400（参数要求不同）、401（这个端点单独鉴权）
 	// 对客户端而言结果相同 —— 拿不到准确值，用估算值。
 	// 而这些失败**不回写健康状态**，所以也不需要按 §4.3 分类。
+	//
+	// 原文进日志前**必须**脱敏：上游的鉴权错误经常把收到的 key 回显在消息里
+	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），而 401 恰好是这里
+	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
+	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
+		safe := redactForLog(respBody, h.logRedactKeys(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
-			collapseSpaces(string(respBody), maxCountTokensLogBody))
+			collapseSpaces(string(safe), maxCountTokensLogBody))
 	}
 
 	// 成功。原样回传上游响应体。
@@ -140,6 +150,52 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	_, _ = w.Write(respBody)
 	return ""
 }
+
+// logRedactKeys 收齐这次请求里所有需要从日志中扫掉的凭据。
+//
+// 两处来源与样本记录完全一致（recordSample）：出站的上游 key 与入站的
+// relay key。位置清单走 inboundCredentials（其内部读 model.AuthHeaders，
+// 是唯一来源）—— 各列一份的话，新增一个鉴权位置时必然漏掉这里。
+func (h *Handler) logRedactKeys(r *http.Request, cand *router.Candidate) []string {
+	keys := []string{cand.Upstream.APIKey}
+	return append(keys, inboundCredentials(r.Header)...)
+}
+
+// redactForLog 脱敏一段准备进日志的上游原文。
+//
+// 为什么不直接用 sample.RedactBodyKeys：它有 minRedactableKey（12 字符）
+// 的下限，短于此的 key 不脱敏。那个下限对**样本**是对的 —— 样本存的是完整
+// 对话原文，一个 4 字符的 key 会偶然命中无数次，把原文打得千疮百孔，
+// 反而毁掉诊断价值。
+//
+// 但日志这条路径没有那个顾虑：进来的只是 200 字符的错误原文，被多打几个码
+// 也无所谓，而漏一个 key 是实实在在的泄露。而 RELAY_KEYS 只校验非空、
+// 没有长度下限（config.validate），所以短 key 是真实可达的配置。
+// 两种代价不对称，这里就该按「宁可多打码」取舍。
+//
+// 先走一遍 RedactBodyKeys（它对长 key 做了 MaskKey 的部分保留形式，
+// 便于辨认是哪个 key），再兜住它跳过的短 key。
+func redactForLog(body []byte, keys []string) []byte {
+	out := sample.RedactBodyKeys(body, keys)
+	for _, k := range keys {
+		// 长 key 已由上面处理；这里只补它按长度跳过的那些。
+		//
+		// 空 key 显式跳过。当前它其实无害（MaskKey("") 返回空串，于是
+		// ReplaceAll 等于原地不动），但那依赖 MaskKey 的实现细节 ——
+		// 若它日后改成返回固定掩码，空串替换会在**每个字节之间**插入掩码，
+		// 把一段错误原文变成几倍长的乱码。写死这个跳过，不押在别处的行为上。
+		if k == "" || len(k) >= minLogRedactableKey {
+			continue
+		}
+		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
+	}
+	return out
+}
+
+// minLogRedactableKey 与 sample.minRedactableKey 是同一个值，但含义相反：
+// 那边是「短于此不脱敏」，这边是「短于此由本函数补脱敏」。
+// 写成常量而不是内联 12，是为了让两者的关联在改动时能被搜到。
+const minLogRedactableKey = 12
 
 const (
 	// maxCountTokensResp 是 count_tokens 响应体的读取上限。
@@ -249,57 +305,74 @@ func walkJSONTokens(v any) int {
 
 // estimateTokens 粗算一段文本的 token 数。
 //
-// 算法：按空白与标点切词，英文词 ×1.3，CJK 字 ×1.5。
+// 算法：按空白与标点切词，英文词 ×1.3，CJK 字 ×1.5。超长的单词按
+// maxCharsPerToken 折算（见下）。
 //
 // 这是经验值，真实 tokenizer 是 BPE subword，行为复杂得多。误差约 ±20%，
 // 且**刻意偏高**：Claude Code 用它做上下文预算，估高只是让它早一点压缩
 // 上下文，估低会让请求超出上下文窗口而被上游 400 拒绝。
-//
-// 已知的最大偏差来源是 base64 图片：一张图在 Anthropic 侧按尺寸计费
-// （约 (w×h)/750），而这里按它的 base64 文本切词。两者碰巧在同一量级，
-// 但那是巧合，不是设计 —— 带图的请求估算值不可靠。
 func estimateTokens(text string) int {
 	if text == "" {
 		return 0
 	}
-	words, cjk := 0, 0
-	inWord := false
+	words, cjk, extra := 0, 0, 0
+	wordLen := 0
+
+	// endWord 收尾一个词。超长的词按字符数折算成多个 token ——
+	// 不这么做的话，一段没有空白的长字符串会被算成 1 个 token。
+	//
+	// 这不是理论问题：**base64 图片**就是这个形态。一张 1024×1024 的图
+	// base64 后有几百 KB 且完全没有空白，按「1 个词」算等于把它当成
+	// 1 个 token，而它在 Anthropic 侧约合 1400 个（按 (w×h)/750 计费）——
+	// 低估上千倍。而低估恰恰是本函数最要避免的方向：Claude Code 会据此
+	// 以为上下文还很空，然后发一个超出窗口的请求，被上游 400 拒掉。
+	//
+	// base64 的实际 tokenizer 密度约 3–4 字符/token，取 4 偏保守（估高）。
+	endWord := func() {
+		if wordLen > longWordChars {
+			extra += wordLen / maxCharsPerToken
+		}
+		wordLen = 0
+	}
 
 	for _, r := range text {
 		switch {
 		// CJK 每字单独算，它们之间没有空格，按词切会把一整句算成一个词。
 		case unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul):
+			endWord()
 			cjk++
-			inWord = false
 		case unicode.IsSpace(r), unicode.IsPunct(r), unicode.IsSymbol(r):
-			inWord = false
+			endWord()
 		default:
-			if !inWord {
+			if wordLen == 0 {
 				words++
-				inWord = true
 			}
+			wordLen++
 		}
 	}
-	return int(float64(words)*1.3 + float64(cjk)*1.5)
+	endWord()
+
+	return int(float64(words)*1.3+float64(cjk)*1.5) + extra
 }
 
+const (
+	// longWordChars 是「超长词」的门槛。普通英文单词远短于此，
+	// 所以正常文本完全不会走到折算分支 —— 它只对 base64、长 hash、
+	// minified JS 这类无空白的长串生效。
+	longWordChars = 24
+	// maxCharsPerToken 是超长词的字符/token 折算率。
+	// base64 实测约 3–4 字符一个 token，取 4 偏保守（宁可估高）。
+	maxCharsPerToken = 4
+)
+
 // collapseSpaces 把连续空白压成单个空格并限长，让上游错误原文在单行日志里可读。
+//
+// 按 rune 而不是 byte 截断：中转站的错误信息常是中文，按字节切会把一个
+// 汉字劈成两半，日志里出现乱码。
 func collapseSpaces(s string, limit int) string {
-	out := make([]rune, 0, limit)
-	prevSpace := false
-	for _, r := range s {
-		if unicode.IsSpace(r) {
-			prevSpace = true
-			continue
-		}
-		if prevSpace && len(out) > 0 {
-			out = append(out, ' ')
-		}
-		prevSpace = false
-		if len(out) >= limit {
-			return string(out) + "…"
-		}
-		out = append(out, r)
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > limit {
+		return string(r[:limit]) + "…"
 	}
-	return string(out)
+	return s
 }
