@@ -5,27 +5,37 @@
 package sample
 
 import (
+	"bytes"
 	"net/http"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
 )
 
-// sensitiveHeaders 是可能携带 key 的头。值一律脱敏后落库（§3.6.3b）。
+// sensitiveHeaders 是可能携带凭据的头。值一律脱敏后落库（§3.6.3b）。
 //
 // 不脱敏的话，样本库就是一份明文 key 库，而它比配置表更容易被整体导出
 // （配置表的 key 是加密的，样本表的头是明文）。
 //
 // 脱敏不损害用途：调探活时需要知道的是「key 放在**哪个头**、什么**格式**」，
 // 头名与 Bearer 前缀都完整保留，值本身由配置提供。
-var sensitiveHeaders = map[string]bool{
-	"Authorization":       true,
-	"X-Api-Key":           true,
-	"Api-Key":             true,
-	"Proxy-Authorization": true,
-	"Cookie":              true,
-	"Set-Cookie":          true,
-}
+//
+// 由 model.AuthHeaders 派生而不是另抄一份：那份清单是 API key 位置的
+// 唯一来源，新增一个位置时这里必须同步，而「忘了同步」的表现是明文 key
+// 静默落库 —— 不报错、不失败，只有翻数据库才会发现。
+// 这里再多加几项：它们不是 API key 的位置，但同样是凭据。
+var sensitiveHeaders = func() map[string]bool {
+	m := map[string]bool{
+		"Proxy-Authorization": true,
+		"Cookie":              true,
+		"Set-Cookie":          true,
+	}
+	for _, h := range model.AuthHeaders {
+		m[http.CanonicalHeaderKey(h)] = true
+	}
+	return m
+}()
 
 // RedactHeaders 返回脱敏后的头副本。原 header 不被修改 ——
 // 它可能还在被转发路径读，改它就违反了「绝不影响转发」。
@@ -73,13 +83,19 @@ func redactValue(v string) string {
 // 少数中转站的自定义字段也会带上它。§9.4 的验收标准是
 // 「用真 key 字符串全表 grep 断言为 0 命中」—— 只清头满足不了。
 //
+// 全程在 []byte 上操作。走 string 转换的话，每次 `string(body)` 都是一次
+// 全量拷贝 —— body 上限 32MB、keys 通常 2~4 个、每条样本调三次，
+// 那是几百 MB 的无谓拷贝，而绝大多数样本里一个 key 都不含（§3.6.3a
+// 要求采集不拖慢转发，这条路径必须在「没命中」时接近零成本）。
+//
 // keys 通常只有 2 个（relay key 与该站的上游 key），所以逐个 Replace
 // 足够快，不必上 Aho-Corasick。
 func RedactBodyKeys(body []byte, keys []string) []byte {
-	// 先判断有没有真需要替换，避免为绝大多数样本白拷贝一份 body
+	// 先只做查找，不做替换：绝大多数样本不含 key，这一支直接原样返回，
+	// 一个字节都不拷。
 	var hit bool
 	for _, k := range keys {
-		if len(k) >= minRedactableKey && strings.Contains(string(body), k) {
+		if len(k) >= minRedactableKey && bytes.Contains(body, []byte(k)) {
 			hit = true
 			break
 		}
@@ -88,14 +104,14 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 		return body
 	}
 
-	s := string(body)
+	out := body
 	for _, k := range keys {
 		if len(k) < minRedactableKey {
 			continue
 		}
-		s = strings.ReplaceAll(s, k, store.MaskKey(k))
+		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
 	}
-	return []byte(s)
+	return out
 }
 
 // minRedactableKey 是参与 body 扫描的最短 key 长度。

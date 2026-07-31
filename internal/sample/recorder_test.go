@@ -66,9 +66,37 @@ func testSettings() model.Settings {
 	return s
 }
 
+// liveSettings 是可热改的配置源，模拟用户在管理界面改保留策略。
+type liveSettings struct {
+	mu  sync.Mutex
+	cur model.Settings
+	err error
+}
+
+func newLiveSettings(s model.Settings) *liveSettings {
+	return &liveSettings{cur: s}
+}
+
+func (l *liveSettings) Settings() (model.Settings, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.cur, l.err
+}
+
+func (l *liveSettings) set(f func(*model.Settings)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f(&l.cur)
+}
+
+// newTestRecorder 用给定设置建一个 Recorder，保留策略跟随同一份设置。
+func newTestRecorder(w Writer, s model.Settings) *Recorder {
+	return NewRecorder(w, s, newLiveSettings(s), discardLog())
+}
+
 func TestRecorder_WritesSamples(t *testing.T) {
 	w := &fakeWriter{}
-	r := NewRecorder(w, testSettings(), discardLog())
+	r := newTestRecorder(w, testSettings())
 
 	for i := 0; i < 5; i++ {
 		r.Record(&model.Sample{RouteID: int64(i)})
@@ -91,7 +119,7 @@ func TestRecorder_DropsWhenFullNeverBlocks(t *testing.T) {
 	w := &fakeWriter{block: block}
 	s := testSettings()
 	s.SampleQueueSize = 4
-	r := NewRecorder(w, s, discardLog())
+	r := newTestRecorder(w, s)
 
 	// 后台 writer 会卡在第一条上，队列很快填满
 	const total = 100
@@ -121,7 +149,7 @@ func TestRecorder_DropsWhenFullNeverBlocks(t *testing.T) {
 // 落库失败只记日志，不重试、不阻塞、不影响后续样本。
 func TestRecorder_ContinuesAfterWriteError(t *testing.T) {
 	w := &fakeWriter{failNth: 2}
-	r := NewRecorder(w, testSettings(), discardLog())
+	r := newTestRecorder(w, testSettings())
 
 	for i := 0; i < 4; i++ {
 		r.Record(&model.Sample{RouteID: int64(i)})
@@ -141,7 +169,7 @@ func TestRecorder_CloseDrainsQueue(t *testing.T) {
 	w := &fakeWriter{}
 	s := testSettings()
 	s.SampleQueueSize = 64
-	r := NewRecorder(w, s, discardLog())
+	r := newTestRecorder(w, s)
 
 	for i := 0; i < 30; i++ {
 		r.Record(&model.Sample{RouteID: int64(i)})
@@ -155,7 +183,7 @@ func TestRecorder_CloseDrainsQueue(t *testing.T) {
 
 // Close 幂等：优雅关闭路径上可能被 defer 与显式调用重复触发。
 func TestRecorder_CloseIsIdempotent(t *testing.T) {
-	r := NewRecorder(&fakeWriter{}, testSettings(), discardLog())
+	r := newTestRecorder(&fakeWriter{}, testSettings())
 	r.Close()
 	r.Close() // 不该 panic（close of closed channel）
 	r.Close()
@@ -163,7 +191,7 @@ func TestRecorder_CloseIsIdempotent(t *testing.T) {
 
 // Close 之后再投递不能 panic —— 转发协程可能还在收尾。
 func TestRecorder_RecordAfterCloseDoesNotPanic(t *testing.T) {
-	r := NewRecorder(&fakeWriter{}, testSettings(), discardLog())
+	r := newTestRecorder(&fakeWriter{}, testSettings())
 	r.Close()
 
 	// 队列还有空间就进队列（无人消费），满了就丢，两种都不该 panic
@@ -180,7 +208,7 @@ func TestRecorder_PrunesPeriodically(t *testing.T) {
 	s.SampleQueueSize = 256
 	s.SampleKeepCount = 500
 	s.SampleKeepDays = 7
-	r := NewRecorder(w, s, discardLog())
+	r := newTestRecorder(w, s)
 
 	for i := 0; i < n; i++ {
 		r.Record(&model.Sample{RouteID: 1})
@@ -218,7 +246,7 @@ func TestRecorder_DoesNotPrunePerSample(t *testing.T) {
 	w := &fakeWriter{written: make(chan struct{}, n)}
 	s := testSettings()
 	s.SampleQueueSize = 64
-	r := NewRecorder(w, s, discardLog())
+	r := newTestRecorder(w, s)
 
 	for i := 0; i < n; i++ {
 		r.Record(&model.Sample{RouteID: 1})
@@ -243,7 +271,7 @@ func TestRecorder_ConcurrentRecord(t *testing.T) {
 	w := &fakeWriter{}
 	s := testSettings()
 	s.SampleQueueSize = 512
-	r := NewRecorder(w, s, discardLog())
+	r := newTestRecorder(w, s)
 
 	const goroutines, each = 20, 25
 	var wg sync.WaitGroup
@@ -266,12 +294,77 @@ func TestRecorder_ConcurrentRecord(t *testing.T) {
 	}
 }
 
+// 保留策略必须每次清理现读，而不是在 NewRecorder 里定格。
+//
+// 曾经的 bug：keepCount/keepDays 在启动时抄进 Recorder。用户在管理界面
+// 把保留量从 500 调到 50 之后，界面显示新值、库里也存了新值，但清理照旧
+// 按 500 执行 —— 一个「改了没反应」且完全不报错的功能，只有翻数据库
+// 数条数才会发现。
+func TestRecorder_RetentionIsHotReloaded(t *testing.T) {
+	w := &fakeWriter{written: make(chan struct{}, 4)}
+	s := testSettings()
+	s.SampleQueueSize = 64
+	s.SampleKeepCount = 500
+	s.SampleKeepDays = 7
+
+	live := newLiveSettings(s)
+	r := NewRecorder(w, s, live, discardLog())
+
+	// 先写一条并 Close 前改配置，用 Close 的收尾清理观察生效与否
+	r.Record(&model.Sample{RouteID: 1})
+	<-w.written
+
+	live.set(func(c *model.Settings) {
+		c.SampleKeepCount = 50
+		c.SampleKeepDays = 1
+	})
+	r.Close()
+
+	w.mu.Lock()
+	args := append([][2]int(nil), w.pruneArgs...)
+	w.mu.Unlock()
+
+	if len(args) == 0 {
+		t.Fatal("Close 应收尾清理一次")
+	}
+	if last := args[len(args)-1]; last != [2]int{50, 1} {
+		t.Errorf("清理应用改后的保留策略 {50 1}，得到 %v —— 配置改了不生效", last)
+	}
+}
+
+// 配置源出错时仍要清理（按默认值），不能跳过。
+//
+// 跳过的话，配置源出问题的那段时间样本会无上限堆积 ——
+// 而那正是最需要留出磁盘的时候。
+func TestRecorder_PrunesWithDefaultsWhenSettingsFail(t *testing.T) {
+	w := &fakeWriter{}
+	s := testSettings()
+	live := newLiveSettings(s)
+	live.err = errors.New("配置源不可用")
+
+	r := NewRecorder(w, s, live, discardLog())
+	r.Close() // 收尾清理
+
+	w.mu.Lock()
+	args := append([][2]int(nil), w.pruneArgs...)
+	w.mu.Unlock()
+
+	if len(args) != 1 {
+		t.Fatalf("读配置失败也应清理一次，得到 %d 次", len(args))
+	}
+	d := model.DefaultSettings()
+	if args[0] != [2]int{d.SampleKeepCount, d.SampleKeepDays} {
+		t.Errorf("应回退到默认保留策略 {%d %d}，得到 %v",
+			d.SampleKeepCount, d.SampleKeepDays, args[0])
+	}
+}
+
 // 队列大小配成 0 或负数时要兜底为 1，不能 make(chan, -1) panic。
 func TestRecorder_InvalidQueueSize(t *testing.T) {
 	for _, size := range []int{0, -1} {
 		s := testSettings()
 		s.SampleQueueSize = size
-		r := NewRecorder(&fakeWriter{}, s, discardLog())
+		r := newTestRecorder(&fakeWriter{}, s)
 		r.Record(&model.Sample{})
 		r.Close()
 	}

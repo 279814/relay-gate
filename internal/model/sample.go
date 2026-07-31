@@ -17,6 +17,17 @@ const (
 	OutcomeClientAbort Outcome = "client_abort"
 )
 
+// Valid 用于筛选参数校验：写错的 outcome 应该报错，
+// 而不是安静地返回一个空列表 —— 那看起来像「这段时间没有请求」。
+func (o Outcome) Valid() bool {
+	switch o {
+	case OutcomeOK, OutcomeUpstreamError, OutcomeTimeout,
+		OutcomeFakeAlive, OutcomeClientAbort:
+		return true
+	}
+	return false
+}
+
 // TruncFlags 是位标记，说明样本里哪些字段被截断了（§3.6.2 的 truncated 列）。
 //
 // 必须记下来：不标记的话，看到一个 256KB 整的 body 无法判断它是恰好这么大

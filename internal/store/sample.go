@@ -97,6 +97,13 @@ type SampleFilter struct {
 	BeforeID int64
 }
 
+// 样本列表的分页边界。上限存在的意义是防一次拉爆内存，
+// 而不是防用户多要 —— 所以超了就截到上限，见 ListSamples。
+const (
+	defaultSampleLimit = 50
+	maxSampleLimit     = 500
+)
+
 // ListSamples 按时间倒序列出样本。
 //
 // **不返回 body** —— 列表页只需要元数据，而三个 body 加起来可达 300KB+，
@@ -123,9 +130,14 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 		q += ` AND id < ?`
 		args = append(args, f.BeforeID)
 	}
+	// 未指定给默认值，超上限则**截到上限**而不是掉回默认值 ——
+	// 后者会让 limit=1000 拿到 50 条，翻页逻辑据此以为「到底了」。
 	limit := f.Limit
-	if limit <= 0 || limit > 500 {
-		limit = 50
+	switch {
+	case limit <= 0:
+		limit = defaultSampleLimit
+	case limit > maxSampleLimit:
+		limit = maxSampleLimit
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)

@@ -33,6 +33,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("PUT /admin/api/settings", s.updateSettings)
 	mux.HandleFunc("GET /admin/api/state", s.getState)
 	mux.HandleFunc("POST /admin/api/state", s.setState)
+	mux.HandleFunc("GET /admin/api/runtime", s.getRuntime)
 
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)

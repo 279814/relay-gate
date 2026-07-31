@@ -41,15 +41,32 @@ type Recorder struct {
 	dropped atomic.Int64
 	written atomic.Int64
 
-	keepCount, keepDays int
+	// retention 每次清理时现读，而不是在 NewRecorder 里定格。
+	//
+	// 定格的话，用户在管理界面把保留量从 500 改成 50 后，界面显示的是新值、
+	// 库里存的也是新值，但清理照旧按 500 执行 —— 一个「改了没反应」且
+	// 完全不报错的功能。改队列大小仍需重启（那要重建 channel），
+	// 但保留策略没有这个限制，就不该继承这个约束。
+	retention RetentionSource
 
 	stop     chan struct{}
 	stopOnce sync.Once
 	done     chan struct{}
 }
 
+// RetentionSource 提供当前的保留策略。由 livecfg 实现（带 2s 缓存），
+// 所以每次清理时现读的代价可以忽略 —— 而清理本身每 50 条才跑一次。
+type RetentionSource interface {
+	Settings() (model.Settings, error)
+}
+
 // NewRecorder 创建并启动后台 writer。调用方必须在关闭时调用 Close。
-func NewRecorder(w Writer, s model.Settings, log *slog.Logger) *Recorder {
+//
+// s 只用于取队列大小（那是 channel 的容量，改它必须重启）；
+// 保留策略走 retention 现读，见 Recorder.retention。
+func NewRecorder(w Writer, s model.Settings, retention RetentionSource,
+	log *slog.Logger) *Recorder {
+
 	size := s.SampleQueueSize
 	if size < 1 {
 		size = 1
@@ -58,8 +75,7 @@ func NewRecorder(w Writer, s model.Settings, log *slog.Logger) *Recorder {
 		ch:        make(chan *model.Sample, size),
 		w:         w,
 		log:       log,
-		keepCount: s.SampleKeepCount,
-		keepDays:  s.SampleKeepDays,
+		retention: retention,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -124,7 +140,19 @@ func (r *Recorder) write(s *model.Sample) {
 }
 
 func (r *Recorder) prune() {
-	n, err := r.w.PruneSamples(r.keepCount, r.keepDays)
+	keepCount, keepDays := defaultRetention()
+	if r.retention != nil {
+		s, err := r.retention.Settings()
+		if err != nil {
+			// 读不到就按默认值清，不能不清 —— 跳过的话，配置源出问题的
+			// 那段时间样本会无上限堆积，而它正是最需要留出磁盘的时候。
+			r.log.Warn("读取保留策略失败，按默认值清理", "err", err)
+		} else {
+			keepCount, keepDays = s.SampleKeepCount, s.SampleKeepDays
+		}
+	}
+
+	n, err := r.w.PruneSamples(keepCount, keepDays)
 	if err != nil {
 		r.log.Error("清理样本失败", "err", err)
 		return
@@ -132,6 +160,11 @@ func (r *Recorder) prune() {
 	if n > 0 {
 		r.log.Debug("已清理过期样本", "deleted", n)
 	}
+}
+
+func defaultRetention() (keepCount, keepDays int) {
+	d := model.DefaultSettings()
+	return d.SampleKeepCount, d.SampleKeepDays
 }
 
 // Close 停止后台 writer 并等它排空队列。

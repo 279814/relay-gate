@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -11,13 +12,33 @@ import (
 // listSamples 返回样本列表（不含 body，见 store.ListSamples 的说明）。
 func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f := store.SampleFilter{
-		RouteID:    queryInt64(q.Get("route_id")),
-		UpstreamID: queryInt64(q.Get("upstream_id")),
-		Outcome:    model.Outcome(q.Get("outcome")),
-		Limit:      int(queryInt64(q.Get("limit"))),
-		BeforeID:   queryInt64(q.Get("before_id")),
+
+	var qerr error
+	num := func(name string) int64 {
+		n, err := queryInt64(q.Get(name))
+		if err != nil && qerr == nil {
+			qerr = fmt.Errorf("%w: 参数 %s 不是合法整数：%q", model.ErrValidation, name, q.Get(name))
+		}
+		return n
 	}
+	f := store.SampleFilter{
+		RouteID:    num("route_id"),
+		UpstreamID: num("upstream_id"),
+		Outcome:    model.Outcome(q.Get("outcome")),
+		Limit:      int(num("limit")),
+		BeforeID:   num("before_id"),
+	}
+	// 参数写错了要说出来。静默当成 0 的话，?before_id=abc 会从头开始返回，
+	// 看着像「翻页转了一圈」，而真正的原因是那个 typo。
+	if qerr != nil {
+		s.writeErr(w, qerr)
+		return
+	}
+	if f.Outcome != "" && !f.Outcome.Valid() {
+		s.writeErr(w, fmt.Errorf("%w: 未知的 outcome：%q", model.ErrValidation, f.Outcome))
+		return
+	}
+
 	list, err := s.st.ListSamples(f)
 	if err != nil {
 		s.writeErr(w, err)
@@ -83,7 +104,10 @@ func (s *Server) clearSamples(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
 }
 
-func queryInt64(s string) int64 {
-	n, _ := strconv.ParseInt(s, 10, 64)
-	return n
+// queryInt64 解析查询参数。空串是「没传」，返回 0 且不算错。
+func queryInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(s, 10, 64)
 }

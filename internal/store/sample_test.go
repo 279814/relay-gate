@@ -192,6 +192,40 @@ func TestListSamples_OrderAndPaging(t *testing.T) {
 	}
 }
 
+// limit 越界要**截到上限**，而不是掉回默认值。
+//
+// 掉回默认值的话，limit=1000 会拿到 50 条 —— 而调用方据此以为
+// 「一共就这么多」，翻页直接停在第 50 条，剩下的样本看不到也查不出原因。
+func TestListSamples_LimitIsClampedNotReset(t *testing.T) {
+	st := testStore(t)
+	base := time.Now().UnixMilli()
+	// 存 60 条：多于默认的 50，少于上限 500
+	for i := 0; i < 60; i++ {
+		if err := st.InsertSample(mkSample(base + int64(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	over, err := st.ListSamples(SampleFilter{Limit: maxSampleLimit + 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(over) != 60 {
+		t.Errorf("超上限的 limit 应截到 %d（此处数据只有 60 条，应全返回），得到 %d 条"+
+			" —— 掉回默认值 %d 会让调用方以为没有更多数据了",
+			maxSampleLimit, len(over), defaultSampleLimit)
+	}
+
+	// 不传 limit 时用默认值
+	def, err := st.ListSamples(SampleFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(def) != defaultSampleLimit {
+		t.Errorf("未指定 limit 应返回默认的 %d 条，得到 %d", defaultSampleLimit, len(def))
+	}
+}
+
 func TestListSamples_Filters(t *testing.T) {
 	st := testStore(t)
 	base := time.Now().UnixMilli()

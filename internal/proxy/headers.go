@@ -20,14 +20,6 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// authHeaders 是入站可能携带 relay key 的位置。出站必须**全部删除**，
-// 再按 auth_style 注入上游 key —— 否则会把 relay key 泄露给公益站。
-var authHeaders = []string{
-	"Authorization",
-	"X-Api-Key",
-	"Api-Key",
-}
-
 // PrepareOutboundHeaders 构造出站请求头。
 //
 // 规则是**黑名单**而非白名单（§3.3.3）：除本函数显式处理的那几项外，
@@ -60,11 +52,13 @@ func PrepareOutboundHeaders(in http.Header, upstreamKey string,
 
 	// 2. 全量复制，只跳过必须删的。
 	//    用 textproto 的规范形式做比较，避免大小写导致漏删。
-	skip := make(map[string]bool, len(hopByHopHeaders)+len(authHeaders)+2)
+	skip := make(map[string]bool, len(hopByHopHeaders)+len(model.AuthHeaders)+2)
 	for _, h := range hopByHopHeaders {
 		skip[http.CanonicalHeaderKey(h)] = true
 	}
-	for _, h := range authHeaders {
+	// 鉴权头必须**全部删除**，再按 auth_style 注入上游 key ——
+	// 漏一个就是把用户的 relay key 直接送给公益站。
+	for _, h := range model.AuthHeaders {
 		skip[http.CanonicalHeaderKey(h)] = true
 	}
 	// Host 由 http.Request.Host 决定，不走 Header（放这里是为了防御

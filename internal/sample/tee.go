@@ -62,12 +62,17 @@ func (h *HeadTail) Write(p []byte) (int, error) {
 		if len(src) > len(h.tail) {
 			src = src[len(src)-len(h.tail):]
 		}
-		for _, b := range src {
-			h.tail[h.tailPos] = b
-			h.tailPos = (h.tailPos + 1) % len(h.tail)
-			if h.tailLen < len(h.tail) {
-				h.tailLen++
-			}
+		// 按段 copy 而不是逐字节搬。这里在 SSE 的每个 chunk 上都会跑，
+		// 逐字节版本对每个字节做一次取模和一次边界判断，把一个本该是
+		// memmove 的操作变成了字节循环 —— 而这条路径的全部要求就是
+		// 「别拖慢转发」。绕回最多切成两段，所以最多两次 copy。
+		n := copy(h.tail[h.tailPos:], src)
+		if n < len(src) {
+			copy(h.tail, src[n:]) // 绕回，从头接着写
+		}
+		h.tailPos = (h.tailPos + len(src)) % len(h.tail)
+		if h.tailLen += len(src); h.tailLen > len(h.tail) {
+			h.tailLen = len(h.tail)
 		}
 	}
 	return len(p), nil
@@ -130,18 +135,48 @@ func (h *HeadTail) Bytes() []byte {
 	return buf.Bytes()
 }
 
-// TruncateBody 按上限截断请求体，返回截断后的内容与是否被截断。
+// PrepareBody 把一份 body 处理成可落库的形式：按上限截断 + 脱敏。
 //
-// 请求体只留头：它是一个 JSON 对象，头部含 model、max_tokens、system
-// 与工具定义 —— 也就是「发了什么头/什么参数」的全部信息。
-// 尾部通常是对话历史的最后几条，对验证「只改了两处」没有额外价值。
-func TruncateBody(body []byte, limit int) ([]byte, bool) {
+// 顺序是刻意的：**只脱敏会被留档的那一段**。反过来（先扫全量再截断）
+// 要在最多 32MB 上逐 key 扫描，而其中除了前 limit 字节以外全部会被
+// 立刻丢弃 —— 纯粹的浪费，且这段扫描跑在转发的收尾路径上，
+// 与 §3.6.3a「采集绝不拖慢转发」直接冲突。默认 limit 是 256KB，
+// 也就是说改这一处就把最坏情况的扫描量压到了原来的 1/128。
+//
+// 截断点可能落在一个 key 的中间，所以脱敏窗口比 limit 多留一个最长 key
+// 的余量：这样任何会出现在留档里的 key 都完整落在窗口内、会被完整替换，
+// 之后的截断至多切碎一个**掩码** —— 而掩码里没有秘密。
+// 少了这个余量，一个恰好横跨截断点的 key 会有前半截以明文落库。
+//
+// limit <= 0 表示不限。
+func PrepareBody(body []byte, keys []string, limit int) ([]byte, bool) {
 	if limit <= 0 || len(body) <= limit {
-		return body, false
+		return RedactBodyKeys(body, keys), false
 	}
+
+	end := limit + longestKey(keys)
+	if end > len(body) {
+		end = len(body)
+	}
+	safe := RedactBodyKeys(body[:end], keys)
+	if len(safe) > limit {
+		safe = safe[:limit]
+	}
+
 	var buf bytes.Buffer
-	buf.Grow(limit + 48)
-	buf.Write(body[:limit])
+	buf.Grow(len(safe) + 48)
+	buf.Write(safe)
+	// 报的是被丢掉的**原始**字节数。脱敏是替换不是丢弃，不计入这里。
 	fmt.Fprintf(&buf, ellipsisFmt, len(body)-limit)
 	return buf.Bytes(), true
+}
+
+func longestKey(keys []string) int {
+	max := 0
+	for _, k := range keys {
+		if len(k) > max {
+			max = len(k)
+		}
+	}
+	return max
 }

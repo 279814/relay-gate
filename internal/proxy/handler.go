@@ -207,7 +207,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	if respTee != nil {
 		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
-			outHeader, outURL, respTee, res)
+			outHeader, outURL, respTee, res, settings)
 	}
 }
 
@@ -245,38 +245,31 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 //
 // 全程只读转发路径产生的数据，绝不回写；投递是非阻塞的，
 // 队列满就丢。任何在这里发生的问题都不该影响已经完成的转发。
+//
+// settings 由调用方传入而不是在这里重读：serve 开头已经读过一次，
+// 重读一次既多一次 livecfg 加锁，又可能拿到与转发时不同的值 ——
+// 样本描述的是**这次**转发，用的必须是它当时那份配置。
 func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	cand *router.Candidate, recvAt time.Time, inModel string,
 	inBody, outBody []byte, outHeader http.Header, outURL string,
-	respTee *sample.HeadTail, res *Result) {
-
-	settings, err := h.cfg.Settings()
-	if err != nil {
-		return // 配置读不到就不记样本，绝不因此影响任何东西
-	}
+	respTee *sample.HeadTail, res *Result, settings model.Settings) {
 
 	// 落库的 key 只有两处来源：入站的 relay key 与出站的上游 key。
 	// 两者都要从 body 里扫掉（§9.4 要求真 key 全表 grep 零命中）。
 	keys := []string{cand.Upstream.APIKey}
-	for _, k := range []string{
-		r.Header.Get("X-Api-Key"),
-		strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "),
-		r.Header.Get("Api-Key"),
-	} {
-		if k = strings.TrimSpace(k); k != "" {
-			keys = append(keys, k)
-		}
+	for _, k := range inboundCredentials(r.Header) {
+		keys = append(keys, k)
 	}
 
-	inSafe := sample.RedactBodyKeys(inBody, keys)
-	outSafe := sample.RedactBodyKeys(outBody, keys)
+	// 先截断再脱敏（PrepareBody 内部保证顺序安全）：body 上限 32MB，
+	// 而留档上限默认 256KB，先扫全量等于为了丢掉的 99% 白扫一遍。
+	inTrunc, inCut := sample.PrepareBody(inBody, keys, settings.SampleMaxBodyBytes)
+	outTrunc, outCut := sample.PrepareBody(outBody, keys, settings.SampleMaxBodyBytes)
 	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
 	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
 	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
+	// 它已被 HeadTail 限长，不需要再截。
 	respSafe := sample.RedactBodyKeys(respTee.Bytes(), keys)
-
-	inTrunc, inCut := sample.TruncateBody(inSafe, settings.SampleMaxBodyBytes)
-	outTrunc, outCut := sample.TruncateBody(outSafe, settings.SampleMaxBodyBytes)
 
 	var flags model.TruncFlags
 	if inCut {
@@ -358,18 +351,34 @@ func classifyOutcome(res *Result) model.Outcome {
 	return model.OutcomeOK
 }
 
+// inboundCredentials 取出入站请求里所有位置上的凭据值。
+//
+// 位置清单来自 model.AuthHeaders（唯一来源）。鉴权与样本脱敏都用它：
+// 两者必须看同一组位置 —— 某个位置能过鉴权却不被脱敏，就等于让一个
+// 有效的 relay key 明文落库。
+func inboundCredentials(h http.Header) []string {
+	out := make([]string, 0, len(model.AuthHeaders))
+	for _, name := range model.AuthHeaders {
+		v := strings.TrimSpace(h.Get(name))
+		// scheme 前缀不是凭据本身。Bearer 最常见，Basic 在中转站上没见过，
+		// 但剥掉任何 "<scheme> <cred>" 形式的前缀总是对的。
+		if i := strings.IndexByte(v, ' '); i > 0 {
+			v = strings.TrimSpace(v[i+1:])
+		}
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // authOK 三个位置都认，因为不同协议的客户端习惯不同（§3.2）。
 func (h *Handler) authOK(r *http.Request) bool {
 	if len(h.relayKeys) == 0 {
 		return false // 未配置 key 时一律拒绝，绝不放开
 	}
-	candidates := []string{
-		r.Header.Get("X-Api-Key"),
-		strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "),
-		r.Header.Get("Api-Key"),
-	}
-	for _, c := range candidates {
-		if c != "" && h.relayKeys[strings.TrimSpace(c)] {
+	for _, c := range inboundCredentials(r.Header) {
+		if h.relayKeys[c] {
 			return true
 		}
 	}

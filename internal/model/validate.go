@@ -40,7 +40,7 @@ func (u *Upstream) Validate() error {
 	// 探活头里不允许出现鉴权头：key 由 Upstream.APIKey 统一注入，
 	// 在这里再写一个会造成「两个 key 来源」，出问题时无从排查。
 	for k := range u.ProbeHeaders {
-		if isAuthHeader(k) {
+		if IsAuthHeader(k) {
 			return invalid("probe_headers 不能包含鉴权头 %q，key 由 api_key 字段统一注入", k)
 		}
 	}
@@ -116,12 +116,4 @@ func (r *Route) Validate() error {
 		return invalid("max_concurrency 不能为负（0 表示不限），收到 %d", r.MaxConcurrency)
 	}
 	return nil
-}
-
-func isAuthHeader(k string) bool {
-	switch strings.ToLower(strings.TrimSpace(k)) {
-	case "authorization", "x-api-key", "api-key":
-		return true
-	}
-	return false
 }

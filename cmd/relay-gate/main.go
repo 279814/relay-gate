@@ -63,13 +63,14 @@ func run() error {
 	cfgSrc := livecfg.New(st, log)
 	tracker := health.NewTracker()
 
-	// 样本记录（§3.6）。开关在 Settings 里，可热改；这里只按启动时的
-	// 队列大小建 Recorder —— 改队列大小要重启，改开关不用。
+	// 样本记录（§3.6）。开关与保留策略都在 Settings 里、都可热改
+	// （前者每请求现读，后者每次清理现读）。只有队列大小是启动时定格的 ——
+	// 它是 channel 的容量，改它必须重启。
 	settings, err := cfgSrc.Settings()
 	if err != nil {
 		return fmt.Errorf("读取设置: %w", err)
 	}
-	recorder := sample.NewRecorder(st, settings, log)
+	recorder := sample.NewRecorder(st, settings, cfgSrc, log)
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
@@ -78,7 +79,10 @@ func run() error {
 	defer fwd.CloseIdleConnections()
 
 	mux := http.NewServeMux()
-	mux.Handle("/admin/api/", api.New(st, log).Routes(cfg.AdminPW))
+	// WithRuntime 把在途计数与样本丢弃数接到 /admin/api/runtime ——
+	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
+	mux.Handle("/admin/api/", api.New(st, log).
+		WithRuntime(tracker, recorder).Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 	// /healthz 报的是**进程活着**，不代表有可用上游 —— 那要看 /admin/api/state。
 	// 混在一起会让容器编排在所有上游都挂时重启进程，而重启治不了上游。

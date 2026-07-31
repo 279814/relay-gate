@@ -13,13 +13,34 @@ import (
 	"github.com/279814/relay-gate/internal/store"
 )
 
+// InFlightView 暴露每个 Route 的在途请求数。由 health.Tracker 实现。
+type InFlightView interface {
+	Snapshot() map[int64]int
+}
+
+// SampleStats 暴露样本记录器的落库/丢弃计数。由 sample.Recorder 实现。
+type SampleStats interface {
+	Stats() (written, dropped int64)
+}
+
 type Server struct {
 	st  *store.Store
 	log *slog.Logger
+	// inFlight 与 samples 可以为 nil（测试里常只关心 CRUD），
+	// runtime 端点会据此把对应字段留空而不是崩。
+	inFlight InFlightView
+	samples  SampleStats
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
 	return &Server{st: st, log: log}
+}
+
+// WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，
+// 是因为这两者属于转发链路，而 api.Server 的主职责是配置 CRUD。
+func (s *Server) WithRuntime(inFlight InFlightView, samples SampleStats) *Server {
+	s.inFlight, s.samples = inFlight, samples
+	return s
 }
 
 // ── 响应helper ────────────────────────────────────────────
