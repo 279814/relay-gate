@@ -7,6 +7,7 @@ package sample
 import (
 	"bytes"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -112,6 +113,38 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
 	}
 	return out
+}
+
+// RedactText 脱敏一段文本里的 key，用于 URL 与 query string。
+//
+// 为什么 URL 也要扫：§3.2 提到少数中转站接受 `?key=<key>` 查询参数，
+// 而 full_url_mode 的 base_url 正是为这类非标准站准备的 —— 它会被整段
+// 存进样本的 out_url。入站 query 同理（客户端可能两处都带）。
+// 漏掉这两个字段，§9.4 的「真 key 全表 grep 零命中」就不成立。
+//
+// URL 里的 key 还有一种**编码**形态：`sk-a/b+c` 在 query 里会写成
+// `sk-a%2Fb%2Bc`，直接搜原文搜不到。所以除了原文，还试一次 URL 解码后的
+// 匹配 —— 命中就把编码形态一并替换掉。
+func RedactText(s string, keys []string) string {
+	if s == "" {
+		return s
+	}
+	for _, k := range keys {
+		if len(k) < minRedactableKey {
+			continue
+		}
+		masked := store.MaskKey(k)
+		s = strings.ReplaceAll(s, k, masked)
+		// 编码形态：只在与原文不同时才多做一次替换
+		if enc := url.QueryEscape(k); enc != k {
+			s = strings.ReplaceAll(s, enc, masked)
+		}
+		// 少数实现用 PathEscape（不把空格编成 +），也一并覆盖
+		if enc := url.PathEscape(k); enc != k {
+			s = strings.ReplaceAll(s, enc, masked)
+		}
+	}
+	return s
 }
 
 // minRedactableKey 是参与 body 扫描的最短 key 长度。

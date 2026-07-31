@@ -80,6 +80,11 @@ func NewTransport(proxyURL string, connectTimeout time.Duration) (*http.Transpor
 // 规则：base_url（去尾斜杠）+ 入站 path + 原样带上 RawQuery。
 // query 必须带：真实 Claude Code 打的是 /v1/messages?beta=true，
 // 丢掉 ?beta=true 会改变上游行为。
+//
+// full_url_mode 下 base_url 自己可能已经带了 query（`...?key=xxx` 是
+// 非标准站的常见形态，而这个开关正是为它们准备的）。这时必须用 `&` 续接，
+// 用 `?` 会拼出 `?key=xxx?beta=true` —— 两个问号是非法 URL，上游要么整个
+// 拒掉、要么把后半段当成 key 值的一部分，症状是「配了 key 却一直 401」。
 func BuildOutboundURL(up *model.Upstream, inPath, rawQuery string) (string, error) {
 	base := strings.TrimRight(up.BaseURL, "/")
 	var full string
@@ -90,7 +95,11 @@ func BuildOutboundURL(up *model.Upstream, inPath, rawQuery string) (string, erro
 		full = base + inPath
 	}
 	if rawQuery != "" {
-		full += "?" + rawQuery
+		sep := "?"
+		if strings.Contains(full, "?") {
+			sep = "&"
+		}
+		full += sep + rawQuery
 	}
 	if _, err := url.Parse(full); err != nil {
 		return "", fmt.Errorf("拼接出站 URL 失败: %w", err)

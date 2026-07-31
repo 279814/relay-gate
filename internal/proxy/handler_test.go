@@ -1001,6 +1001,90 @@ func TestSample_DisabledRecordsNothing(t *testing.T) {
 	}
 }
 
+// key 出现在 URL 里时也必须脱敏（§3.6.3b / §9.4）。
+//
+// 曾经的漏洞：只脱敏了三组头与三份 body，in_query 与 out_url 是原样落库的。
+// 而 §3.2 明确写了「少数中转站也接受 ?key= 查询参数」，full_url_mode 的
+// base_url 正是为这类站准备的 —— 它会被整段存进 out_url。
+// 验收标准是「真 key 全表 grep 零命中」，漏一个字段就不成立。
+func TestSample_RedactsKeysInURL(t *testing.T) {
+	t.Run("full_url_mode 的 base_url 带上游 key", func(t *testing.T) {
+		const upKey = "sk-upstream-secret-in-url"
+		hs := newHarness(t, nil)
+		up := hs.cfg.snap.Upstreams[10]
+		up.APIKey = upKey
+		up.FullURLMode = true
+		up.BaseURL = hs.up.URL + "/v1/messages?key=" + upKey
+
+		hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+		smp := hs.sink.one(t)
+		if strings.Contains(smp.OutURL, upKey) {
+			t.Errorf("out_url 明文含上游 key：%q", smp.OutURL)
+		}
+		// 脱敏不该把 URL 整段抹掉 —— 样本还要能看出打的是哪个端点
+		if !strings.Contains(smp.OutURL, "/v1/messages") {
+			t.Errorf("脱敏后仍应能看出端点路径，得到 %q", smp.OutURL)
+		}
+	})
+
+	t.Run("入站 query 带 relay key", func(t *testing.T) {
+		hs := newHarness(t, nil)
+
+		r := httptest.NewRequest("POST",
+			"/v1/messages?beta=true&key="+hs.relayPW,
+			strings.NewReader(`{"model":"claude-opus-5"}`))
+		r.Header = claudeCodeHeaders()
+		r.Header.Set("X-Api-Key", hs.relayPW)
+
+		mux := http.NewServeMux()
+		hs.h.Routes(mux)
+		mux.ServeHTTP(httptest.NewRecorder(), r)
+
+		smp := hs.sink.one(t)
+		if strings.Contains(smp.InQuery, hs.relayPW) {
+			t.Errorf("in_query 明文含 relay key：%q", smp.InQuery)
+		}
+		if strings.Contains(smp.OutURL, hs.relayPW) {
+			t.Errorf("out_url 明文含 relay key：%q", smp.OutURL)
+		}
+		// beta=true 必须还在：它是诊断「上游为何拒绝」的关键信息
+		if !strings.Contains(smp.InQuery, "beta=true") {
+			t.Errorf("非 key 的 query 参数不该被动，得到 %q", smp.InQuery)
+		}
+	})
+}
+
+// 转发出去的 URL 本身**不能**被脱敏影响 —— 脱敏只作用于样本副本。
+// 搞混的话上游会收到一个打了码的 key，症状是「配了 key 却一直 401」。
+func TestSample_RedactionDoesNotAffectForwardedURL(t *testing.T) {
+	const upKey = "sk-upstream-secret-in-url"
+	var gotQuery string
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Write([]byte(`{}`))
+	})
+	up := hs.cfg.snap.Upstreams[10]
+	up.APIKey = upKey
+	up.FullURLMode = true
+	up.BaseURL = hs.up.URL + "/v1/messages?key=" + upKey
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	if !strings.Contains(gotQuery, "key="+upKey) {
+		t.Errorf("上游应收到**明文** key，得到 %q", gotQuery)
+	}
+	// 同时验证 URL 拼接：base_url 已带 query 时必须用 & 续接，
+	// 用 ? 会拼出 ?key=x?beta=true —— 非法 URL，上游会拒或误解析
+	if strings.Count(gotQuery, "?") != 0 {
+		t.Errorf("query 里不该出现第二个 ?，得到 %q", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "beta=true") {
+		t.Errorf("入站 query 应被续接上，得到 %q", gotQuery)
+	}
+}
+
 // 四个时间戳都要记，且顺序合理 —— 它们的差值就是排队时长、TTFT、总时长。
 func TestSample_Timestamps(t *testing.T) {
 	hs := newHarness(t, nil)

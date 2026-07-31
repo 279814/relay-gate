@@ -300,13 +300,16 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		RouteID:     cand.Route.ID,
 		UpstreamID:  cand.Upstream.ID,
 
-		InMethod:  r.Method,
-		InPath:    r.URL.Path,
-		InQuery:   r.URL.RawQuery,
+		InMethod: r.Method,
+		InPath:   r.URL.Path,
+		// query 与 URL 也要脱敏：§3.2 提到少数站接受 ?key=<key>，
+		// 而 full_url_mode 的 base_url 会被整段存进 out_url。
+		// 只清头和 body 满足不了 §9.4 的「真 key 全表 grep 零命中」。
+		InQuery:   sample.RedactText(r.URL.RawQuery, keys),
 		InHeaders: sample.RedactHeaders(r.Header),
 		InBody:    inTrunc,
 
-		OutURL:     outURL,
+		OutURL:     sample.RedactText(outURL, keys),
 		OutHeaders: sample.RedactHeaders(outHeader),
 		OutBody:    outTrunc,
 
