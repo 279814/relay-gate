@@ -21,3 +21,10 @@ data/
 # 环境
 .env
 .env.local
+
+# 冒烟脚本的运行产物（网关与 mock 靶站的 stdout/stderr）。
+# 每跑一次就重新生成一批，不挡住的话迟早有人误提交一份带着
+# 本地端口与时间戳的日志。
+*-gate.log
+*-gate-err.log
+mock-*.log
