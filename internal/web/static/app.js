@@ -100,8 +100,7 @@ function app() {
       const r = await fetch('/admin/api' + path, opt);
 
       if (r.status === 401) {
-        this.authed = false;
-        this.stopTimer();
+        this.reset();
         throw new Error('会话已过期，请重新登录');
       }
       if (r.status === 204) return null;
@@ -112,7 +111,12 @@ function app() {
         try { data = JSON.parse(text); } catch { /* 非 JSON 响应，下面按状态码处理 */ }
       }
       if (!r.ok) {
-        throw new Error((data && data.error) || text || `HTTP ${r.status}`);
+        const e = new Error((data && data.error) || text || `HTTP ${r.status}`);
+        // 带上状态码，让调用方能按码判断而不是去猜错误文案。
+        // 探活未启用时几个端点回 503，那是「功能没接」不是「出错了」——
+        // 按中文子串匹配来区分的话，后端改一次文案前端就误报。
+        e.status = r.status;
+        throw e;
       }
       return data;
     },
@@ -121,18 +125,22 @@ function app() {
      *
      * 不这么做的话，每个 saveXxx 都要自己写一遍 try/finally，
      * 而漏掉 finally 的那个会把界面永久卡在 busy 状态。
+     *
+     * 返回一个 {ok, data} 而不是直接返回 fn 的结果：调用方需要区分
+     * 「失败了」与「成功了但响应体是空的」。DELETE 回 204、api() 给出
+     * null，用「结果是否为空」当成败判据的话，这两种情况就分不开了。
      */
     async run(fn, okMsg) {
       this.busy = true;
       this.err = '';
       this.msg = '';
       try {
-        const out = await fn();
+        const data = await fn();
         if (okMsg) this.msg = okMsg;
-        return out;
+        return { ok: true, data };
       } catch (e) {
         this.err = e.message;
-        return undefined;
+        return { ok: false };
       } finally {
         this.busy = false;
       }
@@ -142,10 +150,7 @@ function app() {
 
     async login() {
       if (!this.pw) { this.err = '请输入口令'; return; }
-      const ok = await this.run(async () => {
-        await this.api('POST', '/login', { password: this.pw });
-        return true;
-      });
+      const { ok } = await this.run(() => this.api('POST', '/login', { password: this.pw }));
       if (ok) {
         this.pw = '';   // 不留在内存里
         this.authed = true;
@@ -154,11 +159,45 @@ function app() {
     },
 
     async logout() {
-      this.stopTimer();
       try { await this.api('POST', '/logout'); } catch { /* 登出失败也要回登录页 */ }
+      this.reset();
+    },
+
+    /* reset 回到未登录状态，并**清空所有已加载的数据**。
+     *
+     * 清数据是必须的，不只是把 authed 置 false：样本里有完整的对话原文
+     * 与代码（§3.6），上游列表里有站点地址。不清的话，登出后下一个人在
+     * 同一个浏览器登录时，会先看到上一次的数据闪现出来 —— 那些数据本该
+     * 随着登出一起消失。
+     *
+     * 顺带清掉编辑中的表单：留着的话，重新登录后会看到一个半填的弹窗，
+     * 而它引用的 id 可能已经被别人改了。
+     */
+    reset() {
+      this.stopTimer();
       this.authed = false;
+      this.autoRefresh = false;
       this.err = '';
       this.msg = '';
+
+      this.health = {};
+      this.runtime = {};
+      this.cost = {};
+      this.upstreams = [];
+      this.modelNames = [];
+      this.routes = [];
+      this.samples = [];
+      this.samplesTotal = 0;
+      this.settings = null;
+      this.limits = {};
+
+      this.upForm = null;
+      this.mnForm = null;
+      this.rtForm = null;
+      this.sample = null;
+      this.hdrExport = null;
+      this.probeResult = null;
+      this.tab = 'health';
     },
 
     // ── 加载 ─────────────────────────────────────────
@@ -190,10 +229,11 @@ function app() {
         this.health = h || {};
         this.runtime = rt || {};
       } catch (e) {
-        // 健康端点在探活未启用时回 503。那不该让整个界面报错 ——
-        // 其余页面照常可用。
+        // 503 = 探活未启用，那不是错误，其余页面照常可用（api.Server 在
+        // healthView 为 nil 时刻意回 503 而不是让整个管理接口不可用）。
+        // 按状态码判断而不是匹配错误文案 —— 后端改一次措辞就会让匹配失效。
         this.health = { routes: [], summary: { total: 0, selectable: 0 } };
-        if (!/未接入|未启用/.test(e.message)) this.err = e.message;
+        if (e.status !== 503) this.err = e.message;
       }
     },
 
@@ -210,7 +250,7 @@ function app() {
         this.cost = await this.api('GET', '/probe-cost') || {};
       } catch (e) {
         this.cost = {};
-        if (!/未接入|未启用/.test(e.message)) this.err = e.message;
+        if (e.status !== 503) this.err = e.message; // 理由同 loadHealth
       }
     },
 
@@ -239,13 +279,13 @@ function app() {
 
     async toggleState() {
       const next = this.running ? 'paused' : 'running';
-      const out = await this.run(
+      const { ok } = await this.run(
         () => this.api('POST', '/state', { state: next }),
         next === 'paused'
           ? '已暂停：新请求返回 503，探活全停。进行中的流式对话会正常收完'
           : '已恢复：全部 Route 置 unknown 并立即重新探活',
       );
-      if (out) {
+      if (ok) {
         this.running = next === 'running';
         this.loadHealth();
       }
@@ -298,14 +338,19 @@ function app() {
       // 只在真的填了新 key 时才带上这个字段（后端：留空 = 不改）。
       if (f.api_key) body.api_key = f.api_key;
 
-      const ok = await this.run(
-        () => f.id ? this.api('PUT', '/upstreams/' + f.id, body)
-                   : this.api('POST', '/upstreams', body),
-        f.id ? '已保存。改了 key 或地址会立即重新探活' : '已新增',
-      );
-      if (ok !== undefined) {
+      // 保存 + 重新拉列表放在**同一个** run 里。
+      //
+      // 早先把拉列表写在 run 外面，那个裸 await 一旦失败（会话刚过期、
+      // 网络抖动）就会变成一个未捕获的 promise rejection —— 界面静默不动，
+      // 用户以为保存没生效，而其实存进去了。
+      const { ok } = await this.run(async () => {
+        f.id ? await this.api('PUT', '/upstreams/' + f.id, body)
+             : await this.api('POST', '/upstreams', body);
+        this.upstreams = await this.api('GET', '/upstreams') || [];
+      }, f.id ? '已保存。改了 key 或地址会立即重新探活' : '已新增');
+
+      if (ok) {
         this.upForm = null;
-        this.upstreams = await this.api('GET', '/upstreams');
         this.loadHealth();
       }
     },
@@ -314,8 +359,8 @@ function app() {
       const n = this.routes.filter(r => r.upstream_id === u.id).length;
       const warn = n ? `\n\n它下面的 ${n} 条路由会一并删除。` : '';
       if (!confirm(`删除上游「${u.name}」？${warn}`)) return;
-      const ok = await this.run(() => this.api('DELETE', '/upstreams/' + u.id), '已删除');
-      if (ok !== undefined) await this.loadAll();
+      const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id), '已删除');
+      if (ok) await this.loadAll();
     },
 
     // ── 模型 CRUD ────────────────────────────────────
@@ -335,14 +380,14 @@ function app() {
         is_fallback: f.is_fallback, probe_prompt: f.probe_prompt,
         probe_max_tokens: f.probe_max_tokens, enabled: f.enabled,
       };
-      const ok = await this.run(
-        () => f.id ? this.api('PUT', '/model-names/' + f.id, body)
-                   : this.api('POST', '/model-names', body),
-        f.id ? '已保存' : '已新增',
-      );
-      if (ok !== undefined) {
+      const { ok } = await this.run(async () => {
+        f.id ? await this.api('PUT', '/model-names/' + f.id, body)
+             : await this.api('POST', '/model-names', body);
+        this.modelNames = await this.api('GET', '/model-names') || [];
+      }, f.id ? '已保存' : '已新增');
+
+      if (ok) {
         this.mnForm = null;
-        this.modelNames = await this.api('GET', '/model-names');
         this.loadHealth();
       }
     },
@@ -351,8 +396,8 @@ function app() {
       const n = this.routes.filter(r => r.model_name_id === m.id).length;
       const warn = n ? `\n\n它的 ${n} 条路由会一并删除。` : '';
       if (!confirm(`删除模型「${m.name}」？${warn}`)) return;
-      const ok = await this.run(() => this.api('DELETE', '/model-names/' + m.id), '已删除');
-      if (ok !== undefined) await this.loadAll();
+      const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id), '已删除');
+      if (ok) await this.loadAll();
     },
 
     // ── 路由 CRUD ────────────────────────────────────
@@ -374,22 +419,22 @@ function app() {
         upstream_model: f.upstream_model, max_concurrency: f.max_concurrency,
         enabled: f.enabled,
       };
-      const ok = await this.run(
-        () => f.id ? this.api('PUT', '/routes/' + f.id, body)
-                   : this.api('POST', '/routes', body),
-        f.id ? '已保存' : '已新增，正在探活',
-      );
-      if (ok !== undefined) {
+      const { ok } = await this.run(async () => {
+        f.id ? await this.api('PUT', '/routes/' + f.id, body)
+             : await this.api('POST', '/routes', body);
+        this.routes = await this.api('GET', '/routes') || [];
+      }, f.id ? '已保存' : '已新增，正在探活');
+
+      if (ok) {
         this.rtForm = null;
-        this.routes = await this.api('GET', '/routes');
         this.loadHealth();
       }
     },
 
     async delRt(r) {
       if (!confirm(`删除路由「${this.mnName(r.model_name_id)} × ${this.upName(r.upstream_id)}」？`)) return;
-      const ok = await this.run(() => this.api('DELETE', '/routes/' + r.id), '已删除');
-      if (ok !== undefined) await this.loadAll();
+      const { ok } = await this.run(() => this.api('DELETE', '/routes/' + r.id), '已删除');
+      if (ok) await this.loadAll();
     },
 
     // ── 设置 ─────────────────────────────────────────
@@ -425,17 +470,21 @@ function app() {
     },
 
     async togglePin(s) {
-      const ok = await this.run(
+      const { ok, data } = await this.run(
         () => this.api('POST', `/samples/${s.id}/pin`, { pinned: !s.pinned }),
       );
-      if (ok !== undefined) s.pinned = !s.pinned;
+      // 用后端返回的值而不是自己再取反一次：两边各算一遍的话，
+      // 一旦后端将来对这个操作加了条件（比如置顶数量上限），
+      // 界面就会显示一个并没有生效的状态。
+      if (ok && data) s.pinned = data.pinned;
     },
 
     async clearSamples() {
       if (!confirm('清空样本？置顶的会保留。')) return;
-      const out = await this.run(() => this.api('DELETE', '/samples?keep_pinned=true'));
-      if (out) {
-        this.msg = `已删除 ${out.deleted} 条`;
+      const { ok, data } = await this.run(
+        () => this.api('DELETE', '/samples?keep_pinned=true'));
+      if (ok) {
+        this.msg = `已删除 ${data?.deleted ?? 0} 条`;
         await this.loadSamples();
       }
     },

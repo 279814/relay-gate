@@ -69,6 +69,36 @@ func TestHandler_UnknownAssetIs404(t *testing.T) {
 	}
 }
 
+// TestHandler_PathPrefixEdges 钉住路径前缀处理的边界。
+//
+// Handler 用 TrimPrefix(path, "/admin") 剥前缀，而 TrimPrefix 对**不匹配**
+// 的输入是原样返回的 —— 读代码时这看着像个隐患（"/adminfoo" 会被剥成
+// "foo"）。实测下来不是问题：剥出来的路径在 static/ 里找不到，FileServer
+// 给 404，与「本来就不该处理这个路径」的结果一致。
+//
+// 记下来是因为下次有人读到那个 TrimPrefix 会产生同样的疑虑，而结论
+// （靠 FileServer 的 404 兜住，不需要显式校验前缀）值得省掉一次重复排查。
+func TestHandler_PathPrefixEdges(t *testing.T) {
+	h := Handler()
+	cases := []struct {
+		path string
+		code int
+	}{
+		{"/admin", http.StatusOK},          // 少一个斜杠也要给 index
+		{"/admin/", http.StatusOK},         //
+		{"/admin/app.js", http.StatusOK},   // 正常资源
+		{"/adminfoo", http.StatusNotFound}, // 前缀像但不是
+		{"/other", http.StatusNotFound},    // 完全无关（正常挂载下到不了这里）
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", c.path, nil))
+		if rec.Code != c.code {
+			t.Errorf("%s → %d，期望 %d", c.path, rec.Code, c.code)
+		}
+	}
+}
+
 // TestEmbed_OnlyShipsWhatTheBrowserNeeds 守住内嵌资源的边界。
 //
 // go:embed static 会把该目录下的**所有**文件打进二进制并经 FileServer
