@@ -86,6 +86,8 @@ func TestSettingsRejectNonPositive(t *testing.T) {
 		{"global_l2_concurrency", func(s *Settings) { s.GlobalL2Concurrency = 0 }},
 		{"sample_queue_size", func(s *Settings) { s.SampleQueueSize = 0 }},
 		{"l2_first_token_sec 负数", func(s *Settings) { s.L2FirstTokenSec = -5 }},
+		// 0 不是「关闭重试」而是「一次都不发」。关闭重试是 1。
+		{"retry_max_attempts", func(s *Settings) { s.RetryMaxAttempts = 0 }},
 	} {
 		t.Run(f.name, func(t *testing.T) {
 			s := DefaultSettings()
@@ -94,5 +96,34 @@ func TestSettingsRejectNonPositive(t *testing.T) {
 				t.Fatalf("%s 非正数应被拒绝", f.name)
 			}
 		})
+	}
+}
+
+// 重试次数的上限。挡的是手滑，不是「5 次刚好够」。
+//
+// 填成 100 不会报错也不会崩，只会让每个失败请求悄悄放大成 100 次上游
+// 调用 —— 而额度是花在别人的站上，且每次都可能真的消耗 token。
+func TestRetryAttemptsCeiling(t *testing.T) {
+	s := DefaultSettings()
+	s.RetryMaxAttempts = MaxRetryAttempts + 1
+	err := s.Validate()
+	if err == nil {
+		t.Fatalf("retry_max_attempts = %d 应被拒绝", s.RetryMaxAttempts)
+	}
+	// 错误信息要说清后果。「必须 ≤ 5」这种话不解释任何事，
+	// 用户下一步就是去改代码里的常量。
+	if !strings.Contains(err.Error(), "token") {
+		t.Errorf("错误信息应说明为什么有上限（会放大成同样多次上游调用），得到：%v", err)
+	}
+
+	s.RetryMaxAttempts = MaxRetryAttempts
+	if err := s.Validate(); err != nil {
+		t.Errorf("正好等于上限应当接受：%v", err)
+	}
+
+	// 1 = 不重试，是一个完全正常的配置，不该被上下限误伤。
+	s.RetryMaxAttempts = 1
+	if err := s.Validate(); err != nil {
+		t.Errorf("retry_max_attempts=1（不重试）应当接受：%v", err)
 	}
 }

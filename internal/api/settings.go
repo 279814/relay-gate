@@ -18,6 +18,7 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		"settings": st,
 		"limits": map[string]int{
 			"min_real_first_token_sec": model.MinRealFirstTokenSec,
+			"max_retry_attempts":       model.MaxRetryAttempts,
 		},
 	})
 }

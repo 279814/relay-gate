@@ -14,6 +14,17 @@ package model
 // 但实测是乐观下界（空上下文、无扩展思考），真实场景可能到分钟级，故留此余量。
 const MinRealFirstTokenSec = 300
 
+// MaxRetryAttempts 是 RetryMaxAttempts 的上限。
+//
+// 存在的理由不是「5 次刚好够」，而是防一个手滑：这个数字直接决定
+// **一次**客户端请求最多向公益站发几次完整请求（body 可达几 MB，
+// 且每次都可能真的消耗 token）。填成 100 不会报错、不会崩，只会让
+// 每个失败请求悄悄放大成 100 次上游调用 —— 而额度是花在别人的站上。
+//
+// 重试次数还有一条天然上限（试过的 Route 会被排除，最多试完所有 Route），
+// 但那取决于配置，挡不住「一个 Route 被反复……」之类的将来改动。
+const MaxRetryAttempts = 5
+
 // Settings 是全局运行配置，存在 setting 表里（单行 JSON），UI 可热改。
 //
 // 时间单位统一用秒并在字段名里标出（*Sec），避免「这个数是毫秒还是秒」的歧义——
@@ -50,6 +61,16 @@ type Settings struct {
 	ProbeEnabled        bool `json:"probe_enabled"`
 	PiggybackEnabled    bool `json:"piggyback_enabled"`
 	HalfOpenEnabled     bool `json:"half_open_enabled"`
+
+	// ── 请求内重试（§3.5）────────────────────────────────
+	//
+	// RetryMaxAttempts 是**总尝试次数**（含第一次），不是「额外重试几次」。
+	// 1 = 不重试。默认 3，对应 §3.5 的「最多 2 次重试」。
+	//
+	// 只用一个旋钮而不是「开关 + 次数」：两个字段表达同一件事时，
+	// enabled=true 且 attempts=1 这种自相矛盾的组合就必须有人去解释，
+	// 而它没有任何有用的语义。
+	RetryMaxAttempts int `json:"retry_max_attempts"`
 
 	// ── 样本记录（§3.6.3）────────────────────────────────
 	SampleEnabled       bool `json:"sample_enabled"`
@@ -90,6 +111,8 @@ func DefaultSettings() Settings {
 		ProbeEnabled:        true,
 		PiggybackEnabled:    true,
 		HalfOpenEnabled:     true,
+
+		RetryMaxAttempts: 3, // 初次 + 最多 2 次重试（§3.5）
 
 		SampleEnabled:       true,
 		SampleMaxBodyBytes:  256 * 1024,
@@ -135,11 +158,20 @@ func (s *Settings) Validate() error {
 		{"sample_keep_count", s.SampleKeepCount},
 		{"sample_keep_days", s.SampleKeepDays},
 		{"sample_queue_size", s.SampleQueueSize},
+		// 1 = 不重试。0 会让重试循环一次都不发，那不是「关闭重试」而是
+		// 「关闭转发」—— 归进这个统一的正数校验，不单开一条。
+		{"retry_max_attempts", s.RetryMaxAttempts},
 	}
 	for _, p := range positives {
 		if p.val < 1 {
 			return invalid("%s 必须为正数，收到 %d", p.name, p.val)
 		}
+	}
+	if s.RetryMaxAttempts > MaxRetryAttempts {
+		return invalid("retry_max_attempts 不得超过 %d，收到 %d。"+
+			"它是一次客户端请求最多向上游发几次完整请求（每次都可能真的消耗 token），"+
+			"填大不会报错，只会让每个失败请求悄悄放大成同样多次上游调用",
+			MaxRetryAttempts, s.RetryMaxAttempts)
 	}
 	if s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
 		return invalid("sample_resp_head_bytes / sample_resp_tail_bytes 不能为负")

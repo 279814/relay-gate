@@ -171,12 +171,62 @@ type Forwarder struct {
 	RespTee io.Writer
 }
 
+// Attempt 是一次**尚未提交**的转发：请求已发出、响应头已拿到，
+// 但一个字节都还没写给客户端。
+//
+// 为什么需要这个中间状态：§3.5 要求「仅在尚未向客户端写出任何字节时才能
+// 重试」，而原先的 Forward 一拿到响应头就 WriteHeader —— 状态码一旦发出，
+// 5xx 与 429 就再没法换站重试了，而那两类恰好是 §3.5 明确列为可重试的。
+// 把「拿到响应」与「提交给客户端」拆成两步，重试才有可能。
+//
+// 调用方**必须**恰好调用 Commit 或 Discard 之一。两者都负责释放这次尝试
+// 占用的 context 与连接：漏掉就是泄一个 goroutine 加一条连接，而这种泄漏
+// 只在压力下才显形（连接池耗尽），届时很难回溯到这里。
+type Attempt struct {
+	f         *Forwarder
+	resp      *http.Response
+	res       *Result
+	cancel    context.CancelFunc
+	ctx       context.Context // 带 Total 超时
+	clientCtx context.Context // 客户端原始 ctx，用于区分「谁的时限到了」
+	done      bool
+}
+
+// Failed 表示这次尝试连响应头都没拿到。此时只能 Discard。
+func (at *Attempt) Failed() bool { return at.res.Err != nil }
+
+// Status 是上游响应状态码。Failed 时为 0。
+func (at *Attempt) Status() int { return at.res.Status }
+
+// Result 取这次尝试的结果。Commit 之前它只填到响应头那一层，
+// 供重试判定使用（判定只看状态码与错误，不看 body）。
+func (at *Attempt) Result() *Result { return at.res }
+
 // Forward 把请求投递到 cand 指定的上游，响应流式写回 w。
 //
 // body 必须是已经过 ReplaceModel 处理的字节。header 必须是
 // PrepareOutboundHeaders 的产物。
+//
+// 这是 Send + Commit 的薄封装。保留它是因为「不重试」的调用方
+// （count_tokens、既有测试、重试关闭时的转发）不需要关心提交时机 ——
+// 让它们跟着一起改成两步调用，只会把一个内部细节摊给所有人。
 func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	method, outURL string, header http.Header, body []byte) *Result {
+
+	at := f.Send(ctx, method, outURL, header, body)
+	if at.Failed() {
+		at.Discard()
+		return at.res
+	}
+	return at.Commit(w)
+}
+
+// Send 发出请求并等到响应头，**不**写任何东西给客户端。
+//
+// 返回的 Attempt 一定非 nil，即使失败 —— 失败时 Failed() 为 true，
+// 调用方照样要 Discard（它负责释放 context）。
+func (f *Forwarder) Send(ctx context.Context, method, outURL string,
+	header http.Header, body []byte) *Attempt {
 
 	res := &Result{}
 
@@ -185,15 +235,18 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	clientCtx := ctx
 
 	// 总超时是最外层的兜底。首 Token 与 Idle 在读循环里单独控制。
+	//
+	// cancel 不在这里 defer：它要活到 Commit/Discard —— 提交之后响应体
+	// 还在读，提前取消会把一个正常的流掐断。
 	ctx, cancel := context.WithTimeout(ctx, f.Timeouts.Total)
-	defer cancel()
+	at := &Attempt{f: f, res: res, cancel: cancel, ctx: ctx, clientCtx: clientCtx}
 
 	// bytes.NewReader 而不是 strings.NewReader(string(body))：
 	// 后者会把整个 body 复制一遍，而 body 可能有几百 KB 到 MB。
 	req, err := http.NewRequestWithContext(ctx, method, outURL, bytes.NewReader(body))
 	if err != nil {
 		res.Err = fmt.Errorf("构造出站请求: %w", err)
-		return res
+		return at
 	}
 	req.Header = header
 	// ContentLength 显式设置，避免 http 库改用 chunked ——
@@ -232,25 +285,40 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		res.Err = classifyTransportErr(err, clientCtx, headerTimedOut.Load(), f.Timeouts.FirstToken)
 		res.DoneAt = time.Now()
-		return res
+		return at
 	}
-	defer resp.Body.Close()
 
 	res.Status = resp.StatusCode
 	res.RespHeaders = resp.Header.Clone()
+	at.resp = resp
+	return at
+}
+
+// Commit 把这次尝试的响应头与响应体写给客户端。
+//
+// 一旦调用就再也不能重试了 —— 状态码已经发出去。
+func (at *Attempt) Commit(w http.ResponseWriter) *Result {
+	if at.done {
+		return at.res // 防御：重复提交，不该发生
+	}
+	at.done = true
+	defer at.cancel()
+	defer at.resp.Body.Close()
+
+	res, f := at.res, at.f
 
 	// 响应头原样回传。ReverseProxy 会做的逐跳清理这里手动做一次。
 	dst := w.Header()
-	for k, vs := range resp.Header {
+	for k, vs := range at.resp.Header {
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
 	}
 	StripHopByHopResponse(dst)
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 
-	n, err := f.streamBody(ctx, clientCtx, w, resp.Body, resp.Body, res)
+	n, err := f.streamBody(at.ctx, at.clientCtx, w, at.resp.Body, at.resp.Body, res)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if err != nil && res.Err == nil {
@@ -258,6 +326,34 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	}
 	return res
 }
+
+// Discard 放弃这次尝试：不向客户端写任何东西，释放连接与 context。
+//
+// 失败的尝试（连响应头都没拿到）也要走这里 —— context 是在 Send 里建的，
+// 不 cancel 就会留到 Total 超时才回收。
+//
+// 主动读掉一小段 body 再关：不读就关会让这条 TCP 连接被丢弃而不是还回
+// 连接池（net/http 只在 body 读到 EOF 后才复用连接）。重试场景下这个差别
+// 是实际的 —— 每次换站重试都白扔一条连接，握手成本翻倍。
+// 上限 4KB：错误响应通常只有几百字节，读满还没结束就说明这不是一个错误
+// 响应体，那就直接关，别为了复用连接去读一个可能很长的流。
+func (at *Attempt) Discard() {
+	if at.done {
+		return
+	}
+	at.done = true
+	defer at.cancel()
+	if at.resp == nil {
+		return // Send 就失败了，没有 body 可关
+	}
+	io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
+	at.resp.Body.Close()
+	if at.res.DoneAt.IsZero() {
+		at.res.DoneAt = time.Now()
+	}
+}
+
+const discardDrainLimit = 4 << 10
 
 // streamBody 逐块拷贝响应体，并在首字节前后应用不同的超时。
 //
