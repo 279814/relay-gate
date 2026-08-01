@@ -363,6 +363,56 @@ func TestProbeHeaders_ExcludesAuthHeaders(t *testing.T) {
 	}
 }
 
+func TestProbeHeaders_ExcludesAllSensitiveHeadersNotJustAuthHeaders(t *testing.T) {
+	// review 时抓到的缺口：早先这里按 model.IsAuthHeader 过滤，而样本的
+	// 脱敏清单（sample.sensitiveHeaders）比它多 Proxy-Authorization
+	// 与 Cookie 两类 —— 于是那两个头会带着**脱敏后的假凭据**被导进模板。
+	//
+	// 假凭据比没有凭据更糟：它会覆盖真实鉴权头，把整站探活打成 401，
+	// 而界面显示「鉴权失败」，排查方向完全指错（去查真 key 对不对）。
+	h := http.Header{}
+	h.Set("Proxy-Authorization", "Basic YWJjZA…d3h5eg")
+	h.Set("Cookie", "session=abcd…wxyz")
+	h.Set("User-Agent", "claude-cli/2.1.220")
+
+	tmpl, skipped := probeHeadersFromSample(h)
+	for _, bad := range []string{"proxy-authorization", "cookie"} {
+		if _, ok := tmpl[bad]; ok {
+			t.Errorf("%s 携带凭据，不该进探活模板", bad)
+		}
+	}
+	if len(skipped) != 2 {
+		t.Errorf("应排除 2 个凭据头，得到 %v", skipped)
+	}
+	if tmpl["user-agent"] == "" {
+		t.Error("user-agent 是真实指纹的一部分，应保留")
+	}
+}
+
+func TestProbeHeaders_ExcludesHeadersBuildHeadersOwns(t *testing.T) {
+	// probe/headers.go 的三层叠加里，probe_headers 的覆盖发生在
+	// anthropic-version 与 accept **之后**，所以从样本抄来的值会赢。
+	//
+	// accept 是其中后果最实际的一个：探活流式请求需要
+	// text/event-stream，被样本里的 application/json 覆盖后 L2 收不到 SSE，
+	// 会被判成假活 —— 一个完全可用的站因此被判死。
+	h := http.Header{}
+	h.Set("Anthropic-Version", "2023-06-01")
+	h.Set("Accept", "application/json")
+	h.Set("X-App", "cli")
+
+	tmpl, _ := probeHeadersFromSample(h)
+	if _, ok := tmpl["accept"]; ok {
+		t.Error("accept 由 buildHeaders 按 stream 设，从样本抄会让 L2 收不到 SSE")
+	}
+	if _, ok := tmpl["anthropic-version"]; ok {
+		t.Error("anthropic-version 由 buildHeaders 按协议设，抄了会跨协议串味")
+	}
+	if tmpl["x-app"] != "cli" {
+		t.Error("x-app 应保留")
+	}
+}
+
 func TestProbeHeaders_ExcludesTransportManagedHeaders(t *testing.T) {
 	// 这些头由 http.Transport 自己填，手工设会与它打架
 	// （重复的 Host 头是协议错误）。

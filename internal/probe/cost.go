@@ -4,6 +4,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/279814/relay-gate/internal/model"
 )
@@ -191,13 +192,22 @@ func (c *Cost) Restore(snap CostSnapshot) {
 // **是估算，不是账单。** 用途是判断策略是否过激（探活次数 × 每次的量级），
 // 那只需要正确的量级；要精确值得去看各站的计费页，而公益站多半也不提供。
 //
-// 输入按 4 字符 ≈ 1 token 折算，与 count_tokens 的本地兜底用同一个系数
-// （proxy/count_tokens.go）—— 两处对不上的话，同一个 prompt 会给出两个数字。
 // 输出按 max_tokens 的上限计：实际生成通常更少（判定一出就断流，§4.1），
 // 所以这是**上界**，用于成本估算时宁可高估。
 //
-// 固定开销那部分（协议骨架 + system 之类）不计：探活 body 是我们自己
-// 构造的最小请求，除了 prompt 几乎没有别的内容。
+// 固定开销那部分（协议骨架之类）用 perProbeOverhead 一个常数带过：探活 body
+// 是我们自己构造的最小请求，除了 prompt 几乎没有别的内容。
+//
+// ── 与 count_tokens 的关系 ──
+//
+// 两者**不是**同一套算法，也不该假装是。proxy 的 estimateTokens 按词切分
+// （英文词 ×1.3、CJK 字 ×1.5），它要处理的是几百 KB 的真实对话；这里只有
+// 一个几个字的 prompt，量级差四五个数量级。
+//
+// 但 CJK 系数必须一致。早先这里写的是无条件 `len(rune)/4`，实测下来
+// `"你好"` 被算成 **0 个 token** —— 整数除法在短 CJK 串上直接截断到零，
+// 而 CJK 在真实 tokenizer 里恰恰是每字 1.5 个，方向正好错。
+// probe_prompt 是 UI 可改的配置项（§4.7），中文 prompt 完全可达。
 func estimateL2Tokens(mn *model.ModelName) int {
 	prompt := mn.ProbePrompt
 	if prompt == "" {
@@ -207,7 +217,34 @@ func estimateL2Tokens(mn *model.ModelName) int {
 	if maxTok <= 0 {
 		maxTok = 1
 	}
-	// +3 是消息骨架（role/content 的结构性 token）的粗略常数。
-	in := len([]rune(prompt))/4 + 3
-	return in + maxTok
+	return estimatePromptTokens(prompt) + perProbeOverhead + maxTok
 }
+
+// estimatePromptTokens 粗算探活 prompt 的 token 数。
+//
+// CJK 每字 1.5、其余每 4 字符 1 个，与 proxy 的 estimateTokens 在这两个
+// 系数上保持一致。不共用那个函数是因为它在 proxy 包内未导出，而为了一个
+// 几个字的 prompt 去导出它、或让 probe 依赖 proxy 的内部实现，都不划算 ——
+// 这里只需要正确的量级。
+//
+// 至少返回 1：prompt 非空就一定会产生 token，返回 0 会让「今日估算 token」
+// 在中文 prompt 下恒为一个偏小的数，而偏小恰恰是成本估算最不该出的方向。
+func estimatePromptTokens(prompt string) int {
+	var cjk, other int
+	for _, r := range prompt {
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
+			cjk++
+			continue
+		}
+		other++
+	}
+	n := int(float64(cjk)*1.5) + other/4
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// perProbeOverhead 是一次探活请求除 prompt 之外的结构性开销
+// （role/content 的骨架等）。真实 tokenizer 里每条消息约 3–4 个，取 4 偏保守。
+const perProbeOverhead = 4

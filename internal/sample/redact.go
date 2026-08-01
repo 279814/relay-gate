@@ -38,6 +38,19 @@ var sensitiveHeaders = func() map[string]bool {
 	return m
 }()
 
+// IsSensitiveHeader 判断一个头名是否携带凭据（大小写不敏感）。
+//
+// 导出它是为了让「从样本导出探活头模板」（§3.6.4）复用同一份清单。
+// 那边各抄一份的后果与本文件开头说的一样：新增一个凭据位置时漏掉同步，
+// 而漏掉的表现是一个**脱敏后的假凭据**被写进 probe_headers ——
+// 它会覆盖真实鉴权头，把整站探活打成 401，且界面显示「鉴权失败」，
+// 排查方向完全指错（去查真 key 对不对）。
+//
+// 这份清单本身仍以 sensitiveHeaders 为唯一来源，它由 model.AuthHeaders 派生。
+func IsSensitiveHeader(name string) bool {
+	return sensitiveHeaders[http.CanonicalHeaderKey(strings.TrimSpace(name))]
+}
+
 // RedactHeaders 返回脱敏后的头副本。原 header 不被修改 ——
 // 它可能还在被转发路径读，改它就违反了「绝不影响转发」。
 func RedactHeaders(h http.Header) http.Header {
