@@ -312,6 +312,60 @@ func TestAPI_RequestLogEndpointsRequireAuth(t *testing.T) {
 	}
 }
 
+// 样本端点要支持按 req_id 查 —— 这是「从日志跳到样本」的落地点。
+//
+// 测试放在这里而不是单独的 sample_test.go：它守的是 M6 的关联链，
+// 而不是样本端点本身的行为。
+//
+// 缺了这个参数，前端只能拉一页样本回来自己找，而那对「比最近一页更早的
+// 请求」会**静默找不到** —— 正是排查历史故障时要点的那些。
+// store 层一直有这个能力（SampleFilter.ReqID），API 层此前没接上。
+func TestAPI_ListSamplesByReqID(t *testing.T) {
+	s, h := newTestServer(t)
+
+	// 三条样本，只有一条属于目标请求
+	for _, sm := range []*model.Sample{
+		{ReqID: "target-req", TSRecv: 1, Endpoint: "/v1/messages",
+			ModelIn: "claude-opus-5", Outcome: model.OutcomeOK},
+		{ReqID: "other-req", TSRecv: 2, Endpoint: "/v1/messages"},
+		{ReqID: "", TSRecv: 3, Endpoint: "/v1/messages"}, // 早于 M6 的样本
+	} {
+		if err := s.st.InsertSample(sm); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := do(t, h, "GET", "/admin/api/samples?req_id=target-req", "", true)
+	if rec.Code != 200 {
+		t.Fatalf("应 200，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Samples []*model.Sample `json:"samples"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Samples) != 1 {
+		t.Fatalf("按 req_id 应精确筛出 1 条，得到 %d —— API 层没接上这个参数？",
+			len(got.Samples))
+	}
+	if got.Samples[0].ReqID != "target-req" {
+		t.Errorf("筛出的不是目标样本，req_id=%q", got.Samples[0].ReqID)
+	}
+
+	// 查一个不存在的 req_id 要回空列表而不是全部 ——
+	// 忽略未知参数的话，前端会拿到第一条样本并当成「找到了」。
+	rec2 := do(t, h, "GET", "/admin/api/samples?req_id=nope", "", true)
+	var none struct {
+		Samples []*model.Sample `json:"samples"`
+	}
+	json.Unmarshal(rec2.Body.Bytes(), &none)
+	if len(none.Samples) != 0 {
+		t.Errorf("不存在的 req_id 应返回空列表，得到 %d 条 —— 参数被忽略了",
+			len(none.Samples))
+	}
+}
+
 // 游标翻页不重不漏。
 func TestAPI_RequestLogPagination(t *testing.T) {
 	s, _ := newTestServer(t)

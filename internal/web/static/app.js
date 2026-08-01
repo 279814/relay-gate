@@ -377,17 +377,19 @@ function app() {
      * 看完日志「为什么失败」后，下一步往往是看样本「当时发了哪些字节」。
      */
     openLogSample(reqID) {
-      // 样本 API 不直接支持按 req_id 查。先拉最近 100 条，前端过滤。
-      // 大部分场景够用：req_id 点进来时就在眼前，不会是几天前的旧样本。
-      // 真找不到就提示去样本页用时间筛。
+      // 按 req_id 精确查，不拉一页回来自己找 —— 后者对「比最近一页更早的
+      // 请求」会静默找不到，而那正是排查历史故障时要点的那些。
       this.run(async () => {
-        const d = await this.api('GET', '/samples?limit=100');
-        const smp = (d.samples || []).find(s => s.req_id === reqID);
+        const d = await this.api('GET', '/samples?req_id=' + encodeURIComponent(reqID));
+        const smp = (d.samples || [])[0];
         if (smp) {
           this.openSample(smp.id);
-        } else {
-          this.err = `未找到 req_id=${reqID} 的样本。若是较早的请求，请去「样本」页按时间筛选。`;
+          return;
         }
+        // 找不到是**正常**情形，不是错误：样本可以关（日志照记，§3.7.2），
+        // 队列满时也会丢。说清原因，别让人以为界面坏了。
+        this.err = `这次请求没有留下样本（req_id=${reqID.slice(0, 8)}）。` +
+          `样本与日志是两份独立的记录 —— 样本可能被关掉了，或当时队列已满被丢弃。`;
       });
     },
 
