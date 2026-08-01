@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>relay-gate 管理</title>
+<link rel="stylesheet" href="/admin/app.css">
+<script defer src="/admin/alpine.min.js"></script>
+</head>
+<body>
+
+<div x-data="app()" x-init="boot()" x-cloak>
+
+  <!-- 登录页。未登录时只显示这个 —— 数据全在 API 后面，前端拿不到任何东西 -->
+  <template x-if="!authed">
+    <div class="login">
+      <h1>relay-gate</h1>
+      <p>输入管理口令（环境变量 <code>ADMIN_PASSWORD</code>）</p>
+      <div class="alert err" x-show="err" x-text="err"></div>
+      <form @submit.prevent="login()">
+        <div class="field">
+          <input type="password" x-model="pw" placeholder="管理口令" autofocus
+                 autocomplete="current-password">
+        </div>
+        <button class="primary" type="submit" :disabled="busy" style="width:100%"
+                x-text="busy ? '登录中…' : '登录'"></button>
+      </form>
+    </div>
+  </template>
+
+  <template x-if="authed">
+    <div>
+      <header>
+        <h1>relay-gate</h1>
+        <span class="tag dot" :class="running ? 'ok' : 'warn'"
+              x-text="running ? '运行中' : '已暂停'"></span>
+        <span class="grow"></span>
+        <button @click="toggleState()" :disabled="busy"
+                x-text="running ? '暂停服务' : '启动服务'"></button>
+        <button @click="logout()">登出</button>
+      </header>
+
+      <nav>
+        <template x-for="t in tabs" :key="t.id">
+          <button :class="{on: tab === t.id}" @click="go(t.id)" x-text="t.name"></button>
+        </template>
+      </nav>
+
+      <main>
+        <div class="alert err" x-show="err" x-text="err" @click="err = ''"></div>
+        <div class="alert done" x-show="msg" x-text="msg" @click="msg = ''"></div>
+
+        <!-- ── 健康看板 ─────────────────────────────────────── -->
+        <template x-if="tab === 'health'">
+          <div>
+            <div class="cards">
+              <div class="card">
+                <h3>可选路 / 总数</h3>
+                <div class="v" x-text="`${health.summary?.selectable ?? 0} / ${health.summary?.total ?? 0}`"></div>
+                <div class="sub">「可选路」复述的是选路此刻的真实判定</div>
+              </div>
+              <div class="card">
+                <h3>在途请求</h3>
+                <div class="v" x-text="inFlightTotal()"></div>
+                <div class="sub">配了 max_concurrency 却选不中时先看这里</div>
+              </div>
+              <div class="card">
+                <h3>样本落库 / 丢弃</h3>
+                <div class="v" x-text="`${runtime.samples_written ?? 0} / ${runtime.samples_dropped ?? 0}`"></div>
+                <div class="sub">丢弃是静默的：队列满时宁可丢样本也不阻塞转发</div>
+              </div>
+            </div>
+
+            <div class="bar">
+              <label class="check">
+                <input type="checkbox" x-model="autoRefresh"> 自动刷新（3s）
+              </label>
+              <span class="grow"></span>
+              <button @click="loadHealth()">立即刷新</button>
+            </div>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>模型</th><th>上游</th><th>优先级</th><th>状态</th>
+                  <th>可选路</th><th>TTFT</th><th>连续</th><th>最近错误</th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="r in health.routes || []" :key="r.route_id">
+                  <tr>
+                    <td x-text="r.model_name || `#${r.model_name_id}`"></td>
+                    <td>
+                      <span x-text="r.upstream || `#${r.upstream_id}`"></span>
+                      <!-- L1 是站级的，挂了就连坐整站，所以单独标出来 -->
+                      <span class="tag err" x-show="r.l1 && r.l1.probed && !r.l1.ok"
+                            title="站级 L1 探活失败，该站所有 Route 都会被跳过">L1 挂</span>
+                    </td>
+                    <td x-text="`${r.priority} / ${r.weight}`"></td>
+                    <td>
+                      <span class="tag dot" :class="stateClass(r.state)" x-text="r.state"></span>
+                    </td>
+                    <td>
+                      <template x-if="r.selectable">
+                        <span class="tag ok">可用</span>
+                      </template>
+                      <template x-if="!r.selectable">
+                        <!-- reason 区分「配置错」与「站挂了」：前者要改配置，后者等恢复 -->
+                        <span class="tag err" x-text="r.reason" :title="r.reason"></span>
+                      </template>
+                    </td>
+                    <td class="num" x-text="r.health?.last_ttft_ms ? r.health.last_ttft_ms + 'ms' : '—'"></td>
+                    <td class="num">
+                      <span class="ok-text" x-text="r.health?.consecutive_ok ?? 0"></span> /
+                      <span class="err-text" x-text="r.health?.consecutive_fail ?? 0"></span>
+                    </td>
+                    <td class="wrap dim" x-text="r.health?.last_error || '—'"></td>
+                    <td class="nowrap">
+                      <button @click="probe(r.route_id)" :disabled="probing === r.route_id"
+                              x-text="probing === r.route_id ? '探测中…' : '测试'"></button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!(health.routes || []).length">
+                  <td colspan="9" class="empty">还没有 Route。先在「上游」与「模型」页建好，再到「路由」页绑定。</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- 手动探活结果。同步返回，点了就该看到答案 -->
+            <template x-if="probeResult">
+              <div class="panel">
+                <div class="bar">
+                  <strong x-text="`Route #${probeResult.route_id} 探活结果`"></strong>
+                  <span class="grow"></span>
+                  <button @click="probeResult = null">关闭</button>
+                </div>
+                <table>
+                  <thead><tr><th>层级</th><th>判定</th><th>状态码</th><th>TTFT</th><th>错误</th></tr></thead>
+                  <tbody>
+                    <tr>
+                      <td>L1<span class="dim">（零 token）</span></td>
+                      <td><span class="tag" :class="verdictClass(probeResult.l1?.verdict)"
+                                x-text="probeResult.l1?.verdict || '—'"></span></td>
+                      <td class="num" x-text="probeResult.l1?.status || '—'"></td>
+                      <td class="num" x-text="(probeResult.l1?.ttft_ms || 0) + 'ms'"></td>
+                      <td class="wrap dim" x-text="probeResult.l1?.error || '—'"></td>
+                    </tr>
+                    <tr>
+                      <td>L2<span class="dim">（真实模型调用）</span></td>
+                      <!-- l2 为 null = L1 没过、根本没执行。不能显示成 ok：
+                           Verdict 的零值恰好是 OK，那会变成「L1 失败但 L2 成功」 -->
+                      <template x-if="probeResult.l2">
+                        <td><span class="tag" :class="verdictClass(probeResult.l2.verdict)"
+                                  x-text="probeResult.l2.verdict"></span></td>
+                      </template>
+                      <template x-if="!probeResult.l2">
+                        <td><span class="tag unknown">未执行</span></td>
+                      </template>
+                      <td class="num" x-text="probeResult.l2?.status || '—'"></td>
+                      <td class="num" x-text="probeResult.l2 ? probeResult.l2.ttft_ms + 'ms' : '—'"></td>
+                      <td class="wrap dim" x-text="probeResult.l2?.error || '—'"></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p class="dim" x-show="probeResult.l2_skipped" x-text="probeResult.l2_skipped"></p>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <!-- ── 上游 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'upstreams'">
+          <div>
+            <div class="bar">
+              <strong>上游站点</strong>
+              <span class="dim">全局配一次，通过「路由」绑到多个模型</span>
+              <span class="grow"></span>
+              <button class="primary" @click="editUp(null)">新增上游</button>
+            </div>
+            <table>
+              <thead>
+                <tr><th>名称</th><th>地址</th><th>鉴权</th><th>Key</th><th>L1 路径</th>
+                    <th>状态</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template x-for="u in upstreams" :key="u.id">
+                  <tr>
+                    <td x-text="u.name"></td>
+                    <td class="wrap mono" x-text="u.base_url"></td>
+                    <td class="nowrap" x-text="u.auth_style"></td>
+                    <td class="mono dim" x-text="u.api_key_is_set ? u.api_key : '未设置'"></td>
+                    <td class="mono dim" x-text="u.l1_path || '（仅握手）'"></td>
+                    <td>
+                      <span class="tag" :class="u.enabled ? 'ok' : 'unknown'"
+                            x-text="u.enabled ? '启用' : '停用'"></span>
+                    </td>
+                    <td class="nowrap">
+                      <button class="sm" @click="editUp(u)">编辑</button>
+                      <button class="sm danger" @click="delUp(u)">删除</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!upstreams.length">
+                  <td colspan="7" class="empty">还没有上游站点。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── 模型 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'models'">
+          <div>
+            <div class="bar">
+              <strong>逻辑模型</strong>
+              <span class="dim">客户端请求里写的那个 model 值</span>
+              <span class="grow"></span>
+              <button class="primary" @click="editMn(null)">新增模型</button>
+            </div>
+            <table>
+              <thead>
+                <tr><th>名称</th><th>协议</th><th>匹配</th><th>兜底</th>
+                    <th>探活 prompt</th><th>max_tokens</th><th>状态</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template x-for="m in modelNames" :key="m.id">
+                  <tr>
+                    <td class="mono" x-text="m.name"></td>
+                    <td class="nowrap" x-text="m.protocol"></td>
+                    <td x-text="m.match_mode"></td>
+                    <td><span class="tag ok" x-show="m.is_fallback">兜底</span></td>
+                    <td class="mono dim" x-text="m.probe_prompt"></td>
+                    <td class="num" x-text="m.probe_max_tokens"></td>
+                    <td>
+                      <span class="tag" :class="m.enabled ? 'ok' : 'unknown'"
+                            x-text="m.enabled ? '启用' : '停用'"></span>
+                    </td>
+                    <td class="nowrap">
+                      <button class="sm" @click="editMn(m)">编辑</button>
+                      <button class="sm danger" @click="delMn(m)">删除</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!modelNames.length">
+                  <td colspan="8" class="empty">还没有逻辑模型。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── 路由 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'routes'">
+          <div>
+            <div class="bar">
+              <strong>路由</strong>
+              <span class="dim">模型 × 上游的绑定，探活与健康状态的最小单位</span>
+              <span class="grow"></span>
+              <button class="primary" @click="editRt(null)"
+                      :disabled="!upstreams.length || !modelNames.length">新增路由</button>
+            </div>
+            <p class="dim" x-show="!upstreams.length || !modelNames.length">
+              需要先有至少一个上游和一个模型。
+            </p>
+            <table>
+              <thead>
+                <tr><th>模型</th><th>上游</th><th>优先级</th><th>权重</th>
+                    <th>上游模型名</th><th>并发上限</th><th>状态</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template x-for="r in routes" :key="r.id">
+                  <tr>
+                    <td x-text="mnName(r.model_name_id)"></td>
+                    <td x-text="upName(r.upstream_id)"></td>
+                    <td class="num" x-text="r.priority"></td>
+                    <td class="num" x-text="r.weight"></td>
+                    <!-- 空 = 不映射，body 一个字节都不改。这是推荐配置，要说清 -->
+                    <td class="mono dim" x-text="r.upstream_model || '（不映射）'"></td>
+                    <td class="num" x-text="r.max_concurrency || '不限'"></td>
+                    <td>
+                      <span class="tag" :class="r.enabled ? 'ok' : 'unknown'"
+                            x-text="r.enabled ? '启用' : '停用'"></span>
+                    </td>
+                    <td class="nowrap">
+                      <button class="sm" @click="editRt(r)">编辑</button>
+                      <button class="sm danger" @click="delRt(r)">删除</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!routes.length">
+                  <td colspan="8" class="empty">还没有路由绑定。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── 样本 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'samples'">
+          <div>
+            <div class="bar">
+              <strong>请求样本</strong>
+              <span class="dim" x-text="`共 ${samplesTotal} 条（滚动窗口，置顶的不清）`"></span>
+              <span class="grow"></span>
+              <select x-model="sampleFilter.outcome" @change="loadSamples()">
+                <option value="">全部结果</option>
+                <option value="ok">ok</option>
+                <option value="upstream_error">upstream_error</option>
+                <option value="timeout">timeout</option>
+                <option value="fake_alive">fake_alive</option>
+                <option value="client_abort">client_abort</option>
+              </select>
+              <button @click="loadSamples()">刷新</button>
+              <button class="danger" @click="clearSamples()">清空（保留置顶）</button>
+            </div>
+
+            <table>
+              <thead>
+                <tr><th>时间</th><th>端点</th><th>模型</th><th>上游</th>
+                    <th>结果</th><th>状态</th><th>TTFT</th><th>总耗时</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template x-for="s in samples" :key="s.id">
+                  <tr>
+                    <td class="nowrap dim" x-text="fmtTime(s.ts_recv)"></td>
+                    <td class="mono" x-text="s.endpoint"></td>
+                    <td class="mono">
+                      <span x-text="s.model_in"></span>
+                      <!-- 映射发生时两个名字不同，值得显式标出来 -->
+                      <span class="dim" x-show="s.model_out && s.model_out !== s.model_in"
+                            x-text="' → ' + s.model_out"></span>
+                    </td>
+                    <td x-text="upName(s.upstream_id)"></td>
+                    <td><span class="tag" :class="outcomeClass(s.outcome)" x-text="s.outcome"></span></td>
+                    <td class="num" x-text="s.resp_status || '—'"></td>
+                    <td class="num" x-text="ttft(s)"></td>
+                    <td class="num" x-text="dur(s)"></td>
+                    <td class="nowrap">
+                      <button class="sm" @click="openSample(s.id)">详情</button>
+                      <button class="sm" @click="togglePin(s)"
+                              x-text="s.pinned ? '取消置顶' : '置顶'"></button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!samples.length">
+                  <td colspan="9" class="empty">
+                    还没有样本。样本在转发发生时才产生，且需要「设置」页的 sample_enabled 打开。
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── 探活成本 ─────────────────────────────────────── -->
+        <template x-if="tab === 'cost'">
+          <div>
+            <div class="bar">
+              <strong>探活开销</strong>
+              <span class="dim" x-text="cost.cost?.day ? `统计日期 ${cost.cost.day}（本地时区，跨天归零）` : ''"></span>
+              <span class="grow"></span>
+              <button @click="loadCost()">刷新</button>
+            </div>
+
+            <div class="cards">
+              <div class="card">
+                <h3>L1 次数（零 token）</h3>
+                <div class="v" x-text="cost.cost?.l1_count ?? 0"></div>
+                <div class="sub" x-text="`失败 ${cost.cost?.l1_failed ?? 0} 次`"></div>
+              </div>
+              <div class="card">
+                <h3>L2 次数（真实调用）</h3>
+                <div class="v" x-text="cost.cost?.l2_count ?? 0"></div>
+                <div class="sub" x-text="`失败 ${cost.cost?.l2_failed ?? 0} 次`"></div>
+              </div>
+              <div class="card">
+                <h3>估算 token</h3>
+                <div class="v" x-text="cost.cost?.est_tokens ?? 0"></div>
+                <!-- 必须标明是估算：它不是账单，用途是判断策略是否过激 -->
+                <div class="sub">估算上界，非账单</div>
+              </div>
+              <div class="card">
+                <h3>探活总开关</h3>
+                <div class="v" x-text="cost.probe_enabled ? '开' : '关'"></div>
+                <div class="sub" x-text="cost.piggyback_enabled ? 'piggyback 开（真实流量抵扣 L2）' : 'piggyback 关'"></div>
+              </div>
+            </div>
+
+            <!-- 次数要和间隔一起看，否则「今天探了 4300 次」判断不了是否过激 -->
+            <p class="dim" x-show="cost.intervals">
+              当前间隔：L1 alive <span x-text="cost.intervals?.l1_alive_sec"></span>s /
+              dead <span x-text="cost.intervals?.l1_dead_sec"></span>s；
+              L2 alive <span x-text="cost.intervals?.l2_alive_sec"></span>s /
+              dead <span x-text="cost.intervals?.l2_dead_sec"></span>s。
+              dead 站的间隔刻意短得多 —— 尽快发现恢复是本项目的核心诉求。
+            </p>
+
+            <h3 style="font-size:13px;margin:18px 0 8px">各 Route 的 L2 开销</h3>
+            <table>
+              <thead>
+                <tr><th>模型 × 上游</th><th>L2 次数</th><th>失败</th>
+                    <th>估算 token</th><th>最近一次</th></tr>
+              </thead>
+              <tbody>
+                <template x-for="rc in cost.cost?.routes || []" :key="rc.route_id">
+                  <tr>
+                    <td x-text="routeLabel(rc.route_id)"></td>
+                    <td class="num" x-text="rc.l2_count"></td>
+                    <td class="num" :class="rc.l2_failed ? 'err-text' : ''" x-text="rc.l2_failed"></td>
+                    <td class="num" x-text="rc.est_tokens"></td>
+                    <td class="nowrap dim" x-text="fmtTime(rc.last_l2_at)"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(cost.cost?.routes || []).length">
+                  <td colspan="5" class="empty">今天还没有 L2 探活。</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3 style="font-size:13px;margin:18px 0 8px">各上游的 L1 次数</h3>
+            <p class="dim" style="margin:0 0 8px">
+              L1 记在站上而不是 Route 上：一次 L1 被同站多个 Route 共享，
+              记到 Route 会把一次请求算成 N 次。
+            </p>
+            <table>
+              <thead><tr><th>上游</th><th>L1 次数</th><th>失败</th><th>最近一次</th></tr></thead>
+              <tbody>
+                <template x-for="uc in cost.cost?.upstreams || []" :key="uc.upstream_id">
+                  <tr>
+                    <td x-text="upName(uc.upstream_id)"></td>
+                    <td class="num" x-text="uc.l1_count"></td>
+                    <td class="num" :class="uc.l1_failed ? 'err-text' : ''" x-text="uc.l1_failed"></td>
+                    <td class="nowrap dim" x-text="fmtTime(uc.last_l1_at)"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(cost.cost?.upstreams || []).length">
+                  <td colspan="4" class="empty">今天还没有 L1 探活。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <!-- ── 设置 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'settings'">
+          <div>
+            <div class="bar">
+              <strong>全局设置</strong>
+              <span class="dim">热生效，无需重启（队列容量类的除外，已注明）</span>
+              <span class="grow"></span>
+              <button class="primary" @click="saveSettings()" :disabled="busy">保存</button>
+            </div>
+
+            <template x-if="settings">
+              <div>
+                <h3 style="font-size:13px;margin:14px 0 8px">真实请求超时</h3>
+                <div class="row">
+                  <div class="field">
+                    <label>连接 (s)</label>
+                    <input type="number" x-model.number="settings.real_connect_sec">
+                  </div>
+                  <div class="field">
+                    <label>首 Token (s)</label>
+                    <input type="number" x-model.number="settings.real_first_token_sec">
+                    <!-- 这个下限是硬的，后端会 400。先说清比提交后才报错好 -->
+                    <div class="note" x-text="`硬下限 ${limits.min_real_first_token_sec || 300}s。调小会把正常的长思考拦腰砍断，还会因此把好站判死`"></div>
+                  </div>
+                  <div class="field">
+                    <label>流内静默 (s)</label>
+                    <input type="number" x-model.number="settings.real_idle_sec">
+                  </div>
+                  <div class="field">
+                    <label>总时长 (s)</label>
+                    <input type="number" x-model.number="settings.real_total_sec">
+                  </div>
+                </div>
+
+                <h3 style="font-size:13px;margin:18px 0 8px">探活超时</h3>
+                <p class="dim" style="margin:0 0 8px">
+                  与真实请求分开 —— 这正是「容忍长思考」与「快速判死」能同时成立的原因。
+                </p>
+                <div class="row">
+                  <div class="field">
+                    <label>L2 连接 (s)</label>
+                    <input type="number" x-model.number="settings.l2_connect_sec">
+                  </div>
+                  <div class="field">
+                    <label>L2 首 Token (s)</label>
+                    <input type="number" x-model.number="settings.l2_first_token_sec">
+                  </div>
+                  <div class="field">
+                    <label>L2 总时长 (s)</label>
+                    <input type="number" x-model.number="settings.l2_total_sec">
+                  </div>
+                  <div class="field">
+                    <label>L1 连接 (s)</label>
+                    <input type="number" x-model.number="settings.l1_connect_sec">
+                  </div>
+                  <div class="field">
+                    <label>L1 总时长 (s)</label>
+                    <input type="number" x-model.number="settings.l1_total_sec">
+                  </div>
+                  <div class="field">
+                    <label>count_tokens (s)</label>
+                    <input type="number" x-model.number="settings.count_tokens_sec">
+                  </div>
+                </div>
+
+                <h3 style="font-size:13px;margin:18px 0 8px">探活调度</h3>
+                <div class="row">
+                  <div class="field">
+                    <label>L1 间隔 · alive (s)</label>
+                    <input type="number" x-model.number="settings.l1_interval_alive_sec">
+                  </div>
+                  <div class="field">
+                    <label>L1 间隔 · dead (s)</label>
+                    <input type="number" x-model.number="settings.l1_interval_dead_sec">
+                  </div>
+                  <div class="field">
+                    <label>L2 间隔 · alive (s)</label>
+                    <input type="number" x-model.number="settings.l2_interval_alive_sec">
+                  </div>
+                  <div class="field">
+                    <label>L2 间隔 · dead (s)</label>
+                    <input type="number" x-model.number="settings.l2_interval_dead_sec">
+                  </div>
+                  <div class="field">
+                    <label>全局 L2 并发</label>
+                    <input type="number" x-model.number="settings.global_l2_concurrency">
+                    <div class="note">改这个要重启（它是 channel 容量）</div>
+                  </div>
+                </div>
+                <div class="row" style="margin-top:4px">
+                  <label class="check"><input type="checkbox" x-model="settings.probe_enabled"> 启用探活</label>
+                  <label class="check"><input type="checkbox" x-model="settings.piggyback_enabled"> piggyback（真实请求成功抵扣一次 L2）</label>
+                  <label class="check"><input type="checkbox" x-model="settings.half_open_enabled"> 半开（给判死的站放行少量真实请求）</label>
+                </div>
+
+                <h3 style="font-size:13px;margin:18px 0 8px">健康状态机</h3>
+                <div class="row">
+                  <div class="field">
+                    <label>连续失败几次判 dead</label>
+                    <input type="number" x-model.number="settings.fail_threshold">
+                  </div>
+                  <div class="field">
+                    <label>连续成功几次升 alive</label>
+                    <input type="number" x-model.number="settings.ok_threshold">
+                  </div>
+                  <div class="field">
+                    <label>429 冷却 (s)</label>
+                    <input type="number" x-model.number="settings.cooldown_sec">
+                    <div class="note">上游给了 retry-after 时以它为准</div>
+                  </div>
+                </div>
+
+                <h3 style="font-size:13px;margin:18px 0 8px">样本记录</h3>
+                <div class="row" style="margin-bottom:10px">
+                  <label class="check"><input type="checkbox" x-model="settings.sample_enabled"> 记录样本</label>
+                </div>
+                <div class="row">
+                  <div class="field">
+                    <label>body 上限 (B)</label>
+                    <input type="number" x-model.number="settings.sample_max_body_bytes">
+                    <div class="note">只截断留档的副本，转发的 body 仍是完整的</div>
+                  </div>
+                  <div class="field">
+                    <label>响应头部留存 (B)</label>
+                    <input type="number" x-model.number="settings.sample_resp_head_bytes">
+                  </div>
+                  <div class="field">
+                    <label>响应尾部留存 (B)</label>
+                    <input type="number" x-model.number="settings.sample_resp_tail_bytes">
+                  </div>
+                  <div class="field">
+                    <label>保留条数</label>
+                    <input type="number" x-model.number="settings.sample_keep_count">
+                  </div>
+                  <div class="field">
+                    <label>保留天数</label>
+                    <input type="number" x-model.number="settings.sample_keep_days">
+                  </div>
+                  <div class="field">
+                    <label>队列容量</label>
+                    <input type="number" x-model.number="settings.sample_queue_size">
+                    <div class="note">改这个要重启</div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+
+      </main>
+
+      <!-- ── 上游表单 ─────────────────────────────────────── -->
+      <template x-if="upForm">
+        <div class="mask" @click.self="upForm = null">
+          <div class="modal">
+            <h3 x-text="upForm.id ? '编辑上游' : '新增上游'"></h3>
+            <div class="field">
+              <label>名称</label>
+              <input x-model="upForm.name" placeholder="例如 站点A">
+            </div>
+            <div class="field">
+              <label>base_url</label>
+              <input x-model="upForm.base_url" class="mono" placeholder="https://api.example.com">
+              <!-- 带 /v1 是配置时最容易犯的错，症状是 404 且很难看出根因 -->
+              <div class="note">
+                填根地址，<strong>不要带 /v1</strong> —— 出站路径由入站请求决定。
+                带了会拼成 /v1/v1/messages。确实用非标准路径的站请开下面的 full_url_mode。
+              </div>
+            </div>
+            <div class="field">
+              <label>api_key</label>
+              <input type="password" x-model="upForm.api_key" class="mono"
+                     :placeholder="upForm.id && upForm.api_key_is_set ? '留空 = 不修改现有 key' : 'sk-...'">
+              <!-- 后端语义：留空表示不改。不说清的话用户会以为留空是清空 -->
+              <div class="note" x-show="upForm.id && upForm.api_key_is_set"
+                   x-text="`当前：${upForm.api_key_masked}。留空保存则保持不变`"></div>
+              <div class="note">加密存储（AES-GCM），界面只回显脱敏值</div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>鉴权方式</label>
+                <select x-model="upForm.auth_style">
+                  <option value="auto">auto（两个头都发）</option>
+                  <option value="x-api-key">x-api-key</option>
+                  <option value="bearer">bearer</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>L1 探活路径</label>
+                <input x-model="upForm.l1_path" class="mono" placeholder="/v1/models">
+                <div class="note">留空则只做 TCP/TLS 握手探测</div>
+              </div>
+            </div>
+            <div class="field">
+              <label>代理地址（可选）</label>
+              <input x-model="upForm.proxy_url" class="mono" placeholder="http://127.0.0.1:1080">
+            </div>
+            <div class="field">
+              <label>探活头覆盖（JSON，可选）</label>
+              <textarea x-model="upForm.probe_headers_raw" class="mono"
+                        placeholder='{"user-agent": "claude-cli/2.1.220"}'></textarea>
+              <div class="note">
+                空值表示删掉该头。不能放鉴权头 —— key 由上面的 api_key 统一注入。
+                改这个的正确方式是从「样本」页一键导入，手写等于猜。
+              </div>
+            </div>
+            <div class="row">
+              <label class="check"><input type="checkbox" x-model="upForm.enabled"> 启用</label>
+              <label class="check"><input type="checkbox" x-model="upForm.full_url_mode"> full_url_mode（base_url 即完整端点）</label>
+            </div>
+            <footer>
+              <button @click="upForm = null">取消</button>
+              <button class="primary" @click="saveUp()" :disabled="busy">保存</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <!-- ── 模型表单 ─────────────────────────────────────── -->
+      <template x-if="mnForm">
+        <div class="mask" @click.self="mnForm = null">
+          <div class="modal">
+            <h3 x-text="mnForm.id ? '编辑模型' : '新增模型'"></h3>
+            <div class="field">
+              <label>模型名</label>
+              <input x-model="mnForm.name" class="mono" placeholder="claude-opus-4-8">
+              <div class="note">客户端请求 body 里的 model 值</div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>协议</label>
+                <select x-model="mnForm.protocol">
+                  <option value="anthropic">anthropic（/v1/messages）</option>
+                  <option value="openai-chat">openai-chat（/v1/chat/completions）</option>
+                  <option value="openai-responses">openai-responses（/v1/responses）</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>匹配方式</label>
+                <select x-model="mnForm.match_mode">
+                  <option value="exact">exact（精确）</option>
+                  <option value="prefix">prefix（前缀）</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>探活 prompt</label>
+                <input x-model="mnForm.probe_prompt" class="mono" placeholder="1+1=?">
+              </div>
+              <div class="field">
+                <label>探活 max_tokens</label>
+                <input type="number" x-model.number="mnForm.probe_max_tokens">
+                <div class="note">openai-responses 实测最低 16，给 1 会被部分站拒绝</div>
+              </div>
+            </div>
+            <div class="row">
+              <label class="check"><input type="checkbox" x-model="mnForm.enabled"> 启用</label>
+              <label class="check"><input type="checkbox" x-model="mnForm.is_fallback"> 作为该协议的兜底</label>
+            </div>
+            <div class="note">兜底：未匹配任何模型名的请求走它。每种协议至多一个。</div>
+            <footer>
+              <button @click="mnForm = null">取消</button>
+              <button class="primary" @click="saveMn()" :disabled="busy">保存</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <!-- ── 路由表单 ─────────────────────────────────────── -->
+      <template x-if="rtForm">
+        <div class="mask" @click.self="rtForm = null">
+          <div class="modal">
+            <h3 x-text="rtForm.id ? '编辑路由' : '新增路由'"></h3>
+            <div class="row">
+              <div class="field">
+                <label>模型</label>
+                <select x-model.number="rtForm.model_name_id">
+                  <template x-for="m in modelNames" :key="m.id">
+                    <option :value="m.id" x-text="m.name"></option>
+                  </template>
+                </select>
+              </div>
+              <div class="field">
+                <label>上游</label>
+                <select x-model.number="rtForm.upstream_id">
+                  <template x-for="u in upstreams" :key="u.id">
+                    <option :value="u.id" x-text="u.name"></option>
+                  </template>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>优先级</label>
+                <input type="number" x-model.number="rtForm.priority">
+                <div class="note">1 最高。同优先级按权重加权随机</div>
+              </div>
+              <div class="field">
+                <label>权重</label>
+                <input type="number" x-model.number="rtForm.weight">
+              </div>
+              <div class="field">
+                <label>并发上限</label>
+                <input type="number" x-model.number="rtForm.max_concurrency">
+                <div class="note">0 = 不限</div>
+              </div>
+            </div>
+            <div class="field">
+              <label>上游模型名（可选）</label>
+              <input x-model="rtForm.upstream_model" class="mono" placeholder="留空 = 不映射">
+              <!-- 不映射是推荐路径：body 一个字节都不改 -->
+              <div class="note">
+                留空则 body 一个字节都不改，这是推荐配置。
+                只有该站的模型名与上面的逻辑模型名不同时才需要填。
+              </div>
+            </div>
+            <div class="row">
+              <label class="check"><input type="checkbox" x-model="rtForm.enabled"> 启用</label>
+            </div>
+            <footer>
+              <button @click="rtForm = null">取消</button>
+              <button class="primary" @click="saveRt()" :disabled="busy">保存</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <!-- ── 样本详情 ─────────────────────────────────────── -->
+      <template x-if="sample">
+        <div class="mask" @click.self="sample = null">
+          <div class="modal wide">
+            <h3>
+              <span x-text="`样本 #${sample.id}`"></span>
+              <span class="tag" :class="outcomeClass(sample.outcome)" x-text="sample.outcome"></span>
+            </h3>
+
+            <dl class="kv">
+              <dt>入站</dt>
+              <dd class="mono" x-text="`${sample.in_method} ${sample.in_path}${sample.in_query ? '?' + sample.in_query : ''}`"></dd>
+              <dt>出站</dt>
+              <dd class="mono" x-text="sample.out_url"></dd>
+              <dt>模型</dt>
+              <dd class="mono" x-text="sample.model_in + (sample.model_out !== sample.model_in ? ' → ' + sample.model_out : '（未映射）')"></dd>
+              <dt>响应</dt>
+              <dd x-text="`HTTP ${sample.resp_status}`"></dd>
+              <dt>时间线</dt>
+              <dd x-text="timeline(sample)"></dd>
+              <dt x-show="sample.error">错误</dt>
+              <dd x-show="sample.error" class="err-text" x-text="sample.error"></dd>
+            </dl>
+
+            <!-- truncated 是位标记，不显示的话无法判断 256KB 是恰好还是被砍过 -->
+            <div class="alert err" x-show="sample.truncated" style="margin-top:12px">
+              <span x-text="truncNote(sample.truncated)"></span>
+            </div>
+
+            <div class="bar" style="margin-top:14px">
+              <button @click="exportHeaders(sample.id)">以此为模板导出探活头</button>
+              <span class="dim">从真实请求导，而不是手写 —— 手写等于猜</span>
+            </div>
+
+            <template x-if="hdrExport">
+              <div class="panel">
+                <strong>建议的 probe_headers</strong>
+                <pre class="body mono" x-text="JSON.stringify(hdrExport.headers, null, 2)"></pre>
+                <!-- skipped 要显式展示：让用户知道鉴权头是刻意排除的 -->
+                <p class="dim" x-show="hdrExport.skipped?.length">
+                  已排除（<span x-text="hdrExport.skipped.length"></span> 项）：
+                  <span class="mono" x-text="hdrExport.skipped.join(', ')"></span>。
+                  凭据类的头一律不导 —— 样本里存的是脱敏值，拿它当 key 会让整站探活 401。
+                  另外几个由探活自己按协议设，抄过来反而会出错。
+                </p>
+                <div class="bar" style="margin-top:8px">
+                  <button class="primary" @click="applyHeaders()">填入该上游的表单</button>
+                  <button @click="hdrExport = null">关闭</button>
+                </div>
+              </div>
+            </template>
+
+            <details class="blk">
+              <summary>入站 headers</summary>
+              <pre class="body mono" x-text="JSON.stringify(sample.in_headers, null, 2)"></pre>
+            </details>
+            <details class="blk">
+              <summary>入站 body</summary>
+              <pre class="body mono" x-text="b64(sample.in_body)"></pre>
+            </details>
+            <details class="blk">
+              <summary>出站 headers（实际发给上游的）</summary>
+              <pre class="body mono" x-text="JSON.stringify(sample.out_headers, null, 2)"></pre>
+            </details>
+            <details class="blk">
+              <summary>出站 body</summary>
+              <pre class="body mono" x-text="b64(sample.out_body)"></pre>
+            </details>
+            <details class="blk">
+              <summary>响应 headers</summary>
+              <pre class="body mono" x-text="JSON.stringify(sample.resp_headers, null, 2)"></pre>
+            </details>
+            <details class="blk" open>
+              <summary>响应 body</summary>
+              <pre class="body mono" x-text="b64(sample.resp_body)"></pre>
+            </details>
+
+            <footer>
+              <button @click="sample = null; hdrExport = null">关闭</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+    </div>
+  </template>
+
+</div>
+
+<style>[x-cloak] { display: none !important; }</style>
+<script src="/admin/app.js"></script>
+</body>
+</html>

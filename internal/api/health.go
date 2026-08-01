@@ -212,12 +212,28 @@ func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	// L1 失败时 ProbeNow 直接返回，l2 是**零值**（§4.1：站都连不上，
+	// 探模型只是白等一次超时）。
+	//
+	// 而 health.Verdict 的零值恰好是 VerdictOK（iota 的第一个），
+	// 直接序列化会报成 `"l2": {"verdict": "ok"}` —— 界面上就成了
+	// 「L1 失败但 L2 成功」，一个自相矛盾、且让人无法判断能不能用的结论。
+	//
+	// 所以显式区分「未执行」与「执行了且成功」。判据用 l1 而不是给
+	// Outcome 加一个 executed 字段：ProbeNow 的契约就是「L1 不通就不探 L2」，
+	// 在这里复述它比在探活热路径上多带一个字段干净。
+	body := map[string]any{
 		"route_id": id,
 		"l1":       outcomeJSON(l1),
-		"l2":       outcomeJSON(l2),
 		"state":    s.healthStateOf(id),
-	})
+	}
+	if l1.Verdict == health.VerdictOK {
+		body["l2"] = outcomeJSON(l2)
+	} else {
+		body["l2"] = nil
+		body["l2_skipped"] = "L1 未通过，已跳过 L2（站连不上时探模型只是白等一次超时）"
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // manualProbeTimeout 是手动探活的上限。
