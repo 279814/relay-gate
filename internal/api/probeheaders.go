@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // sampleProbeHeaders 把一条真实样本的入站头导出成探活头模板（§3.6.4）。
@@ -68,7 +68,12 @@ func probeHeadersFromSample(h http.Header) (tmpl map[string]string, skipped []st
 		// 这里自己过滤而不是依赖下游（buildHeaders 会跳过、model.Validate
 		// 会拒绝）：那两处是纵深防御，而这里是**语义**上的正确 ——
 		// 导出一个注定无效的头，本身就是错的。
-		if model.IsAuthHeader(lower) {
+		//
+		// 用 sample.IsSensitiveHeader 而不是 model.IsAuthHeader：前者是
+		// 「样本里哪些头被脱敏过」的唯一来源，比后者多 Proxy-Authorization
+		// 与 Cookie 两类。按 AuthHeaders 过滤会漏掉它们，而漏掉的正是
+		// 一个**脱敏后的假凭据**被导进模板。
+		if sample.IsSensitiveHeader(lower) {
 			skipped = append(skipped, name)
 			continue
 		}
@@ -82,16 +87,22 @@ func probeHeadersFromSample(h http.Header) (tmpl map[string]string, skipped []st
 	return tmpl, skipped
 }
 
-// skipHeaderForProbe 是不该进探活模板的头。
+// skipHeaderForProbe 是不该进探活模板的头。凭据类不在这里，走
+// sample.IsSensitiveHeader。
 //
-// 分三类，理由不同：
+// 分四类，理由不同：
 //   - 逐请求变化的：content-length（探活 body 长度不同）、
 //     content-type（探活自己按协议设）
-//   - 由 Transport 管的：host、connection、accept-encoding ——
-//     手工设这些会与 Go 的 http.Transport 打架（它会自己填，
-//     而重复的 Host 头是协议错误）
-//   - 与内容绑定的：anthropic-version 之类由 buildHeaders 按协议设，
-//     从样本抄反而会把一个协议的版本头带到另一个协议上
+//   - 由 Transport 管的：host、connection、accept-encoding、
+//     transfer-encoding —— 手工设这些会与 Go 的 http.Transport 打架
+//     （它会自己填，而重复的 Host 头是协议错误）
+//   - 由 buildHeaders 按协议设的：anthropic-version、accept。
+//     必须排除，因为 probe_headers 的覆盖发生在它们**之后**
+//     （probe/headers.go 的三层叠加），从样本抄来的值会赢 ——
+//     于是一个 Anthropic 样本导出的版本头会被带到 OpenAI 协议的探活上，
+//     而 accept 会把流式探活的 text/event-stream 覆盖成 application/json，
+//     那会让 L2 收不到 SSE、判成假活
+//   - 本网关自己加的：不属于上游指纹
 var skipHeaderForProbe = map[string]bool{
 	"host":              true,
 	"content-length":    true,
@@ -99,9 +110,8 @@ var skipHeaderForProbe = map[string]bool{
 	"connection":        true,
 	"accept-encoding":   true,
 	"transfer-encoding": true,
-	// cookie 可能带会话凭据，与鉴权头同理
-	"cookie": true,
-	// 这两个是本网关自己加的，不属于上游指纹
-	"x-relay-state":   true,
-	"x-forwarded-for": true,
+	"anthropic-version": true,
+	"accept":            true,
+	"x-relay-state":     true,
+	"x-forwarded-for":   true,
 }
