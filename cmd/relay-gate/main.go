@@ -120,14 +120,16 @@ func run() error {
 	}()
 
 	mux := http.NewServeMux()
-	// WithRuntime 把在途计数与样本丢弃数接到 /admin/api/runtime ——
+	// WithRuntime 把在途计数、样本与日志的丢弃数接到 /admin/api/runtime ——
 	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
+	// 日志的丢弃更要紧：它会让重试统计偏低，而那个统计正是用来决定
+	// 「要不要保留重试」的。
 	//
 	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
 	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
 	// 只是慢一点，不会变成「改了不生效」。
 	mux.Handle("/admin/api/", api.New(st, log).
-		WithRuntime(tracker, recorder).
+		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).
 		WithCost(cost).
 		WithInvalidator(sched).

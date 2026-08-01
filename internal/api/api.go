@@ -19,6 +19,10 @@ type InFlightView interface {
 }
 
 // SampleStats 暴露样本记录器的落库/丢弃计数。由 sample.Recorder 实现。
+//
+// 请求日志记录器（sample.LogRecorder）满足同一个签名，所以两者共用这个
+// 接口。不为它单开一个同形状的类型 —— 那只会让「这两个计数是一回事」
+// 这个事实变得不明显。
 type SampleStats interface {
 	Stats() (written, dropped int64)
 }
@@ -26,10 +30,11 @@ type SampleStats interface {
 type Server struct {
 	st  *store.Store
 	log *slog.Logger
-	// inFlight 与 samples 可以为 nil（测试里常只关心 CRUD），
+	// inFlight、samples 与 reqLogs 可以为 nil（测试里常只关心 CRUD），
 	// runtime 端点会据此把对应字段留空而不是崩。
 	inFlight InFlightView
 	samples  SampleStats
+	reqLogs  SampleStats
 
 	// 探活链路。同样可以为 nil —— 探活未启用时相关端点回 503，
 	// 而不是让整个管理接口不可用（管理端点必须始终可用，§4.8）。
@@ -54,9 +59,13 @@ func New(st *store.Store, log *slog.Logger) *Server {
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，
-// 是因为这两者属于转发链路，而 api.Server 的主职责是配置 CRUD。
-func (s *Server) WithRuntime(inFlight InFlightView, samples SampleStats) *Server {
-	s.inFlight, s.samples = inFlight, samples
+// 是因为这几者属于转发链路，而 api.Server 的主职责是配置 CRUD。
+//
+// 三个参数都可以为 nil。日志记录器（M6）作为第三个参数追加在末尾，
+// 而不是另开一个 WithRequestLogs —— 它与前两个是同一类东西
+// （「此刻转发链路上正在发生什么」），拆开只会让装配代码多一行。
+func (s *Server) WithRuntime(inFlight InFlightView, samples, reqLogs SampleStats) *Server {
+	s.inFlight, s.samples, s.reqLogs = inFlight, samples, reqLogs
 	return s
 }
 

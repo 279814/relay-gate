@@ -127,6 +127,15 @@ th {
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #1f232a; }
 
+/* 展开后的重试尝试行（M6 请求日志）。
+ *
+ * 必须与代表行有视觉区分：一次三连重试展开后是 3 行，若长得一样，
+ * 看起来就像 3 次独立的客户端请求 —— 而那正好是这个页面要澄清的事。
+ * 左边一道竖线 + 缩进表达「这些属于上面那一行」。 */
+tbody tr.attempt-sub { background: var(--bg-2); }
+tbody tr.attempt-sub td:first-child { border-left: 2px solid var(--line); }
+tbody tr.attempt-sub td { padding-left: 14px; color: var(--fg-dim); }
+
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.nowrap { white-space: nowrap; }
 
