@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,6 +334,74 @@ func TestLogin_SuccessResetsFailureCount(t *testing.T) {
 	do(t, h, "POST", "/admin/api/login", `{"password":"wrong"}`, false)
 	if len(slept) != 0 {
 		t.Error("登录成功应把失败计数归零，下一次失败不该被延迟")
+	}
+}
+
+func TestSessionStore_ConcurrentAccessDoesNotRace(t *testing.T) {
+	// sessionStore 持有一个 map，而 issue 会在持锁时遍历它做 GC。
+	// 并发是真实的：浏览器开多个标签页、或者一边登录一边有请求在校验
+	// Cookie，都会同时打到它。
+	//
+	// 这条测试的全部价值在 -race 下（CI 会跑）。不带 -race 时它仍能抓到
+	// map 并发读写导致的 panic。
+	s := newSessionStore()
+	const workers = 8
+	var wg sync.WaitGroup
+	toks := make(chan string, workers*10)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				tok, err := s.issue()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				toks <- tok
+				s.valid(tok)
+			}
+		}()
+	}
+	// 同时有 goroutine 在校验和吊销。
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				select {
+				case tok := <-toks:
+					s.valid(tok)
+					if j%3 == 0 {
+						s.revoke(tok)
+					}
+				default:
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSessionStore_IssuedTokensAreUnique(t *testing.T) {
+	// 令牌等价于管理口令。撞一次就是两个人共用一个会话，
+	// 而 256 位随机数撞的概率可以忽略 —— 这条测试真正防的是
+	// 「哪天有人把 crypto/rand 换成了别的东西」。
+	s := newSessionStore()
+	seen := map[string]bool{}
+	for i := 0; i < 500; i++ {
+		tok, err := s.issue()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[tok] {
+			t.Fatalf("第 %d 个令牌与之前重复：%q", i, tok)
+		}
+		seen[tok] = true
+		if len(tok) < 40 { // 32 字节 base64url ≈ 43 字符
+			t.Fatalf("令牌太短（%d 字符），熵不足：%q", len(tok), tok)
+		}
 	}
 }
 
