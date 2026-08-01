@@ -36,10 +36,21 @@ type Server struct {
 	healthView HealthView
 	gate       GateView
 	prober     Prober
+
+	// cost 是探活成本计数器（§5.2d）。为 nil 时对应端点回 503。
+	cost CostView
+
+	// invalidator 让配置写入立刻触发探活（§4.5）。为 nil 时静默跳过 ——
+	// 那只意味着回到「等下一个探活周期」，不是错误。
+	invalidator ConfigInvalidator
+
+	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
+	adminPW  string
+	sessions *sessionStore
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{st: st, log: log}
+	return &Server{st: st, log: log, sessions: newSessionStore()}
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，

@@ -55,6 +55,10 @@ type Scheduler struct {
 	gate  *health.UpstreamGate
 	log   *slog.Logger
 
+	// cost 累计探活开销（§5.2d）。可以为 nil —— 测试里多数用例不关心计数，
+	// 而记账失败绝不该影响探活本身。
+	cost *Cost
+
 	// l2Sem 是全局 L2 并发闸。L2 消耗 token 且打的是真实模型端点，
 	// 不限并发的话，一次「全部 Route 都到期」会同时向所有站发请求 ——
 	// 那看起来就像一次小型压测，很容易触发站点的限流。
@@ -80,6 +84,7 @@ type Scheduler struct {
 type Tracker interface {
 	ClaimL1(routeID int64) bool
 	ClaimL2(routeID int64) bool
+	TriggerL1(routeID int64)
 	TriggerL2(routeID int64)
 	Report(rep health.Report) bool
 	State(routeID int64) model.HealthState
@@ -97,6 +102,15 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 		inflightL2:  map[int64]bool{},
 		lastRunning: store.StateRunning,
 	}
+}
+
+// WithCost 接上探活成本计数器（§5.2d）。
+//
+// 分成单独的 setter 而不是加构造参数：计数是观测，不是调度的依赖，
+// 而 NewScheduler 已经有五个参数了。
+func (s *Scheduler) WithCost(c *Cost) *Scheduler {
+	s.cost = c
+	return s
 }
 
 // Run 阻塞运行调度循环，直到 ctx 结束。
@@ -223,6 +237,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 	}
 
 	ok := out.Verdict == health.VerdictOK
+	s.countL1(up.ID, ok)
 	recovered := s.gate.Report(up.ID, ok, out.Err)
 
 	if !ok {
@@ -299,6 +314,7 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
+	s.countL2(rt.ID, mn, out.Verdict == health.VerdictOK)
 
 	changed := s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: out.Verdict, Source: health.SourceL2,
@@ -484,6 +500,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	p := &Prober{Transport: tr}
 
 	l1 = p.L1(ctx, up, settings)
+	s.countL1(up.ID, l1.Verdict == health.VerdictOK)
 	s.gate.Report(up.ID, l1.Verdict == health.VerdictOK, l1.Err)
 
 	// L1 失败就不必再探 L2 —— 站都连不上，探模型只是白等一次超时。
@@ -497,11 +514,27 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	}
 
 	l2 = p.L2(ctx, up, mn, rt, settings)
+	s.countL2(rt.ID, mn, l2.Verdict == health.VerdictOK)
 	s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
 		Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
 	})
 	return l1, l2, nil
+}
+
+// countL1 / countL2 记一次探活开销（§5.2d）。
+//
+// cost 为 nil 时静默跳过：记账是观测，绝不该让探活因为它而失败。
+func (s *Scheduler) countL1(upstreamID int64, ok bool) {
+	if s.cost != nil {
+		s.cost.AddL1(upstreamID, ok)
+	}
+}
+
+func (s *Scheduler) countL2(routeID int64, mn *model.ModelName, ok bool) {
+	if s.cost != nil {
+		s.cost.AddL2(routeID, ok, estimateL2Tokens(mn))
+	}
 }
 
 func findModelName(snap *router.Snapshot, id int64) *model.ModelName {
@@ -511,4 +544,55 @@ func findModelName(snap *router.Snapshot, id int64) *model.ModelName {
 		}
 	}
 	return nil
+}
+
+// ── 配置变更触发即时探活（§4.5 表格第 3 行）─────────────────
+
+// InvalidateRoute 让某个 Route 在下一个 tick 立刻重探。
+//
+// 只清预占，不在这里直接发探活请求。理由与 TriggerL2 相同（health/schedule.go）：
+// 直接探的话，一次批量配置导入会同时发起几十个请求，而 tick 里已经有
+// 完整的并发闸与「同站串行」约束。走 tick 最多等 1 秒。
+//
+// 顺带清 L1：改了 key 或 base_url 时，L1 的结论同样过期了 —— 而站级 L1
+// 失败会让 L2 被整个跳过（§4.1），不清 L1 的话，一个刚被改对的站
+// 仍会因为旧的 L1 失败结论而探不到 L2。
+func (s *Scheduler) InvalidateRoute(routeID int64) {
+	s.track.TriggerL1(routeID)
+	s.track.TriggerL2(routeID)
+}
+
+// InvalidateUpstream 让某个 Upstream 下所有 Route 立刻重探。
+//
+// 同时清掉站级 L1 结论：改 key 后旧的「这个站 401」必须作废，
+// 否则 L2 会被 gate.OK 挡住，用户改对了 key 也看不到恢复。
+func (s *Scheduler) InvalidateUpstream(upstreamID int64) {
+	s.gate.Forget(upstreamID)
+
+	snap, err := s.cfg.Snapshot()
+	if err != nil {
+		return
+	}
+	for _, rts := range snap.RoutesByModelName {
+		for _, rt := range rts {
+			if rt.UpstreamID == upstreamID {
+				s.InvalidateRoute(rt.ID)
+			}
+		}
+	}
+}
+
+// InvalidateModelName 让某个 ModelName 下所有 Route 重探 L2。
+//
+// 只清 L2：这个层级能改的是 probe_prompt / probe_max_tokens / protocol，
+// 全都只影响 L2 的请求内容。L1 打的是站的 /v1/models，与模型无关 ——
+// 清它等于白发一次请求。
+func (s *Scheduler) InvalidateModelName(modelNameID int64) {
+	snap, err := s.cfg.Snapshot()
+	if err != nil {
+		return
+	}
+	for _, rt := range snap.RoutesByModelName[modelNameID] {
+		s.track.TriggerL2(rt.ID)
+	}
 }
