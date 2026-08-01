@@ -46,3 +46,17 @@ jobs:
 
       - name: go build
         run: go build ./...
+
+      # 前端的两个静态检查。ubuntu-latest 自带 node，不需要 setup-node ——
+      # 原先「CI 里没有 node」的判断已经不成立了。
+      #
+      # 值得接进来的理由：这两项查的都是**静默**失败。绑定检查器查
+      # 「x-model 写向一个不存在的属性」（勾了没反应，不报错也不空白），
+      # 契约测试查 run() 的返回形状（漏改一处就让失败的操作看起来成功了）。
+      # 只靠「有人记得手跑」的检查，等于没有检查 —— M6 的
+      # logFilter.retriedOnly 就是在检查器存在的情况下漏进主干的。
+      - name: 前端绑定检查
+        run: node internal/web/bindings.check.js
+
+      - name: 前端契约测试
+        run: node internal/web/app.contract.test.js
