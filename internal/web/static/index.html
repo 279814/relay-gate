@@ -558,27 +558,33 @@
                 <div class="row" style="margin-bottom:10px">
                   <label class="check"><input type="checkbox" x-model="settings.sample_enabled"> 记录样本</label>
                 </div>
+                <div class="note" style="margin-bottom:10px">
+                  三个体积上限填 <b>0 = 不限</b>（完整留档，当前默认）。完整留档才能拿去逐字节比对，
+                  代价是磁盘与内存随上游响应大小增长 —— 吃紧时填回非零即恢复封顶。
+                </div>
                 <div class="row">
                   <div class="field">
                     <label>body 上限 (B)</label>
-                    <input type="number" x-model.number="settings.sample_max_body_bytes">
-                    <div class="note">只截断留档的副本，转发的 body 仍是完整的</div>
+                    <input type="number" min="0" x-model.number="settings.sample_max_body_bytes">
+                    <div class="note">0 = 完整保留入站/出站请求体。只影响留档的副本，转发的 body 一直是完整的</div>
                   </div>
                   <div class="field">
                     <label>响应头部留存 (B)</label>
-                    <input type="number" x-model.number="settings.sample_resp_head_bytes">
+                    <input type="number" min="0" x-model.number="settings.sample_resp_head_bytes">
+                    <div class="note">与尾部<b>同时</b>为 0 = 完整保留响应</div>
                   </div>
                   <div class="field">
                     <label>响应尾部留存 (B)</label>
-                    <input type="number" x-model.number="settings.sample_resp_tail_bytes">
+                    <input type="number" min="0" x-model.number="settings.sample_resp_tail_bytes">
                   </div>
                   <div class="field">
                     <label>保留条数</label>
-                    <input type="number" x-model.number="settings.sample_keep_count">
+                    <input type="number" min="1" x-model.number="settings.sample_keep_count">
+                    <div class="note">与天数取先到者。不限体积时，这是磁盘的主要闸门</div>
                   </div>
                   <div class="field">
                     <label>保留天数</label>
-                    <input type="number" x-model.number="settings.sample_keep_days">
+                    <input type="number" min="1" x-model.number="settings.sample_keep_days">
                   </div>
                   <div class="field">
                     <label>队列容量</label>

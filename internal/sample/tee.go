@@ -12,14 +12,18 @@ import (
 // 用注释风格的标记，人一眼能看懂，机器也不会当成数据。
 const ellipsisFmt = "\n/* …relay-gate: 省略 %d 字节… */\n"
 
-// HeadTail 是「留头 + 留尾」的有界收集器，用于 SSE 响应体（§3.6.3c）。
+// HeadTail 是响应体的收集器，用于 SSE 响应体（§3.6.3c）。有两种模式：
 //
+// **完整模式**（headMax 与 tailMax 都为 0，即当前默认）：一字不差地全收。
+// 留档的价值就在「到底是哪些字节」—— 截断过的样本没法拿去与入站请求逐字段
+// 比对，而那是 §3.6.1 给这个功能定的头号用途。代价是内存占用等于响应大小，
+// 且**由上游决定**：每个在途请求都会在 RAM 里攒一份完整副本。
+//
+// **有界模式**（任一为正）：留头 + 留尾，中间省略。
 // 为什么不能只留头：SSE 的诊断信息分布在两端 —— 头部有错误信息与首个 delta，
 // 尾部有 message_stop 与 usage（真实 token 消耗）。只留头会丢掉「这次到底
 // 花了多少 token」，而那正是公益站配额排查最需要的。
-//
-// 为什么不能先攒完再截：响应可达数 MB，攒完等于把内存上限交给上游决定。
-// 这个类型的内存占用恒为 head+tail，与流的实际长度无关。
+// 这个模式下内存占用恒为 head+tail，与流的实际长度无关。
 type HeadTail struct {
 	head    []byte
 	tail    []byte // 环形缓冲：只保留最后 tailMax 字节
@@ -27,9 +31,15 @@ type HeadTail struct {
 	tailLen int    // 已填充长度（未绕回时 < len(tail)）
 
 	headMax int
-	total   int64
+	// full 表示完整模式。用一个显式字段而不是靠 headMax==0 现判：
+	// headMax=0 且 tailMax>0 是有意义的有界配置（只留最后 N 字节），
+	// 与「不限」是两回事。混为一谈的话，「只留尾」会静默变成「全留」。
+	full  bool
+	total int64
 }
 
+// NewHeadTail 构造收集器。headMax 与 tailMax **同时为 0** 表示完整保留；
+// 任一为正则是有界的留头留尾。负数按 0 处理。
 func NewHeadTail(headMax, tailMax int) *HeadTail {
 	if headMax < 0 {
 		headMax = 0
@@ -41,6 +51,7 @@ func NewHeadTail(headMax, tailMax int) *HeadTail {
 		head:    make([]byte, 0, headMax),
 		tail:    make([]byte, tailMax),
 		headMax: headMax,
+		full:    headMax == 0 && tailMax == 0,
 	}
 }
 
@@ -48,6 +59,13 @@ func NewHeadTail(headMax, tailMax int) *HeadTail {
 // 它的失败不该以任何形式传播到转发路径上。
 func (h *HeadTail) Write(p []byte) (int, error) {
 	h.total += int64(len(p))
+
+	// 完整模式：全部进 head，tail 不用。Bytes 与 Truncated 的既有公式
+	// （head 已含全文 → 直接返回、不算截断）正好覆盖这一支，不需要特例。
+	if h.full {
+		h.head = append(h.head, p...)
+		return len(p), nil
+	}
 
 	if n := h.headMax - len(h.head); n > 0 {
 		if n > len(p) {

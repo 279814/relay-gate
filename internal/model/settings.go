@@ -73,13 +73,28 @@ type Settings struct {
 	RetryMaxAttempts int `json:"retry_max_attempts"`
 
 	// ── 样本记录（§3.6.3）────────────────────────────────
-	SampleEnabled       bool `json:"sample_enabled"`
-	SampleMaxBodyBytes  int  `json:"sample_max_body_bytes"`
-	SampleRespHeadBytes int  `json:"sample_resp_head_bytes"`
-	SampleRespTailBytes int  `json:"sample_resp_tail_bytes"`
-	SampleKeepCount     int  `json:"sample_keep_count"`
-	SampleKeepDays      int  `json:"sample_keep_days"`
-	SampleQueueSize     int  `json:"sample_queue_size"`
+	//
+	// 三个体积上限都以 **0 = 不限**（完整留档）为默认值。留档的价值恰恰在
+	// 「到底是哪些字节」—— 截断过的样本没法拿去逐字段比对，而那是 §3.6.1
+	// 给这个功能定的头号用途。
+	//
+	// 代价是磁盘与内存，且**由上游的响应大小决定**，不再由我们封顶：
+	//   - 磁盘：最坏约 keep_count × (in + out + resp)。300 条 × 单条几 MB
+	//     可以到 GB 级；靠 keep_count(300) 与 keep_days(7) 兜住。
+	//   - 内存：每个**在途**请求会在 RAM 里攒一份完整响应副本（采集用 tee）。
+	//     并发 N 路就是 N 份。
+	// 磁盘或内存吃紧时，把这三项调回非零即恢复原来的封顶行为。
+	SampleEnabled bool `json:"sample_enabled"`
+	// SampleMaxBodyBytes 是 in_body / out_body 的留档上限。0 = 不截断。
+	SampleMaxBodyBytes int `json:"sample_max_body_bytes"`
+	// SampleRespHeadBytes / SampleRespTailBytes 是响应体的留头/留尾上限。
+	// **两者同时为 0** 表示完整保留（不分头尾、不插省略标记）；
+	// 只有一个为 0 仍是有界的（例如头 0 尾 8KB = 只留最后 8KB）。
+	SampleRespHeadBytes int `json:"sample_resp_head_bytes"`
+	SampleRespTailBytes int `json:"sample_resp_tail_bytes"`
+	SampleKeepCount     int `json:"sample_keep_count"`
+	SampleKeepDays      int `json:"sample_keep_days"`
+	SampleQueueSize     int `json:"sample_queue_size"`
 }
 
 // DefaultSettings 返回 §4.2 超时矩阵与 §3.6.3 样本上限的默认值。
@@ -115,10 +130,10 @@ func DefaultSettings() Settings {
 		RetryMaxAttempts: 3, // 初次 + 最多 2 次重试（§3.5）
 
 		SampleEnabled:       true,
-		SampleMaxBodyBytes:  256 * 1024,
-		SampleRespHeadBytes: 64 * 1024,
-		SampleRespTailBytes: 8 * 1024,
-		SampleKeepCount:     500,
+		SampleMaxBodyBytes:  0, // 0 = 不截断，完整保留入站与出站请求体
+		SampleRespHeadBytes: 0, // 0 = 完整保留响应（不再分头尾）
+		SampleRespTailBytes: 0,
+		SampleKeepCount:     300, // 从 500 降至 300
 		SampleKeepDays:      7,
 		SampleQueueSize:     256,
 	}
@@ -154,7 +169,10 @@ func (s *Settings) Validate() error {
 		{"ok_threshold", s.OKThreshold},
 		{"cooldown_sec", s.CooldownSec},
 		{"global_l2_concurrency", s.GlobalL2Concurrency},
-		{"sample_max_body_bytes", s.SampleMaxBodyBytes},
+		// sample_max_body_bytes **不在**这里：它的 0 是「不截断」，是当前的
+		// 默认值。归进正数校验会让默认配置自己校验不过 —— 保存一次设置就
+		// 400，而且错误信息还说「必须为正数」，完全指错方向。
+		// 它的下限（不为负）在下面与另两个体积上限一起判。
 		{"sample_keep_count", s.SampleKeepCount},
 		{"sample_keep_days", s.SampleKeepDays},
 		{"sample_queue_size", s.SampleQueueSize},
@@ -173,8 +191,14 @@ func (s *Settings) Validate() error {
 			"填大不会报错，只会让每个失败请求悄悄放大成同样多次上游调用",
 			MaxRetryAttempts, s.RetryMaxAttempts)
 	}
-	if s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
-		return invalid("sample_resp_head_bytes / sample_resp_tail_bytes 不能为负")
+	// 三个体积上限：0 = 不限（完整留档），负数无意义。
+	//
+	// 不设**上限**是刻意的：这几个值的作用就是封顶，给封顶再封一层顶
+	// 只会让「我要完整留档」这个明确的意图变成一个需要绕过的限制。
+	// 磁盘由 sample_keep_count / sample_keep_days 兜住。
+	if s.SampleMaxBodyBytes < 0 || s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
+		return invalid("sample_max_body_bytes / sample_resp_head_bytes / " +
+			"sample_resp_tail_bytes 不能为负（0 表示不限，即完整留档）")
 	}
 
 	// 总时长必须容得下首 Token，否则总超时会先触发，首 Token 超时形同虚设。
