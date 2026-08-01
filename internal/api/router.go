@@ -49,6 +49,12 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	// 而不是手写 —— 手写就又回到了 M0 证明会把活站判死的那种猜。
 	mux.HandleFunc("GET /admin/api/samples/{id}/probe-headers", s.sampleProbeHeaders)
 
+	// 请求日志与重试统计（M6）。日志是「重试到底有没有用」的唯一依据 ——
+	// 没有它，这个功能的收益就只能靠感觉，而它的代价是实打实的。
+	mux.HandleFunc("GET /admin/api/request-logs", s.listRequestLogs)
+	mux.HandleFunc("GET /admin/api/retry-stats", s.getRetryStats)
+	mux.HandleFunc("DELETE /admin/api/request-logs", s.clearRequestLogs)
+
 	// 探活成本（§5.2d）。没有它无法判断探活策略是否过激。
 	mux.HandleFunc("GET /admin/api/probe-cost", s.getProbeCost)
 
