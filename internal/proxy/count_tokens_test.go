@@ -330,6 +330,63 @@ func TestCountTokens_EmptyKeyKeepsLogReadable(t *testing.T) {
 	}
 }
 
+// 真实请求的 ErrBody 必须在交给健康判定前脱敏。
+//
+// 这与 count_tokens 的日志脱敏是**不同的路径**，泄露面也更大：ErrBody 经
+// probe.ClassifyHTTP → errFromBody 拼进 Outcome.Err → health.Report →
+// 存成 route_health.last_error（**落库**）→ 由 /admin/api/health 显示。
+// 不脱敏的话一个明文上游 key 会同时躺在数据库里和管理界面上。
+//
+// 断言在 ResultView 上而不是走完整个 health 链路：viewOf 是 ErrBody 进入
+// 健康判定的唯一入口，在这里拦住就覆盖了全部下游。
+func TestServe_ErrBodyRedactedBeforeHealthReport(t *testing.T) {
+	const upKey = "sk-upstream-secret" // 与 newHarness 里配的一致
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		// 上游把收到的 key 回显 —— 401 最常见的形态
+		fmt.Fprintf(w, `{"error":{"message":"Invalid API key: %s"}}`, upKey)
+	})
+
+	spy := &capturingReporter{}
+	hs.h.WithHealthReporter(spy)
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`))
+
+	got := spy.last()
+	if got == nil {
+		t.Fatal("401 应上报健康结论")
+	}
+	if bytes.Contains(got.ErrBody, []byte(upKey)) {
+		t.Errorf("ErrBody 里有明文上游 key（会落库并显示在 UI 上）：%s", got.ErrBody)
+	}
+	// 脱敏不能把诊断内容一起吞掉 —— 健康判定要靠 ErrBody 区分
+	// 「鉴权错误」与「普通 5xx」（§4.3），内容没了就只能一律按最保守处理。
+	if len(got.ErrBody) == 0 {
+		t.Error("ErrBody 被清空了，健康判定将无法区分致命错误与普通故障")
+	}
+}
+
+// capturingReporter 留下最后一次上报的内容，用于断言脱敏。
+type capturingReporter struct {
+	mu   sync.Mutex
+	seen *ResultView
+}
+
+func (c *capturingReporter) ReportResult(_ int64, res *ResultView) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen = res
+}
+
+func (c *capturingReporter) TriggerProbe(int64) {}
+
+func (c *capturingReporter) last() *ResultView {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
+}
+
 // §3.1 / §10.3：count_tokens 的失败**不得**计入健康状态。
 // 这是刻意的 —— 它每轮对话都被调用，噪声会淹没真实请求给出的信号，
 // 而一个轻量端点的失败不该把一个能正常对话的站判死。

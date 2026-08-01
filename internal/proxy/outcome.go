@@ -3,6 +3,8 @@ package proxy
 import (
 	"net/http"
 	"time"
+
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // HealthReporter 接收真实请求的健康结论。由 probe 包适配到 health.Tracker。
@@ -43,11 +45,23 @@ type ResultView struct {
 }
 
 // viewOf 从完整结果里摘出健康判定需要的部分。
-func viewOf(res *Result) *ResultView {
+//
+// redactKeys 是本次请求涉及的凭据。**ErrBody 必须在这里脱敏**：它是上游
+// 响应体的原文，而上游的鉴权错误经常把收到的 key 回显在消息里
+// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式）。
+//
+// 不脱敏的后果不止于日志：ErrBody 会经 probe.ClassifyHTTP → errFromBody
+// 拼进 Outcome.Err → health.Report → 存成 route_health.last_error →
+// 由 /admin/api/health 显示出来。也就是说一个明文 key 会**落库**，
+// 并出现在管理界面上。
+//
+// 放在 viewOf 而不是各调用点：这是 ErrBody 进入健康判定的唯一入口，
+// 在这里拦一次就覆盖全部路径；散到调用点则漏一处就是漏一个泄露口。
+func viewOf(res *Result, redactKeys []string) *ResultView {
 	return &ResultView{
 		Status:       res.Status,
 		Err:          res.Err,
-		ErrBody:      res.ErrBody,
+		ErrBody:      sample.RedactDiagnostic(res.ErrBody, redactKeys),
 		Header:       res.RespHeaders,
 		TTFT:         res.TTFT(),
 		BytesWritten: res.BytesWritten,

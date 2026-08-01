@@ -255,8 +255,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	//    20 秒），真实请求没有延迟，站挂掉那一刻就有请求撞上去（§3.5）。
 	//    放在写错误响应之前：客户端已经在等了，先把状态记下来，
 	//    下一个请求就能绕开这个站。
+	//
+	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
+	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
-		h.reporter.ReportResult(cand.Route.ID, viewOf(res))
+		h.reporter.ReportResult(cand.Route.ID, viewOf(res, h.credentialsOf(r, cand)))
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
@@ -357,10 +360,7 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 
 	// 落库的 key 只有两处来源：入站的 relay key 与出站的上游 key。
 	// 两者都要从 body 里扫掉（§9.4 要求真 key 全表 grep 零命中）。
-	keys := []string{cand.Upstream.APIKey}
-	for _, k := range inboundCredentials(r.Header) {
-		keys = append(keys, k)
-	}
+	keys := h.credentialsOf(r, cand)
 
 	// 先截断再脱敏（PrepareBody 内部保证顺序安全）：body 上限 32MB，
 	// 而留档上限默认 256KB，先扫全量等于为了丢掉的 99% 白扫一遍。
@@ -453,6 +453,21 @@ func classifyOutcome(res *Result) model.Outcome {
 		return model.OutcomeFakeAlive
 	}
 	return model.OutcomeOK
+}
+
+// credentialsOf 收齐这次请求涉及的全部凭据，供脱敏使用。
+//
+// 两处来源：出站的上游 key 与入站的 relay key。位置清单走
+// inboundCredentials（其内部读 model.AuthHeaders，是唯一来源）——
+// 各列一份的话，新增一个鉴权位置时必然漏掉其中之一，而漏掉的表现是
+// 明文 key 静默落库或进日志，不报错、不失败。
+//
+// 三个消费方共用它：样本落库（recordSample）、健康回写的 ErrBody
+// （viewOf）、count_tokens 的降级日志。
+func (h *Handler) credentialsOf(r *http.Request, cand *router.Candidate) []string {
+	keys := make([]string, 0, len(model.AuthHeaders)+1)
+	keys = append(keys, cand.Upstream.APIKey)
+	return append(keys, inboundCredentials(r.Header)...)
 }
 
 // inboundCredentials 取出入站请求里所有位置上的凭据值。

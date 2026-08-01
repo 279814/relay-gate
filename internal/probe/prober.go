@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,12 +13,36 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/proxy"
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // Prober 执行单次探测。Transport 由调用方按 Upstream 提供，
 // 与转发路径共用连接池 —— 探活顺带把连接热着，真实请求就省了 TLS 握手。
 type Prober struct {
 	Transport http.RoundTripper
+}
+
+// redactOutcome 脱敏一个 Outcome 里可能含上游原文的错误。
+//
+// **必须做**：ClassifyHTTP 经 errFromBody 把上游响应体原文拼进了 Err，
+// 而上游的鉴权错误经常把收到的 key 回显在消息里
+// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式）。
+//
+// 泄露面比日志更大：这个 Err 会流进 health.Report → 存成
+// route_health.last_error（**落库**）→ 由 /admin/api/health 显示在管理界面上。
+// 也就是说一个明文上游 key 会同时出现在数据库和 UI 里。
+//
+// 放在这里而不是 errFromBody：那个函数只收 status 与 body，拿不到 key。
+// 而 Prober 的每个方法都持有 up，是能同时看到「原文」与「key」的最内层。
+func redactOutcome(out Outcome, up *model.Upstream) Outcome {
+	if out.Err == nil || up == nil || up.APIKey == "" {
+		return out
+	}
+	safe := sample.RedactDiagnosticText(out.Err.Error(), []string{up.APIKey})
+	if safe != out.Err.Error() {
+		out.Err = errors.New(safe)
+	}
+	return out
 }
 
 // L1 是传输层探测（§4.1）：GET {base_url}{l1_path}，零 token。
@@ -28,7 +53,12 @@ type Prober struct {
 //
 // l1_path 为空时只做连接层探测（HEAD base_url），给那些连 /v1/models
 // 都会报错的站留一条退路。
-func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) Outcome {
+func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (out Outcome) {
+	// 统一在出口脱敏，覆盖下面所有 return 路径（含 ClassifyHTTP 拼的上游原文）。
+	// 逐个 return 包一层的话，六条返回路径漏掉任何一条就是一个泄露口，
+	// 而漏掉的表现是明文 key 静默落库 —— 不报错、不失败，只有翻库才发现。
+	defer func() { out = redactOutcome(out, up) }()
+
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L1TotalSec)*time.Second)
 	defer cancel()
 
@@ -74,7 +104,7 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) O
 		return Outcome{Verdict: health.VerdictOK, TTFT: ttft, Status: resp.StatusCode}
 	}
 
-	out := ClassifyHTTP(resp.StatusCode, resp.Header, body)
+	out = ClassifyHTTP(resp.StatusCode, resp.Header, body)
 	out.TTFT = ttft
 	return out
 }
@@ -86,7 +116,11 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) O
 //
 // 读到首个有效事件后立即返回并关闭响应体，不再消耗上游 token（§4.1）。
 func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName,
-	rt *model.Route, s model.Settings) Outcome {
+	rt *model.Route, s model.Settings) (out Outcome) {
+
+	// 同 L1：统一在出口脱敏。L2 的返回路径更多（含流内错误 payload
+	// 与假活分支自己拼的错误），逐个包更容易漏。
+	defer func() { out = redactOutcome(out, up) }()
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L2TotalSec)*time.Second)
 	defer cancel()

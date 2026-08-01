@@ -147,9 +147,51 @@ func RedactText(s string, keys []string) string {
 	return s
 }
 
+// RedactDiagnostic 脱敏一段要进日志/UI/落库的上游原文。
+//
+// 与 RedactBodyKeys 的区别只有一条：**不设长度下限**，短 key 也脱敏。
+//
+// 为什么要两个函数而不是一个：minRedactableKey 那个下限对**样本**是对的 ——
+// 样本存的是完整对话原文，一个 4 字符的 key 会在正文里偶然命中无数次，
+// 把原文打得千疮百孔，反而毁掉样本的诊断价值。
+//
+// 但诊断文本（探活的 last_error、转发失败的日志）不同：进来的只是几百字节
+// 的错误原文，多打几个码无所谓，而漏一个 key 是实实在在的泄露 —— 它会
+// 落进 route_health 表、经 /admin/api/health 显示出来、或者写进日志文件。
+// 两种代价不对称，这里就该按「宁可多打码」取舍。
+//
+// 而短 key 是**真实可达**的配置：config.validate 对 RELAY_KEYS 只校验非空，
+// 上游 api_key 同样没有长度下限。
+func RedactDiagnostic(body []byte, keys []string) []byte {
+	out := RedactBodyKeys(body, keys) // 长 key：保留 MaskKey 的部分可辨形式
+	for _, k := range keys {
+		// 长 key 已由上面处理，这里只补它按长度跳过的那些。
+		//
+		// 空 key 显式跳过。当前它其实无害（MaskKey("") 返回空串，于是
+		// ReplaceAll 等于原地不动），但那依赖 MaskKey 的实现细节 ——
+		// 若它日后改成返回固定掩码，空串替换会在**每个字节之间**插入掩码，
+		// 把一段错误原文变成几倍长的乱码。写死这个跳过，不押在别处的行为上。
+		if k == "" || len(k) >= minRedactableKey {
+			continue
+		}
+		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
+	}
+	return out
+}
+
+// RedactDiagnosticText 是 RedactDiagnostic 的 string 版本，供拼错误信息用。
+func RedactDiagnosticText(s string, keys []string) string {
+	if s == "" {
+		return s
+	}
+	return string(RedactDiagnostic([]byte(s), keys))
+}
+
 // minRedactableKey 是参与 body 扫描的最短 key 长度。
 //
 // 太短的字符串在正常 body 里会大量偶然命中（想象一个 4 字符的 key
 // 恰好是对话内容的子串），把对话原文打得千疮百孔，反而毁掉样本的诊断价值。
 // 真实的 relay key 与上游 key 都远长于此。
+//
+// 注意这个下限**只对样本适用**。诊断文本走 RedactDiagnostic，它不设下限。
 const minRedactableKey = 12
