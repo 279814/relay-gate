@@ -661,3 +661,85 @@ func TestSelect_ReturnsFullCandidate(t *testing.T) {
 		t.Errorf("ModelName 不正确：%q", c.ModelName.Name)
 	}
 }
+
+// ── SelectExcluding：重试换站（§3.5）────────────────────────
+
+// 排除已试过的 Route 后，应按优先级顺序换到下一个。
+func TestSelectExcluding_SkipsTriedRoutes(t *testing.T) {
+	snap := basicSnapshot()
+	hv := newFakeHealth()
+
+	// 没有排除项时行为与 Select 一致 —— 这条保证既有调用方不受影响。
+	c, err := SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic, nil)
+	if err != nil || c.Route.ID != 100 {
+		t.Fatalf("空排除集应选优先级最高的 100，得到 %v / %v", c, err)
+	}
+	c.Release()
+
+	// 试过 100 之后应换到 200，而不是重复 100 或直接跳到 300。
+	c, err = SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic,
+		map[int64]bool{100: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Route.ID != 200 {
+		t.Errorf("排除 100 后应选 200（按优先级顺序），得到 %d", c.Route.ID)
+	}
+	c.Release()
+
+	// 试过前两个，只剩 300。
+	c, err = SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic,
+		map[int64]bool{100: true, 200: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Route.ID != 300 {
+		t.Errorf("排除 100/200 后应选 300，得到 %d", c.Route.ID)
+	}
+	c.Release()
+}
+
+// 全部试过之后必须给出「已试过」的错误，而不是假装还有得选。
+//
+// 原因写进错误里很重要：「3 个 Route 都试过了」与「3 个 Route 都 dead」
+// 是完全不同的处境 —— 后者该去看健康状态，前者该去看那几次尝试各自
+// 失败在哪。混成一句话会把人引向错误的排查方向。
+func TestSelectExcluding_AllTriedReportsWhy(t *testing.T) {
+	snap := basicSnapshot()
+	_, err := SelectExcluding(snap, newFakeHealth(), "claude-opus-5",
+		model.ProtoAnthropic, map[int64]bool{100: true, 200: true, 300: true})
+
+	if !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("全部试过应回 ErrNoRouteAvailable，得到 %v", err)
+	}
+	if !strings.Contains(err.Error(), "已试过") {
+		t.Errorf("错误信息应说明是「本次已试过」而不是「都挂了」，得到：%v", err)
+	}
+}
+
+// 排除集不该影响健康状态的判定 —— 一个被排除的 Route 仍然是「可用」的，
+// 只是这一次请求不再选它。下一次请求必须能重新选到它。
+//
+// 这条防的是「把重试历史记在 selector 里」那种实现：一次失败之后
+// 某个站就再也选不到了，而且不会自愈。
+func TestSelectExcluding_DoesNotPersistAcrossCalls(t *testing.T) {
+	snap := basicSnapshot()
+	hv := newFakeHealth()
+
+	c, err := SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic,
+		map[int64]bool{100: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Release()
+
+	// 新的一次请求（空排除集）必须又能选到 100。
+	c, err = SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Route.ID != 100 {
+		t.Errorf("排除集不该跨请求残留，新请求应重新选到 100，得到 %d", c.Route.ID)
+	}
+	c.Release()
+}

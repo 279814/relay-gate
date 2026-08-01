@@ -49,6 +49,9 @@ type Handler struct {
 	// reporter 接收真实请求的健康结论。可为 nil（不做健康回写）。
 	reporter HealthReporter
 
+	// logs 接收逐次尝试的请求日志。可为 nil（不记日志）。
+	logs LogSink
+
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
 
@@ -90,6 +93,16 @@ func NewHandler(cfg ConfigSource, health router.HealthView,
 // 冒烟脚本都不需要它），而 NewHandler 的参数已经有五个了。
 func (h *Handler) WithHealthReporter(r HealthReporter) *Handler {
 	h.reporter = r
+	return h
+}
+
+// WithLogSink 接上请求日志（M6）。
+//
+// 同样是 setter 而不是构造参数，理由同上 —— 而且日志与样本是**两个独立的
+// 开关**：样本可以关掉，日志不该跟着关（日志是判断重试策略有没有用的
+// 唯一依据，而那个判断恰恰在样本关掉、只留统计时最需要）。
+func (h *Handler) WithLogSink(s LogSink) *Handler {
+	h.logs = s
 	return h
 }
 
@@ -194,84 +207,54 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	if !ok {
 		return
 	}
-	settings, body, inModel, snap := pre.settings, pre.body, pre.inModel, pre.snapshot
+	// 6~8. 选路 → 改两处 → 转发，失败时按 §3.5 换站重试。
+	//
+	// 并发额度由 forwardWithRetry 全程持有并归还：重试会依次占用多个 Route
+	// 的额度，而被丢弃的那次必须**立刻**还 —— 攒到函数出口统一还的话，
+	// 一次三连重试就会同时占住三个站的额度，把并发上限当场翻三倍。
+	oc, ok := h.forwardWithRetry(w, r, proto, pre, recvAt)
+	if !ok {
+		return // 错误响应已写好（选路失败或配置错误）
+	}
+	res, keys := oc.res, oc.keys
 
-	// 6. 选路
-	// Select 在选中的同时就占下了并发额度（判定与占位原子完成），
-	// 所以这里必须 defer 释放，任何返回路径都不能漏 —— 漏了那个 Route
-	// 的在途计数就只增不减，之后永远选不到它。
-	cand, err := router.Select(snap, h.health, inModel, proto)
-	if err != nil {
-		// 全部 dead 时半开放行一次（§4.4c），避免「全挂 → 只能干等探活」。
-		cand = h.halfOpen(snap, inModel, proto, settings, err)
-		if cand == nil {
-			h.writeSelectError(w, err, proto, inModel)
-			return
+	h.logResult(oc.cand, pre.inModel, oc.outURL, res, oc.attempts)
+
+	// 请求日志（M6）：**每次尝试一行**，含被丢弃的那些。
+	//
+	// 攒到这里一次性投递，而不是在循环里逐行发：attempts（总次数）要等
+	// 循环结束才知道，而列表页正是靠它显示「这次试了 3 个站」。
+	//
+	// 与样本各走各的开关 —— 样本关掉时日志照记。
+	if h.logs != nil && pre.settings.RequestLogEnabled {
+		for _, l := range oc.logs {
+			h.logs.Record(l)
 		}
-		w.Header().Set("X-Relay-Half-Open", "1")
 	}
-	defer cand.Release()
-
-	// 6. 改两处：body 顶层 model（配了映射才改）+ 鉴权头（必改）
-	outBody, err := ReplaceModel(body, cand.Route.UpstreamModel)
-	if err != nil {
-		h.log.Error("替换 model 失败", "err", err, "route", cand.Route.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error",
-			fmt.Sprintf("改写请求失败: %v", err))
-		return
-	}
-	outHeader := PrepareOutboundHeaders(r.Header, cand.Upstream.APIKey,
-		cand.Upstream.AuthStyle, proto)
-
-	outURL, err := BuildOutboundURL(cand.Upstream, r.URL.Path, r.URL.RawQuery)
-	if err != nil {
-		h.log.Error("拼接出站 URL 失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
-		return
-	}
-
-	// 7. 转发
-	tr, err := h.TransportFor(cand.Upstream, settings)
-	if err != nil {
-		h.log.Error("构造 Transport 失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
-		return
-	}
-	fwd := &Forwarder{Transport: tr, Timeouts: RealTimeouts(settings)}
-
-	// 8. 挂上样本采集的 tee。只有开关打开时才有开销 ——
-	//    关掉时 RespTee 为 nil，读循环里连一次判空之外的成本都没有。
-	var respTee *sample.HeadTail
-	if h.samples != nil && settings.SampleEnabled {
-		respTee = sample.NewHeadTail(settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
-		fwd.RespTee = respTee
-	}
-
-	res := fwd.Forward(r.Context(), w, r.Method, outURL, outHeader, outBody)
-
-	h.logResult(cand, inModel, outURL, res)
 
 	// 9. 健康回写。**这是最快的故障发现路径** —— 探活有周期（dead 状态
 	//    20 秒），真实请求没有延迟，站挂掉那一刻就有请求撞上去（§3.5）。
 	//    放在写错误响应之前：客户端已经在等了，先把状态记下来，
 	//    下一个请求就能绕开这个站。
 	//
+	//    这里回写的是**最终**那次尝试。被丢弃的尝试已经在重试循环里各自
+	//    回写过了（那是 §3.5 要求的「任何失败都立刻回写」）。
+	//
 	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
 	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
-		h.reporter.ReportResult(cand.Route.ID, viewOf(res, h.credentialsOf(r, cand)))
+		h.reporter.ReportResult(oc.cand.Route.ID, viewOf(res, keys))
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
 	// 不写的话 net/http 会在 handler 返回时补一个 HTTP 200 空 body ——
 	// 客户端拿到「成功但没内容」，既看不到原因也不会重试。
 	if res.Err != nil && !res.HeadersSent {
-		h.writeForwardError(w, res.Err, proto, cand)
+		h.writeForwardError(w, res.Err, proto, oc.cand, keys)
 	}
 
-	if respTee != nil {
-		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
-			outHeader, outURL, respTee, res, settings)
+	if oc.respTee != nil {
+		h.recordSample(r, proto, oc, recvAt, pre.inModel, pre.body, pre.settings)
 	}
 }
 
@@ -319,17 +302,29 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 //
 // 只在响应头尚未发出时可用 —— 已经发出后状态码就定死了，
 // 再往流里写错误结构只会破坏客户端的 SSE 解析。
+//
+// redactKeys 是本次请求涉及的凭据。**必须脱敏**：err 的文本里可能带出站
+// URL，而 full_url_mode 的 base_url 允许把 key 放在 query 里（§3.2）。
+// 客户端是外部的 —— 持有 relay key 不等于有资格看到上游 key。
+//
+// 当前标准库恰好不会把 URL 放进错误里（forward.go 直接调 Transport.RoundTrip，
+// 而带 URL 的 *url.Error 是 http.Client.Do 包的），所以这层脱敏此刻扫不到
+// 东西。留着是因为那条性质**不由我们控制**：改用 *http.Client 是个完全自然
+// 的重构，而它会让上游 key 静默出现在客户端的错误响应里。
+// 有 TestErrorResponse_NeverEchoesUpstreamKeyFromURL 钉着这条不变量。
 func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
-	proto model.Protocol, cand *router.Candidate) {
+	proto model.Protocol, cand *router.Candidate, redactKeys []string) {
 
 	// 客户端自己走了就别再写了：连接多半已经没了，写也是白写。
 	if !IsUpstreamFault(err) {
 		return
 	}
 
+	safeErr := sample.RedactDiagnosticText(err.Error(), redactKeys)
+
 	// X-Relay-Reason 让 502/504 可诊断：不带它的话，客户端只看到
 	// 「网关错误」，分不清是站连不上、超时，还是我们自己配错了。
-	w.Header().Set("X-Relay-Reason", err.Error())
+	w.Header().Set("X-Relay-Reason", safeErr)
 	w.Header().Set("X-Relay-Upstream", cand.Upstream.Name)
 
 	code, msg := http.StatusBadGateway, "上游站点不可用"
@@ -342,7 +337,7 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 		code, msg = http.StatusGatewayTimeout, "请求超过总时限"
 	}
 	writeAPIError(w, code, proto, "api_error",
-		fmt.Sprintf("%s（%s）：%v", msg, cand.Upstream.Name, err))
+		fmt.Sprintf("%s（%s）：%s", msg, cand.Upstream.Name, safeErr))
 }
 
 // recordSample 组装并投递一条样本（§3.6）。
@@ -350,27 +345,32 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 // 全程只读转发路径产生的数据，绝不回写；投递是非阻塞的，
 // 队列满就丢。任何在这里发生的问题都不该影响已经完成的转发。
 //
+// 大部分入参走 oc（转发结果的聚合）而不是逐个摊开：这些字段本来就是
+// 一起产生、一起消费的，摊成十几个参数只会让调用点难读，也更容易在
+// 加字段时把顺序传错 —— 而 outBody 与 outHeader 都是 []byte / Header，
+// 传反了编译器不会拦。
+//
 // settings 由调用方传入而不是在这里重读：serve 开头已经读过一次，
 // 重读一次既多一次 livecfg 加锁，又可能拿到与转发时不同的值 ——
 // 样本描述的是**这次**转发，用的必须是它当时那份配置。
+//
+// keys 走 oc.keys（它只有两处来源：入站 relay key 与出站上游 key）。
+// 与健康回写、出站错误响应共用同一份，避免各算一遍时漏掉某个凭据位置。
 func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
-	cand *router.Candidate, recvAt time.Time, inModel string,
-	inBody, outBody []byte, outHeader http.Header, outURL string,
-	respTee *sample.HeadTail, res *Result, settings model.Settings) {
+	oc *forwardOutcome, recvAt time.Time, inModel string, inBody []byte,
+	settings model.Settings) {
 
-	// 落库的 key 只有两处来源：入站的 relay key 与出站的上游 key。
-	// 两者都要从 body 里扫掉（§9.4 要求真 key 全表 grep 零命中）。
-	keys := h.credentialsOf(r, cand)
+	cand, keys, res := oc.cand, oc.keys, oc.res
 
 	// 先截断再脱敏（PrepareBody 内部保证顺序安全）：body 上限 32MB，
-	// 而留档上限默认 256KB，先扫全量等于为了丢掉的 99% 白扫一遍。
+	// 而留档上限可配（默认不限），先扫全量等于为了丢掉的部分白扫一遍。
 	inTrunc, inCut := sample.PrepareBody(inBody, keys, settings.SampleMaxBodyBytes)
-	outTrunc, outCut := sample.PrepareBody(outBody, keys, settings.SampleMaxBodyBytes)
+	outTrunc, outCut := sample.PrepareBody(oc.outBody, keys, settings.SampleMaxBodyBytes)
 	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
 	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
 	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
 	// 它已被 HeadTail 限长，不需要再截。
-	respSafe := sample.RedactBodyKeys(respTee.Bytes(), keys)
+	respSafe := sample.RedactBodyKeys(oc.respTee.Bytes(), keys)
 
 	var flags model.TruncFlags
 	if inCut {
@@ -379,7 +379,7 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	if outCut {
 		flags |= model.TruncOutBody
 	}
-	if respTee.Truncated() {
+	if oc.respTee.Truncated() {
 		flags |= model.TruncRespBody
 	}
 
@@ -389,6 +389,9 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	}
 
 	smp := &model.Sample{
+		// 与这次请求的多行日志同组（M6），便于在「发了哪些字节」与
+		// 「试过哪几个站」之间互跳。
+		ReqID:       oc.reqID,
 		TSRecv:      recvAt.UnixMilli(),
 		TSSent:      msOrZero(res.SentAt),
 		TSFirstByte: msOrZero(res.FirstByteAt),
@@ -410,8 +413,8 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		InHeaders: sample.RedactHeaders(r.Header),
 		InBody:    inTrunc,
 
-		OutURL:     sample.RedactText(outURL, keys),
-		OutHeaders: sample.RedactHeaders(outHeader),
+		OutURL:     sample.RedactText(oc.outURL, keys),
+		OutHeaders: sample.RedactHeaders(oc.outHeader),
 		OutBody:    outTrunc,
 
 		RespStatus: res.Status,
@@ -596,13 +599,20 @@ func (h *Handler) writeSelectError(w http.ResponseWriter, err error,
 	}
 }
 
-func (h *Handler) logResult(cand *router.Candidate, inModel, outURL string, res *Result) {
+func (h *Handler) logResult(cand *router.Candidate, inModel, outURL string,
+	res *Result, attempts int) {
+
 	attrs := []any{
 		"model", inModel,
 		"upstream", cand.Upstream.Name,
 		"route", cand.Route.ID,
 		"status", res.Status,
 		"bytes", res.BytesWritten,
+	}
+	// 只在真的重试过时才记。恒定的 attempts=1 是噪音，而它出现在**每一条**
+	// 转发日志上 —— 那样反而会让真正重试过的那几条不显眼。
+	if attempts > 1 {
+		attrs = append(attrs, "attempts", attempts)
 	}
 	if ttft := res.TTFT(); ttft > 0 {
 		attrs = append(attrs, "ttft_ms", ttft.Milliseconds())

@@ -25,6 +25,7 @@ function app() {
       { id: 'models',    name: '模型' },
       { id: 'routes',    name: '路由' },
       { id: 'samples',   name: '样本' },
+      { id: 'reqlogs',   name: '请求日志' },
       { id: 'cost',      name: '探活开销' },
       { id: 'settings',  name: '设置' },
     ],
@@ -39,6 +40,16 @@ function app() {
     samples: [],
     samplesTotal: 0,
     sampleFilter: { outcome: '' },
+
+    // 请求日志（M6）。逐次尝试一行，靠 req_id 聚成组。
+    reqLogs: [],
+    reqLogsTotal: 0,
+    logFilter: { outcome: '', upstream_id: '', only_retried: false, only_failed: false },
+    retryStats: null,
+    // 展开的组（req_id → true）。默认全折叠：列表页要能一眼扫过，
+    // 而多次尝试的详情只在追查某一条时才需要。
+    expandedLogs: {},
+
     settings: null,
     limits: {},
 
@@ -188,6 +199,13 @@ function app() {
       this.routes = [];
       this.samples = [];
       this.samplesTotal = 0;
+      // 请求日志同样要清。它含 model 名、站名、失败原因 —— 那是运营信息，
+      // 登出后不该还留在内存里被下一个登录的人看到（M5 review 抓到过
+      // 「登出不清内存数据」，这里是同一条要求）。
+      this.reqLogs = [];
+      this.reqLogsTotal = 0;
+      this.retryStats = null;
+      this.expandedLogs = {};
       this.settings = null;
       this.limits = {};
 
@@ -265,12 +283,123 @@ function app() {
       });
     },
 
+    /* loadReqLogs 拉请求日志（M6 的诊断视图）。
+     *
+     * 与样本分开拉、分开筛：两者的行数不是一对一的（一次客户端请求可能
+     * 有多次尝试），而且日志在样本关掉时照常有 —— 那正是最需要它的场景。
+     *
+     * 统计一起拉：光看一列失败的日志判断不了「重试有没有用」，
+     * 要同时知道「救回来几次」。两个端点一次往返拿回来。
+     */
+    async loadReqLogs() {
+      const q = new URLSearchParams();
+      const f = this.logFilter;
+      if (f.outcome) q.set('outcome', f.outcome);
+      if (f.upstream_id) q.set('upstream_id', f.upstream_id);
+      // 这两个是**不同**的问题：only_retried 问「实际换过站的」，
+      // only_failed 问「没成功的」。一次 401（不可重试）只命中后者。
+      if (f.only_retried) q.set('only_retried', 'true');
+      if (f.only_failed) q.set('only_failed', 'true');
+      q.set('limit', '100');
+
+      await this.run(async () => {
+        const [d, s] = await Promise.all([
+          this.api('GET', '/request-logs?' + q),
+          this.api('GET', '/retry-stats?hours=24'),
+        ]);
+        this.reqLogs = d.logs || [];
+        this.reqLogsTotal = d.total || 0;
+        this.retryStats = s.stats || null;
+      });
+    },
+
+    /* logGroups 把平铺的日志行按 req_id 归组。
+     *
+     * 后端刻意返回平铺的行（一次尝试一行）而不是嵌套结构：那样翻页、
+     * 筛选、统计都是普通 SQL，而嵌套要么多查一轮要么在 SQL 里拼 JSON。
+     * 归组放在这里，因为它纯粹是展示需要。
+     *
+     * 顺序：后端按 id DESC 返回，组内要反过来 —— 尝试 1、2、3 的顺序
+     * 才读得通「先试了 A、失败、再试 B」。
+     */
+    logGroups() {
+      const byReq = new Map();
+      for (const l of this.reqLogs) {
+        if (!byReq.has(l.req_id)) byReq.set(l.req_id, []);
+        byReq.get(l.req_id).push(l);
+      }
+      const out = [];
+      for (const [reqID, rows] of byReq) {
+        rows.sort((a, b) => a.attempt - b.attempt);
+        const last = rows[rows.length - 1];
+        out.push({
+          req_id: reqID,
+          rows,
+          // 代表行取**最后**一次尝试：那是客户端实际拿到的结果。
+          // 取第一次的话，一个「先失败后成功」的请求会显示成失败。
+          head: last,
+          attempts: last.attempts || rows.length,
+          // 只有多于一次尝试时才值得展开。
+          expandable: rows.length > 1,
+        });
+      }
+      return out;
+    },
+
+    /* retriedPct：重试过的请求占总数的百分比。
+     *
+     * 显示它是为了回答「重试功能有没有被实际用到」—— 如果所有站都活着，
+     * 这个比例会接近零（不需要重试），而那说明整套机制纯属开销。
+     */
+    retriedPct() {
+      const st = this.retryStats;
+      if (!st || !st.requests) return '';
+      const pct = ((st.retried / st.requests) * 100).toFixed(1);
+      return `${pct}% 的请求重试过`;
+    },
+
+    /* failedLogs 取当前页里所有失败的尝试 —— 它们的错误原因单独列出来。
+     *
+     * 表格里那一列放不下完整的错误文本，而错误原文恰恰是排查时最有用的
+     * 东西（后端刻意写给人看的，见 model/validate.go 的注释）。
+     */
+    failedLogs() {
+      return this.reqLogs.filter(l => l.outcome !== 'ok' && l.error);
+    },
+
+    toggleLog(reqID) {
+      this.expandedLogs[reqID] = !this.expandedLogs[reqID];
+    },
+
+    /* openLogSample 从日志跳到样本。
+     *
+     * 两张表靠 req_id 关联：样本存字节，日志存「这次请求经历了什么」。
+     * 看完日志「为什么失败」后，下一步往往是看样本「当时发了哪些字节」。
+     */
+    openLogSample(reqID) {
+      // 按 req_id 精确查，不拉一页回来自己找 —— 后者对「比最近一页更早的
+      // 请求」会静默找不到，而那正是排查历史故障时要点的那些。
+      this.run(async () => {
+        const d = await this.api('GET', '/samples?req_id=' + encodeURIComponent(reqID));
+        const smp = (d.samples || [])[0];
+        if (smp) {
+          this.openSample(smp.id);
+          return;
+        }
+        // 找不到是**正常**情形，不是错误：样本可以关（日志照记，§3.7.2），
+        // 队列满时也会丢。说清原因，别让人以为界面坏了。
+        this.err = `这次请求没有留下样本（req_id=${reqID.slice(0, 8)}）。` +
+          `样本与日志是两份独立的记录 —— 样本可能被关掉了，或当时队列已满被丢弃。`;
+      });
+    },
+
     // 切页时按需拉数据。一次全拉的话，只想看配置的人也要等样本查询。
     go(tab) {
       this.tab = tab;
       this.err = '';
       this.msg = '';
       if (tab === 'samples' && !this.samples.length) this.loadSamples();
+      if (tab === 'reqlogs' && !this.reqLogs.length) this.loadReqLogs();
       if (tab === 'cost') this.loadCost();
       if (tab === 'health') this.loadHealth();
     },
@@ -486,6 +615,22 @@ function app() {
       if (ok) {
         this.msg = `已删除 ${data?.deleted ?? 0} 条`;
         await this.loadSamples();
+      }
+    },
+
+    /* clearReqLogs 清空请求日志。
+     *
+     * 没有「保留置顶」的对应物：日志没有置顶。单行日志离开它那一组就没什么
+     * 意义，而按组置顶会让「保留 N 条」变成一个无法预估的数字。
+     * 要留证据就置顶样本 —— 两者靠 req_id 关联得上。
+     */
+    async clearReqLogs() {
+      if (!confirm('清空请求日志？重试统计会一起归零。')) return;
+      const { ok, data } = await this.run(
+        () => this.api('DELETE', '/request-logs'));
+      if (ok) {
+        this.msg = `已删除 ${data?.deleted ?? 0} 行`;
+        await this.loadReqLogs();
       }
     },
 

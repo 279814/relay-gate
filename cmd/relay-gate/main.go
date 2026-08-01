@@ -78,10 +78,19 @@ func run() error {
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
+	// 请求日志（M6）：每次尝试一行，含被重试丢弃的那些。
+	//
+	// 与样本各是一套独立的旋钮（开关、保留策略、队列都分开）。样本可以关，
+	// 日志不该跟着关 —— 日志是判断「重试策略有没有用」的唯一依据，而那个
+	// 判断恰恰在「样本太占地方所以关掉、只留统计」的场景下最需要。
+	logRecorder := sample.NewLogRecorder(st, settings, cfgSrc, log)
+	defer logRecorder.Close()
+
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
-		WithHealthReporter(probe.NewReporter(tracker))
+		WithHealthReporter(probe.NewReporter(tracker)).
+		WithLogSink(logRecorder)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer fwd.CloseIdleConnections()
 
@@ -111,14 +120,16 @@ func run() error {
 	}()
 
 	mux := http.NewServeMux()
-	// WithRuntime 把在途计数与样本丢弃数接到 /admin/api/runtime ——
+	// WithRuntime 把在途计数、样本与日志的丢弃数接到 /admin/api/runtime ——
 	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
+	// 日志的丢弃更要紧：它会让重试统计偏低，而那个统计正是用来决定
+	// 「要不要保留重试」的。
 	//
 	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
 	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
 	// 只是慢一点，不会变成「改了不生效」。
 	mux.Handle("/admin/api/", api.New(st, log).
-		WithRuntime(tracker, recorder).
+		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).
 		WithCost(cost).
 		WithInvalidator(sched).

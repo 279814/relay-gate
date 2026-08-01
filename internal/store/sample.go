@@ -30,13 +30,15 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 	}
 
 	res, err := s.db.Exec(`INSERT INTO sample (
+		req_id,
 		ts_recv, ts_sent, ts_first_byte, ts_done,
 		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
 		in_method, in_path, in_query, in_headers, in_body,
 		out_url, out_headers, out_body,
 		resp_status, resp_headers, resp_body,
 		outcome, error, truncated, pinned
-	) VALUES (?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?)`,
+	) VALUES (?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?)`,
+		smp.ReqID,
 		smp.TSRecv, smp.TSSent, smp.TSFirstByte, smp.TSDone,
 		smp.Endpoint, smp.ModelIn, smp.ModelOut, smp.ModelNameID, smp.RouteID, smp.UpstreamID,
 		smp.InMethod, smp.InPath, smp.InQuery, inH, smp.InBody,
@@ -50,7 +52,7 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 	return err
 }
 
-const sampleCols = `id, ts_recv, ts_sent, ts_first_byte, ts_done,
+const sampleCols = `id, req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
 	endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
 	in_method, in_path, in_query, in_headers, in_body,
 	out_url, out_headers, out_body,
@@ -62,7 +64,7 @@ func scanSample(sc interface{ Scan(...any) error }) (*model.Sample, error) {
 	var inH, outH, respH string
 	var outcome string
 	var trunc int
-	if err := sc.Scan(&s.ID, &s.TSRecv, &s.TSSent, &s.TSFirstByte, &s.TSDone,
+	if err := sc.Scan(&s.ID, &s.ReqID, &s.TSRecv, &s.TSSent, &s.TSFirstByte, &s.TSDone,
 		&s.Endpoint, &s.ModelIn, &s.ModelOut, &s.ModelNameID, &s.RouteID, &s.UpstreamID,
 		&s.InMethod, &s.InPath, &s.InQuery, &inH, &s.InBody,
 		&s.OutURL, &outH, &s.OutBody,
@@ -91,7 +93,9 @@ type SampleFilter struct {
 	RouteID    int64
 	UpstreamID int64
 	Outcome    model.Outcome
-	Limit      int
+	// ReqID 按请求分组筛选，供「从日志跳到样本」用（M6）。
+	ReqID string
+	Limit int
 	// BeforeID 用于翻页（游标式）。样本表只增不改，用 id 游标比 OFFSET 稳 ——
 	// OFFSET 在翻页期间有新样本写入时会漏记录。
 	BeforeID int64
@@ -109,7 +113,7 @@ const (
 // **不返回 body** —— 列表页只需要元数据，而三个 body 加起来可达 300KB+，
 // 一页 50 条就是 15MB。详情用 GetSample 单独取。
 func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
-	q := `SELECT id, ts_recv, ts_sent, ts_first_byte, ts_done,
+	q := `SELECT id, req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
 		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
 		in_method, in_path, in_query, resp_status, outcome, error, truncated, pinned
 		FROM sample WHERE 1=1`
@@ -117,6 +121,10 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 	if f.RouteID > 0 {
 		q += ` AND route_id = ?`
 		args = append(args, f.RouteID)
+	}
+	if f.ReqID != "" {
+		q += ` AND req_id = ?`
+		args = append(args, f.ReqID)
 	}
 	if f.UpstreamID > 0 {
 		q += ` AND upstream_id = ?`
@@ -153,7 +161,7 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 		var smp model.Sample
 		var outcome string
 		var trunc int
-		if err := rows.Scan(&smp.ID, &smp.TSRecv, &smp.TSSent, &smp.TSFirstByte, &smp.TSDone,
+		if err := rows.Scan(&smp.ID, &smp.ReqID, &smp.TSRecv, &smp.TSSent, &smp.TSFirstByte, &smp.TSDone,
 			&smp.Endpoint, &smp.ModelIn, &smp.ModelOut, &smp.ModelNameID, &smp.RouteID,
 			&smp.UpstreamID, &smp.InMethod, &smp.InPath, &smp.InQuery,
 			&smp.RespStatus, &outcome, &smp.Error, &trunc, &smp.Pinned); err != nil {

@@ -12,6 +12,7 @@ scenario:
     xk_only     只认 x-api-key，Bearer 返回 401
     dead        全挂：一律 503
     slow        首 Token 延迟 8 秒（测延迟测量是否准）
+    bad_gateway 一律 502（M6：可重试的失败，用来验证换站）
 """
 import json
 import sys
@@ -29,7 +30,17 @@ class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
-        sys.stderr.write("  [mock] %s %s\n" % (self.command, self.path))
+        # 把收到的鉴权头也记下来。
+        #
+        # M6 的冒烟要验证一条不变量：**A 站的 key 绝不出现在发往 B 站的
+        # 请求里**（换站重试时复用上一次的出站头就会这样）。而这件事只能
+        # 从**站这一侧**观察 —— 网关自己的样本存的是脱敏后的值，看不出
+        # 收到的到底是谁的 key。
+        #
+        # 只影响 stderr 输出，HTTP 行为一个字节都没变，所以 m2/m3 的
+        # 冒烟不受影响。
+        xk = self.headers.get("x-api-key") or "-"
+        sys.stderr.write("  [mock] %s %s key=%s\n" % (self.command, self.path, xk))
 
     # ---- helpers ----
     def _json(self, code, obj):
@@ -75,19 +86,39 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if SCENARIO == "dead":
             return self._json(503, {"error": "upstream down"})
+        # bad_gateway 只让 POST（真实转发）失败，GET /v1/models 照常成功 ——
+        # 那是 L1 探活的端点。两者都挂的话这个站会被判 dead 而被选路排除，
+        # 于是重试根本不会撞上它，而验证换站恰恰需要它被选中一次。
+        if SCENARIO == "bad_gateway" and not self.path.startswith("/v1/models"):
+            return self._json(502, {"error": "bad gateway"})
         if self.path.startswith("/v1/models"):
             return self._json(200, {"object": "list", "data": [
                 {"id": m, "object": "model"} for m in sorted(KNOWN_MODELS)]})
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        # **必须先读走请求体**，哪怕这个场景要立刻返回错误。
+        #
+        # HTTP/1.1 默认 keep-alive：不读走 body 的话，它会留在连接里，
+        # 被下一次请求当成请求行解析 —— Python 于是回 501 Unsupported
+        # method。表现为「偶尔一个请求的状态码莫名其妙」，而真正的原因
+        # 在**上一个**请求里。M6 的冒烟就是这样先记到一个假的 501 的。
+        body = self._body()
+
         if SCENARIO == "dead":
             return self._json(503, {"error": "upstream down"})
+        if SCENARIO == "bad_gateway":
+            # 502 是 §3.5 明确列为可重试的一类。响应体里回显收到的 key，
+            # 让冒烟能验证「日志与样本里的 key 都被脱敏了」——
+            # 真实中转站的鉴权错误经常这么回显。
+            return self._json(502, {"error": {
+                "type": "bad_gateway",
+                "message": "upstream unavailable, got key %s" % (
+                    self.headers.get("x-api-key") or "-")}})
         if not self._auth_ok():
             return self._json(401, {"type": "error",
                                     "error": {"type": "authentication_error",
                                               "message": "invalid api key"}})
-        body = self._body()
         model = body.get("model", "")
         p = self.path.split("?")[0]
 

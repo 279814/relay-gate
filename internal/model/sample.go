@@ -50,6 +50,14 @@ func (f TruncFlags) Has(x TruncFlags) bool { return f&x != 0 }
 type Sample struct {
 	ID int64 `json:"id"`
 
+	// ReqID 与 RequestLog 同组，便于从样本跳到「这次请求试过哪几个站」
+	// （反向亦然）。空串表示这条样本早于 M6，或请求日志被关掉了。
+	//
+	// 关联方向是「样本存 req_id」而不是「日志存 sample_id」：样本 id 由
+	// 后台 writer 落库时才分配，而日志在转发路径上就要写出去 —— 那一刻
+	// sample_id 还不存在。req_id 则是请求开始时生成的，两边同步可知。
+	ReqID string `json:"req_id"`
+
 	// 四个时间戳（Unix 毫秒）。差值即排队时长、TTFT、总时长。
 	TSRecv      int64 `json:"ts_recv"`
 	TSSent      int64 `json:"ts_sent"`

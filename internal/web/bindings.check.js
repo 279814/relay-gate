@@ -38,6 +38,7 @@ const builtins = new Set([
   'Number', 'Array', 'confirm', 'window', 'console',
   // x-for 引入的循环变量
   'r', 'u', 'm', 's', 't', 'rc', 'uc', 'c', 'e', 'i', 'v', 'n', 'x', 'p', 'k', 'd',
+  'g', 'l',
 ]);
 
 /* 抽出所有 Alpine 指令的表达式。

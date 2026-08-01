@@ -14,6 +14,17 @@ package model
 // 但实测是乐观下界（空上下文、无扩展思考），真实场景可能到分钟级，故留此余量。
 const MinRealFirstTokenSec = 300
 
+// MaxRetryAttempts 是 RetryMaxAttempts 的上限。
+//
+// 存在的理由不是「5 次刚好够」，而是防一个手滑：这个数字直接决定
+// **一次**客户端请求最多向公益站发几次完整请求（body 可达几 MB，
+// 且每次都可能真的消耗 token）。填成 100 不会报错、不会崩，只会让
+// 每个失败请求悄悄放大成 100 次上游调用 —— 而额度是花在别人的站上。
+//
+// 重试次数还有一条天然上限（试过的 Route 会被排除，最多试完所有 Route），
+// 但那取决于配置，挡不住「一个 Route 被反复……」之类的将来改动。
+const MaxRetryAttempts = 5
+
 // Settings 是全局运行配置，存在 setting 表里（单行 JSON），UI 可热改。
 //
 // 时间单位统一用秒并在字段名里标出（*Sec），避免「这个数是毫秒还是秒」的歧义——
@@ -51,14 +62,55 @@ type Settings struct {
 	PiggybackEnabled    bool `json:"piggyback_enabled"`
 	HalfOpenEnabled     bool `json:"half_open_enabled"`
 
+	// ── 请求内重试（§3.5）────────────────────────────────
+	//
+	// RetryMaxAttempts 是**总尝试次数**（含第一次），不是「额外重试几次」。
+	// 1 = 不重试。默认 3，对应 §3.5 的「最多 2 次重试」。
+	//
+	// 只用一个旋钮而不是「开关 + 次数」：两个字段表达同一件事时，
+	// enabled=true 且 attempts=1 这种自相矛盾的组合就必须有人去解释，
+	// 而它没有任何有用的语义。
+	RetryMaxAttempts int `json:"retry_max_attempts"`
+
 	// ── 样本记录（§3.6.3）────────────────────────────────
-	SampleEnabled       bool `json:"sample_enabled"`
-	SampleMaxBodyBytes  int  `json:"sample_max_body_bytes"`
-	SampleRespHeadBytes int  `json:"sample_resp_head_bytes"`
-	SampleRespTailBytes int  `json:"sample_resp_tail_bytes"`
-	SampleKeepCount     int  `json:"sample_keep_count"`
-	SampleKeepDays      int  `json:"sample_keep_days"`
-	SampleQueueSize     int  `json:"sample_queue_size"`
+	//
+	// 三个体积上限都以 **0 = 不限**（完整留档）为默认值。留档的价值恰恰在
+	// 「到底是哪些字节」—— 截断过的样本没法拿去逐字段比对，而那是 §3.6.1
+	// 给这个功能定的头号用途。
+	//
+	// 代价是磁盘与内存，且**由上游的响应大小决定**，不再由我们封顶：
+	//   - 磁盘：最坏约 keep_count × (in + out + resp)。300 条 × 单条几 MB
+	//     可以到 GB 级；靠 keep_count(300) 与 keep_days(7) 兜住。
+	//   - 内存：每个**在途**请求会在 RAM 里攒一份完整响应副本（采集用 tee）。
+	//     并发 N 路就是 N 份。
+	// 磁盘或内存吃紧时，把这三项调回非零即恢复原来的封顶行为。
+	SampleEnabled bool `json:"sample_enabled"`
+	// SampleMaxBodyBytes 是 in_body / out_body 的留档上限。0 = 不截断。
+	SampleMaxBodyBytes int `json:"sample_max_body_bytes"`
+	// SampleRespHeadBytes / SampleRespTailBytes 是响应体的留头/留尾上限。
+	// **两者同时为 0** 表示完整保留（不分头尾、不插省略标记）；
+	// 只有一个为 0 仍是有界的（例如头 0 尾 8KB = 只留最后 8KB）。
+	SampleRespHeadBytes int `json:"sample_resp_head_bytes"`
+	SampleRespTailBytes int `json:"sample_resp_tail_bytes"`
+	SampleKeepCount     int `json:"sample_keep_count"`
+	SampleKeepDays      int `json:"sample_keep_days"`
+	SampleQueueSize     int `json:"sample_queue_size"`
+
+	// ── 请求日志（M6）──────────────────────────────────────
+	//
+	// 与样本是**两套独立的旋钮**，不共用。样本一条可达几 MB（现在不封顶），
+	// 日志一行几百字节 —— 共用一个 keep_count 会让「多留点日志」的代价
+	// 变成磁盘翻 GB，于是没人敢调大它。
+	//
+	// 日志也不跟着 sample_enabled 关：它是判断「重试策略有没有用」的唯一
+	// 依据，而那个判断恰恰在样本被关掉、只留统计的场景下最需要。
+	RequestLogEnabled bool `json:"request_log_enabled"`
+	// RequestLogKeepCount 按**客户端请求**计（一组尝试算一条），不是按行。
+	// 按行的话，「保留 1000 条」在重试频繁时只能覆盖 300 多次请求，
+	// 而覆盖多久完全取决于故障率 —— 一个说不清含义的数字。
+	RequestLogKeepCount int `json:"request_log_keep_count"`
+	RequestLogKeepDays  int `json:"request_log_keep_days"`
+	RequestLogQueueSize int `json:"request_log_queue_size"`
 }
 
 // DefaultSettings 返回 §4.2 超时矩阵与 §3.6.3 样本上限的默认值。
@@ -91,13 +143,23 @@ func DefaultSettings() Settings {
 		PiggybackEnabled:    true,
 		HalfOpenEnabled:     true,
 
+		RetryMaxAttempts: 3, // 初次 + 最多 2 次重试（§3.5）
+
 		SampleEnabled:       true,
-		SampleMaxBodyBytes:  256 * 1024,
-		SampleRespHeadBytes: 64 * 1024,
-		SampleRespTailBytes: 8 * 1024,
-		SampleKeepCount:     500,
+		SampleMaxBodyBytes:  0, // 0 = 不截断，完整保留入站与出站请求体
+		SampleRespHeadBytes: 0, // 0 = 完整保留响应（不再分头尾）
+		SampleRespTailBytes: 0,
+		SampleKeepCount:     300, // 从 500 降至 300
 		SampleKeepDays:      7,
 		SampleQueueSize:     256,
+
+		// 日志比样本留得多得多：一行几百字节，5000 条客户端请求
+		// 也就几 MB，而「最近一周的重试到底有没有用」需要足够的样本量
+		// 才算得出有意义的比例。
+		RequestLogEnabled:   true,
+		RequestLogKeepCount: 5000,
+		RequestLogKeepDays:  7,
+		RequestLogQueueSize: 512,
 	}
 }
 
@@ -131,18 +193,42 @@ func (s *Settings) Validate() error {
 		{"ok_threshold", s.OKThreshold},
 		{"cooldown_sec", s.CooldownSec},
 		{"global_l2_concurrency", s.GlobalL2Concurrency},
-		{"sample_max_body_bytes", s.SampleMaxBodyBytes},
+		// sample_max_body_bytes **不在**这里：它的 0 是「不截断」，是当前的
+		// 默认值。归进正数校验会让默认配置自己校验不过 —— 保存一次设置就
+		// 400，而且错误信息还说「必须为正数」，完全指错方向。
+		// 它的下限（不为负）在下面与另两个体积上限一起判。
 		{"sample_keep_count", s.SampleKeepCount},
 		{"sample_keep_days", s.SampleKeepDays},
 		{"sample_queue_size", s.SampleQueueSize},
+		// 1 = 不重试。0 会让重试循环一次都不发，那不是「关闭重试」而是
+		// 「关闭转发」—— 归进这个统一的正数校验，不单开一条。
+		{"retry_max_attempts", s.RetryMaxAttempts},
+		// 日志的三项都必须为正。这里的 0 没有「不限」的语义 ——
+		// 关日志用 request_log_enabled，而保留 0 条日志等于开着功能却
+		// 把刚写的行立刻删掉，那不是任何人想要的配置。
+		{"request_log_keep_count", s.RequestLogKeepCount},
+		{"request_log_keep_days", s.RequestLogKeepDays},
+		{"request_log_queue_size", s.RequestLogQueueSize},
 	}
 	for _, p := range positives {
 		if p.val < 1 {
 			return invalid("%s 必须为正数，收到 %d", p.name, p.val)
 		}
 	}
-	if s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
-		return invalid("sample_resp_head_bytes / sample_resp_tail_bytes 不能为负")
+	if s.RetryMaxAttempts > MaxRetryAttempts {
+		return invalid("retry_max_attempts 不得超过 %d，收到 %d。"+
+			"它是一次客户端请求最多向上游发几次完整请求（每次都可能真的消耗 token），"+
+			"填大不会报错，只会让每个失败请求悄悄放大成同样多次上游调用",
+			MaxRetryAttempts, s.RetryMaxAttempts)
+	}
+	// 三个体积上限：0 = 不限（完整留档），负数无意义。
+	//
+	// 不设**上限**是刻意的：这几个值的作用就是封顶，给封顶再封一层顶
+	// 只会让「我要完整留档」这个明确的意图变成一个需要绕过的限制。
+	// 磁盘由 sample_keep_count / sample_keep_days 兜住。
+	if s.SampleMaxBodyBytes < 0 || s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
+		return invalid("sample_max_body_bytes / sample_resp_head_bytes / " +
+			"sample_resp_tail_bytes 不能为负（0 表示不限，即完整留档）")
 	}
 
 	// 总时长必须容得下首 Token，否则总超时会先触发，首 Token 超时形同虚设。

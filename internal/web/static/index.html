@@ -353,6 +353,134 @@
           </div>
         </template>
 
+        <!-- ── 请求日志（M6 诊断视图）──────────────────────── -->
+        <template x-if="tab === 'reqlogs'">
+          <div>
+            <div class="bar">
+              <strong>请求日志</strong>
+              <span class="dim" x-text="`共 ${reqLogsTotal} 行（每次尝试一行）`"></span>
+              <span class="grow"></span>
+              <select x-model="logFilter.outcome" @change="loadReqLogs()">
+                <option value="">全部结果</option>
+                <option value="ok">ok</option>
+                <option value="upstream_error">upstream_error</option>
+                <option value="timeout">timeout</option>
+                <option value="fake_alive">fake_alive</option>
+                <option value="client_abort">client_abort</option>
+              </select>
+              <label class="check">
+                <input type="checkbox" x-model="logFilter.retriedOnly" @change="loadReqLogs()">
+                只看重试过的
+              </label>
+              <button @click="loadReqLogs()">刷新</button>
+              <button class="danger" @click="clearReqLogs()">清空</button>
+            </div>
+
+            <!-- 重试统计：这是整张表存在的理由 —— 回答「重试到底有没有用」。
+                 救回来的次数是唯一能证明它有价值的数字。 -->
+            <div class="cards" x-show="retryStats">
+              <div class="card">
+                <h3>客户端请求</h3>
+                <div class="v" x-text="retryStats?.requests ?? 0"></div>
+                <div class="sub">近 24 小时</div>
+              </div>
+              <div class="card">
+                <h3>重试过的</h3>
+                <div class="v" x-text="retryStats?.retried ?? 0"></div>
+                <div class="sub" x-text="retriedPct()"></div>
+              </div>
+              <div class="card">
+                <h3>重试救回来的</h3>
+                <div class="v" x-text="retryStats?.rescued_by_retry ?? 0"></div>
+                <div class="sub">首次失败、换站后成功。这个数字是重试的全部价值</div>
+              </div>
+              <div class="card">
+                <h3>重试后仍失败</h3>
+                <div class="v" x-text="retryStats?.failed_after_retry ?? 0"></div>
+                <div class="sub">换过站还是不行 —— 多半是所有站同时不可用</div>
+              </div>
+              <div class="card">
+                <h3>尝试总数</h3>
+                <div class="v" x-text="retryStats?.attempts ?? 0"></div>
+                <div class="sub">比请求数多出的部分就是重试的额外开销</div>
+              </div>
+            </div>
+
+            <!-- 丢弃计数必须显示：丢掉的日志会让上面的统计偏低（分母少了），
+                 而一个不知道自己不准的数字比没有数字更糟。 -->
+            <div class="empty" x-show="(runtime.request_logs_dropped ?? 0) > 0">
+              有 <strong x-text="runtime.request_logs_dropped"></strong> 行日志因队列满被丢弃，
+              上面的统计据此偏低。调大「设置」页的「日志队列容量」（改这个要重启）。
+            </div>
+
+            <table>
+              <thead>
+                <tr><th>时间</th><th>请求</th><th>尝试</th><th>上游</th><th>模型</th>
+                    <th>结果</th><th>状态</th><th>TTFT</th><th></th></tr>
+              </thead>
+              <tbody>
+                <template x-for="g in logGroups()" :key="g.req_id">
+                  <template x-for="(l, i) in g.rows" :key="l.id">
+                    <tr :class="i > 0 ? 'attempt-sub' : ''" x-show="i === 0 || expandedLogs[g.req_id]">
+                      <td class="nowrap dim" x-text="i === 0 ? fmtTime(l.ts_recv) : ''"></td>
+                      <td class="mono dim" x-text="i === 0 ? l.req_id.slice(0, 8) : ''"></td>
+                      <!-- 第几次 / 共几次。一眼能看出这行是被丢弃的那次还是最终那次 -->
+                      <td class="num nowrap">
+                        <span x-text="`${l.attempt}/${l.attempts}`"></span>
+                        <span class="tag err" x-show="l.retried" title="这次尝试被丢弃并换了站">换站</span>
+                        <span class="tag unknown" x-show="l.half_open" title="全部站 dead 时的试探（§4.4c）">半开</span>
+                      </td>
+                      <td x-text="l.upstream_name || upName(l.upstream_id)"></td>
+                      <td class="mono">
+                        <span x-text="l.model_in"></span>
+                        <span class="dim" x-show="l.model_out && l.model_out !== l.model_in"
+                              x-text="' → ' + l.model_out"></span>
+                      </td>
+                      <td><span class="tag" :class="outcomeClass(l.outcome)" x-text="l.outcome"></span></td>
+                      <td class="num" x-text="l.resp_status || '—'"></td>
+                      <td class="num" x-text="l.ttft_ms ? l.ttft_ms + 'ms' : '—'"></td>
+                      <td class="nowrap">
+                        <button class="sm" x-show="i === 0 && g.rows.length > 1"
+                                @click="toggleLog(g.req_id)"
+                                x-text="expandedLogs[g.req_id] ? '收起' : `展开 ${g.rows.length} 次`"></button>
+                        <button class="sm" x-show="i === 0" @click="openLogSample(g.req_id)">样本</button>
+                      </td>
+                    </tr>
+                  </template>
+                </template>
+                <tr x-show="!reqLogs.length">
+                  <td colspan="9" class="empty">
+                    还没有日志。日志在转发发生时才产生，且需要「设置」页的
+                    「记录请求日志」打开。它与样本是<b>两份独立的</b>记录：
+                    样本存字节，日志存「这次请求经历了什么」。
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <!-- 失败原因单独列出来。表格里那一列放不下完整的错误文本，
+                 而错误原文恰恰是排查时最有用的东西（后端刻意写给人看的）。 -->
+            <div x-show="failedLogs().length" style="margin-top:14px">
+              <h3 style="font-size:13px;margin:0 0 8px">失败详情</h3>
+              <table>
+                <thead>
+                  <tr><th>请求</th><th>上游</th><th>原因</th></tr>
+                </thead>
+                <tbody>
+                  <template x-for="l in failedLogs()" :key="l.id">
+                    <tr>
+                      <td class="mono dim nowrap"
+                          x-text="l.req_id.slice(0, 8) + ' #' + l.attempt"></td>
+                      <td class="nowrap" x-text="l.upstream_name || upName(l.upstream_id)"></td>
+                      <td class="mono" x-text="l.error"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </template>
+
         <!-- ── 探活成本 ─────────────────────────────────────── -->
         <template x-if="tab === 'cost'">
           <div>
@@ -554,31 +682,77 @@
                   </div>
                 </div>
 
+                <h3 style="font-size:13px;margin:18px 0 8px">请求内重试（§3.5）</h3>
+                <div class="row">
+                  <div class="field">
+                    <label>最大尝试次数</label>
+                    <input type="number" min="1" :max="limits.max_retry_attempts || 5"
+                           x-model.number="settings.retry_max_attempts">
+                    <div class="note"
+                         x-text="`含第一次，填 1 = 不重试。上限 ${limits.max_retry_attempts || 5} —— 这是一次客户端请求最多向上游发几次完整请求，每次都可能真的消耗 token`"></div>
+                  </div>
+                </div>
+
+                <h3 style="font-size:13px;margin:18px 0 8px">请求日志</h3>
+                <div class="note" style="margin-bottom:10px">
+                  与样本是<b>两份独立的</b>记录，开关也分开：样本存「发出去的是哪些字节」，
+                  日志存「这次请求试了几个站、为什么换、最后有没有救回来」。
+                  样本关掉时日志照记 —— 那恰恰是最需要日志的场景。
+                </div>
+                <div class="row" style="margin-bottom:10px">
+                  <label class="check">
+                    <input type="checkbox" x-model="settings.request_log_enabled"> 记录请求日志
+                  </label>
+                </div>
+                <div class="row">
+                  <div class="field">
+                    <label>保留条数</label>
+                    <input type="number" min="1" x-model.number="settings.request_log_keep_count">
+                    <div class="note">按<b>客户端请求</b>计（一组尝试算一条），不是按行。清理时整组一起删</div>
+                  </div>
+                  <div class="field">
+                    <label>保留天数</label>
+                    <input type="number" min="1" x-model.number="settings.request_log_keep_days">
+                    <div class="note">与条数取先到者</div>
+                  </div>
+                  <div class="field">
+                    <label>队列容量</label>
+                    <input type="number" min="1" x-model.number="settings.request_log_queue_size">
+                    <div class="note">改这个要重启。队列满时静默丢弃，丢弃数显示在「请求日志」页顶部</div>
+                  </div>
+                </div>
+
                 <h3 style="font-size:13px;margin:18px 0 8px">样本记录</h3>
                 <div class="row" style="margin-bottom:10px">
                   <label class="check"><input type="checkbox" x-model="settings.sample_enabled"> 记录样本</label>
                 </div>
+                <div class="note" style="margin-bottom:10px">
+                  三个体积上限填 <b>0 = 不限</b>（完整留档，当前默认）。完整留档才能拿去逐字节比对，
+                  代价是磁盘与内存随上游响应大小增长 —— 吃紧时填回非零即恢复封顶。
+                </div>
                 <div class="row">
                   <div class="field">
                     <label>body 上限 (B)</label>
-                    <input type="number" x-model.number="settings.sample_max_body_bytes">
-                    <div class="note">只截断留档的副本，转发的 body 仍是完整的</div>
+                    <input type="number" min="0" x-model.number="settings.sample_max_body_bytes">
+                    <div class="note">0 = 完整保留入站/出站请求体。只影响留档的副本，转发的 body 一直是完整的</div>
                   </div>
                   <div class="field">
                     <label>响应头部留存 (B)</label>
-                    <input type="number" x-model.number="settings.sample_resp_head_bytes">
+                    <input type="number" min="0" x-model.number="settings.sample_resp_head_bytes">
+                    <div class="note">与尾部<b>同时</b>为 0 = 完整保留响应</div>
                   </div>
                   <div class="field">
                     <label>响应尾部留存 (B)</label>
-                    <input type="number" x-model.number="settings.sample_resp_tail_bytes">
+                    <input type="number" min="0" x-model.number="settings.sample_resp_tail_bytes">
                   </div>
                   <div class="field">
                     <label>保留条数</label>
-                    <input type="number" x-model.number="settings.sample_keep_count">
+                    <input type="number" min="1" x-model.number="settings.sample_keep_count">
+                    <div class="note">与天数取先到者。不限体积时，这是磁盘的主要闸门</div>
                   </div>
                   <div class="field">
                     <label>保留天数</label>
-                    <input type="number" x-model.number="settings.sample_keep_days">
+                    <input type="number" min="1" x-model.number="settings.sample_keep_days">
                   </div>
                   <div class="field">
                     <label>队列容量</label>

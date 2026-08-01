@@ -25,8 +25,13 @@ func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 		RouteID:    num("route_id"),
 		UpstreamID: num("upstream_id"),
 		Outcome:    model.Outcome(q.Get("outcome")),
-		Limit:      int(num("limit")),
-		BeforeID:   num("before_id"),
+		// req_id 让「从日志跳到样本」成为一次精确查询（M6，§3.7.3）。
+		//
+		// 少了它，前端只能拉一页回来自己找 —— 而那对「比最近一页更早的
+		// 请求」会**静默找不到**，正是排查历史故障时要点的那些。
+		ReqID:    q.Get("req_id"),
+		Limit:    int(num("limit")),
+		BeforeID: num("before_id"),
 	}
 	// 参数写错了要说出来。静默当成 0 的话，?before_id=abc 会从头开始返回，
 	// 看着像「翻页转了一圈」，而真正的原因是那个 typo。

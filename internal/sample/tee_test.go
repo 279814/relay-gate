@@ -230,19 +230,71 @@ func TestHeadTail_OverlapWithChunkedWrites(t *testing.T) {
 	}
 }
 
-// 零配置不能 panic。head=0 是「只留尾」的合法配置。
-func TestHeadTail_ZeroSizes(t *testing.T) {
+// 两者同时为 0 = 完整保留（当前的默认配置）。
+//
+// 这条曾经断言的是相反的行为（「全零应几乎不留内容」）。语义是刻意改的：
+// 默认值改成了完整留档，而 0 是它的表达方式。若这里仍按「不留」实现，
+// 默认配置下 resp_body 会**恒为空** —— 样本表照常长出几百行，
+// 每行的响应体都是空的，而且不报错。
+func TestHeadTail_ZeroSizesMeansFull(t *testing.T) {
 	ht := NewHeadTail(0, 0)
-	ht.Write([]byte("anything at all"))
-	if got := ht.Bytes(); len(got) > 64 {
-		t.Errorf("全零配置应几乎不留内容，得到 %d 字节", len(got))
+	const data = "event: message_start\ndata: {\"usage\":{\"output_tokens\":42}}\n\n"
+	ht.Write([]byte(data))
+
+	if string(ht.Bytes()) != data {
+		t.Errorf("全零应完整保留，want %q got %q", data, ht.Bytes())
 	}
-	if ht.Total() != 15 {
-		t.Errorf("Total 仍应统计流经字节，得到 %d", ht.Total())
+	if ht.Truncated() {
+		t.Error("完整保留时不该标记截断")
+	}
+	if ht.Total() != int64(len(data)) {
+		t.Errorf("Total 应为 %d，得到 %d", len(data), ht.Total())
 	}
 
-	// 负数按 0 处理，不能 panic
-	NewHeadTail(-1, -1).Write([]byte("x"))
+	// 负数按 0 处理，等同完整保留，且不能 panic
+	neg := NewHeadTail(-1, -1)
+	neg.Write([]byte("xyz"))
+	if string(neg.Bytes()) != "xyz" {
+		t.Errorf("负数应按 0（完整）处理，得到 %q", neg.Bytes())
+	}
+}
+
+// 完整模式下分块写入要按顺序拼回去，且大流不丢字节。
+func TestHeadTail_FullModeAcrossChunks(t *testing.T) {
+	ht := NewHeadTail(0, 0)
+	var want []byte
+	for i := 0; i < 500; i++ {
+		chunk := []byte(strings.Repeat(string(rune('a'+i%26)), 300))
+		ht.Write(chunk)
+		want = append(want, chunk...)
+	}
+	if !bytes.Equal(ht.Bytes(), want) {
+		t.Errorf("完整模式应无损，want %d 字节 got %d 字节", len(want), len(ht.Bytes()))
+	}
+	if ht.Truncated() {
+		t.Error("完整模式永不截断")
+	}
+}
+
+// head=0 但 tail>0 仍是**有界**的「只留尾」，不能被当成不限。
+//
+// 这条钉的是 full 标志为什么不能写成 headMax==0：混为一谈的话，
+// 一个想「只留最后 8KB」的配置会静默变成「全留」，而症状是内存慢慢涨。
+func TestHeadTail_HeadZeroWithTailIsStillBounded(t *testing.T) {
+	ht := NewHeadTail(0, 16)
+	ht.Write([]byte(strings.Repeat("A", 100) + "TAIL-0123456789x"))
+
+	if !ht.Truncated() {
+		t.Error("head=0 tail=16 是有界配置，超出应标记截断")
+	}
+	got := ht.Bytes()
+	if !bytes.HasSuffix(got, []byte("TAIL-0123456789x")) {
+		t.Errorf("应保留最后 16 字节，得到 %q", got)
+	}
+	// 省略标记之外不该有别的内容 —— head 是 0
+	if bytes.Contains(got, bytes.Repeat([]byte("A"), 20)) {
+		t.Errorf("head=0 不该留头部内容，得到 %q", got)
+	}
 }
 
 // Write 永不返回错误：采集是旁路，它的失败不该以任何形式传播到转发路径。

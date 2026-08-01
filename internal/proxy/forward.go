@@ -171,12 +171,79 @@ type Forwarder struct {
 	RespTee io.Writer
 }
 
+// Attempt 是一次**尚未提交**的转发：请求已发出、响应头已拿到，
+// 但一个字节都还没写给客户端。
+//
+// 为什么需要这个中间状态：§3.5 要求「仅在尚未向客户端写出任何字节时才能
+// 重试」，而原先的 Forward 一拿到响应头就 WriteHeader —— 状态码一旦发出，
+// 5xx 与 429 就再没法换站重试了，而那两类恰好是 §3.5 明确列为可重试的。
+// 把「拿到响应」与「提交给客户端」拆成两步，重试才有可能。
+//
+// 调用方**必须**恰好调用 Commit 或 Discard 之一。两者都负责释放这次尝试
+// 占用的 context 与连接：漏掉就是泄一个 goroutine 加一条连接，而这种泄漏
+// 只在压力下才显形（连接池耗尽），届时很难回溯到这里。
+type Attempt struct {
+	f         *Forwarder
+	resp      *http.Response
+	res       *Result
+	cancel    context.CancelFunc
+	ctx       context.Context // 带 Total 超时
+	clientCtx context.Context // 客户端原始 ctx，用于区分「谁的时限到了」
+	done      bool
+
+	// peeked 是 Peek 预读到的响应体前缀，Commit 时原样重放给客户端。
+	peeked   []byte
+	peekDone bool
+	// peekBroke 表示预读阶段就确定这次响应没有可提交的内容
+	// （首 Token 超时，或上游一个字节都没吐就断开）。
+	peekBroke bool
+}
+
+// Failed 表示这次尝试没有可用的响应。
+//
+// 两种情形：连响应头都没拿到，或者 Peek 发现响应体根本没开始。
+// 两者都只能 Discard。
+func (at *Attempt) Failed() bool { return at.res.Err != nil }
+
+// CanCommit 表示这次尝试还有东西可以交给客户端。
+//
+// 与 Failed 不是简单的反面：一个 HTTP 500、甚至一个「200 但载荷是错误」
+// 都是**可以提交**的 —— 上游的错误原文对客户端有用，§3.3 也要求响应
+// 方向原样透传。只有连响应体都没开始的那种失败才没有可提交的内容。
+func (at *Attempt) CanCommit() bool { return at.resp != nil && !at.peekBroke }
+
+// Status 是上游响应状态码。Failed 时为 0。
+func (at *Attempt) Status() int { return at.res.Status }
+
+// Result 取这次尝试的结果。Commit 之前它只填到响应头那一层，
+// 供重试判定使用（判定只看状态码与错误，不看 body）。
+func (at *Attempt) Result() *Result { return at.res }
+
 // Forward 把请求投递到 cand 指定的上游，响应流式写回 w。
 //
 // body 必须是已经过 ReplaceModel 处理的字节。header 必须是
 // PrepareOutboundHeaders 的产物。
+//
+// 这是 Send + Commit 的薄封装。保留它是因为「不重试」的调用方
+// （count_tokens、既有测试、重试关闭时的转发）不需要关心提交时机 ——
+// 让它们跟着一起改成两步调用，只会把一个内部细节摊给所有人。
 func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	method, outURL string, header http.Header, body []byte) *Result {
+
+	at := f.Send(ctx, method, outURL, header, body)
+	if at.Failed() {
+		at.Discard()
+		return at.res
+	}
+	return at.Commit(w)
+}
+
+// Send 发出请求并等到响应头，**不**写任何东西给客户端。
+//
+// 返回的 Attempt 一定非 nil，即使失败 —— 失败时 Failed() 为 true，
+// 调用方照样要 Discard（它负责释放 context）。
+func (f *Forwarder) Send(ctx context.Context, method, outURL string,
+	header http.Header, body []byte) *Attempt {
 
 	res := &Result{}
 
@@ -185,15 +252,18 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	clientCtx := ctx
 
 	// 总超时是最外层的兜底。首 Token 与 Idle 在读循环里单独控制。
+	//
+	// cancel 不在这里 defer：它要活到 Commit/Discard —— 提交之后响应体
+	// 还在读，提前取消会把一个正常的流掐断。
 	ctx, cancel := context.WithTimeout(ctx, f.Timeouts.Total)
-	defer cancel()
+	at := &Attempt{f: f, res: res, cancel: cancel, ctx: ctx, clientCtx: clientCtx}
 
 	// bytes.NewReader 而不是 strings.NewReader(string(body))：
 	// 后者会把整个 body 复制一遍，而 body 可能有几百 KB 到 MB。
 	req, err := http.NewRequestWithContext(ctx, method, outURL, bytes.NewReader(body))
 	if err != nil {
 		res.Err = fmt.Errorf("构造出站请求: %w", err)
-		return res
+		return at
 	}
 	req.Header = header
 	// ContentLength 显式设置，避免 http 库改用 chunked ——
@@ -222,36 +292,218 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	defer headerTimer.Stop()
 
 	res.SentAt = time.Now()
+	// 直接用 Transport.RoundTrip 而不是 http.Client。除了「不要自动跟随
+	// 重定向」之外还有一条不显然的理由：Client.Do 会把错误包成 *url.Error，
+	// 而它的 Error() 带上**完整 URL** —— full_url_mode 的 base_url 允许把
+	// key 放在 query 里（§3.2），那就等于把上游 key 拼进错误文本。
+	// writeForwardError 已对此做了脱敏兜底，两层都在。
 	resp, err := f.Transport.RoundTrip(req)
 	headerTimer.Stop()
 	if err != nil {
 		res.Err = classifyTransportErr(err, clientCtx, headerTimedOut.Load(), f.Timeouts.FirstToken)
 		res.DoneAt = time.Now()
-		return res
+		return at
 	}
-	defer resp.Body.Close()
 
 	res.Status = resp.StatusCode
 	res.RespHeaders = resp.Header.Clone()
+	at.resp = resp
+	return at
+}
+
+// peekLimit 是预读缓冲的上限。
+//
+// 32KB 与 streamBody 的读缓冲同大小：预读拿的是「上游已经 flush 出来的
+// 那一段」，不该比一次正常的读多要。
+const peekLimit = 32 << 10
+
+// Peek 预读响应体开头的一段，让调用方能在提交前判断这是不是错误载荷
+// （§3.5 的「200 但流内立刻 error」）。返回已读到的前缀。
+//
+// **只做一次 Read**，不循环凑满 peekLimit。这一条是硬要求：SSE 的下一个
+// chunk 可能在几十秒之后（模型正在思考），凑满缓冲就等于把这段思考时间
+// 变成客户端的首字节延迟 —— 而首字节延迟正是这个项目要优化的东西。
+// 一次 Read 只拿上游已经吐出来的内容，等于零额外等待。
+//
+// 代价是前缀可能被 TCP 分段切在半截。classifyPayload 对切碎的处理是
+// 「解析不了就放行」，所以最坏结果是退化成不重试，不会误判。
+//
+// 预读的字节由 Commit 原样重放，不会丢。多次调用只读一次。
+func (at *Attempt) Peek() []byte {
+	if at.peekDone || at.resp == nil {
+		return at.peeked
+	}
+	at.peekDone = true
+	res, f := at.res, at.f
+
+	// 首 Token 时限与断流唤醒，与 streamBody 用同一套手段：关响应体来
+	// 解开阻塞的 Read（拿不到底层 net.Conn，设不了 ReadDeadline）。
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(f.Timeouts.FirstToken, func() {
+		timedOut.Store(true)
+		_ = at.resp.Body.Close()
+	})
+	defer timer.Stop()
+
+	peekDone := make(chan struct{})
+	defer close(peekDone)
+	go func() {
+		select {
+		case <-at.ctx.Done():
+			_ = at.resp.Body.Close()
+		case <-peekDone:
+		}
+	}()
+
+	buf := make([]byte, peekLimit)
+	n, err := at.resp.Body.Read(buf)
+	if n > 0 {
+		at.peeked = buf[:n]
+		res.FirstByteAt = time.Now()
+		if f.OnFirstByte != nil {
+			f.OnFirstByte()
+		}
+	}
+
+	// n > 0 时一律算拿到了内容，即使同时带回 EOF —— 那是「短响应一次读完」
+	// 的正常形态，Commit 重放前缀后再读一次拿到 EOF 即可。
+	if n > 0 || err == nil {
+		return at.peeked
+	}
+
+	// EOF 且零字节：200 但 body 为空。这是「假活」（§4.3），不是断流 ——
+	// 它不在 §3.5 的可重试清单里，所以照常提交，由 classifyOutcome
+	// 归成 fake_alive。不在这里判错，否则会把一个已有分类的情形
+	// 悄悄改成 upstream_error。
+	if errors.Is(err, io.EOF) {
+		return at.peeked
+	}
+
+	// 走到这里：一个字节都没读到就出错了，没有任何可提交的内容。
+	// 分类与 streamBody 保持一致 —— 两处判据不同的话，同一个故障
+	// 在「有没有预读」两条路径上会得到不同的健康结论。
+	at.peekBroke = true
+	res.DoneAt = time.Now()
+	switch {
+	case timedOut.Load():
+		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.FirstToken)
+	case at.clientCtx.Err() != nil:
+		res.Err = fmt.Errorf("%w: %v", ErrCanceled, err)
+	case at.ctx.Err() != nil:
+		res.Err = fmt.Errorf("%w: 超过总时限 %v", ErrTotalTimeout, f.Timeouts.Total)
+	default:
+		res.Err = fmt.Errorf("%w: %v", ErrUpstreamBroke, err)
+	}
+	return nil
+}
+
+// Commit 把这次尝试的响应头与响应体写给客户端。
+//
+// 一旦调用就再也不能重试了 —— 状态码已经发出去。
+func (at *Attempt) Commit(w http.ResponseWriter) *Result {
+	if at.done {
+		return at.res // 防御：重复提交，不该发生
+	}
+	at.done = true
+	defer at.cancel()
+	defer at.resp.Body.Close()
+
+	res, f := at.res, at.f
 
 	// 响应头原样回传。ReverseProxy 会做的逐跳清理这里手动做一次。
 	dst := w.Header()
-	for k, vs := range resp.Header {
+	for k, vs := range at.resp.Header {
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
 	}
 	StripHopByHopResponse(dst)
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 
-	n, err := f.streamBody(ctx, clientCtx, w, resp.Body, resp.Body, res)
+	// 预读走的字节要接回流的最前面。漏掉它就是**静默吞掉响应的开头** ——
+	// 客户端收到的 SSE 少了 message_start，或 JSON 少了左半边。
+	var src io.Reader = at.resp.Body
+	if len(at.peeked) > 0 {
+		src = io.MultiReader(bytes.NewReader(at.peeked), at.resp.Body)
+	}
+
+	n, err := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if err != nil && res.Err == nil {
 		res.Err = err
 	}
 	return res
+}
+
+// Discard 放弃这次尝试：不向客户端写任何东西，释放连接与 context。
+//
+// 失败的尝试（连响应头都没拿到）也要走这里 —— context 是在 Send 里建的，
+// 不 cancel 就会留到 Total 超时才回收。
+//
+// 主动读掉一小段 body 再关：不读就关会让这条 TCP 连接被丢弃而不是还回
+// 连接池（net/http 只在 body 读到 EOF 后才复用连接）。重试场景下这个差别
+// 是实际的 —— 每次换站重试都白扔一条连接，握手成本翻倍。
+// 上限 4KB：错误响应通常只有几百字节，读满还没结束就说明这不是一个错误
+// 响应体，那就直接关，别为了复用连接去读一个可能很长的流。
+func (at *Attempt) Discard() {
+	if at.done {
+		return
+	}
+	at.done = true
+	defer at.cancel()
+	if at.resp == nil {
+		return // Send 就失败了，没有 body 可关
+	}
+
+	// 排水读到的字节**不能真的丢掉** —— 被丢弃的错误响应，它的 body 正是
+	// 健康判定要看的东西。
+	//
+	// 正常路径上 ErrBody 由 streamBody 填，但重试丢弃的尝试永远走不到那里。
+	// 少了这份 body，ClassifyHTTP 只能看状态码 —— 而「500 + body 里写着
+	// rate limit」（Anthropic 的 529 overloaded 就是这个形态）会因此被判成
+	// Unavailable 而累计判死，本该只是冷却 60 秒。一个热门的好站会就这样
+	// 被踢出池子。
+	//
+	// 这里**不会多读一个字节**：为了让连接还回池子，这段排水本来就要做。
+	// 只是把目的地从 io.Discard 换成一个缓冲区，所以阻塞行为与之前完全一致。
+	at.captureDrain()
+	at.resp.Body.Close()
+	if at.res.DoneAt.IsZero() {
+		at.res.DoneAt = time.Now()
+	}
+}
+
+const discardDrainLimit = 4 << 10
+
+// captureDrain 排掉剩余 body（让连接能还回池子），顺带把错误响应的开头
+// 留给健康判定。
+//
+// 上限与正常路径共用 maxErrBodyCapture：两处不一致的话，同一个上游错误
+// 在「有没有走重试」两条路径上会给出不同长度的 last_error，
+// 而那正是 UI 上用来比对的字段。
+func (at *Attempt) captureDrain() {
+	// 只有错误响应才留。被丢弃的 200（载荷是 error）走不到健康判定的
+	// ErrBody 分支，攒了也没人看。
+	if at.res.Status < 400 || len(at.res.ErrBody) > 0 {
+		io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
+		return
+	}
+
+	// 预读已经拿到的部分先接上。4xx/5xx 通常没走 Peek —— 为一个注定不重试
+	// 的 4xx 等一次首 Token 超时是白等，所以那条路径上 peeked 是空的。
+	at.res.ErrBody = at.peeked
+
+	var buf bytes.Buffer
+	io.CopyN(&buf, at.resp.Body, discardDrainLimit)
+	room := maxErrBodyCapture - len(at.res.ErrBody)
+	if b := buf.Bytes(); room > 0 && len(b) > 0 {
+		if len(b) > room {
+			b = b[:room]
+		}
+		at.res.ErrBody = append(at.res.ErrBody, b...)
+	}
 }
 
 // streamBody 逐块拷贝响应体，并在首字节前后应用不同的超时。
@@ -308,7 +560,11 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 		n, err := src.Read(buf)
 
 		if n > 0 {
-			if total == 0 {
+			// FirstByteAt 可能已由 Peek 填过。不能覆盖：Commit 重放的是
+			// **早先**读到的字节，用此刻的时间会把 TTFT 记成「预读到提交」
+			// 的间隔（几微秒），于是所有经过预读的请求都报出一个假的超快
+			// TTFT —— 而它会经 last_ttft_ms 显示在管理界面上。
+			if res.FirstByteAt.IsZero() {
 				res.FirstByteAt = time.Now()
 				if f.OnFirstByte != nil {
 					f.OnFirstByte()

@@ -303,6 +303,13 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 	if !got.SampleEnabled {
 		t.Error("缺失的 bool 也应回落默认（true）")
 	}
+	// M6 新增项走的是同一条合并路径，但它的 0 值后果特别：
+	// retry_max_attempts=0 不是「关闭重试」，而是「一次都不发」——
+	// 升级后所有转发直接失败。这条单独断言一次。
+	if got.RetryMaxAttempts != 3 {
+		t.Errorf("升级时缺失的 retry_max_attempts 应回落默认 3，得到 %d"+
+			"（若为 0，升级后每个请求都不会发出任何尝试）", got.RetryMaxAttempts)
+	}
 }
 
 func TestRunStatePersistence(t *testing.T) {

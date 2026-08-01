@@ -19,6 +19,14 @@ type runtimeInfo struct {
 	// 会变成一个无从下手的疑问 —— 而它其实有确切答案。
 	SamplesWritten int64 `json:"samples_written"`
 	SamplesDropped int64 `json:"samples_dropped"`
+
+	// RequestLogs* 是请求日志的落库/丢弃计数（M6）。
+	//
+	// dropped 在这里比样本更要紧：丢掉的日志会让重试统计**偏低**
+	// （分母少了几次请求），而那个统计正是用来决定「要不要保留重试」的。
+	// 一个不知道自己不准的数字比没有数字更糟 —— 后者至少不会误导决策。
+	RequestLogsWritten int64 `json:"request_logs_written"`
+	RequestLogsDropped int64 `json:"request_logs_dropped"`
 }
 
 func (s *Server) getRuntime(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +36,9 @@ func (s *Server) getRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.samples != nil {
 		out.SamplesWritten, out.SamplesDropped = s.samples.Stats()
+	}
+	if s.reqLogs != nil {
+		out.RequestLogsWritten, out.RequestLogsDropped = s.reqLogs.Stats()
 	}
 	writeJSON(w, http.StatusOK, out)
 }
