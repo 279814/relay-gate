@@ -12,6 +12,14 @@ docker-compose.yml text eol=lf
 go.mod text eol=lf
 go.sum text eol=lf
 
+# 前端资源（M5）。go:embed 本身不在意行尾，但 alpine.min.js 是**第三方
+# 原样收录**的文件 —— CRLF 转换会改变它的字节与哈希，想核对「打进二进制的
+# 是不是官方发布的那个」时就对不上了。同目录的其余文件一并统一，
+# 免得 diff 里混着两种行尾。
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+
 # PowerShell 脚本只在 Windows 上跑，CRLF 是它的原生行尾。
 # 显式写出来，免得以后误以为是漏了一条 eol=lf。
 *.ps1  text eol=crlf

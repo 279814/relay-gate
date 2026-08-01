@@ -22,6 +22,7 @@ import (
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/web"
 )
 
 func main() {
@@ -123,6 +124,13 @@ func run() error {
 		WithInvalidator(sched).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
+
+	// 管理界面（§6）。挂在 /admin/ 下，与 /admin/api/ 并存 ——
+	// ServeMux 的最长前缀匹配保证 API 请求不会掉进这里。
+	//
+	// 静态资源刻意不鉴权：它们只有 HTML/CSS/JS，数据全在 /admin/api/ 后面。
+	// 反过来说也**不能**鉴权 —— 登录页自己就是静态资源。
+	mux.Handle("/admin/", web.Handler())
 	// /healthz 报的是**进程活着**，不代表有可用上游 —— 那要看 /admin/api/state。
 	// 混在一起会让容器编排在所有上游都挂时重启进程，而重启治不了上游。
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
