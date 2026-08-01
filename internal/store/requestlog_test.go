@@ -361,6 +361,45 @@ func TestRetryStats(t *testing.T) {
 	}
 }
 
+// 队列满丢了行之后，重试统计仍要认得出这是一次重试。
+//
+// 日志队列满时会丢行（§3.7，丢弃数因此暴露在 runtime 里）。靠 COUNT(*)
+// 数组内行数的话，一次三连重试只落库了最后一行时会被数成「1 次尝试、
+// 没重试过」—— 而那一行明明如实记着 attempts=3。
+//
+// 后果是**恰恰在丢日志的高负载时段**，重试的效果被系统性低估，
+// 而度量那个效果正是这张表存在的理由。attempts 列的冗余就是为这种
+// 情形准备的（见 schema.sql），统计必须用它而不是数行数。
+func TestRetryStatsSurvivesDroppedRows(t *testing.T) {
+	st := testStore(t)
+
+	// 一次三连重试，但前两行被丢弃，只有最终那次落了库
+	must(t, st.InsertRequestLog(mkLog("dropped", 3, 3, model.OutcomeOK)))
+
+	// 对照：同样是三连重试并救回来了，三行都在
+	must(t, st.InsertRequestLog(mkLog("intact", 1, 3, model.OutcomeUpstreamError)))
+	must(t, st.InsertRequestLog(mkLog("intact", 2, 3, model.OutcomeUpstreamError)))
+	must(t, st.InsertRequestLog(mkLog("intact", 3, 3, model.OutcomeOK)))
+
+	got, err := st.RetryStatsSince(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Retried != 2 {
+		t.Errorf("两组的 attempts 都是 3，重试过的应为 2，得到 %d —— "+
+			"丢了行的那组被数成 1 次尝试了", got.Retried)
+	}
+	if got.RescuedByRetry != 2 {
+		t.Errorf("两组都是重试后成功，救回来的应为 2，得到 %d", got.RescuedByRetry)
+	}
+	// Attempts 数的是**实际留下来的行**，它偏低是丢弃的直接后果、无解，
+	// 也不该修：这个字段问的是「记下了多少次」，不是「发生过多少次」。
+	if got.Attempts != 4 {
+		t.Errorf("总尝试数按实际落库的行算，应为 4，得到 %d", got.Attempts)
+	}
+}
+
 // 时间窗口要真的生效，否则「最近 24 小时」显示的是开服以来的累计值 ——
 // 而那个数字永远不会变好，看它做不出任何决定。
 func TestRetryStatsRespectsWindow(t *testing.T) {
