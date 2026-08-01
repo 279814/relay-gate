@@ -289,7 +289,13 @@ function app() {
      * 有多次尝试），而且日志在样本关掉时照常有 —— 那正是最需要它的场景。
      *
      * 统计一起拉：光看一列失败的日志判断不了「重试有没有用」，
-     * 要同时知道「救回来几次」。两个端点一次往返拿回来。
+     * 要同时知道「救回来几次」。三个端点一次往返拿回来。
+     *
+     * runtime 也**必须**一起拉，尽管这一页只用它的一个字段。丢弃计数是
+     * 「上面那五个数字偏低」的唯一警告，而丢弃恰恰发生在高负载时 ——
+     * 也就是用户正盯着这一页的时候。不在这里刷的话，统计是新算的、
+     * 而旁边的丢弃数还是页面加载那一刻的（自动刷新只在健康看板生效），
+     * 于是「统计已经不准」这件事没有任何提示。
      */
     async loadReqLogs() {
       const q = new URLSearchParams();
@@ -303,13 +309,15 @@ function app() {
       q.set('limit', '100');
 
       await this.run(async () => {
-        const [d, s] = await Promise.all([
+        const [d, s, rt] = await Promise.all([
           this.api('GET', '/request-logs?' + q),
           this.api('GET', '/retry-stats?hours=24'),
+          this.api('GET', '/runtime'),
         ]);
         this.reqLogs = d.logs || [];
         this.reqLogsTotal = d.total || 0;
         this.retryStats = s.stats || null;
+        this.runtime = rt || {};
       });
     },
 

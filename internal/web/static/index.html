@@ -369,7 +369,7 @@
                 <option value="client_abort">client_abort</option>
               </select>
               <label class="check">
-                <input type="checkbox" x-model="logFilter.retriedOnly" @change="loadReqLogs()">
+                <input type="checkbox" x-model="logFilter.only_retried" @change="loadReqLogs()">
                 只看重试过的
               </label>
               <button @click="loadReqLogs()">刷新</button>

@@ -224,23 +224,33 @@ func (s *Store) RetryStatsSince(sinceHours int) (*RetryStats, error) {
 		args = append(args, cutoff)
 	}
 
-	// 一条查询算完五个数：先把每组折叠成一行（组内的尝试数、最大尝试号、
-	// 以及最后一次尝试的 outcome），再对这些行做计数。
+	// 一条查询算完五个数：先把每组折叠成一行（组内的行数、这次请求实际的
+	// 总尝试次数、以及有没有哪次尝试成功了），再对这些行做计数。
 	//
 	// 分五条查询跑的话，每条都要重扫一遍表，而且五个数可能来自不同时刻的
 	// 快照 —— 于是出现「救回来的比重试过的还多」这种不自洽的展示。
+	//
+	// 判「重试过」用 MAX(attempts) 而不是 COUNT(*)：日志队列满时会丢行
+	// （§3.7 明说了这一点，丢弃数也因此暴露在 runtime 里）。靠 COUNT(*) 数的话，
+	// 一次三连重试只落库了最后一行时会被数成「1 次尝试、没重试过」——
+	// 而那一行明明如实记着 attempts=3。于是**恰恰在丢日志的高负载时段**，
+	// 重试的效果被系统性低估，而这张表存在的理由就是度量那个效果。
+	//
+	// attempts 列的冗余（同组内恒定）正是为这种情形准备的，见 schema.sql。
+	// SUM(n) 仍是「实际记下来几次」，它偏低无解也无妨 —— 那个数问的是
+	// 「留下了多少行」，不是「发生过多少次」。
 	q := `WITH grp AS (
 		SELECT req_id,
 		       COUNT(*) AS n,
-		       MAX(attempt) AS last_attempt,
+		       MAX(attempts) AS tries,
 		       SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS oks
 		FROM request_log` + where + `
 		GROUP BY req_id
 	)
 	SELECT COUNT(*), COALESCE(SUM(n), 0),
-	       COALESCE(SUM(CASE WHEN n > 1 THEN 1 ELSE 0 END), 0),
-	       COALESCE(SUM(CASE WHEN n > 1 AND oks > 0 THEN 1 ELSE 0 END), 0),
-	       COALESCE(SUM(CASE WHEN n > 1 AND oks = 0 THEN 1 ELSE 0 END), 0)
+	       COALESCE(SUM(CASE WHEN tries > 1 THEN 1 ELSE 0 END), 0),
+	       COALESCE(SUM(CASE WHEN tries > 1 AND oks > 0 THEN 1 ELSE 0 END), 0),
+	       COALESCE(SUM(CASE WHEN tries > 1 AND oks = 0 THEN 1 ELSE 0 END), 0)
 	FROM grp`
 
 	var st RetryStats
