@@ -78,10 +78,19 @@ func run() error {
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
+	// 请求日志（M6）：每次尝试一行，含被重试丢弃的那些。
+	//
+	// 与样本各是一套独立的旋钮（开关、保留策略、队列都分开）。样本可以关，
+	// 日志不该跟着关 —— 日志是判断「重试策略有没有用」的唯一依据，而那个
+	// 判断恰恰在「样本太占地方所以关掉、只留统计」的场景下最需要。
+	logRecorder := sample.NewLogRecorder(st, settings, cfgSrc, log)
+	defer logRecorder.Close()
+
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
-		WithHealthReporter(probe.NewReporter(tracker))
+		WithHealthReporter(probe.NewReporter(tracker)).
+		WithLogSink(logRecorder)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer fwd.CloseIdleConnections()
 

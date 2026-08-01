@@ -63,6 +63,13 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 		return nil, fmt.Errorf("初始化 schema: %w", err)
 	}
 
+	// schema.sql 只能让**新**库长对：CREATE TABLE IF NOT EXISTS 对已存在的表
+	// 是空操作，加不了列。老库的增量变更走 migrate。
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 schema: %w", err)
+	}
+
 	return &Store{db: db, cipher: c}, nil
 }
 

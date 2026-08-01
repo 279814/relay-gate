@@ -31,13 +31,21 @@ import (
 // dispatch 的入参只有 pre.body（入站原文）与 cand，就是为了让这件事在
 // 结构上做不到，而不是靠记得。
 
+// LogSink 接收请求日志。由 sample.LogRecorder 实现，可为 nil（关闭日志）。
+//
+// Record 必须是**非阻塞**的：它在转发路径的收尾处被调用，阻塞就等于让
+// 「记日志」拖慢真实请求（§3.6.3a 的主次关系对日志同样成立）。
+type LogSink interface {
+	Record(*model.RequestLog)
+}
+
 // forwardOutcome 是转发（含重试）结束后，收尾阶段需要的全部信息。
 //
 // 它描述的是**最终那次**尝试 —— 也就是客户端实际拿到的那个响应。
 // 被丢弃的尝试在循环里就已经回写过健康状态并记过日志，不留在这里：
 // 样本表的一行代表「客户端的一次请求」，把 N 次尝试记成 N 行会让
 // 样本浏览器显示成 N 个客户端请求，那比不记更误导。
-// 逐次尝试的完整留档归 request_log（M6 PR-B）。
+// 逐次尝试的完整留档归 request_log。
 type forwardOutcome struct {
 	cand      *router.Candidate
 	outBody   []byte
@@ -48,6 +56,11 @@ type forwardOutcome struct {
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
 	attempts int
+	// reqID 把这次客户端请求的样本与它的多行日志串起来。
+	reqID string
+	// logs 是**全部**尝试的日志（含被丢弃的），等 attempts 定下来之后
+	// 才由调用方统一投递 —— 见 forwardWithRetry 里的说明。
+	logs []*model.RequestLog
 }
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
@@ -79,7 +92,7 @@ type retryPlan struct {
 // 返回的 outcome 里那个 Candidate 的并发额度**已经归还** —— 本函数全程持有
 // 额度的所有权，调用方不需要（也不应该）再 Release 一次。
 func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
-	proto model.Protocol, pre *preambleResult) (*forwardOutcome, bool) {
+	proto model.Protocol, pre *preambleResult, recvAt time.Time) (*forwardOutcome, bool) {
 
 	settings := pre.settings
 	plan := &retryPlan{
@@ -113,6 +126,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		w.Header().Set("X-Relay-Half-Open", "1")
 	}
 
+	// reqID 在这里生成而不是在写日志时：同一次客户端请求的所有尝试
+	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
+	reqID := sample.NewReqID()
+	var logs []*model.RequestLog
+
 	for attempt := 1; ; attempt++ {
 		plan.tried[cand.Route.ID] = true
 
@@ -136,7 +154,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
 				outURL: la.url, respTee: la.tee, keys: la.keys,
-				res: la.at.Result(), attempts: attempt,
+				res: la.at.Result(), attempts: attempt, reqID: reqID,
 			}
 			if la.at.CanCommit() {
 				oc.res = la.at.Commit(w)
@@ -144,6 +162,17 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				la.at.Discard()
 			}
 			la.cand.Release()
+
+			// 最后一行日志要在 Commit **之后**记：BytesWritten 与 DoneAt
+			// 都是流式写完才有的，提前记会把每个成功响应的字节数记成 0。
+			oc.logs = append(logs, h.attemptLog(la, pre, proto, reqID,
+				attempt, halfOpen && attempt == 1, false, oc.res, recvAt))
+
+			// attempts 到这一刻才知道。逐行写的话前面几行只能填一个
+			// 猜的值 —— 而列表页正是靠它显示「这次试了 3 个站」。
+			for _, l := range oc.logs {
+				l.Attempts = attempt
+			}
 			return oc, true
 		}
 
@@ -163,6 +192,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		// 本该只是冷却 60 秒。
 		la.at.Discard()
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
+		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
+			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
 		if h.reporter != nil {
 			h.reporter.ReportResult(la.cand.Route.ID, viewOf(la.at.Result(), la.keys))
 		}
@@ -338,6 +369,60 @@ func retryable(at *Attempt) bool {
 		return IsUpstreamFault(err)
 	}
 	return verdict == payloadError
+}
+
+// attemptLog 把一次尝试整理成一行日志。
+//
+// retried 表示这次尝试被丢弃并换了站。它与「失败」不是一回事：最后一次
+// 尝试失败时同样是失败，但没有被重试（次数用尽、无站可换、或本就不可重试）。
+// 区分这两者才能回答「重试有没有救回来」—— 而那是这张表存在的理由。
+//
+// Attempts 字段在这里**填不上**（总次数要等循环结束才知道），由调用方
+// 在最后统一回填。
+//
+// 刻意不记任何 body 与头：那是样本的职责，两边都存一份只会让磁盘翻倍，
+// 还多一处需要脱敏的地方 —— 而漏一处就是明文 key 落库。
+// 两张表靠 req_id 关联。
+func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
+	proto model.Protocol, reqID string, attempt int,
+	halfOpen, retried bool, res *Result, recvAt time.Time) *model.RequestLog {
+
+	modelOut := pre.inModel
+	if la.cand.Route.UpstreamModel != "" {
+		modelOut = la.cand.Route.UpstreamModel
+	}
+
+	l := &model.RequestLog{
+		ReqID: reqID, Attempt: attempt,
+		TSRecv:      recvAt.UnixMilli(),
+		TSSent:      msOrZero(res.SentAt),
+		TSFirstByte: msOrZero(res.FirstByteAt),
+		TSDone:      msOrZero(res.DoneAt),
+
+		Endpoint:    proto.Path(),
+		ModelIn:     pre.inModel,
+		ModelOut:    modelOut,
+		ModelNameID: la.cand.ModelName.ID,
+		RouteID:     la.cand.Route.ID,
+		UpstreamID:  la.cand.Upstream.ID,
+		// 站名冗余存一份：站被删掉之后，日志仍要能说清当时走的是哪个站。
+		UpstreamName: la.cand.Upstream.Name,
+
+		RespStatus:   res.Status,
+		TTFTMs:       res.TTFT().Milliseconds(),
+		BytesWritten: res.BytesWritten,
+
+		Outcome:  classifyOutcome(res),
+		Retried:  retried,
+		HalfOpen: halfOpen,
+	}
+	if res.Err != nil {
+		// 与样本、健康回写同一条脱敏规则。日志会显示在管理界面上，
+		// 而错误文本里可能带出站 URL —— full_url_mode 的 base_url
+		// 允许把 key 放在 query 里（§3.2）。
+		l.Error = sample.RedactDiagnosticText(res.Err.Error(), la.keys)
+	}
+	return l
 }
 
 // logRetry 记一次被丢弃的尝试。

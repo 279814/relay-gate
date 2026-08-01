@@ -95,6 +95,22 @@ type Settings struct {
 	SampleKeepCount     int `json:"sample_keep_count"`
 	SampleKeepDays      int `json:"sample_keep_days"`
 	SampleQueueSize     int `json:"sample_queue_size"`
+
+	// ── 请求日志（M6）──────────────────────────────────────
+	//
+	// 与样本是**两套独立的旋钮**，不共用。样本一条可达几 MB（现在不封顶），
+	// 日志一行几百字节 —— 共用一个 keep_count 会让「多留点日志」的代价
+	// 变成磁盘翻 GB，于是没人敢调大它。
+	//
+	// 日志也不跟着 sample_enabled 关：它是判断「重试策略有没有用」的唯一
+	// 依据，而那个判断恰恰在样本被关掉、只留统计的场景下最需要。
+	RequestLogEnabled bool `json:"request_log_enabled"`
+	// RequestLogKeepCount 按**客户端请求**计（一组尝试算一条），不是按行。
+	// 按行的话，「保留 1000 条」在重试频繁时只能覆盖 300 多次请求，
+	// 而覆盖多久完全取决于故障率 —— 一个说不清含义的数字。
+	RequestLogKeepCount int `json:"request_log_keep_count"`
+	RequestLogKeepDays  int `json:"request_log_keep_days"`
+	RequestLogQueueSize int `json:"request_log_queue_size"`
 }
 
 // DefaultSettings 返回 §4.2 超时矩阵与 §3.6.3 样本上限的默认值。
@@ -136,6 +152,14 @@ func DefaultSettings() Settings {
 		SampleKeepCount:     300, // 从 500 降至 300
 		SampleKeepDays:      7,
 		SampleQueueSize:     256,
+
+		// 日志比样本留得多得多：一行几百字节，5000 条客户端请求
+		// 也就几 MB，而「最近一周的重试到底有没有用」需要足够的样本量
+		// 才算得出有意义的比例。
+		RequestLogEnabled:   true,
+		RequestLogKeepCount: 5000,
+		RequestLogKeepDays:  7,
+		RequestLogQueueSize: 512,
 	}
 }
 
@@ -179,6 +203,12 @@ func (s *Settings) Validate() error {
 		// 1 = 不重试。0 会让重试循环一次都不发，那不是「关闭重试」而是
 		// 「关闭转发」—— 归进这个统一的正数校验，不单开一条。
 		{"retry_max_attempts", s.RetryMaxAttempts},
+		// 日志的三项都必须为正。这里的 0 没有「不限」的语义 ——
+		// 关日志用 request_log_enabled，而保留 0 条日志等于开着功能却
+		// 把刚写的行立刻删掉，那不是任何人想要的配置。
+		{"request_log_keep_count", s.RequestLogKeepCount},
+		{"request_log_keep_days", s.RequestLogKeepDays},
+		{"request_log_queue_size", s.RequestLogQueueSize},
 	}
 	for _, p := range positives {
 		if p.val < 1 {
