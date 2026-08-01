@@ -110,6 +110,21 @@ func (g *UpstreamGate) RetainOnly(keep map[int64]bool) {
 	}
 }
 
+// Forget 丢弃某个站的 L1 结论，让它回到「没探过」（乐观视为 OK）。
+//
+// 用于配置变更（§4.5）：改了 key 或 base_url 之后，旧的「这个站 401」
+// 必须作废。不作废的话 L2 会被 OK() 一直挡住（§4.1 的「站连不上就别探模型」），
+// 于是用户明明改对了 key，界面上却看不到恢复 —— 而这正是最需要立刻
+// 看到结果的时刻。
+//
+// 与 RetainOnly 的区别：那个按「配置里还剩谁」批量清理，是垃圾回收；
+// 这个是针对单个站的定点作废。
+func (g *UpstreamGate) Forget(upstreamID int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.ups, upstreamID)
+}
+
 // Reset 清空全部站级状态（§4.8 从暂停恢复时用）。
 func (g *UpstreamGate) Reset() {
 	g.mu.Lock()

@@ -56,6 +56,7 @@ func (s *Server) updateModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	before := *cur
 	if err := decodeJSON(r, cur); err != nil {
 		s.writeErr(w, err)
 		return
@@ -66,6 +67,15 @@ func (s *Server) updateModelName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("更新 model_name", "id", id, "name", cur.Name)
+	// §4.5：只有改了探活请求的内容才重探。protocol 也算 —— 它决定
+	// 探活打哪个端点、body 用哪种参数名（§3.3.1）。
+	if before.ProbePrompt != cur.ProbePrompt ||
+		before.ProbeMaxTokens != cur.ProbeMaxTokens ||
+		before.Protocol != cur.Protocol ||
+		before.Name != cur.Name || // 不映射时 Name 就是发给上游的模型名
+		(!before.Enabled && cur.Enabled) {
+		s.invalidateModelName(id)
+	}
 	writeJSON(w, http.StatusOK, cur)
 }
 

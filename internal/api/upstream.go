@@ -65,6 +65,7 @@ func (s *Server) createUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("新增 upstream", "id", u.ID, "name", u.Name)
+	// 新建的站还没有 Route，没什么可探的。等 Route 建好时由那边触发。
 	writeJSON(w, http.StatusCreated, maskUpstream(&u))
 }
 
@@ -81,6 +82,11 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// 留一份改动前的副本用于比对。必须在置空 APIKey **之前**拷贝：
+	// 置空后再比就会把「没改 key」误判成「key 从有变没」，于是每次
+	// 保存都触发一轮全站重探。
+	before := *cur
+
 	cur.APIKey = "" // 置空 = 不改；若请求体带了新 key 会覆盖它
 	if err := decodeJSON(r, cur); err != nil {
 		s.writeErr(w, err)
@@ -97,6 +103,12 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	// §4.5：改了 key / 地址 / 探活头就立刻重探整站，不等下一个周期。
+	// 用 fresh 而不是 cur 比对：cur 的 APIKey 可能是「留空表示不改」的空串，
+	// 而 fresh 是库里的真实现值。
+	if probeAffectingUpstream(&before, fresh) || (!before.Enabled && fresh.Enabled) {
+		s.invalidateUpstream(id)
 	}
 	writeJSON(w, http.StatusOK, maskUpstream(fresh))
 }

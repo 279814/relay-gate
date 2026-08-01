@@ -27,11 +27,16 @@ type fakeCfg struct {
 	snap     *router.Snapshot
 	settings model.Settings
 	state    store.RunState
+	// snapErr 让 Snapshot 报错，用于测「配置读不出来时不崩」的路径。
+	snapErr error
 }
 
 func (f *fakeCfg) Snapshot() (*router.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.snapErr != nil {
+		return nil, f.snapErr
+	}
 	return f.snap, nil
 }
 func (f *fakeCfg) Settings() (model.Settings, error) {
@@ -68,11 +73,15 @@ type recordingTracker struct {
 	l2Allowed map[int64]bool
 	states    map[int64]model.HealthState
 
-	l1Claims  []int64
-	l2Claims  []int64
-	reports   []health.Report
-	triggered []int64
-	resets    int
+	l1Claims []int64
+	l2Claims []int64
+	reports  []health.Report
+	// triggered 记 TriggerL2，triggeredL1 记 TriggerL1。分开记是必要的：
+	// InvalidateModelName 的正确性正是「只清 L2、不动 L1」（L1 打的是站的
+	// /v1/models，与模型无关），混在一个 slice 里就断言不了这件事。
+	triggered   []int64
+	triggeredL1 []int64
+	resets      int
 }
 
 func newRecordingTracker() *recordingTracker {
@@ -103,6 +112,12 @@ func (r *recordingTracker) TriggerL2(id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.triggered = append(r.triggered, id)
+}
+
+func (r *recordingTracker) TriggerL1(id int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.triggeredL1 = append(r.triggeredL1, id)
 }
 
 func (r *recordingTracker) Report(rep health.Report) bool {

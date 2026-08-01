@@ -86,16 +86,24 @@ func run() error {
 
 	// 探活（§4）。Transport 由 fwd 提供，与转发共用连接池 ——
 	// 探活顺带把连接热着，真实请求就省掉一次 TLS 握手。
-	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log)
+	//
+	// 探活成本计数（§5.2d）落库跨重启：纯内存计数在重启后归零，
+	// 「今日 L1 次数」会一天里越报越少 —— 会骗人的计数器比没有更糟。
+	cost := probe.NewCost()
+	costPersister := probe.NewCostPersister(cost, st, log)
+	costPersister.Restore()
+
+	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).WithCost(cost)
 	persister := health.NewPersister(tracker, st, log)
 
 	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：
 	// 关闭期间在途的真实请求仍会回写健康状态，Persister 还要把它刷进库。
 	bgCtx, stopBG := context.WithCancel(context.Background())
 	var bg sync.WaitGroup
-	bg.Add(2)
+	bg.Add(3)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
 	go func() { defer bg.Done(); persister.Run(bgCtx) }()
+	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
 	defer func() {
 		stopBG()
 		bg.Wait()
@@ -104,9 +112,15 @@ func run() error {
 	mux := http.NewServeMux()
 	// WithRuntime 把在途计数与样本丢弃数接到 /admin/api/runtime ——
 	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
+	//
+	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
+	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
+	// 只是慢一点，不会变成「改了不生效」。
 	mux.Handle("/admin/api/", api.New(st, log).
 		WithRuntime(tracker, recorder).
 		WithHealth(tracker, gate, sched).
+		WithCost(cost).
+		WithInvalidator(sched).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 	// /healthz 报的是**进程活着**，不代表有可用上游 —— 那要看 /admin/api/state。
