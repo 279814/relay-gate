@@ -251,6 +251,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	h.logResult(cand, inModel, outURL, res)
 
+	// 本次请求涉及的凭据。三个下游都要它：健康回写的 ErrBody、
+	// 出站错误响应、样本落库。取一次传下去 ——
+	// 各自再算一遍的话，新增一个凭据位置时必然漏掉其中之一。
+	keys := h.credentialsOf(r, cand)
+
 	// 9. 健康回写。**这是最快的故障发现路径** —— 探活有周期（dead 状态
 	//    20 秒），真实请求没有延迟，站挂掉那一刻就有请求撞上去（§3.5）。
 	//    放在写错误响应之前：客户端已经在等了，先把状态记下来，
@@ -259,19 +264,19 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
 	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
-		h.reporter.ReportResult(cand.Route.ID, viewOf(res, h.credentialsOf(r, cand)))
+		h.reporter.ReportResult(cand.Route.ID, viewOf(res, keys))
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
 	// 不写的话 net/http 会在 handler 返回时补一个 HTTP 200 空 body ——
 	// 客户端拿到「成功但没内容」，既看不到原因也不会重试。
 	if res.Err != nil && !res.HeadersSent {
-		h.writeForwardError(w, res.Err, proto, cand)
+		h.writeForwardError(w, res.Err, proto, cand, keys)
 	}
 
 	if respTee != nil {
 		h.recordSample(r, proto, cand, recvAt, inModel, body, outBody,
-			outHeader, outURL, respTee, res, settings)
+			outHeader, outURL, respTee, res, settings, keys)
 	}
 }
 
@@ -319,17 +324,29 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 //
 // 只在响应头尚未发出时可用 —— 已经发出后状态码就定死了，
 // 再往流里写错误结构只会破坏客户端的 SSE 解析。
+//
+// redactKeys 是本次请求涉及的凭据。**必须脱敏**：err 的文本里可能带出站
+// URL，而 full_url_mode 的 base_url 允许把 key 放在 query 里（§3.2）。
+// 客户端是外部的 —— 持有 relay key 不等于有资格看到上游 key。
+//
+// 当前标准库恰好不会把 URL 放进错误里（forward.go 直接调 Transport.RoundTrip，
+// 而带 URL 的 *url.Error 是 http.Client.Do 包的），所以这层脱敏此刻扫不到
+// 东西。留着是因为那条性质**不由我们控制**：改用 *http.Client 是个完全自然
+// 的重构，而它会让上游 key 静默出现在客户端的错误响应里。
+// 有 TestErrorResponse_NeverEchoesUpstreamKeyFromURL 钉着这条不变量。
 func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
-	proto model.Protocol, cand *router.Candidate) {
+	proto model.Protocol, cand *router.Candidate, redactKeys []string) {
 
 	// 客户端自己走了就别再写了：连接多半已经没了，写也是白写。
 	if !IsUpstreamFault(err) {
 		return
 	}
 
+	safeErr := sample.RedactDiagnosticText(err.Error(), redactKeys)
+
 	// X-Relay-Reason 让 502/504 可诊断：不带它的话，客户端只看到
 	// 「网关错误」，分不清是站连不上、超时，还是我们自己配错了。
-	w.Header().Set("X-Relay-Reason", err.Error())
+	w.Header().Set("X-Relay-Reason", safeErr)
 	w.Header().Set("X-Relay-Upstream", cand.Upstream.Name)
 
 	code, msg := http.StatusBadGateway, "上游站点不可用"
@@ -342,7 +359,7 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 		code, msg = http.StatusGatewayTimeout, "请求超过总时限"
 	}
 	writeAPIError(w, code, proto, "api_error",
-		fmt.Sprintf("%s（%s）：%v", msg, cand.Upstream.Name, err))
+		fmt.Sprintf("%s（%s）：%s", msg, cand.Upstream.Name, safeErr))
 }
 
 // recordSample 组装并投递一条样本（§3.6）。
@@ -353,14 +370,14 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 // settings 由调用方传入而不是在这里重读：serve 开头已经读过一次，
 // 重读一次既多一次 livecfg 加锁，又可能拿到与转发时不同的值 ——
 // 样本描述的是**这次**转发，用的必须是它当时那份配置。
+//
+// keys 同样由调用方传入（它只有两处来源：入站 relay key 与出站上游 key）。
+// 与健康回写、出站错误响应共用同一份，避免各算一遍时漏掉某个凭据位置。
 func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	cand *router.Candidate, recvAt time.Time, inModel string,
 	inBody, outBody []byte, outHeader http.Header, outURL string,
-	respTee *sample.HeadTail, res *Result, settings model.Settings) {
-
-	// 落库的 key 只有两处来源：入站的 relay key 与出站的上游 key。
-	// 两者都要从 body 里扫掉（§9.4 要求真 key 全表 grep 零命中）。
-	keys := h.credentialsOf(r, cand)
+	respTee *sample.HeadTail, res *Result, settings model.Settings,
+	keys []string) {
 
 	// 先截断再脱敏（PrepareBody 内部保证顺序安全）：body 上限 32MB，
 	// 而留档上限默认 256KB，先扫全量等于为了丢掉的 99% 白扫一遍。

@@ -222,6 +222,11 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter,
 	defer headerTimer.Stop()
 
 	res.SentAt = time.Now()
+	// 直接用 Transport.RoundTrip 而不是 http.Client。除了「不要自动跟随
+	// 重定向」之外还有一条不显然的理由：Client.Do 会把错误包成 *url.Error，
+	// 而它的 Error() 带上**完整 URL** —— full_url_mode 的 base_url 允许把
+	// key 放在 query 里（§3.2），那就等于把上游 key 拼进错误文本。
+	// writeForwardError 已对此做了脱敏兜底，两层都在。
 	resp, err := f.Transport.RoundTrip(req)
 	headerTimer.Stop()
 	if err != nil {
