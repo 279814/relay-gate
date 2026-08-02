@@ -28,6 +28,19 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 原生命令的非零退出码**不要**自动抛异常。
+#
+# PowerShell 7.4 起 $PSNativeCommandUseErrorActionPreference 默认为 true，
+# 于是 `$ErrorActionPreference='Stop'` 会让任何一条 docker 命令的非零退出码
+# 直接抛出。这个脚本里有好几处**故意**允许失败的调用 ——
+# 最典型的是 Cleanup 里的 `docker rm -f`（首次运行时容器根本不存在），
+# 它是脚本的第一个动作，抛在这里等于一条断言都跑不到。
+#
+# 本脚本对每处需要判定的地方都显式检查 $LASTEXITCODE 或输出内容，
+# 不依赖自动抛异常。写死 false 是为了让行为在 Windows 与 CI 的 Linux runner
+# 上一致 —— 否则「本地全绿、CI 一开头就崩」。
+$PSNativeCommandUseErrorActionPreference = $false
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -73,6 +86,23 @@ function Cleanup {
 function InC($cmd) {
     (docker exec $CNAME sh -c $cmd 2>&1 | Out-String).Trim()
 }
+
+# 把内嵌的 shell 脚本转成 LF。
+#
+# **这个脚本文件是 CRLF 的**（.gitattributes 强制 *.ps1 eol=crlf），于是
+# here-string 里的每一行都以 \r 结尾。而运行镜像用的是 alpine，它的
+# /bin/sh 是 busybox ash —— busybox **不容忍任何 \r**：
+#
+#     /bin/sh: syntax error: unexpected end of file (expecting "then")
+#
+# 因为 `then\r` 不是关键字 `then`。整段脚本一行都不执行。
+#
+# 开发机上的 MSYS sh 恰好容忍行尾 \r，所以这个问题在本地**复现不出来** ——
+# 它只在 CI 的 Linux runner + alpine 容器里才现形，而这正是当初漏过去的原因。
+# （更早的一版只修了「反斜杠续行 + \r」那一种，那是必要但远不充分的。）
+#
+# 凡是要送进容器 shell 的 here-string，一律先过这个函数。
+function ShLF($script) { $script -replace "`r", '' }
 
 function WaitFor($what, $timeoutSec, $probe) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -319,30 +349,28 @@ try {
     # 不是「匿名 ACME」，而是**语法错误（email 缺参数）**；公网 profile 会
     # 启动即退出。compose 的 command 应只在邮箱非空时保留这行。
     $caddyMount = "${root}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+    $caddyScript = ShLF @'
+config=/tmp/relay-gate-Caddyfile
+if [ -n "${RELAY_ACME_EMAIL:-}" ]; then
+  cp /etc/caddy/Caddyfile "${config}"
+else
+  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' /etc/caddy/Caddyfile > "${config}"
+fi
+caddy validate --config "${config}" --adapter caddyfile
+'@
     $caddyCheck = (docker run --rm `
         -e RELAY_DOMAIN=example.com `
         -e RELAY_ACME_EMAIL= `
         -e RELAY_ALLOW_IPS= `
         -v $caddyMount `
-        caddy:2.8-alpine /bin/sh -ec @'
-config=/tmp/relay-gate-Caddyfile
-if [ -n "${RELAY_ACME_EMAIL:-}" ]; then
-  cp /etc/caddy/Caddyfile "${config}"
-else
-  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' \
-    /etc/caddy/Caddyfile > "${config}"
-fi
-caddy validate --config "${config}" --adapter caddyfile
-'@ 2>&1 | Out-String)
+        caddy:2.8-alpine /bin/sh -ec $caddyScript 2>&1 | Out-String)
     Check 'RELAY_ACME_EMAIL 留空时 Caddyfile 仍合法' ($caddyCheck -match 'Valid configuration') `
         "Caddy 验证失败：$($caddyCheck.Trim())"
 
     # 空白名单的语义也不能靠注释自证。Caddy 会把空 remote_ip 适配成
     # `remote_ip: {}`；在 `not` 外层下应匹配所有来源，管理面全部 403，
     # 而普通转发路径仍可达。用真实 Caddy 进程跑两个请求验证这一点。
-    $caddyRuntime = (docker run --rm `
-        -e RELAY_ALLOW_IPS= `
-        caddy:2.8-alpine /bin/sh -ec @'
+    $aclScript = ShLF @'
 cat >/tmp/acl.Caddyfile <<'EOF'
 :8080 {
   @admin path /admin*
@@ -362,10 +390,22 @@ for i in 1 2 3 4 5; do
   sleep 1
 done
 admin=$(wget -qO- --server-response http://127.0.0.1:8080/admin/ 2>&1 || true)
-printf 'admin403=%s\n' "$(printf '%s' "$admin" | grep -c '403 Forbidden')"
+# 判「有没有被 403 挡住」，不数出现次数：wget 会把状态行打一遍
+# （--server-response 的响应头），再在错误信息里打一遍
+# （`wget: server returned error: HTTP/1.1 403 Forbidden`），
+# 于是计数是 2 而不是 1 —— 而这个数字取决于 wget 的措辞，不是我们要验的东西。
+# 要验的是语义：空白名单下管理面被拒。（CI 实测：原来的 =1 断言恒假。）
+if printf '%s' "$admin" | grep -q '403'; then
+  printf 'admin_blocked=yes\n'
+else
+  printf 'admin_blocked=no\n'
+fi
 printf 'proxy=%s\n' "$(cat /tmp/proxy 2>/dev/null || true)"
-'@ 2>&1 | Out-String)
-    Check 'IP 白名单留空时管理面全部 403' ($caddyRuntime -match 'admin403=1') `
+'@
+    $caddyRuntime = (docker run --rm `
+        -e RELAY_ALLOW_IPS= `
+        caddy:2.8-alpine /bin/sh -ec $aclScript 2>&1 | Out-String)
+    Check 'IP 白名单留空时管理面全部 403' ($caddyRuntime -match 'admin_blocked=yes') `
         "运行结果：$($caddyRuntime.Trim())"
     Check 'IP 白名单留空不影响转发端点' ($caddyRuntime -match 'proxy=proxy-ok') `
         "运行结果：$($caddyRuntime.Trim())"

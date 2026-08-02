@@ -116,8 +116,15 @@ echo "=== 构建上下文不含凭据 ==="
 # data/ 里有明文样本（完整对话原文），.env 里有三项凭据。
 # 它们不会进最终镜像（运行阶段只 COPY 二进制），但会留在构建缓存层里，
 # 而镜像层是可以逐层导出的。
+#
+# 判据必须是**整行精确匹配**，不能用 grep -F 做子串匹配：
+# 子串匹配下把 `.env` 注释成 `#.env` 仍然会被 `.env.local` 那一行命中，
+# 把 `data/` 注释成 `#data/` 也会被自己命中 —— 检查器全绿，而凭据与
+# 明文对话原文照进构建上下文。（实测：两处注释掉后原版都不报。）
 for pat in 'data/' '.env' 'scripts/upstreams.tsv'; do
-    if grep -qF "$pat" "$dockerignore"; then
+    # 剥掉注释与首尾空白后按整行比对
+    if sed 's/#.*//' "$dockerignore" | sed 's/[[:space:]]*$//' |
+        grep -qxF "$pat"; then
         pass ".dockerignore 排除了 $pat"
     else
         fail ".dockerignore 没有排除 $pat —— 凭据或对话原文会进构建上下文"
@@ -148,6 +155,30 @@ for key in ENCRYPTION_KEY RELAY_KEYS ADMIN_PASSWORD; do
         pass ".env.example 有 $key"
     else
         fail ".env.example 缺 $key —— 照模板填完仍然起不来"
+    fi
+done
+
+echo "=== 送进容器 shell 的 here-string 必须先转成 LF ==="
+# *.ps1 是 CRLF 的（.gitattributes 强制），而运行镜像是 alpine ——
+# 它的 /bin/sh 是 busybox ash，**不容忍任何 \r**：`then\r` 不是关键字 `then`，
+# 整段脚本报 `syntax error: unexpected end of file (expecting "then")` 后
+# 一行都不执行。
+#
+# 症状是**冒烟脚本少跑了一整段却依然显示通过**，这比断言失败更糟。
+# 而开发机上的 MSYS sh 恰好容忍行尾 \r，所以这个问题本地复现不出来 ——
+# 只在 CI 的 Linux runner + alpine 容器里才现形。（实测：CI 抓到的。）
+#
+# 判据：凡是把 here-string 交给 `sh -ec` 的地方，都必须经过 ShLF 去掉 \r。
+# 也就是 `/bin/sh -ec` 后面只能跟变量，不能直接跟 @' 开头的 here-string。
+for ps1 in "$root"/scripts/*.ps1; do
+    [ -e "$ps1" ] || continue
+    # `sh -ec @'` ：here-string 直接喂给容器 shell，没有过 ShLF
+    raw=$(grep -cE "sh +-ec +@'" "$ps1" || true)
+    if [ "$raw" -gt 0 ]; then
+        fail "$(basename "$ps1") 有 $raw 处把 here-string 直接交给 sh -ec —— "\
+"CRLF 会让 busybox ash 整段拒绝执行，断言恒不触发。应先过 ShLF 去掉 \\r"
+    else
+        pass "$(basename "$ps1") 的内嵌 shell 都经过 LF 转换"
     fi
 done
 

@@ -70,3 +70,21 @@ jobs:
 
       - name: 部署清单静态检查
         run: sh scripts/check-deploy.sh
+
+  # M7 的容器端到端。单独一个 job，因为它要 Docker 引擎而上面那些不要 ——
+  # 合在一起的话，一次镜像构建会拖慢每一次纯 Go 的改动。
+  #
+  # 为什么必须在 CI 跑：开发机上禁止使用 Docker，而 M7 引入的每一样东西
+  # （0600 库权限、PID 1 是谁、SIGTERM 直达、端口只绑 127.0.0.1、
+  # 空 ACME 邮箱、空 IP 白名单）都**只在容器里**才成立或才会坏。
+  # 本地 go test 全绿证明不了其中任何一条。
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # smoke-m7.ps1 是 PowerShell 的。ubuntu-latest 自带 pwsh，
+      # 不需要额外安装步骤。
+      - name: 容器端到端冒烟（M7）
+        shell: pwsh
+        run: pwsh -File scripts/smoke-m7.ps1
