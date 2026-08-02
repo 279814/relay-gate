@@ -390,13 +390,22 @@ for i in 1 2 3 4 5; do
   sleep 1
 done
 admin=$(wget -qO- --server-response http://127.0.0.1:8080/admin/ 2>&1 || true)
-printf 'admin403=%s\n' "$(printf '%s' "$admin" | grep -c '403 Forbidden')"
+# 判「有没有被 403 挡住」，不数出现次数：wget 会把状态行打一遍
+# （--server-response 的响应头），再在错误信息里打一遍
+# （`wget: server returned error: HTTP/1.1 403 Forbidden`），
+# 于是计数是 2 而不是 1 —— 而这个数字取决于 wget 的措辞，不是我们要验的东西。
+# 要验的是语义：空白名单下管理面被拒。（CI 实测：原来的 =1 断言恒假。）
+if printf '%s' "$admin" | grep -q '403'; then
+  printf 'admin_blocked=yes\n'
+else
+  printf 'admin_blocked=no\n'
+fi
 printf 'proxy=%s\n' "$(cat /tmp/proxy 2>/dev/null || true)"
 '@
     $caddyRuntime = (docker run --rm `
         -e RELAY_ALLOW_IPS= `
         caddy:2.8-alpine /bin/sh -ec $aclScript 2>&1 | Out-String)
-    Check 'IP 白名单留空时管理面全部 403' ($caddyRuntime -match 'admin403=1') `
+    Check 'IP 白名单留空时管理面全部 403' ($caddyRuntime -match 'admin_blocked=yes') `
         "运行结果：$($caddyRuntime.Trim())"
     Check 'IP 白名单留空不影响转发端点' ($caddyRuntime -match 'proxy=proxy-ok') `
         "运行结果：$($caddyRuntime.Trim())"
