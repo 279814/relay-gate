@@ -27,8 +27,10 @@
 - [x] M6 请求内重试 + 日志
 - [x] M7 Docker Compose 部署
 
-仍待真实流量验证的两项（都需要接上 Claude Code 才能做）：
-`/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准。
+仍待真实流量验证的三项（都需要接上 Claude Code 才能做）：
+`/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准、
+公网模式下长思考不被 Caddy 中途掐断（配置已通过 `caddy validate`，
+但「解析器接受」不等于「运行时按预期生效」）。
 
 ## 设计要点
 
