@@ -1,0 +1,148 @@
+# relay-gate 部署（M7）。
+#
+# 默认只起网关一个容器，端口**绑在 127.0.0.1 上**（§5.2f）。
+# 要对公网提供服务时加 `--profile public` 起 Caddy，由它做 TLS 与 IP 白名单。
+#
+#   本机自用：  docker compose up -d
+#   公网访问：  docker compose --profile public up -d
+#
+# 凭据全部从 .env 读，绝不写在这个文件里 —— 它是要提交进仓库的。
+# 见 .env.example。
+
+services:
+  relay-gate:
+    build:
+      context: .
+      args:
+        # 构建时注入版本号，出现在启动日志与 /healthz 里。
+        # 没有它的话「线上跑的是哪个版本」只能靠猜。
+        VERSION: ${VERSION:-dev}
+    image: relay-gate:${VERSION:-dev}
+    container_name: relay-gate
+    restart: unless-stopped
+
+    # 端口只绑 127.0.0.1（§5.2f）。
+    #
+    # 这一行是整个部署里安全后果最重的一处：写成 "18787:18787" 的话，
+    # Docker 会插一条 iptables 规则把端口**直接暴露到公网**，而且它绕过
+    # ufw/firewalld —— 你在防火墙里看不到，`ufw status` 显示一切正常。
+    # 那等于把管理界面和所有上游 key 公开（§5.2f）。
+    #
+    # 公网访问一律走 Caddy（--profile public），它在同一个 docker 网络里
+    # 通过服务名访问，不需要这个映射。
+    ports:
+      - "127.0.0.1:${RELAY_PORT:-18787}:18787"
+
+    env_file: .env
+    environment:
+      # 时区影响探活成本的「按天」分桶（§5.2d）。不设的话容器只认 UTC，
+      # 「今日 L1 次数」会在东八区的早上 8 点才清零。
+      TZ: ${TZ:-Asia/Shanghai}
+
+    # 运行身份**刻意不在这里指定**。
+    #
+    # 容器以 root 进入 entrypoint，它把挂载目录的属主修正到 10001 之后
+    # 用 su-exec 降权（见 deploy/entrypoint.sh）—— root 的存续时间只有那几行。
+    #
+    # 为什么不用 `user: "${UID}:${GID}"`：绑定挂载的 ./data 在宿主上属主是
+    # 启动者，而镜像里的进程是 uid 10001，两者对不上时进程建不了库文件，
+    # 启动失败并报 `unable to open database file (14)` —— 一个完全看不出是
+    # 权限问题的错误。（实测踩到的。）用 UID 变量能在 Linux 上绕过，
+    # 但 Windows/macOS 的 Docker Desktop 上 `id -u` 与虚拟机里的挂载语义
+    # 对不上，容器直接起不来 —— 而 §8 的主路径正是「先本地后服务器」，
+    # 两边都得能跑。
+    #
+    # 确实需要固定成宿主某个用户时（例如共享服务器上多人各跑一份），
+    # 在这里加 `user: "1000:1000"`：entrypoint 会发现自己不是 root 而跳过
+    # chown，那时目录属主由你自己负责。
+
+    volumes:
+      # 库文件与它的 WAL 都在这里。**这是唯一需要备份的东西** ——
+      # 上游配置、样本、请求日志、健康历史全在里面。
+      #
+      # 用绑定挂载而不是具名卷：备份、复制、grep 一个看得见的目录，
+      # 比 `docker volume inspect` 找路径再 sudo 进去简单得多。
+      # 而这个项目的定位是单人自用，备份就是 cp 一个文件。
+      - ./data:/app/data
+
+    healthcheck:
+      # 与 Dockerfile 里的 HEALTHCHECK 一致。在这里重复一遍是因为
+      # compose 的配置会覆盖镜像的，写在这里更显眼、也便于按环境调。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18787/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # 给优雅关闭留够时间。
+    #
+    # 默认的 10s 不够：main.go 给在途请求留了 30s 收尾，而真实对话的
+    # 一次长回复可能正在流式传输。10s 就 SIGKILL 的话，每次重启都会
+    # 掐断一次正在进行的对话 —— 而那正是 §4.8 要避免的。
+    # 比 30s 多给 5s，让进程有机会自己退干净而不是被杀。
+    stop_grace_period: 35s
+
+    logging:
+      # 不限制的话，一个跑了几个月的容器能把磁盘写满 —— 而这个服务
+      # 每个请求都记一行结构化日志。
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── 公网入口（可选）──────────────────────────────────────
+  #
+  # 只有 `--profile public` 时才起。默认不起是刻意的：
+  # 绝大多数时候这个网关跑在本机或内网，多一个容器只是多一份维护面。
+  caddy:
+    profiles: ["public"]
+    image: caddy:2.8-alpine
+    container_name: relay-gate-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 ACME 账号密钥。**必须持久化**：不持久化的话每次重启都会
+      # 重新申请证书，而 Let's Encrypt 有速率限制（同一域名每周 5 张），
+      # 反复重启几次就会被限流,届时拿不到证书、服务直接不可用。
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # Caddyfile 里引用它们做自动 TLS 与 IP 白名单。
+      #
+      # 这里**不能**用 `${RELAY_DOMAIN:?...}` 的必填语法：compose 的变量
+      # 插值发生在 profile 过滤**之前**，于是没配域名时连默认的
+      # `docker compose up -d`（根本不起 Caddy）都会直接报错退出 ——
+      # 而那是这个项目最常走的路径。（实测踩到的。）
+      #
+      # 缺失时留空，由 Caddy 自己在启动时报「域名为空」。代价是错误信息
+      # 不如这里直白，换来的是默认路径不被一个可选服务拖累。
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-}
+      RELAY_ACME_EMAIL: ${RELAY_ACME_EMAIL:-}
+      RELAY_ALLOW_IPS: ${RELAY_ALLOW_IPS:-}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        # Caddy 的 `email` global option 在值为空时不是「不设置」，而是
+        # 语法错误（`email` 缺参数）。所以只在用户真的填邮箱时保留这一行；
+        # 空值就删掉它，让 Caddy 使用匿名 ACME 账号。不能把这一逻辑放进
+        # Caddyfile 本身：Caddyfile 没有按环境变量条件包含指令的语法。
+        config=/tmp/relay-gate-Caddyfile
+        if [ -n "$${RELAY_ACME_EMAIL:-}" ]; then
+          cp /etc/caddy/Caddyfile "$${config}"
+        else
+          sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$$/d' \
+            /etc/caddy/Caddyfile > "$${config}"
+        fi
+        # exec 让 Caddy 接管 PID 1，SIGTERM 不会被 /bin/sh 吞掉。
+        exec caddy run --config "$${config}" --adapter caddyfile
+    depends_on:
+      relay-gate:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

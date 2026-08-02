@@ -60,3 +60,13 @@ jobs:
 
       - name: 前端契约测试
         run: node internal/web/app.contract.test.js
+
+      # M7 部署清单的静态检查（不需要 Docker，因此能进 CI）。
+      # 它们守的是几条「一旦写错就有实际安全后果、但不会报错」的不变量。
+      # 真正的容器行为由 scripts/smoke-m7.ps1 验（那个需要 Docker 引擎），
+      # 这里守的是那些光读文件就能判定的部分。
+      - name: 部署 entrypoint 静态检查
+        run: sh scripts/check-entrypoint.sh
+
+      - name: 部署清单静态检查
+        run: sh scripts/check-deploy.sh
