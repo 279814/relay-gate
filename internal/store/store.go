@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go 驱动，无需 CGO，交叉编译到 Linux 容器不用改工具链
@@ -70,7 +72,60 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 		return nil, fmt.Errorf("迁移 schema: %w", err)
 	}
 
+	// 收紧文件权限。放在建表之后：WAL 与 shm 是第一次写才出现的，
+	// 提前 chmod 会漏掉它们。
+	restrictPerms(dsn)
+
 	return &Store{db: db, cipher: c}, nil
+}
+
+// dbFilePerm 是库文件应有的权限：**只有属主可读写**。
+//
+// 这不是「加固」，是把 §3.6.3d 的承诺落实。库里躺着两类东西：
+// AES-GCM 加密的上游 key，以及**明文的**样本 —— 完整对话原文、
+// 你贴进去的代码、以及请求日志。加密只保护了 key。
+const dbFilePerm = 0o600
+
+// restrictPerms 把库文件及其 WAL/shm 副产品收到 0600。
+//
+// 为什么必须显式做：SQLite 建文件用的是 SQLITE_DEFAULT_FILE_PERMISSIONS
+// （0644）再减 umask。默认 umask 022 下结果就是 0644 —— **同机其它用户可读**。
+// 而 M7 会把 data/ 挂到宿主机上，那台机器上的任何账号都能拖走全部对话原文。
+// 目录建成 0700（main.go）挡不住这一点：挂载点的权限由宿主决定，
+// 而且用户完全可能把 RELAY_DB 指到一个共享目录。
+//
+// 三个文件都要：-wal 里是尚未 checkpoint 的**最新**写入（也就是最近的样本），
+// 只收紧主文件等于把最新的那部分留在 0644 上。
+//
+// 失败一律忽略（这里没有 logger，加一个只为报一句话不值）：权限收不紧是
+// 真实的隐患，但它不该让一个本来能用的网关起不来 —— 那会把「数据可能被
+// 同机用户读到」升级成「服务完全不可用」。常见的失败恰恰是无害的：
+// Windows 上 chmod 语义不同，容器里文件属主可能不是当前进程。
+// 真正需要它的是 Linux 部署，而那里它会生效。
+func restrictPerms(dsn string) {
+	path := dbPathOf(dsn)
+	if path == "" || path == ":memory:" {
+		return
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(p); err != nil {
+			continue // 不存在就跳过：WAL/shm 要等第一次写才出现
+		}
+		_ = os.Chmod(p, dbFilePerm)
+	}
+}
+
+// dbPathOf 从 DSN 里取出文件路径。
+//
+// 当前所有调用方传的都是裸路径（connPragmas 是在 sql.Open 那一行才拼上去的，
+// 不经过这里）。剥 query 是防将来：哪天有人把带参数的 DSN 直接传进 Open，
+// 少了这一步 Stat 会全部失败，于是 restrictPerms 静默退化成空操作 ——
+// 它没有任何输出，谁也不会发现权限其实没收紧。
+func dbPathOf(dsn string) string {
+	if i := strings.IndexByte(dsn, '?'); i >= 0 {
+		return dsn[:i]
+	}
+	return dsn
 }
 
 func (s *Store) Close() error { return s.db.Close() }
