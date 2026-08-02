@@ -87,6 +87,23 @@ function InC($cmd) {
     (docker exec $CNAME sh -c $cmd 2>&1 | Out-String).Trim()
 }
 
+# 把内嵌的 shell 脚本转成 LF。
+#
+# **这个脚本文件是 CRLF 的**（.gitattributes 强制 *.ps1 eol=crlf），于是
+# here-string 里的每一行都以 \r 结尾。而运行镜像用的是 alpine，它的
+# /bin/sh 是 busybox ash —— busybox **不容忍任何 \r**：
+#
+#     /bin/sh: syntax error: unexpected end of file (expecting "then")
+#
+# 因为 `then\r` 不是关键字 `then`。整段脚本一行都不执行。
+#
+# 开发机上的 MSYS sh 恰好容忍行尾 \r，所以这个问题在本地**复现不出来** ——
+# 它只在 CI 的 Linux runner + alpine 容器里才现形，而这正是当初漏过去的原因。
+# （更早的一版只修了「反斜杠续行 + \r」那一种，那是必要但远不充分的。）
+#
+# 凡是要送进容器 shell 的 here-string，一律先过这个函数。
+function ShLF($script) { $script -replace "`r", '' }
+
 function WaitFor($what, $timeoutSec, $probe) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -332,33 +349,28 @@ try {
     # 不是「匿名 ACME」，而是**语法错误（email 缺参数）**；公网 profile 会
     # 启动即退出。compose 的 command 应只在邮箱非空时保留这行。
     $caddyMount = "${root}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"
+    $caddyScript = ShLF @'
+config=/tmp/relay-gate-Caddyfile
+if [ -n "${RELAY_ACME_EMAIL:-}" ]; then
+  cp /etc/caddy/Caddyfile "${config}"
+else
+  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' /etc/caddy/Caddyfile > "${config}"
+fi
+caddy validate --config "${config}" --adapter caddyfile
+'@
     $caddyCheck = (docker run --rm `
         -e RELAY_DOMAIN=example.com `
         -e RELAY_ACME_EMAIL= `
         -e RELAY_ALLOW_IPS= `
         -v $caddyMount `
-        caddy:2.8-alpine /bin/sh -ec @'
-config=/tmp/relay-gate-Caddyfile
-if [ -n "${RELAY_ACME_EMAIL:-}" ]; then
-  cp /etc/caddy/Caddyfile "${config}"
-else
-  # 刻意写成一行：这个 here-string 是 CRLF 的（.gitattributes 强制
-  # *.ps1 eol=crlf），而反斜杠续行后面跟 \r 时，shell 会把那个 \r 当成
-  # 续行的第一个参数 —— sed 报 "can't read r"，set -e 当场中止，
-  # 底下的 caddy validate 根本不会执行。断言于是恒不触发。（实测复现。）
-  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' /etc/caddy/Caddyfile > "${config}"
-fi
-caddy validate --config "${config}" --adapter caddyfile
-'@ 2>&1 | Out-String)
+        caddy:2.8-alpine /bin/sh -ec $caddyScript 2>&1 | Out-String)
     Check 'RELAY_ACME_EMAIL 留空时 Caddyfile 仍合法' ($caddyCheck -match 'Valid configuration') `
         "Caddy 验证失败：$($caddyCheck.Trim())"
 
     # 空白名单的语义也不能靠注释自证。Caddy 会把空 remote_ip 适配成
     # `remote_ip: {}`；在 `not` 外层下应匹配所有来源，管理面全部 403，
     # 而普通转发路径仍可达。用真实 Caddy 进程跑两个请求验证这一点。
-    $caddyRuntime = (docker run --rm `
-        -e RELAY_ALLOW_IPS= `
-        caddy:2.8-alpine /bin/sh -ec @'
+    $aclScript = ShLF @'
 cat >/tmp/acl.Caddyfile <<'EOF'
 :8080 {
   @admin path /admin*
@@ -380,7 +392,10 @@ done
 admin=$(wget -qO- --server-response http://127.0.0.1:8080/admin/ 2>&1 || true)
 printf 'admin403=%s\n' "$(printf '%s' "$admin" | grep -c '403 Forbidden')"
 printf 'proxy=%s\n' "$(cat /tmp/proxy 2>/dev/null || true)"
-'@ 2>&1 | Out-String)
+'@
+    $caddyRuntime = (docker run --rm `
+        -e RELAY_ALLOW_IPS= `
+        caddy:2.8-alpine /bin/sh -ec $aclScript 2>&1 | Out-String)
     Check 'IP 白名单留空时管理面全部 403' ($caddyRuntime -match 'admin403=1') `
         "运行结果：$($caddyRuntime.Trim())"
     Check 'IP 白名单留空不影响转发端点' ($caddyRuntime -match 'proxy=proxy-ok') `

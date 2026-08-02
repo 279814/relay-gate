@@ -158,26 +158,27 @@ for key in ENCRYPTION_KEY RELAY_KEYS ADMIN_PASSWORD; do
     fi
 done
 
-echo "=== CRLF 的脚本里不能有反斜杠续行 ==="
-# smoke-m7.ps1 是 CRLF 的（.gitattributes 强制 *.ps1 eol=crlf），它内嵌的
-# here-string 会被原样塞进容器里的 `sh -ec`。而反斜杠续行后面跟 \r 时，
-# shell 把那个 \r 当成续行的第一个参数 —— 命令报一个与行尾毫无关系的错
-# （`sed: can't read r`），set -e 当场中止，后面的断言根本不执行。
+echo "=== 送进容器 shell 的 here-string 必须先转成 LF ==="
+# *.ps1 是 CRLF 的（.gitattributes 强制），而运行镜像是 alpine ——
+# 它的 /bin/sh 是 busybox ash，**不容忍任何 \r**：`then\r` 不是关键字 `then`，
+# 整段脚本报 `syntax error: unexpected end of file (expecting "then")` 后
+# 一行都不执行。
 #
-# 症状是**冒烟脚本少跑了一整段却依然显示通过**，这比断言失败更糟：
-# 实测踩到的，空 ACME 邮箱那条检查从来没跑到 caddy validate。
+# 症状是**冒烟脚本少跑了一整段却依然显示通过**，这比断言失败更糟。
+# 而开发机上的 MSYS sh 恰好容忍行尾 \r，所以这个问题本地复现不出来 ——
+# 只在 CI 的 Linux runner + alpine 容器里才现形。（实测：CI 抓到的。）
 #
-# 判据按**字节**匹配 5c 0d 0a（\ CR LF），不用 grep/awk 的正则：
-# 实测在 MSYS/不同 locale 下 `grep -E '\\$'` 会对根本不以反斜杠结尾的行
-# 大面积误报（168/401 行），拿它当判据等于没有判据。
+# 判据：凡是把 here-string 交给 `sh -ec` 的地方，都必须经过 ShLF 去掉 \r。
+# 也就是 `/bin/sh -ec` 后面只能跟变量，不能直接跟 @' 开头的 here-string。
 for ps1 in "$root"/scripts/*.ps1; do
     [ -e "$ps1" ] || continue
-    hits=$(od -An -tx1 -v "$ps1" | tr -s ' ' '\n' | grep -v '^$' |
-        tr '\n' ' ' | grep -o '5c 0d 0a' | wc -l)
-    if [ "$hits" -gt 0 ]; then
-        fail "$(basename "$ps1") 有 $hits 处「反斜杠续行 + CRLF」—— 内嵌 shell 会把 \\r 当成参数，整段静默中止"
+    # `sh -ec @'` ：here-string 直接喂给容器 shell，没有过 ShLF
+    raw=$(grep -cE "sh +-ec +@'" "$ps1" || true)
+    if [ "$raw" -gt 0 ]; then
+        fail "$(basename "$ps1") 有 $raw 处把 here-string 直接交给 sh -ec —— "\
+"CRLF 会让 busybox ash 整段拒绝执行，断言恒不触发。应先过 ShLF 去掉 \\r"
     else
-        pass "$(basename "$ps1") 无「反斜杠续行 + CRLF」"
+        pass "$(basename "$ps1") 的内嵌 shell 都经过 LF 转换"
     fi
 done
 
