@@ -1,0 +1,48 @@
+# 构建上下文的排除清单。
+#
+# 这不只是「让构建快一点」：`COPY . .` 会把整个上下文送进构建阶段，
+# 而下面头几项含**真实凭据与对话原文**。它们不会出现在最终镜像里
+# （运行阶段只 COPY 那个二进制），但会留在构建缓存层里 ——
+# 而镜像层是可以被逐层导出的。
+
+# 运行时数据：库文件里有加密的上游 key，以及**明文的**样本
+# （完整对话原文与贴进去的代码）。
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 环境变量：ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD 都在这里
+.env
+.env.local
+
+# M0 的探测输入含真实站点地址与 key
+scripts/upstreams.tsv
+scripts/*.local.tsv
+docs/02-上游能力矩阵.md
+
+# 冒烟脚本的运行产物
+*-gate.log
+*-gate-err.log
+mock-*.log
+
+# 构建产物：宿主机上编译的二进制是 windows/amd64，
+# 拷进去既没用又会让上下文多几十 MB
+/relay-gate
+/relay-gate.exe
+/dist/
+
+# 版本控制与 CI 配置，构建用不到
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# 容器自身的定义文件，构建时用不到（它们由 docker 读，不进上下文）
+Dockerfile
+compose.yaml
+.dockerignore
+
+# 文档。改一个错别字不该让 go build 那一层缓存失效
+docs/
+README.md

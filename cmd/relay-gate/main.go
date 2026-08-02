@@ -25,6 +25,16 @@ import (
 	"github.com/279814/relay-gate/internal/web"
 )
 
+// version 由构建时注入（Dockerfile 的 -ldflags "-X main.version=..."）。
+//
+// 存在的理由很实际：出问题时第一个要回答的是「线上跑的到底是哪个版本」。
+// 没有它就只能比对二进制的 mtime，而容器里那个时间是镜像构建时间，
+// 与代码版本没有可靠对应。
+//
+// 默认 dev 而不是空串：空串在日志里看起来像「字段丢了」，
+// 而 dev 明确表示「这是本地构建的，不是发布产物」。
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败：%v\n", err)
@@ -144,13 +154,17 @@ func run() error {
 	mux.Handle("/admin/", web.Handler())
 	// /healthz 报的是**进程活着**，不代表有可用上游 —— 那要看 /admin/api/state。
 	// 混在一起会让容器编排在所有上游都挂时重启进程，而重启治不了上游。
+	//
+	// 带上 version：这是唯一不需要凭据就能问出「线上跑的是哪个版本」的地方，
+	// 而部署之后第一个要回答的往往就是它（尤其「我到底推上去了没有」）。
+	// 版本号不是秘密 —— 仓库是自己的，且它换不来任何攻击面。
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		state, err := cfgSrc.RunState()
 		if err != nil {
 			state = runState // 库暂时读不出来时报启动时的状态，别让健康检查失败
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","state":%q}`, state)
+		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)
 	})
 
 	srv := &http.Server{
@@ -164,7 +178,7 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("relay-gate 已启动", "addr", cfg.Addr, "db", cfg.DBPath,
+		log.Info("relay-gate 已启动", "version", version, "addr", cfg.Addr, "db", cfg.DBPath,
 			"state", runState, "relay_keys", len(cfg.RelayKeys),
 			"endpoints", "/v1/messages /v1/responses /v1/chat/completions "+
 				"/v1/messages/count_tokens /v1/models")

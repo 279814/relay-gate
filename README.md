@@ -15,16 +15,20 @@
 
 ## 状态
 
-开发中。当前进度见 [需求与设计文档](docs/01-需求与设计.md) 的里程碑一节。
+功能已完整，可部署。各阶段的实际完成范围与偏离说明见
+[需求与设计文档](docs/01-需求与设计.md) 的里程碑一节。
 
 - [x] M0 实测上游能力
-- [ ] M1 骨架 + SQLite + 配置 CRUD
-- [ ] M2 透传核心 + 选路 + 样本记录
-- [ ] M3 探活 + 健康状态机
-- [ ] M4 其余端点
-- [ ] M5 Web UI + 一键启停
-- [ ] M6 请求内重试 + 日志
-- [ ] M7 Docker Compose 部署
+- [x] M1 骨架 + SQLite + 配置 CRUD
+- [x] M2 透传核心 + 选路 + 样本记录
+- [x] M3 探活 + 健康状态机
+- [x] M4 其余端点
+- [x] M5 Web UI + 一键启停
+- [x] M6 请求内重试 + 日志
+- [x] M7 Docker Compose 部署
+
+仍待真实流量验证的两项（都需要接上 Claude Code 才能做）：
+`/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准。
 
 ## 设计要点
 
@@ -40,8 +44,41 @@
 ## 目录
 
 ```
-docs/     需求与设计文档
-scripts/  M0 上游能力探测脚本
+cmd/relay-gate/   入口：启动、优雅关闭、依赖装配
+internal/         proxy 透传 / probe 探活 / health 状态机 / router 选路 /
+                  store SQLite / api 管理端 / web 内嵌界面
+deploy/           Caddyfile 与容器 entrypoint
+docs/             需求与设计文档
+scripts/          M0 探测脚本、各阶段冒烟、部署静态检查
+```
+
+## 部署
+
+```bash
+cp .env.example .env
+# 填三项必填：ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD
+# 缺任何一项都会拒绝启动，而不是带着空 key 跑起来
+docker compose up -d
+```
+
+端口只绑 `127.0.0.1:18787`，管理界面在 `http://127.0.0.1:18787/admin/`。
+
+要对公网提供服务时加 `--profile public`，由 Caddy 做 TLS 与管理面 IP 白名单：
+
+```bash
+# .env 里再填 RELAY_DOMAIN、RELAY_ALLOW_IPS（留空 = 管理面全部 403）
+docker compose --profile public up -d
+```
+
+**唯一需要备份的是 `data/` 目录** —— 上游配置、样本、请求日志、健康历史全在里面。
+库文件权限是 0600（里面有明文的对话原文，加密只保护了上游 key）。
+
+验证部署改动：
+
+```bash
+sh scripts/check-entrypoint.sh   # entrypoint 的静态不变量，无需 Docker
+sh scripts/check-deploy.sh       # 部署清单的静态不变量，无需 Docker
+pwsh -File scripts/smoke-m7.ps1  # 容器端到端，需要 Docker 引擎
 ```
 
 ## M0：探测上游能力

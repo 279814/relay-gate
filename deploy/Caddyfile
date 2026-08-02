@@ -1,0 +1,67 @@
+# Caddy 反代（M7，§8）。仅在 `docker compose --profile public up` 时使用。
+#
+# 它负责三件网关自己刻意不做的事（§1.1 把 TLS 与证书管理列为非目标）：
+#   1. TLS 终结与证书自动续期
+#   2. 管理界面的 IP 白名单（§5.2f）
+#   3. 把 80 跳到 443
+#
+# 网关自身只监听容器内的 18787，且 compose 里的端口只绑 127.0.0.1 ——
+# 也就是说**绕过 Caddy 直连是进不来的**，白名单不会被旁路。
+
+{
+	# ACME 邮箱用于证书到期提醒。留空则 Caddy 用匿名账号申请 ——
+	# 能签发，但到期前收不到任何通知，而证书过期的表现是客户端全面报错。
+	email {$RELAY_ACME_EMAIL}
+}
+
+{$RELAY_DOMAIN} {
+	# ── 管理界面与管理 API：IP 白名单 ──────────────────────
+	#
+	# 这一段必须在通用 reverse_proxy **之前**：Caddy 的 handle 是按
+	# 最长路径匹配的，但顺序仍决定同级块的优先级。
+	#
+	# 为什么单独收紧管理面：它能读写所有上游 key（§5.2f），
+	# 而转发端点只是用 key 转发、不回显 key。两者的泄露后果差一个量级。
+	@admin path /admin*
+	handle @admin {
+		# 白名单未配置时**拒绝全部**，而不是放行全部。
+		#
+		# 这个默认方向是刻意的：忘了配 RELAY_ALLOW_IPS 的后果应该是
+		# 「我进不去管理界面」（立刻发现、自己动手修），而不是
+		# 「全世界都能进我的管理界面」（永远不会发现）。
+		#
+		# not remote_ip 在列表为空时匹配任何来源 —— 于是全部 403。
+		@notAllowed not remote_ip {$RELAY_ALLOW_IPS}
+		respond @notAllowed "403 —— 管理界面仅限白名单 IP。设置 RELAY_ALLOW_IPS 后重启 Caddy。" 403
+
+		reverse_proxy relay-gate:18787
+	}
+
+	# ── 转发端点：不限 IP，靠 relay key 鉴权 ────────────────
+	#
+	# 这里不能加 IP 白名单：客户端可能从任意网络访问（笔记本、手机热点、
+	# 另一台机器上的 Claude Code），而鉴权由 RELAY_KEYS 保证（§3.2）。
+	reverse_proxy relay-gate:18787 {
+		# SSE 必须逐块透传。Caddy 默认不缓冲响应，这里显式写出来是为了
+		# 防止将来有人为了「优化」加上 buffer —— 一旦缓冲，流式输出会
+		# 变成「长时间无反应后一次性刷出」，而那正是这个项目要避免的。
+		flush_interval -1
+
+		# 首 Token 可达 20 分钟（§4.2），长思考期间连接上没有任何字节。
+		# 不放宽的话 Caddy 会在默认超时后掐断一个完全正常的请求。
+		transport http {
+			response_header_timeout 30m
+			read_timeout 35m
+			write_timeout 35m
+		}
+	}
+
+	# 访问日志。默认 Caddy 只在出错时记，而「谁在什么时候访问过管理界面」
+	# 是安全事件排查的起点。
+	log {
+		output file /data/access.log {
+			roll_size 10m
+			roll_keep 3
+		}
+	}
+}
