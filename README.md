@@ -81,6 +81,11 @@ sh scripts/check-deploy.sh       # 部署清单的静态不变量，无需 Docke
 pwsh -File scripts/smoke-m7.ps1  # 容器端到端，需要 Docker 引擎
 ```
 
+前两项已接进 CI。第三项也在 CI 里跑（独立的 `container` job）——
+它验的每一条（0600 库权限、PID 1 是谁、SIGTERM 直达、端口只绑 127.0.0.1、
+空 ACME 邮箱、空 IP 白名单）都**只在容器里**才成立或才会坏，本地 `go test`
+全绿证明不了其中任何一条。
+
 ## M0：探测上游能力
 
 写代码前先实测各站到底支持什么。复制模板填入自己的站点：
