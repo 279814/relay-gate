@@ -28,6 +28,19 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# 原生命令的非零退出码**不要**自动抛异常。
+#
+# PowerShell 7.4 起 $PSNativeCommandUseErrorActionPreference 默认为 true，
+# 于是 `$ErrorActionPreference='Stop'` 会让任何一条 docker 命令的非零退出码
+# 直接抛出。这个脚本里有好几处**故意**允许失败的调用 ——
+# 最典型的是 Cleanup 里的 `docker rm -f`（首次运行时容器根本不存在），
+# 它是脚本的第一个动作，抛在这里等于一条断言都跑不到。
+#
+# 本脚本对每处需要判定的地方都显式检查 $LASTEXITCODE 或输出内容，
+# 不依赖自动抛异常。写死 false 是为了让行为在 Windows 与 CI 的 Linux runner
+# 上一致 —— 否则「本地全绿、CI 一开头就崩」。
+$PSNativeCommandUseErrorActionPreference = $false
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -329,8 +342,11 @@ config=/tmp/relay-gate-Caddyfile
 if [ -n "${RELAY_ACME_EMAIL:-}" ]; then
   cp /etc/caddy/Caddyfile "${config}"
 else
-  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' \
-    /etc/caddy/Caddyfile > "${config}"
+  # 刻意写成一行：这个 here-string 是 CRLF 的（.gitattributes 强制
+  # *.ps1 eol=crlf），而反斜杠续行后面跟 \r 时，shell 会把那个 \r 当成
+  # 续行的第一个参数 —— sed 报 "can't read r"，set -e 当场中止，
+  # 底下的 caddy validate 根本不会执行。断言于是恒不触发。（实测复现。）
+  sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' /etc/caddy/Caddyfile > "${config}"
 fi
 caddy validate --config "${config}" --adapter caddyfile
 '@ 2>&1 | Out-String)

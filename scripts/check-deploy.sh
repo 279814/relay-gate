@@ -116,8 +116,15 @@ echo "=== 构建上下文不含凭据 ==="
 # data/ 里有明文样本（完整对话原文），.env 里有三项凭据。
 # 它们不会进最终镜像（运行阶段只 COPY 二进制），但会留在构建缓存层里，
 # 而镜像层是可以逐层导出的。
+#
+# 判据必须是**整行精确匹配**，不能用 grep -F 做子串匹配：
+# 子串匹配下把 `.env` 注释成 `#.env` 仍然会被 `.env.local` 那一行命中，
+# 把 `data/` 注释成 `#data/` 也会被自己命中 —— 检查器全绿，而凭据与
+# 明文对话原文照进构建上下文。（实测：两处注释掉后原版都不报。）
 for pat in 'data/' '.env' 'scripts/upstreams.tsv'; do
-    if grep -qF "$pat" "$dockerignore"; then
+    # 剥掉注释与首尾空白后按整行比对
+    if sed 's/#.*//' "$dockerignore" | sed 's/[[:space:]]*$//' |
+        grep -qxF "$pat"; then
         pass ".dockerignore 排除了 $pat"
     else
         fail ".dockerignore 没有排除 $pat —— 凭据或对话原文会进构建上下文"
@@ -148,6 +155,29 @@ for key in ENCRYPTION_KEY RELAY_KEYS ADMIN_PASSWORD; do
         pass ".env.example 有 $key"
     else
         fail ".env.example 缺 $key —— 照模板填完仍然起不来"
+    fi
+done
+
+echo "=== CRLF 的脚本里不能有反斜杠续行 ==="
+# smoke-m7.ps1 是 CRLF 的（.gitattributes 强制 *.ps1 eol=crlf），它内嵌的
+# here-string 会被原样塞进容器里的 `sh -ec`。而反斜杠续行后面跟 \r 时，
+# shell 把那个 \r 当成续行的第一个参数 —— 命令报一个与行尾毫无关系的错
+# （`sed: can't read r`），set -e 当场中止，后面的断言根本不执行。
+#
+# 症状是**冒烟脚本少跑了一整段却依然显示通过**，这比断言失败更糟：
+# 实测踩到的，空 ACME 邮箱那条检查从来没跑到 caddy validate。
+#
+# 判据按**字节**匹配 5c 0d 0a（\ CR LF），不用 grep/awk 的正则：
+# 实测在 MSYS/不同 locale 下 `grep -E '\\$'` 会对根本不以反斜杠结尾的行
+# 大面积误报（168/401 行），拿它当判据等于没有判据。
+for ps1 in "$root"/scripts/*.ps1; do
+    [ -e "$ps1" ] || continue
+    hits=$(od -An -tx1 -v "$ps1" | tr -s ' ' '\n' | grep -v '^$' |
+        tr '\n' ' ' | grep -o '5c 0d 0a' | wc -l)
+    if [ "$hits" -gt 0 ]; then
+        fail "$(basename "$ps1") 有 $hits 处「反斜杠续行 + CRLF」—— 内嵌 shell 会把 \\r 当成参数，整段静默中止"
+    else
+        pass "$(basename "$ps1") 无「反斜杠续行 + CRLF」"
     fi
 done
 

@@ -33,13 +33,17 @@ else
 fi
 
 echo "=== 2. 脚本里引用的每个变量都必须先被赋值 ==="
-# 取出所有 ${VAR} / $VAR 形式的引用（排除 $1 $@ $? 这类特殊变量与位置参数），
-# 再确认它要么在脚本里赋过值，要么是我们刻意从环境读的那几个。
+# 取出所有 ${VAR} **与裸 $VAR** 形式的引用（排除 $1 $@ $? 这类特殊变量与
+# 位置参数），再确认它要么在脚本里赋过值，要么是我们刻意从环境读的那几个。
 #
 # 这一条正是上面那个 bug 的直接判据：DB_PATH 被引用但从未赋值。
+#
+# 必须同时认裸 $VAR：第一版只匹配 ${VAR}，于是同一个 bug 换成
+# `chown "$RELAY_UID" "$MISSING"` 的写法就能整个漏过去 —— 检查器全绿，
+# 而那正是它唯一存在的理由。（实测：注入裸 $MISSING_MODE 后原版不报。）
 env_provided='RELAY_DB RELAY_UID RELAY_GID'
-referenced=$(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*' "$script" |
-    sed 's/^\${//' | sort -u)
+referenced=$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' "$script" |
+    sed 's/^\$[{]\?//' | sort -u)
 for var in $referenced; do
     # 在脚本里被赋值？（VAR=... 或 for VAR in ...）
     if grep -qE "^[[:space:]]*${var}=" "$script" ||
@@ -56,21 +60,33 @@ done
 [ "$fails" -eq 0 ] && pass '所有引用的变量都有来源'
 
 echo "=== 3. chown 的目标必须是绝对路径 ==="
-# 直接跑一遍那段路径拼接，断言四个目标都以 / 开头。
+# 直接跑一遍 entrypoint.sh **自己**的那段路径拼接，断言四个目标都以 / 开头。
 # 只看代码文本不够：${DB_PATH} 拼出来是什么，得真的展开一次才知道。
-targets=$(RELAY_DB=/tmp/probe/x.db sh -c '
-    DB_PATH="${RELAY_DB:-/app/data/relay-gate.db}"
-    for suffix in "" -wal -shm -journal; do printf "%s\n" "${DB_PATH}${suffix}"; done')
-abs=0
-total=0
-for t in $targets; do
-    total=$((total + 1))
-    case "$t" in /*) abs=$((abs + 1)) ;; esac
-done
-if [ "$abs" -eq "$total" ] && [ "$total" -eq 4 ]; then
-    pass "4 个 chown 目标全是绝对路径"
+#
+# 关键是从真实脚本里把那两行抠出来跑，而不是在这里重抄一份。
+# 第一版就是重抄的 —— 于是它验的是检查器里那份硬编码副本，
+# entrypoint.sh 的默认值被改成相对路径时它照样全绿。（实测：把默认值
+# 换成 relay-gate.db 后原版仍 PASS。）一个永远为真的断言不是防线。
+assign=$(grep -E '^DB_PATH=' "$script")
+if [ -z "$assign" ]; then
+    fail 'entrypoint.sh 里找不到 DB_PATH= 赋值 —— 无法验证 chown 目标'
 else
-    fail "只有 $abs/$total 个目标是绝对路径 —— 其余是相对路径垃圾，chown 不到真实库文件"
+    # 不带 RELAY_DB 跑，验的是**默认值**那条路径（真实部署里 compose
+    # 不设 RELAY_DB 时走的就是它）。
+    targets=$(env -u RELAY_DB sh -c "
+        $assign
+        for suffix in \"\" -wal -shm -journal; do printf '%s\n' \"\${DB_PATH}\${suffix}\"; done")
+    abs=0
+    total=0
+    for t in $targets; do
+        total=$((total + 1))
+        case "$t" in /*) abs=$((abs + 1)) ;; esac
+    done
+    if [ "$abs" -eq "$total" ] && [ "$total" -eq 4 ]; then
+        pass "4 个 chown 目标全是绝对路径"
+    else
+        fail "只有 $abs/$total 个目标是绝对路径 —— 其余是相对路径垃圾，chown 不到真实库文件"
+    fi
 fi
 
 echo "=== 4. 必须用 exec 交棒（SIGTERM 直达） ==="
