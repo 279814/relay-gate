@@ -1,6 +1,6 @@
 #!/bin/sh
 # 在「已有 nginx + certbot 且 80/443 已被占用」的服务器上一键部署 relay-gate
-#（§13 的脚本实现）。**不需要编辑任何文件**，默认值都在下面的环境变量里。
+#（docs/03-部署与配置.md §14 的脚本实现）。**不需要编辑任何文件**。
 #
 # 与项目自带 `docker compose --profile public`（Caddy）的区别：
 # 那套要独占 80/443 并自己管证书；本机已有一个跑得好好的 nginx（含证书与
@@ -8,86 +8,89 @@
 # 127.0.0.1:18787，由现有 nginx 反代出去 —— 网关容器对公网不可直连，
 # 「绕过反代直连」不存在，安全性与 Caddy 方案等价。
 #
-# 流程：
-#   1. clone / pull 仓库到 $HOME/relay-gate，生成 .env（三项必填凭据）
-#   2. 构建并启动 relay-gate 容器（不启 Caddy）
-#   3. 为 $DOMAINS[0]（默认 relay.ienvie.top）生成 nginx 反代配置并 reload
-#      （先出 80 的 ACME 验证口，证书下来前 443 用的是现有证书，不影响老站）
-#   4. certbot --expand 把新域名并入现有证书（老域名一个不少）
-#   5. 自验证：健康检查 / 管理面 403 / 证书 SAN
+# 自动探测 nginx / certbot 的形态（容器优先）：
+#   - nginx 容器：conf 写到宿主机 /tmp → docker cp 进容器 → exec nginx -t/reload。
+#     **并把 nginx 容器接入 relay-gate 的 compose 网络**，反代目标用服务名
+#     relay-gate:18787（容器内的 127.0.0.1 是 nginx 自己，不通宿主机）。
+#   - 宿主机 nginx：sudo 写 /etc/nginx/conf.d/ → sudo nginx -t/reload
+#   - certbot 镜像：docker run --rm 临时容器挂载宿主证书/webroot 目录
+#     （不动你已有的任何容器；挂载模式与 setup-cron.sh 的续期命令一致）
+#   - 宿主机 certbot：sudo certbot ...
 #
 # 用法（在服务器上执行，或先下载后执行）。
-# **注意：变量要 export，不能写成 `RELAY_ALLOW_IPS=x curl ... | sh` ——
-# 前缀变量只对管道里的第一个命令（curl）生效，管道另一头的 sh 看不到，
-# 脚本会报「缺少白名单」而中止。**（实测踩到过。）
-#   export RELAY_ALLOW_IPS="156.229.165.212"
+# **注意：变量要 export**；前缀式 `VAR=x curl ... | sh` 只对管道第一个
+# 命令（curl）生效，sh 看不到 —— 会报「缺少白名单」。（实测踩到过。）
+# 容器形态**不需要 sudo**（docker 命令 + /tmp 暂存）；只有宿主 nginx /
+# 宿主 certbot 才需要，且要用 sudo -E（sudo 默认剥离环境变量）：
+#   export RELAY_ALLOW_IPS="<你电脑的出口IP>"
 #   curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
 #
 # 可覆盖的默认值（export 后再跑，或在下载到本地后直接执行）：
-#   RELAY_DOMAIN=relay.ienvie.top      # 对外域名
-#   RELAY_ALLOW_IPS='203.0.113.4'      # 管理面 IP 白名单（**必填**，空格分隔，
-#                                      # 支持 CIDR）。填的是你**自己电脑**的出口
-#                                      # IP —— 在自己电脑上 curl -s ifconfig.me
-#                                      # 查。脚本跑在服务器上，不能在服务器上取
-#                                      # （那拿到的是服务器自己的 IP，管理面
-#                                      # 白名单等于没配，你从家里访问会被 403）
-#   RELAY_DIR="$HOME/relay-gate"       # 仓库目录
-#   NGINX_CONTAINER=nginx              # nginx 容器名；空 = 宿主机 nginx
-#   CERTBOT_CONTAINER=certbot          # certbot 容器名；空 = 宿主机 certbot
-#   CERT_LIVE=/etc/letsencrypt/live/ienvie.top
-#   CERT_DOMAINS='ienvie.top www.ienvie.top rag.ienvie.top sub2api.ienvie.top'
+#   RELAY_DOMAIN=relay.ienvie.top        # 对外域名
+#   RELAY_ALLOW_IPS='203.0.113.4'        # 管理面 IP 白名单（**必填**，空格分隔，
+#                                        # 支持 CIDR）。填的是你**自己电脑**的出口
+#                                        # IP —— 在自己电脑上 curl -s ifconfig.me
+#                                        # 查。脚本跑在服务器上，不能在服务器上取
+#                                        # （那拿到的是服务器自己的 IP，管理面
+#                                        # 白名单等于没配，你从家里访问会被 403）
+#   RELAY_DIR="$HOME/relay-gate"         # 仓库目录
+#   NGINX_CONTAINER=nginx                # nginx 容器名；空 = 宿主机 nginx
+#   CERTBOT_IMAGE=certbot/certbot        # certbot 镜像；空 = 宿主机 certbot
+#   CERT_LIVE=/etc/letsencrypt/live/ienvie.top   # **nginx 容器内**证书路径
+#                                        # （宿主机 nginx 场景下同路径也成立）
+#   CERT_HOST_ROOT=/etc/letsencrypt      # 宿主上 certbot 配置根（含 live/），
+#                                        # 给 docker run 挂载用
+#   WEBROOT_HOST=/var/www/certbot        # 宿主上 ACME webroot 目录
+#   NGINX_ACME=/var/www/certbot          # nginx 容器内 ACME webroot 路径
+#   NGINX_CONF_D=/etc/nginx/conf.d       # 容器内 conf.d（宿主机场景亦适用）
 
 set -eu
 
 RELAY_DOMAIN=${RELAY_DOMAIN:-relay.ienvie.top}
-# 管理面白名单**必填**：填的是你自己电脑的出口 IP（在自己电脑上
-# `curl -s ifconfig.me` 查），不能在这里默认取服务器自己的出口 IP ——
-# 服务器上的 ifconfig.me 拿到的是服务器 IP，白名单等于没配，
-# 你从家里/办公室访问管理界面必被 403。忘了配的后果应该是
-# 「我进不去」（立刻发现），而不是「全世界都能进」。
-# 多个 IP 空格分隔：RELAY_ALLOW_IPS='203.0.113.4 198.51.100.0/24'
 RELAY_ALLOW_IPS=${RELAY_ALLOW_IPS:-}
 RELAY_DIR=${RELAY_DIR:-"$HOME/relay-gate"}
 NGINX_CONTAINER=${NGINX_CONTAINER:-nginx}
-CERTBOT_CONTAINER=${CERTBOT_CONTAINER:-certbot}
+CERTBOT_IMAGE=${CERTBOT_IMAGE:-certbot/certbot}
 CERT_LIVE=${CERT_LIVE:-/etc/letsencrypt/live/ienvie.top}
+CERT_HOST_ROOT=${CERT_HOST_ROOT:-/etc/letsencrypt}
+WEBROOT_HOST=${WEBROOT_HOST:-/var/www/certbot}
+NGINX_ACME=${NGINX_ACME:-/var/www/certbot}
+NGINX_CONF_D=${NGINX_CONF_D:-/etc/nginx/conf.d}
 
-CONF_FILE=/etc/nginx/conf.d/relay-ienvie-top.conf
-ACME_WEBROOT=/var/www/certbot
+CONF_NAME=relay-gate.conf
+# 容器 nginx 时 conf 先写到这里，docker cp 进去后即删。
+HOST_CONF_FILE="${TMPDIR:-/tmp}/$CONF_NAME"
 
 info() { printf '\033[1;32m[%s]\033[0m %s\n' "$1" "$2"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$1" "$2"; }
 die()  { printf '\033[1;31m[%s]\033[0m %s\n' "$1" "$2" >&2; exit 1; }
 
-for c in curl docker git; do
+for c in curl docker git openssl; do
     command -v "$c" >/dev/null 2>&1 || die "缺少依赖" "需要 $c，先装：sudo apt-get install -y $c"
 done
-# 白名单必填。空值直接中止 —— 绝不让「管理面默认全开放」的状态存在。
 [ -n "$RELAY_ALLOW_IPS" ] || die "缺少白名单" \
 'RELAY_ALLOW_IPS 未设置。在自己电脑上先 `curl -s ifconfig.me` 查出口 IP，
-然后这样跑（变量要 export —— 写在 curl 前面只对 curl 生效，管道另一头的
-sh 看不到）：
+然后这样跑（变量要 export，前缀式 `VAR=x curl ... | sh` 对 sh 不生效）：
     export RELAY_ALLOW_IPS="<你电脑的出口IP>"
     curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
 多个 IP（或 CIDR）用空格分隔，例如：export RELAY_ALLOW_IPS="203.0.113.4 198.51.100.0/24"'
 
-# 容器检测：存在就叫 docker exec，不存在就走宿主机。两层分别检测，
-# 因为有的服务器是「容器 nginx + 宿主 certbot」之类的混搭。
+# 形态探测：容器优先，两层分开（常有「容器 nginx + 宿主 certbot」的混搭）。
 if [ -n "$NGINX_CONTAINER" ] && docker inspect "$NGINX_CONTAINER" >/dev/null 2>&1; then
     NGINX_CT=1
-    info "nginx" "容器 $NGINX_CONTAINER，操作走 docker exec"
+    info "nginx" "容器 $NGINX_CONTAINER（conf 走 docker cp，反代目标用服务名）"
 else
     NGINX_CT=0
     command -v nginx >/dev/null 2>&1 || die "nginx" "没有 nginx 容器也没有宿主机 nginx —— 本脚本是给「已有 nginx」的服务器用的"
-    info "nginx" "宿主机 nginx"
+    info "nginx" "宿主机 nginx（需要 sudo）"
 fi
-if [ -n "$CERTBOT_CONTAINER" ] && docker inspect "$CERTBOT_CONTAINER" >/dev/null 2>&1; then
+if [ -n "$CERTBOT_IMAGE" ] && docker image inspect "$CERTBOT_IMAGE" >/dev/null 2>&1; then
     CERTBOT_CT=1
-    info "certbot" "容器 $CERTBOT_CONTAINER，操作走 docker exec"
+    info "certbot" "镜像 $CERTBOT_IMAGE（docker run --rm 临时调用，不动现有容器）"
 else
     CERTBOT_CT=0
-    command -v certbot >/dev/null 2>&1 || die "certbot" "没有 certbot 容器也没有宿主机 certbot —— 证书没法签。先装：sudo apt-get install -y certbot"
-    info "certbot" "宿主机 certbot"
+    command -v certbot >/dev/null 2>&1 || die "certbot" "没有 certbot 镜像也没有宿主机 certbot —— 证书没法签。先装：sudo apt-get install -y certbot"
+    info "certbot" "宿主机 certbot（需要 sudo）"
 fi
 
 # 域名先确认解析到本机，再往下走。解析都还没生效就去签证书，只会白等。
@@ -137,9 +140,28 @@ for _ in $(seq 1 60); do
 done
 [ "$ready" -eq 1 ] || die "网关" "relay-gate 120 秒没就绪，看日志：docker logs --tail 50 relay-gate"
 
-info "步骤 3/5" "生成 nginx 反代配置 $CONF_FILE"
+if [ "$NGINX_CT" -eq 1 ]; then
+    # 容器 nginx 必须能解析到网关：把 nginx 容器接进 relay-gate 的
+    # compose 网络，容器内才能用服务名 relay-gate:18787 访问网关。
+    # （容器内的 127.0.0.1 是 nginx 自己，不通宿主上的网关端口。）
+    info "步骤 3/5" "把 $NGINX_CONTAINER 接入 relay-gate 的 compose 网络"
+    net=$(docker network ls --format '{{.Name}}' | grep -E '^relay-gate_default$' || true)
+    if [ -z "$net" ]; then
+        net=$(docker inspect relay-gate --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)
+    fi
+    [ -n "$net" ] || die "网络" "找不到 relay-gate 的网络。手动接：docker network connect <网络名> $NGINX_CONTAINER"
+    docker network connect "$net" "$NGINX_CONTAINER" 2>/dev/null || true
+fi
+
+info "步骤 3/5" "生成 nginx 反代配置（$CONF_NAME）"
 # 模板里的 $host / $request_uri 是 nginx 变量，写文件时不能被这里展开，
 # 所以转义成 \$。
+# 反代目标：容器 nginx 用服务名 relay-gate:18787（走 docker 网络）；
+# 宿主机 nginx 用 127.0.0.1:18787。由 NGINX_CT 决定。
+NGINX_PROXY_TARGET=relay-gate:18787
+if [ "$NGINX_CT" -eq 0 ]; then
+    NGINX_PROXY_TARGET=127.0.0.1:18787
+fi
 # admin 白名单：allow 列表 + 兜底 deny all，与 Caddy 的
 # `not remote_ip` 语义一致 —— 没配 IP 时拒绝一切而不是放行一切。
 if [ -n "$RELAY_ALLOW_IPS" ]; then
@@ -147,7 +169,7 @@ if [ -n "$RELAY_ALLOW_IPS" ]; then
 else
     ALLOW_LINES='        deny all;'
 fi
-tee "$CONF_FILE" >/dev/null <<EOF
+tee "$HOST_CONF_FILE" >/dev/null <<EOF
 # relay-gate 反代（由 scripts/deploy-nginx.sh 生成，改这里不如改脚本重跑）
 # 网关容器只绑 127.0.0.1:18787，公网无法直连 —— 这里就是唯一入口。
 # 管理面（/admin）按 IP 白名单收紧；转发端点不限 IP，靠 RELAY_KEYS 鉴权。
@@ -158,7 +180,7 @@ server {
 
     # ACME HTTP-01 验证口，必须留在 80 上（续期也要用）
     location /.well-known/acme-challenge/ {
-        root $ACME_WEBROOT;
+        root $NGINX_ACME;
     }
 
     location / {
@@ -171,8 +193,8 @@ server {
     listen [::]:443 ssl;
     server_name $RELAY_DOMAIN;
 
-    # 复用现有证书。证书刚扩完 SAN 之前指向它也没关系 ——
-    # 文件存在，老站不会因此受影响。
+    # 复用现有证书（nginx 容器内路径；宿主机 nginx 场景下同路径亦成立）。
+    # 证书刚扩完 SAN 之前指向它也没关系 —— 文件存在，老站不会受影响。
     ssl_certificate     $CERT_LIVE/fullchain.pem;
     ssl_certificate_key $CERT_LIVE/privkey.pem;
 
@@ -180,7 +202,7 @@ server {
     location ^~ /admin {
 $ALLOW_LINES
         deny all;
-        proxy_pass http://127.0.0.1:18787;
+        proxy_pass http://$NGINX_PROXY_TARGET;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -189,7 +211,7 @@ $ALLOW_LINES
 
     # 转发端点：不限 IP，靠 relay key 鉴权
     location / {
-        proxy_pass http://127.0.0.1:18787;
+        proxy_pass http://$NGINX_PROXY_TARGET;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -209,28 +231,34 @@ $ALLOW_LINES
 EOF
 
 if [ "$NGINX_CT" -eq 1 ]; then
-    docker cp "$CONF_FILE" "$NGINX_CONTAINER:$CONF_FILE"
+    docker cp "$HOST_CONF_FILE" "$NGINX_CONTAINER:$NGINX_CONF_D/$CONF_NAME"
+    rm -f "$HOST_CONF_FILE"
     docker exec "$NGINX_CONTAINER" nginx -t
     docker exec "$NGINX_CONTAINER" nginx -s reload
 else
+    sudo install -m 644 "$HOST_CONF_FILE" /etc/nginx/conf.d/$CONF_NAME
     sudo nginx -t
     sudo systemctl reload nginx
 fi
 info "步骤 3/5" "nginx 已 reload（80 的 ACME 验证口已生效）"
 
 info "步骤 4/5" "certbot --expand：把 $RELAY_DOMAIN 并入现有证书（老域名一个不少）"
-# --cert-name 固定证书名：certbot 会读现有证书的域名集合，
+# --cert-name 固定证书名（live 目录名）：certbot 会读该证书现有的域名集合，
 # 把新域名加进去重新签发，续期 cron 不用改。
+CERT_NAME=$(basename "$CERT_LIVE")
 if [ "$CERTBOT_CT" -eq 1 ]; then
-    docker exec "$CERTBOT_CONTAINER" certbot certonly --webroot \
-        --cert-name ienvie.top \
-        -w "$ACME_WEBROOT" \
-        -d "$RELAY_DOMAIN" \
-        --expand --keep-until-expiring --non-interactive
+    docker run --rm \
+        -v "$CERT_HOST_ROOT:/etc/letsencrypt" \
+        -v "$WEBROOT_HOST:/var/www/certbot" \
+        "$CERTBOT_IMAGE" certbot certonly --webroot \
+            --cert-name "$CERT_NAME" \
+            -w /var/www/certbot \
+            -d "$RELAY_DOMAIN" \
+            --expand --keep-until-expiring --non-interactive
 else
     sudo certbot certonly --webroot \
-        --cert-name ienvie.top \
-        -w "$ACME_WEBROOT" \
+        --cert-name "$CERT_NAME" \
+        -w "$WEBROOT_HOST" \
         -d "$RELAY_DOMAIN" \
         --expand --keep-until-expiring --non-interactive
 fi
@@ -248,7 +276,7 @@ sleep 2
 code=$(curl -s -o /dev/null -w '%{http_code}' "https://$RELAY_DOMAIN/healthz")
 [ "$code" = "200" ] || die "验证" "https://$RELAY_DOMAIN/healthz 返回 $code，期望 200。排障：docker logs --tail 50 relay-gate"
 code=$(curl -s -o /dev/null -w '%{http_code}' "https://$RELAY_DOMAIN/admin/")
-[ "$code" = "403" ] || warn "验证" "管理面返回 $code，期望 403（白名单外）—— 检查 $CONF_FILE 里的 allow 列表"
+[ "$code" = "403" ] || warn "验证" "管理面返回 $code，期望 403（白名单外）—— 检查容器内 $NGINX_CONF_D/$CONF_NAME 的 allow 列表"
 if openssl s_client -connect "$RELAY_DOMAIN:443" -servername "$RELAY_DOMAIN" </dev/null 2>/dev/null |
     openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -q "$RELAY_DOMAIN"; then
     info "验证" "证书 SAN 已含 $RELAY_DOMAIN"
@@ -259,5 +287,5 @@ fi
 echo
 info "完成" "转发端点：https://$RELAY_DOMAIN  （客户端 base_url 填这个）"
 info "完成" "管理界面：https://$RELAY_DOMAIN/admin/  （口令在 $RELAY_DIR/.env 的 ADMIN_PASSWORD）"
-info "完成" "管理面仅限白名单 IP：$RELAY_ALLOW_IPS（换 IP 后改 .env 无效 —— 直接编辑 $CONF_FILE 的 allow 行再 reload）"
+info "完成" "管理面仅限白名单 IP：$RELAY_ALLOW_IPS（换 IP 后编辑容器内 $NGINX_CONF_D/$CONF_NAME 的 allow 行再 reload）"
 echo "接下来到管理界面里配：上游（中转站）→ 模型（客户端要的 model 名）→ 路由（优先级）。"

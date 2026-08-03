@@ -187,11 +187,22 @@ echo "=== deploy-nginx.sh 的部署不变量（§13 场景）==="
 # 会在 curl | sh 后才暴露。这里盯住几条可以纯静态判定的不变量。
 deploy_nginx="$root/scripts/deploy-nginx.sh"
 if [ -f "$deploy_nginx" ]; then
-    # 1. 公网入口不能把网关直接暴露 —— 脚本必须配宿主 127.0.0.1。
-    if grep -qE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:18787' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 反代目标是 127.0.0.1:18787（不经反代不可直连）'
+    # 1. 公网入口不能把网关直接暴露 —— 反代目标由形态决定且都指向网关：
+    #    容器 nginx → 服务名 relay-gate:18787（走 compose 网络，容器内
+    #    127.0.0.1 是 nginx 自己、不通宿主网关端口，写错 = 502）；
+    #    宿主机 nginx → 127.0.0.1:18787。两种都必须在脚本里，缺一不可。
+    if grep -qE 'NGINX_PROXY_TARGET=relay-gate:18787' "$deploy_nginx" &&
+        grep -qE 'NGINX_PROXY_TARGET=127\.0\.0\.1:18787' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 反代目标覆盖容器（relay-gate:18787）与宿主（127.0.0.1:18787）'
     else
-        fail 'deploy-nginx.sh 的反代目标不是 127.0.0.1:18787 —— 网关可能被直接暴露'
+        fail 'deploy-nginx.sh 的反代目标缺容器形态（relay-gate:18787）或宿主形态（127.0.0.1:18787）—— 容器 nginx 会 502，宿主 nginx 会直连公网'
+    fi
+
+    # 1b. 容器 nginx 必须把 nginx 容器接入网关网络，否则服务名解析不了。
+    if grep -qE 'docker network connect' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 有 docker network connect（容器 nginx 接入网关网络）'
+    else
+        fail 'deploy-nginx.sh 缺 docker network connect —— 容器 nginx 解析不到 relay-gate 服务名'
     fi
 
     # 2. 管理面默认拒绝而不是放行：白名单为空时必须 deny all。
