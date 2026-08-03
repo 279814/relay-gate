@@ -72,6 +72,17 @@ type Scheduler struct {
 	inflightL2  map[int64]bool
 	lastRunning store.RunState
 
+	// l1Scheduled 收敛同一轮 tick 内「同时到期」的多条 Route。
+	//
+	// 与 inflightL1 的分工：inflightL1 标记 goroutine 生命周期（跨 tick，
+	// L1 最长 25s 必然跨 tick）；l1Scheduled 标记本轮 tick（每轮开始重置）。
+	// 两道闸缺一不可 —— 只靠 inflightL1，同一 tick 内如果第一个 L1 先跑完
+	// endL1，后面的 Route 会再抢一次（Issue #21 的根因）；只靠 l1Scheduled，
+	// 则一个慢 L1 跨 tick 时会放行并发重复。
+	//
+	// 只在 tick() 的单线程遍历里读写，不需要额外锁。
+	l1Scheduled map[int64]bool
+
 	// wg 等所有在途探活收尾，让 Close 有确定的语义。
 	wg sync.WaitGroup
 }
@@ -100,6 +111,7 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 		busyUp:      map[int64]bool{},
 		inflightL1:  map[int64]bool{},
 		inflightL2:  map[int64]bool{},
+		l1Scheduled: map[int64]bool{},
 		lastRunning: store.StateRunning,
 	}
 }
@@ -169,6 +181,17 @@ func (s *Scheduler) tick(ctx context.Context) {
 
 	s.gcRemoved(snap)
 
+	// 每轮 tick 重新开始，站级 L1 收敛只对本轮生效。
+	// 不能把「本轮已调度」的信息留在 inflightL1 里 —— 那是 goroutine
+	// 生命周期级的标记，会跨 tick 残留（L1 最长 25s，必然跨 tick）。
+	//
+	// 在锁内重置：beginL1 在 s.mu 内读写 l1Scheduled，重置与读写必须
+	// 用同一把锁，否则将来若有人从其他 goroutine 调 maybeProbe，
+	// 这里就成了一个未加锁的整表替换。
+	s.mu.Lock()
+	s.l1Scheduled = map[int64]bool{}
+	s.mu.Unlock()
+
 	for _, mn := range snap.ModelNames {
 		if !mn.Enabled {
 			continue
@@ -191,8 +214,11 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	mn *model.ModelName, rt *model.Route, settings model.Settings) {
 
 	// L1 是站级的，但到期判定挂在 Route 上（间隔取决于 Route 的状态）。
-	// 同一个站下的多个 Route 会各自判定到期，由 inflightL1 收敛成一次请求 ——
+	// 同一个站下的多个 Route 会各自判定到期，由 beginL1 收敛成一次请求 ——
 	// 这正是分两级的收益：N 个 Route 共享一次 L1 结果。
+	//
+	// beginL1 有两道闸（见其注释）：l1Scheduled 收本轮 tick 内同时到期的
+	// 多条 Route，inflightL1 收跨 tick 仍在跑的 L1。
 	if s.track.ClaimL1(rt.ID) && s.beginL1(up.ID) {
 		s.wg.Add(1)
 		go func() {
@@ -335,16 +361,28 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 
 // ── 并发闸 ───────────────────────────────────────────────
 
-// beginL1 保证同一个站同时只有一个 L1 在跑。
+// beginL1 保证「同一轮 tick 内同一个站只调度一次 L1」，且「同一时刻
+// 同一个站只有一个 L1 在跑」。
 //
-// 收敛是必须的：一个站下挂 5 个 Route 时，5 个 Route 各自判定 L1 到期，
-// 不收敛就会对同一个 /v1/models 打 5 次完全相同的请求。
+// 两道闸，各挡一种重复：
+//
+//  1. l1Scheduled 挡「同一 tick 内同时到期」。一个站下挂 5 个 Route 时，
+//     5 个 Route 各自判定 L1 到期，若都放行就会对同一个 /v1/models 打 5 次
+//     完全相同的请求。这个标记在每轮 tick 开始重置（见 tick）。
+//
+//  2. inflightL1 挡「跨 tick 重叠」。L1 最长给 25s，必然跨 tick；若一个站
+//     的 L1 还在跑，下一个 tick 里该站的 Route 不该再发一个。这个标记在
+//     L1 goroutine 完成时清除（endL1）。
+//
+// 缺任一道闸都会重复：Issue #21 的根因就是只靠 inflightL1 —— 同一 tick 内
+// 若第一个 L1 先跑完 endL1，后面的 Route 会再抢一次。
 func (s *Scheduler) beginL1(upstreamID int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inflightL1[upstreamID] {
+	if s.l1Scheduled[upstreamID] || s.inflightL1[upstreamID] {
 		return false
 	}
+	s.l1Scheduled[upstreamID] = true
 	s.inflightL1[upstreamID] = true
 	return true
 }
