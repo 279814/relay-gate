@@ -28,3 +28,9 @@ data/
 *-gate.log
 *-gate-err.log
 mock-*.log
+
+# 本地工具与编辑器的工作目录。
+# .claude/ 下有 worktrees 等本地状态，与项目无关，也不该进公开仓库。
+.claude/
+.idea/
+.vscode/
