@@ -16,10 +16,14 @@
 #   4. certbot --expand 把新域名并入现有证书（老域名一个不少）
 #   5. 自验证：健康检查 / 管理面 403 / 证书 SAN
 #
-# 用法（在服务器上执行，或先下载后执行）：
+# 用法（在服务器上执行，或先下载后执行）。
+# **注意：变量要 export，不能写成 `RELAY_ALLOW_IPS=x curl ... | sh` ——
+# 前缀变量只对管道里的第一个命令（curl）生效，管道另一头的 sh 看不到，
+# 脚本会报「缺少白名单」而中止。**（实测踩到过。）
+#   export RELAY_ALLOW_IPS="156.229.165.212"
 #   curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
 #
-# 可覆盖的默认值（前缀式环境变量，不想用默认就导出后再跑）：
+# 可覆盖的默认值（export 后再跑，或在下载到本地后直接执行）：
 #   RELAY_DOMAIN=relay.ienvie.top      # 对外域名
 #   RELAY_ALLOW_IPS='203.0.113.4'      # 管理面 IP 白名单（**必填**，空格分隔，
 #                                      # 支持 CIDR）。填的是你**自己电脑**的出口
@@ -61,9 +65,11 @@ done
 # 白名单必填。空值直接中止 —— 绝不让「管理面默认全开放」的状态存在。
 [ -n "$RELAY_ALLOW_IPS" ] || die "缺少白名单" \
 'RELAY_ALLOW_IPS 未设置。在自己电脑上先 `curl -s ifconfig.me` 查出口 IP，
-然后这样跑：
-    RELAY_ALLOW_IPS="<你电脑的出口IP>" curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
-多个 IP（或 CIDR）用空格分隔，例如：RELAY_ALLOW_IPS="203.0.113.4 198.51.100.0/24"'
+然后这样跑（变量要 export —— 写在 curl 前面只对 curl 生效，管道另一头的
+sh 看不到）：
+    export RELAY_ALLOW_IPS="<你电脑的出口IP>"
+    curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
+多个 IP（或 CIDR）用空格分隔，例如：export RELAY_ALLOW_IPS="203.0.113.4 198.51.100.0/24"'
 
 # 容器检测：存在就叫 docker exec，不存在就走宿主机。两层分别检测，
 # 因为有的服务器是「容器 nginx + 宿主 certbot」之类的混搭。
