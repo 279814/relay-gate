@@ -62,6 +62,13 @@ docker compose up -d
 
 需要**服务器公网访问 + 多中转站 + Claude Code 接入 + 运维**的逐步示例，
 请直接看 [服务器部署与配置](docs/03-部署与配置.md)。
+服务器上**已有 nginx + 证书**（80/443 被占用）的话，用其中
+[第 14 章的一键脚本](docs/03-部署与配置.md#14-已有-nginx--证书的服务器一键脚本)：
+```bash
+curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
+```
+脚本自动生成凭据与 nginx 反代、扩证书 SAN，全程无需编辑文件，
+中转站配置走网页管理界面。
 
 ### 接上 Claude Code
 
