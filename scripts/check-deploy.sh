@@ -182,6 +182,53 @@ for ps1 in "$root"/scripts/*.ps1; do
     fi
 done
 
+echo "=== deploy-nginx.sh 的部署不变量（§13 场景）==="
+# 一条命令部署脚本是「已有 nginx + certbot」服务器的主路径，它的问题
+# 会在 curl | sh 后才暴露。这里盯住几条可以纯静态判定的不变量。
+deploy_nginx="$root/scripts/deploy-nginx.sh"
+if [ -f "$deploy_nginx" ]; then
+    # 1. 公网入口不能把网关直接暴露 —— 脚本必须配宿主 127.0.0.1。
+    if grep -qE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:18787' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 反代目标是 127.0.0.1:18787（不经反代不可直连）'
+    else
+        fail 'deploy-nginx.sh 的反代目标不是 127.0.0.1:18787 —— 网关可能被直接暴露'
+    fi
+
+    # 2. 管理面默认拒绝而不是放行：白名单为空时必须 deny all。
+    if grep -qE 'ALLOW_LINES=.*deny all' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 白名单为空时管理面 deny all'
+    else
+        fail 'deploy-nginx.sh 缺「白名单为空时 deny all」的兜底 —— 忘了配 IP 就是全开放'
+    fi
+
+    # 3. 长思考不能被掐断：SSE 不缓冲 + 超时放宽。
+    if grep -qE 'proxy_buffering[[:space:]]+off' "$deploy_nginx" &&
+        grep -qE 'proxy_read_timeout[[:space:]]+35m' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 有 proxy_buffering off 与 proxy_read_timeout 35m'
+    else
+        fail 'deploy-nginx.sh 缺 proxy_buffering off 或 proxy_read_timeout —— 长思考会被 60s 默认超时掐断'
+    fi
+
+    # 4. 80 必须留 ACME 验证口（证书续期依赖它）。
+    if grep -qE 'acme-challenge' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 的 80 端口留了 /.well-known/acme-challenge/'
+    else
+        fail 'deploy-nginx.sh 的 80 端口没有 ACME 验证口 —— 续期会失败'
+    fi
+
+    # 5. 证书扩展必须保住老域名：--cert-name 固定证书名 + --expand。
+    # 用 -e 显式指定模式（模式本身以 -- 开头，直接当参数会被 grep
+    # 当成选项吞掉）。
+    if grep -qE -e '--cert-name' "$deploy_nginx" &&
+        grep -qE -e '--expand' "$deploy_nginx"; then
+        pass 'deploy-nginx.sh 的 certbot 用 --cert-name + --expand（老域名不丢）'
+    else
+        fail 'deploy-nginx.sh 的 certbot 缺 --cert-name 或 --expand —— 可能把证书换成只有新域名的'
+    fi
+else
+    fail '缺少 scripts/deploy-nginx.sh —— §13 场景的一键部署入口没了'
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "$fails 项失败" >&2
