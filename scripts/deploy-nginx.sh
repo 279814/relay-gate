@@ -21,7 +21,12 @@
 #
 # 可覆盖的默认值（前缀式环境变量，不想用默认就导出后再跑）：
 #   RELAY_DOMAIN=relay.ienvie.top      # 对外域名
-#   RELAY_ALLOW_IPS='203.0.113.4'      # 管理面 IP 白名单，空格分隔
+#   RELAY_ALLOW_IPS='203.0.113.4'      # 管理面 IP 白名单（**必填**，空格分隔，
+#                                      # 支持 CIDR）。填的是你**自己电脑**的出口
+#                                      # IP —— 在自己电脑上 curl -s ifconfig.me
+#                                      # 查。脚本跑在服务器上，不能在服务器上取
+#                                      # （那拿到的是服务器自己的 IP，管理面
+#                                      # 白名单等于没配，你从家里访问会被 403）
 #   RELAY_DIR="$HOME/relay-gate"       # 仓库目录
 #   NGINX_CONTAINER=nginx              # nginx 容器名；空 = 宿主机 nginx
 #   CERTBOT_CONTAINER=certbot          # certbot 容器名；空 = 宿主机 certbot
@@ -31,7 +36,13 @@
 set -eu
 
 RELAY_DOMAIN=${RELAY_DOMAIN:-relay.ienvie.top}
-RELAY_ALLOW_IPS=${RELAY_ALLOW_IPS:-$(curl -s ifconfig.me || true)}
+# 管理面白名单**必填**：填的是你自己电脑的出口 IP（在自己电脑上
+# `curl -s ifconfig.me` 查），不能在这里默认取服务器自己的出口 IP ——
+# 服务器上的 ifconfig.me 拿到的是服务器 IP，白名单等于没配，
+# 你从家里/办公室访问管理界面必被 403。忘了配的后果应该是
+# 「我进不去」（立刻发现），而不是「全世界都能进」。
+# 多个 IP 空格分隔：RELAY_ALLOW_IPS='203.0.113.4 198.51.100.0/24'
+RELAY_ALLOW_IPS=${RELAY_ALLOW_IPS:-}
 RELAY_DIR=${RELAY_DIR:-"$HOME/relay-gate"}
 NGINX_CONTAINER=${NGINX_CONTAINER:-nginx}
 CERTBOT_CONTAINER=${CERTBOT_CONTAINER:-certbot}
@@ -47,7 +58,12 @@ die()  { printf '\033[1;31m[%s]\033[0m %s\n' "$1" "$2" >&2; exit 1; }
 for c in curl docker git; do
     command -v "$c" >/dev/null 2>&1 || die "缺少依赖" "需要 $c，先装：sudo apt-get install -y $c"
 done
-[ -n "$RELAY_ALLOW_IPS" ] || die "缺少白名单" '取不到出口 IP（ifconfig.me 不通）。手动指定：RELAY_ALLOW_IPS="<你的IP>" 重跑'
+# 白名单必填。空值直接中止 —— 绝不让「管理面默认全开放」的状态存在。
+[ -n "$RELAY_ALLOW_IPS" ] || die "缺少白名单" \
+'RELAY_ALLOW_IPS 未设置。在自己电脑上先 `curl -s ifconfig.me` 查出口 IP，
+然后这样跑：
+    RELAY_ALLOW_IPS="<你电脑的出口IP>" curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
+多个 IP（或 CIDR）用空格分隔，例如：RELAY_ALLOW_IPS="203.0.113.4 198.51.100.0/24"'
 
 # 容器检测：存在就叫 docker exec，不存在就走宿主机。两层分别检测，
 # 因为有的服务器是「容器 nginx + 宿主 certbot」之类的混搭。
