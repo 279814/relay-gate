@@ -147,6 +147,17 @@ else
     fail '没有 CGO_ENABLED=0 —— alpine(musl) 与 debian(glibc) 的动态链接差异会让「本地好好的，容器里起不来」'
 fi
 
+echo "=== GOPROXY 必须声明为 ARG（未声明的 build-arg 会被静默丢弃）==="
+# 国内服务器连不上 proxy.golang.org，构建时报 dial tcp i/o timeout。
+# 解决手段是 `--build-arg GOPROXY=https://goproxy.cn,direct` —— 但
+# Dockerfile 不声明 `ARG GOPROXY` 的话，这个 build-arg 会被**静默丢弃**
+# （不报错，就是不变），用户传了等于没传，报错原样复现。（实测踩到过。）
+if grep -qE '^ARG[[:space:]]+GOPROXY=' "$dockerfile"; then
+    pass 'Dockerfile 声明了 ARG GOPROXY（--build-arg 才不会被静默丢弃）'
+else
+    fail 'Dockerfile 缺 ARG GOPROXY —— 国内服务器用 --build-arg GOPROXY 会静默无效'
+fi
+
 echo "=== .env.example 覆盖 config.validate 要求的三项 ==="
 # 少一项的话，用户照着模板填完仍然起不来，而错误信息出现在容器日志里 ——
 # 一个本该在模板里就避免的往返。

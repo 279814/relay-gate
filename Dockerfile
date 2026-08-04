@@ -14,6 +14,13 @@ WORKDIR /src
 # 先只拷依赖清单再 download，让这一层能被缓存 ——
 # 改一行代码就重下一遍全部依赖的话，每次构建都要多等一分钟。
 COPY go.mod go.sum ./
+# 依赖下载的 Go module 代理。默认 proxy.golang.org（CI/海外直连没问题）。
+# 国内服务器连不上它（dial tcp ... i/o timeout），构建时传
+# `--build-arg GOPROXY=https://goproxy.cn,direct` 覆盖。
+#
+# **必须声明成 ARG**：Dockerfile 没声明的 build-arg 会被静默丢弃
+# （不报错，就是不变），用户传了等于没传。（实测踩到过。）
+ARG GOPROXY=https://proxy.golang.org,direct
 RUN go mod download
 
 COPY . .
