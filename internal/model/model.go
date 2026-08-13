@@ -29,6 +29,19 @@ func (p Protocol) Path() string {
 
 func (p Protocol) Valid() bool { return p.Path() != "" }
 
+func (p Protocol) Endpoint() (EndpointKind, bool) {
+	switch p {
+	case ProtoAnthropic:
+		return EndpointMessages, true
+	case ProtoOpenAIResponses:
+		return EndpointResponses, true
+	case ProtoOpenAIChat:
+		return EndpointChatCompletions, true
+	default:
+		return "", false
+	}
+}
+
 // AuthStyle 决定出站注入哪个鉴权头（§3.2）。
 type AuthStyle string
 

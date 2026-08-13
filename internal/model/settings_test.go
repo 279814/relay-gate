@@ -2,9 +2,66 @@ package model
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestDefaultSettingsP0StageBudgets(t *testing.T) {
+	settings := DefaultSettings()
+	got := []int{
+		settings.RealConnectSec,
+		settings.RealResponseHeaderSec,
+		settings.RealFirstByteSec,
+		settings.RealFirstSemanticSec,
+		settings.RealIdleSec,
+		settings.RealTotalSec,
+		settings.L1ConnectSec,
+		settings.L1TotalSec,
+		settings.L2ConnectSec,
+		settings.L2ResponseHeaderSec,
+		settings.L2FirstByteSec,
+		settings.L2FirstEventSec,
+		settings.L2FirstSemanticSec,
+		settings.L2IdleSec,
+		settings.L2TotalSec,
+		settings.CountTokensConnectSec,
+		settings.CountTokensTotalSec,
+	}
+	want := []int{30, 1200, 1200, 1200, 600, 1800, 30, 90, 30, 300, 300, 300, 300, 120, 600, 30, 180}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("P0 stage defaults = %v, want %v", got, want)
+	}
+	if err := settings.Validate(); err != nil {
+		t.Fatalf("default settings must validate: %v", err)
+	}
+}
+
+func TestSettingsValidateP0StageBudgets(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Settings)
+	}{
+		{"real first semantic below hard floor", func(settings *Settings) { settings.RealFirstSemanticSec = 299 }},
+		{"real response header exceeds total", func(settings *Settings) { settings.RealResponseHeaderSec = settings.RealTotalSec + 1 }},
+		{"real first byte exceeds total", func(settings *Settings) { settings.RealFirstByteSec = settings.RealTotalSec + 1 }},
+		{"real first semantic exceeds total", func(settings *Settings) { settings.RealFirstSemanticSec = settings.RealTotalSec + 1 }},
+		{"L2 response header exceeds total", func(settings *Settings) { settings.L2ResponseHeaderSec = settings.L2TotalSec + 1 }},
+		{"L2 first byte exceeds total", func(settings *Settings) { settings.L2FirstByteSec = settings.L2TotalSec + 1 }},
+		{"L2 first event exceeds total", func(settings *Settings) { settings.L2FirstEventSec = settings.L2TotalSec + 1 }},
+		{"L2 first semantic exceeds total", func(settings *Settings) { settings.L2FirstSemanticSec = settings.L2TotalSec + 1 }},
+		{"count tokens connect exceeds total", func(settings *Settings) { settings.CountTokensConnectSec = settings.CountTokensTotalSec + 1 }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := DefaultSettings()
+			tc.mutate(&settings)
+			if err := settings.Validate(); !errors.Is(err, ErrValidation) {
+				t.Fatalf("error = %v, want validation", err)
+			}
+		})
+	}
+}
 
 // 首 Token 超时的 5 分钟硬下限是刻意设计的约束（§4.2），
 // 不是随手取的数字，所以要有测试守住它，防止日后被「顺手改小一点」。

@@ -2,8 +2,10 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -18,6 +20,7 @@ var schemaFS embed.FS
 type Store struct {
 	db     *sql.DB
 	cipher *Cipher
+	lock   *instanceLock
 }
 
 // connPragmas 是必须写在 DSN 里的**连接级** pragma。
@@ -37,6 +40,21 @@ const connPragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock
 
 // Open 打开（或创建）数据库并建表。
 func Open(dsn string, c *Cipher) (*Store, error) {
+	if c == nil {
+		return nil, ErrNoKey
+	}
+	databasePath := dbPathOf(dsn)
+	lock, err := acquireInstanceLock(databasePath)
+	if err != nil {
+		return nil, err
+	}
+	closeLock := true
+	defer func() {
+		if closeLock {
+			_ = lock.Close()
+		}
+	}()
+
 	// _txlock=immediate：写事务一开始就取写锁，避免 SQLite 在事务中途升级锁时
 	// 报 SQLITE_BUSY（读事务升级为写事务是死锁的经典来源）。
 	db, err := sql.Open("sqlite", dsn+connPragmas)
@@ -44,10 +62,10 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 		return nil, fmt.Errorf("打开数据库: %w", err)
 	}
 
-	// SQLite 单写者。并发写连接只会撞锁，不会更快，所以限制为 1，
-	// 让排队发生在连接池而不是数据库层（前者可控，后者报 BUSY）。
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Migration 在线备份需要一条持有 BEGIN IMMEDIATE 的连接和另一条只读
+	// source 连接。完成 migration 后再收紧为单写连接。
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(0)
 
 	if err := db.Ping(); err != nil {
@@ -55,28 +73,60 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 		return nil, fmt.Errorf("连接数据库: %w", err)
 	}
 
-	schema, err := schemaFS.ReadFile("schema.sql")
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("读取 schema: %w", err)
-	}
-	if _, err := db.Exec(string(schema)); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("初始化 schema: %w", err)
-	}
-
-	// schema.sql 只能让**新**库长对：CREATE TABLE IF NOT EXISTS 对已存在的表
-	// 是空操作，加不了列。老库的增量变更走 migrate。
-	if err := migrate(db); err != nil {
+	if err := migrateToDevelopmentSchema(context.Background(), db, databasePath, c, defaultMigrationBackupIdentity()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("迁移 schema: %w", err)
 	}
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&journalMode); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("启用 WAL: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		db.Close()
+		return nil, fmt.Errorf("启用 WAL: SQLite 返回 %q", journalMode)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// 收紧文件权限。放在建表之后：WAL 与 shm 是第一次写才出现的，
 	// 提前 chmod 会漏掉它们。
 	restrictPerms(dsn)
 
-	return &Store{db: db, cipher: c}, nil
+	closeLock = false
+	return &Store{db: db, cipher: c, lock: lock}, nil
+}
+
+func defaultMigrationBackupIdentity() MigrationBackupIdentity {
+	return MigrationBackupIdentity{
+		PairedBuildID:  "relay-gate-pre-p0",
+		ReaderContract: "schema-1-reader",
+	}
+}
+
+func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath string, cipher *Cipher, identity MigrationBackupIdentity) error {
+	for {
+		state, err := inspectSchemaState(ctx, db)
+		if err != nil {
+			return err
+		}
+		switch {
+		case state.Empty:
+			return initializeEmptySchemaTwo(ctx, db)
+		case state.Version == 0 && state.Variant != "":
+			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
+		case state.Version == 1:
+			if _, err := migrateSchemaOneToTwo(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
+		case state.Version == developmentSchemaVersion:
+			return nil
+		default:
+			return fmt.Errorf("%w: 无迁移路径 %+v", ErrUnknownSchema, state)
+		}
+	}
 }
 
 // dbFilePerm 是库文件应有的权限：**只有属主可读写**。
@@ -128,7 +178,12 @@ func dbPathOf(dsn string) string {
 	return dsn
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	return errors.Join(s.db.Close(), s.lock.Close())
+}
 
 // DB 暴露底层连接，供尚未封装的查询使用（样本浏览器等）。
 func (s *Store) DB() *sql.DB { return s.db }

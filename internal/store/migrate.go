@@ -49,6 +49,9 @@ const (
 	schemaV1FreshFingerprint           = "cef6c9e40b9fe61f3faf3bb3b4c3262713c5d74482ecff6d85a634725efebc8c"
 	schemaV1M2UpgradeFingerprint       = "ea5bae56d38415486c8f4b9f57c1e59699b58d49df18b6186fce8af17e808a9d"
 	schemaV1M6UpgradeFingerprint       = "56fca9b32c6683310c6808fa6c1a5400d72e847703112e6debbd33dc94b15ea2"
+	schemaV2FreshFingerprint           = "ca6217482a0464d771535862bc99f2624f985732fdc4b7f951b00810b655bcbf"
+	schemaV2M2UpgradeFingerprint       = "82fbd450859331bc56bebeb2b5019e2d3bf26d53a722c4f042e2d8d5b0898295"
+	schemaV2M6UpgradeFingerprint       = "0be11e42d9f087afba819457b94458d03aa595e9a504d49ee9dce6ac1b1c4710"
 )
 
 type schemaQuerier interface {
@@ -100,15 +103,18 @@ func inspectSchemaState(ctx context.Context, db schemaQuerier) (inspectedSchemaS
 }
 
 func schemaVersionFingerprintKnown(version int, fingerprint string) bool {
-	if version != 1 {
-		return false
+	switch version {
+	case 1:
+		switch fingerprint {
+		case schemaV1FreshFingerprint, schemaV1M2UpgradeFingerprint, schemaV1M6UpgradeFingerprint:
+			return true
+		}
+	case 2:
+		return fingerprint == schemaV2FreshFingerprint ||
+			fingerprint == schemaV2M2UpgradeFingerprint ||
+			fingerprint == schemaV2M6UpgradeFingerprint
 	}
-	switch fingerprint {
-	case schemaV1FreshFingerprint, schemaV1M2UpgradeFingerprint, schemaV1M6UpgradeFingerprint:
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 func readSchemaCatalog(ctx context.Context, db schemaQuerier) ([]schemaCatalogRow, string, error) {
@@ -201,6 +207,17 @@ func initializeEmptySchemaOne(ctx context.Context, db *sql.DB) (err error) {
 	return applySchemaOne(ctx, db, script)
 }
 
+func initializeEmptySchemaTwo(ctx context.Context, db *sql.DB) error {
+	if err := initializeEmptySchemaOne(ctx, db); err != nil {
+		return err
+	}
+	script, err := migrationFS.ReadFile("migrations/0002_p0_probe.sql")
+	if err != nil {
+		return fmt.Errorf("读取 schema 2 migration: %w", err)
+	}
+	return applySchemaTwo(ctx, db, script)
+}
+
 func applySchemaOne(ctx context.Context, db *sql.DB, script []byte) (err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -237,6 +254,135 @@ func applySchemaOne(ctx context.Context, db *sql.DB, script []byte) (err error) 
 		return fmt.Errorf("提交 schema 1 migration: %w", err)
 	}
 	return nil
+}
+
+func applySchemaTwo(ctx context.Context, db *sql.DB, script []byte) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始 schema 2 migration: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	before, err := inspectSchemaState(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("schema 2 migration 前检查: %w", err)
+	}
+	if before.Version != 1 {
+		return fmt.Errorf("%w: schema 2 migration 需要 version=1，得到 %+v", ErrUnknownSchema, before)
+	}
+	if _, err = tx.ExecContext(ctx, string(script)); err != nil {
+		return fmt.Errorf("执行 schema 2 migration: %w", err)
+	}
+	// 与所有 migration 一样，schema_version 必须是事务中的最后一条写 SQL。
+	if _, err = tx.ExecContext(ctx, `UPDATE schema_version SET version=2 WHERE singleton=1 AND version=1`); err != nil {
+		return fmt.Errorf("标记 schema 2: %w", err)
+	}
+	after, err := inspectSchemaState(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("schema 2 migration 后检查: %w", err)
+	}
+	if after.Version != 2 {
+		return fmt.Errorf("%w: schema 2 migration 得到 version=%d", ErrUnknownSchema, after.Version)
+	}
+	if err = validateForeignKeys(ctx, tx); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("提交 schema 2 migration: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaOneToTwo(ctx context.Context, db *sql.DB, databasePath string, cipher *Cipher, identity MigrationBackupIdentity) (result MigrationBackupResult, err error) {
+	if cipher == nil {
+		return result, ErrNoKey
+	}
+	script, err := migrationFS.ReadFile("migrations/0002_p0_probe.sql")
+	if err != nil {
+		return result, fmt.Errorf("读取 schema 2 migration: %w", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return result, fmt.Errorf("取得 schema 1→2 migration 连接: %w", err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return result, fmt.Errorf("锁定 schema 1→2 migration: %w", err)
+	}
+	transactionOpen := true
+	defer func() {
+		if transactionOpen {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+
+	state, err := inspectSchemaState(ctx, conn)
+	if err != nil {
+		return result, fmt.Errorf("锁内重验 schema 1: %w", err)
+	}
+	if state.Version != 1 {
+		return result, fmt.Errorf("%w: schema 1→2 需要 version=1，得到 %+v", ErrUnknownSchema, state)
+	}
+	if err = validateLegacyUpstreamKeys(ctx, conn, cipher); err != nil {
+		return result, err
+	}
+
+	backupConn, backupConnErr := db.Conn(ctx)
+	if backupConnErr != nil {
+		return result, fmt.Errorf("取得 schema 1→2 备份连接: %w", backupConnErr)
+	}
+	result, err = createMigrationBackup(ctx, backupConn, databasePath, MigrationBackupSpec{
+		SourceSchema:      1,
+		SourceFingerprint: state.Fingerprint,
+		TargetSchema:      2,
+		LegacyCipherID:    cipher.KeyID(),
+		SourceValidator:   "schema-1-v1",
+		PairedBuildID:     identity.PairedBuildID,
+		ReaderContract:    identity.ReaderContract,
+		CreatedAt:         identity.CreatedAt,
+	})
+	closeBackupErr := backupConn.Close()
+	if err != nil {
+		return result, fmt.Errorf("创建 schema 1→2 备份: %w", err)
+	}
+	if closeBackupErr != nil {
+		return result, fmt.Errorf("关闭 schema 1→2 备份连接: %w", closeBackupErr)
+	}
+
+	if _, err = conn.ExecContext(ctx, string(script)); err != nil {
+		return result, fmt.Errorf("执行 schema 2 migration: %w", err)
+	}
+	// Backfill belongs to this transaction; schema_version remains the final write.
+	if err = backfillSchemaTwo(ctx, conn, cipher); err != nil {
+		return result, err
+	}
+	if _, err = conn.ExecContext(ctx, `UPDATE schema_version SET version=2 WHERE singleton=1 AND version=1`); err != nil {
+		return result, fmt.Errorf("标记 schema 2: %w", err)
+	}
+	after, err := inspectSchemaState(ctx, conn)
+	if err != nil {
+		return result, fmt.Errorf("校验 schema 2: %w", err)
+	}
+	if after.Version != 2 {
+		return result, fmt.Errorf("%w: schema 1→2 得到 %+v", ErrUnknownSchema, after)
+	}
+	if err = validateForeignKeys(ctx, conn); err != nil {
+		return result, err
+	}
+	if _, err = conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return result, fmt.Errorf("提交 schema 1→2: %w", err)
+	}
+	transactionOpen = false
+	return result, nil
+}
+
+type schemaTwoExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func normalizeLegacyToSchemaOne(ctx context.Context, db *sql.DB, databasePath string, cipher *Cipher, identity MigrationBackupIdentity) (result MigrationBackupResult, err error) {

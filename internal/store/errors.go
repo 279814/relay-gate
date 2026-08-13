@@ -1,10 +1,17 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+)
+
+var (
+	ErrRevisionConflict    = errors.New("revision conflict")
+	ErrIdempotencyConflict = errors.New("idempotency conflict")
+	ErrDependencyConflict  = errors.New("dependent history or configuration exists")
 )
 
 // wrapConstraint 把 SQLite 的约束冲突翻译成人能看懂的、且 API 层能判 400 的错误。

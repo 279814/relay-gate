@@ -1,19 +1,22 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/279814/relay-gate/internal/model"
 )
 
 const routeCols = `id, model_name_id, upstream_id, priority, weight,
-	upstream_model, max_concurrency, enabled, created_at, updated_at`
+	upstream_model, max_concurrency, enabled, created_at, updated_at,revision,capability_revision`
 
 func scanRoute(sc interface{ Scan(...any) error }) (*model.Route, error) {
 	var r model.Route
 	if err := sc.Scan(&r.ID, &r.ModelNameID, &r.UpstreamID, &r.Priority, &r.Weight,
-		&r.UpstreamModel, &r.MaxConcurrency, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		&r.UpstreamModel, &r.MaxConcurrency, &r.Enabled, &r.CreatedAt, &r.UpdatedAt,
+		&r.Revision, &r.CapabilityRevision); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -63,10 +66,21 @@ func (s *Store) CreateRoute(r *model.Route) error {
 	}
 	r.CreatedAt = nowMS()
 	r.UpdatedAt = r.CreatedAt
+	r.Revision = 1
+	r.CapabilityRevision = 1
 
-	res, err := s.db.Exec(`INSERT INTO route
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validateRouteEndpointCompleteness(tx, r.UpstreamID); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`INSERT INTO route
 		(model_name_id, upstream_id, priority, weight, upstream_model,
-		 max_concurrency, enabled, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		 max_concurrency, enabled, created_at, updated_at,revision,capability_revision)
+		 VALUES (?,?,?,?,?,?,?,?,?,1,1)`,
 		r.ModelNameID, r.UpstreamID, r.Priority, r.Weight, r.UpstreamModel,
 		r.MaxConcurrency, r.Enabled, r.CreatedAt, r.UpdatedAt)
 	if err != nil {
@@ -76,27 +90,101 @@ func (s *Store) CreateRoute(r *model.Route) error {
 		return err
 	}
 	// 建 health 行，让 UI 立刻能显示 unknown 而不是空白。
-	_, err = s.db.Exec(`INSERT OR IGNORE INTO route_health (route_id, state, updated_at)
+	_, err = tx.Exec(`INSERT OR IGNORE INTO route_health (route_id, state, updated_at)
 		VALUES (?, ?, ?)`, r.ID, model.StateUnknown, r.CreatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateRoute(r *model.Route) error {
-	r.Defaults()
-	if err := r.Validate(); err != nil {
+	current, err := s.GetRoute(r.ID)
+	if err != nil {
 		return err
 	}
-	r.UpdatedAt = nowMS()
+	return s.UpdateRouteWithRevision(context.Background(), r, current.Revision)
+}
 
-	res, err := s.db.Exec(`UPDATE route SET
-		model_name_id=?, upstream_id=?, priority=?, weight=?, upstream_model=?,
-		max_concurrency=?, enabled=?, updated_at=? WHERE id=?`,
-		r.ModelNameID, r.UpstreamID, r.Priority, r.Weight, r.UpstreamModel,
-		r.MaxConcurrency, r.Enabled, r.UpdatedAt, r.ID)
+func (s *Store) UpdateRouteWithRevision(ctx context.Context, value *model.Route, expectedRevision int64) (err error) {
+	value.Defaults()
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	current, err := scanRoute(tx.QueryRowContext(ctx, `SELECT `+routeCols+` FROM route WHERE id=?`, value.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if current.Revision != expectedRevision {
+		return ErrRevisionConflict
+	}
+	if err := validateRouteEndpointCompleteness(tx, value.UpstreamID); err != nil {
+		return err
+	}
+	semanticChanged := value.ModelNameID != current.ModelNameID || value.UpstreamID != current.UpstreamID ||
+		value.UpstreamModel != current.UpstreamModel
+	rowChanged := semanticChanged || value.Priority != current.Priority || value.Weight != current.Weight ||
+		value.MaxConcurrency != current.MaxConcurrency || value.Enabled != current.Enabled
+	if !rowChanged {
+		value.Revision = current.Revision
+		value.CapabilityRevision = current.CapabilityRevision
+		value.CreatedAt = current.CreatedAt
+		value.UpdatedAt = current.UpdatedAt
+		return tx.Commit()
+	}
+	value.Revision = current.Revision + 1
+	value.CapabilityRevision = current.CapabilityRevision
+	if semanticChanged {
+		value.CapabilityRevision++
+	}
+	value.CreatedAt = current.CreatedAt
+	value.UpdatedAt = nowMS()
+	result, err := tx.ExecContext(ctx, `UPDATE route SET model_name_id=?,upstream_id=?,priority=?,weight=?,
+		upstream_model=?,max_concurrency=?,enabled=?,updated_at=?,revision=?,capability_revision=?
+		WHERE id=? AND revision=?`, value.ModelNameID, value.UpstreamID, value.Priority, value.Weight,
+		value.UpstreamModel, value.MaxConcurrency, value.Enabled, value.UpdatedAt, value.Revision,
+		value.CapabilityRevision, value.ID, expectedRevision)
 	if err != nil {
 		return wrapConstraint(err, "route")
 	}
-	return checkAffected(res)
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrRevisionConflict
+	}
+	return tx.Commit()
+}
+
+func validateRouteEndpointCompleteness(query interface {
+	QueryRow(string, ...any) *sql.Row
+}, upstreamID int64) error {
+	var upstreamExists int
+	if err := query.QueryRow(`SELECT COUNT(*) FROM upstream WHERE id=?`, upstreamID).Scan(&upstreamExists); err != nil {
+		return err
+	}
+	if upstreamExists != 1 {
+		return model.WrapValidation("引用的 Upstream 不存在")
+	}
+	var total, migrationOnly int
+	err := query.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN url_mode='legacy_exact' OR auth_mode='legacy_auto_real_only' THEN 1 ELSE 0 END),0)
+		FROM upstream_endpoint WHERE upstream_id=?`, upstreamID).Scan(&total, &migrationOnly)
+	if err != nil {
+		return err
+	}
+	if total != 5 && migrationOnly == 0 {
+		return fmt.Errorf("%w: Upstream 必须先补齐五个 Endpoint", ErrDependencyConflict)
+	}
+	return nil
 }
 
 func (s *Store) DeleteRoute(id int64) error {
