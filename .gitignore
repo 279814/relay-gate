@@ -1,6 +1,9 @@
 # M0 探测输入：含真实 key，绝不入库
 scripts/upstreams.tsv
-scripts/*.local.tsv
+scripts/*.local.*
+
+# P0 探活夹具的本机抓包与私有报告。
+.local/p0/
 
 # M0 输出：含站点地址
 docs/02-上游能力矩阵.md
@@ -34,3 +37,4 @@ mock-*.log
 .claude/
 .idea/
 .vscode/
+.vs/

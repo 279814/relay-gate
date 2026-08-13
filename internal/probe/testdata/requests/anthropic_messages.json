@@ -1,0 +1,1 @@
+{"model":"{{UPSTREAM_MODEL}}","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"1+1=? control:{{CONTROL_NONCE}}"}]}],"stream":true}

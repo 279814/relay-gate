@@ -45,3 +45,6 @@ Caddyfile       text eol=lf
 *.db   binary
 *.png  binary
 *.ico  binary
+
+# 协议响应夹具是逐字节 wire 输入；即使内容可读，也禁止 CRLF 归一化。
+internal/probe/testdata/responses/*.bin binary

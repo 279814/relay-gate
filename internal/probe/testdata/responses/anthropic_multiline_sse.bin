@@ -1,0 +1,4 @@
+event: content_block_delta
+data: {"type":"content_block_delta",
+data: "index":0,"delta":{"type":"text_delta","text":"2"}}
+
