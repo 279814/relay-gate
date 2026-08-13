@@ -1,0 +1,3 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_fixture","type":"message","role":"assistant","content":[],"model":"fixture-model","usage":{"input_tokens":8,"output_tokens":0}}}
+

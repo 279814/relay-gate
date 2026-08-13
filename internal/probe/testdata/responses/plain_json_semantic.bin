@@ -1,0 +1,1 @@
+{"id":"chatcmpl_fixture","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":1,"total_tokens":9}}

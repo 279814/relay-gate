@@ -18,8 +18,10 @@ data/
 
 # M0 的探测输入含真实站点地址与 key
 scripts/upstreams.tsv
-scripts/*.local.tsv
+scripts/*.local.*
 docs/02-上游能力矩阵.md
+.local/p0/
+.vs/
 
 # 冒烟脚本的运行产物
 *-gate.log
