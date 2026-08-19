@@ -89,7 +89,7 @@ func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 	}
 }
 
-// 迁移必须幂等：schema.sql 每次启动都跑，migrate 也一样。
+// 迁移必须幂等：建表脚本每次启动都跑，migrate 也一样。
 //
 // 不幂等的表现是**第二次启动直接失败**（duplicate column name），
 // 也就是说升级后能跑，重启一次就起不来了。
@@ -109,10 +109,10 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 }
 
-// 新库走 schema.sql 就该带 req_id，不依赖迁移补。
+// 新库走 0001_legacy.sql 就该带 req_id，不依赖迁移补。
 //
-// 两条路径都要通：只靠迁移的话，schema.sql 与实际结构会越差越远，
-// 而 schema.sql 是唯一能一眼看全表结构的地方。
+// 两条路径都要通：只靠迁移的话，建表脚本与实际结构会越差越远，
+// 而建表脚本是唯一能一眼看全表结构的地方。
 func TestMigrate_FreshDBHasReqIDFromSchema(t *testing.T) {
 	st := testStore(t)
 	has, err := hasColumn(st.db, "sample", "req_id")
@@ -120,7 +120,7 @@ func TestMigrate_FreshDBHasReqIDFromSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !has {
-		t.Error("新库的 schema.sql 里就该有 req_id")
+		t.Error("新库的 0001_legacy.sql 里就该有 req_id")
 	}
 }
 

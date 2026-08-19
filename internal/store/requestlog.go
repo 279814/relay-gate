@@ -236,7 +236,7 @@ func (s *Store) RetryStatsSince(sinceHours int) (*RetryStats, error) {
 	// 而那一行明明如实记着 attempts=3。于是**恰恰在丢日志的高负载时段**，
 	// 重试的效果被系统性低估，而这张表存在的理由就是度量那个效果。
 	//
-	// attempts 列的冗余（同组内恒定）正是为这种情形准备的，见 schema.sql。
+	// attempts 列的冗余（同组内恒定）正是为这种情形准备的，见 0001_legacy.sql。
 	// SUM(n) 仍是「实际记下来几次」，它偏低无解也无妨 —— 那个数问的是
 	// 「留下了多少行」，不是「发生过多少次」。
 	q := `WITH grp AS (

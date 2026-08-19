@@ -4,7 +4,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"errors"
 	"fmt"
 	"os"
@@ -14,9 +13,6 @@ import (
 	_ "modernc.org/sqlite" // 纯 Go 驱动，无需 CGO，交叉编译到 Linux 容器不用改工具链
 )
 
-//go:embed schema.sql
-var schemaFS embed.FS
-
 type Store struct {
 	db     *sql.DB
 	cipher *Cipher
@@ -25,7 +21,7 @@ type Store struct {
 
 // connPragmas 是必须写在 DSN 里的**连接级** pragma。
 //
-// 关键点：pragma 的作用域是「连接」，不是「数据库文件」。写在 schema.sql 里
+// 关键点：pragma 的作用域是「连接」，不是「数据库文件」。写在建表脚本里
 // 只对执行那条 SQL 的连接生效，连接池后来新建的连接一概没有 —— 而
 // database/sql 会在连接出错时静默丢弃并重建。
 //
@@ -35,7 +31,7 @@ type Store struct {
 // 兜底，不该让脏数据先进库。
 //
 // 对比：journal_mode=WAL 是**库级持久**的，写一次就留在文件头里，
-// 所以它留在 schema.sql 里没问题。busy_timeout 同样是连接级，一并放这里。
+// 所以由迁移完成后统一设置即可。busy_timeout 同样是连接级，一并放这里。
 const connPragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 
 // Open 打开（或创建）数据库并建表。

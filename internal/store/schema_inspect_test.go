@@ -325,9 +325,14 @@ func loadLegacyVariantFixture(t *testing.T, db *sql.DB, variant legacySchemaVari
 	}
 }
 
+// loadLegacySchema 建出 schema 1（pre-P0 的结构）。
+//
+// 它现在读 testdata/legacy-v1.sql —— 这份 SQL 曾是生产用的 schema.sql 并被
+// embed 进二进制，但版本化 runner 接管建库后就只剩测试在用它。留在包根
+// 且带 //go:embed，会让人误以为启动路径还会执行它。
 func loadLegacySchema(t *testing.T, db *sql.DB) {
 	t.Helper()
-	schema, err := schemaFS.ReadFile("schema.sql")
+	schema, err := os.ReadFile(filepath.Join("testdata", "legacy-v1.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}

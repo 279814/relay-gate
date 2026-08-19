@@ -372,15 +372,15 @@ func TestEmptyListsAreNotNil(t *testing.T) {
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
-// 回归测试：foreign_keys 必须在**每一条**连接上生效，不能只在跑过 schema.sql
+// 回归测试：foreign_keys 必须在**每一条**连接上生效，不能只在跑过建表脚本
 // 的那条上生效。
 //
-// 曾经的隐患：pragma 写在 schema.sql 里，而 pragma 是连接级的。今天没出事
+// 曾经的隐患：pragma 写在建表脚本里，而 pragma 是连接级的。今天没出事
 // 完全靠 MaxOpenConns(1) 恰好只有一条连接 —— 一旦 database/sql 判定连接坏了
 // 并重建，外键就静默变成装饰：坏数据能插进去，ON DELETE CASCADE 也不再清理
 // 子行。这类失效不报错，只能靠测试锁住。
 //
-// 用新开的 sql.DB 检验，等价于「连接池重建了一条没跑过 schema.sql 的连接」。
+// 用新开的 sql.DB 检验，等价于「连接池重建了一条没跑过建表脚本的连接」。
 func TestForeignKeysOnEveryConn(t *testing.T) {
 	dir := t.TempDir()
 	dsn := filepath.Join(dir, "fk.db")
@@ -407,7 +407,7 @@ func TestForeignKeysOnEveryConn(t *testing.T) {
 	}
 	if fk != 1 {
 		t.Fatalf("新连接的 foreign_keys 应为 1，得到 %d —— "+
-			"pragma 必须写在 DSN 里，写在 schema.sql 里只对首条连接有效", fk)
+			"pragma 必须写在 DSN 里，写在建表脚本里只对首条连接有效", fk)
 	}
 
 	// 行为验证：光看 pragma 值不够，要确认约束真的拦得住
@@ -419,7 +419,7 @@ func TestForeignKeysOnEveryConn(t *testing.T) {
 		t.Error("指向不存在 ModelName/Upstream 的 Route 竟然插入成功了")
 	}
 
-	// WAL 是库级持久的，新连接不跑 schema.sql 也该是 wal
+	// WAL 是库级持久的，新连接不跑建表脚本也该是 wal
 	var jm string
 	if err := fresh.QueryRow("PRAGMA journal_mode").Scan(&jm); err != nil {
 		t.Fatal(err)

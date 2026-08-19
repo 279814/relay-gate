@@ -553,13 +553,13 @@ const legacyRequestLogTableSQL = `CREATE TABLE request_log (
 	error TEXT NOT NULL DEFAULT ''
 )`
 
-// migrate 把 schema.sql 覆盖不到的变更补上。
+// migrate 把 0001_legacy.sql 覆盖不到的变更补上。
 //
 // 为什么需要它：`CREATE TABLE IF NOT EXISTS` 对**已存在**的表是空操作，
-// 加不了列。也就是说 schema.sql 只能让新库长对，老库会静默停在旧结构上 ——
+// 加不了列。也就是说建表脚本只能让新库长对，老库会静默停在旧结构上 ——
 // 而症状是「新字段读出来永远是零值」，不报错、不失败。
 //
-// 每一条都必须幂等：schema.sql 每次启动都跑一遍，这里也一样。
+// 每一条都必须幂等：建表脚本每次都跑一遍，这里也一样。
 func migrate(db *sql.DB) error {
 	// M6：样本挂上 req_id，与 request_log 同组。
 	//
