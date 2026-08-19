@@ -159,3 +159,85 @@ func TestReachabilityTokenGoldenVector(t *testing.T) {
 		t.Fatal("network and settings revisions must both affect reachability token")
 	}
 }
+
+func TestProbeEvidenceHashExcludesApplyDispositionButBindsNilAndDecision(t *testing.T) {
+	observation := model.ProbeObservation{Execution: model.ProbeExecution{
+		ID: "execution-1", Trigger: model.TriggerScheduled, UpstreamID: 7,
+		Endpoint: model.EndpointMessages, RecipeBindingUse: model.BindingResolved,
+		RecipeStorage: model.RecipeStorageEmbedded, RecipeOrigin: model.RecipeBasic,
+		TemplateID: "builtin:messages", RecipeIdentityRevision: 1,
+		EvidenceHash: "must-be-excluded", ErrorClass: model.ErrorNone,
+		Capability: model.CapabilitySupported, Scope: model.ScopeRouteEndpoint,
+		Success: true, SemanticSeen: true, ObservationOrder: 9,
+		ReachabilityDisposition: model.ApplyCurrent, CapabilityDisposition: model.ApplyConfigStale,
+	}}
+	first, err := NewProbeEvidenceHash(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "v1:3ebefc983468e73c1edbeb19fcb35997a8ebed6699adabee1e3acbf05b9062d1" {
+		t.Fatalf("probe evidence golden = %q", first)
+	}
+	observation.Execution.EvidenceHash = "different-self-hash"
+	observation.Execution.ReachabilityDisposition = model.ApplySuperseded
+	observation.Execution.CapabilityDisposition = model.ApplyCurrent
+	second, err := NewProbeEvidenceHash(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("self hash or apply disposition changed immutable evidence hash")
+	}
+	observation.Execution.SemanticSeen = false
+	changed, err := NewProbeEvidenceHash(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == first {
+		t.Fatal("decision change did not affect evidence hash")
+	}
+	observation.Execution.SemanticSeen = true
+	observation.ReachabilityExpectation = &model.ReachabilityExpectation{}
+	withEmptyExpectation, err := NewProbeEvidenceHash(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEmptyExpectation == first {
+		t.Fatal("nil and present expectation must encode differently")
+	}
+}
+
+func TestProbeCostEvidenceMappersAndStableHash(t *testing.T) {
+	execution := model.ProbeExecution{
+		Trigger: model.TriggerManual, RecipeOrigin: model.RecipeManual,
+		Endpoint: model.EndpointMessages, RouteID: 3, UpstreamID: 4,
+		SentAtMS: time.Date(2026, 8, 13, 23, 59, 0, 0, time.UTC).UnixMilli(),
+		Success:  true, EstimatedInputTokens: 7, ObservedOutputTokens: 2,
+	}
+	evidence, err := CostEvidenceFromExecution(execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.DayUTC != "2026-08-13" || evidence.Requests != 1 || evidence.Succeeded != 1 ||
+		evidence.EstimatedInputTokens != 7 || evidence.ObservedOutputTokens != 2 {
+		t.Fatalf("execution cost evidence = %+v", evidence)
+	}
+	hash, err := NewProbeCostEvidenceHash(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != "v1:f97652cae1d18c4e11944cdfa4080f24fb8d4ff2605060cc5509f7a9b731a5ef" {
+		t.Fatalf("cost evidence golden = %q", hash)
+	}
+	execution.Trigger = model.TriggerRealTraffic
+	if _, err := CostEvidenceFromExecution(execution); err == nil {
+		t.Fatal("real traffic accepted as probe cost")
+	}
+	piggyback, err := CostEvidenceFromPiggyback(model.ProbeCostDaily{
+		DayUTC: "2026-08-13", Trigger: model.TriggerScheduled, Origin: model.RecipeBasic,
+		Endpoint: model.EndpointMessages, RouteID: 3, UpstreamID: 4,
+	})
+	if err != nil || piggyback.PiggybackL2Saved != 1 || piggyback.Requests != 0 {
+		t.Fatalf("piggyback evidence=%+v err=%v", piggyback, err)
+	}
+}

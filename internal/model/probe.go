@@ -17,6 +17,15 @@ const (
 	RecipeScopeRoute    RecipeScope = "route"
 )
 
+func (trigger ProbeTrigger) Valid() bool {
+	switch trigger {
+	case TriggerScheduled, TriggerManual, TriggerCalibration, TriggerRecovery, TriggerRealTraffic:
+		return true
+	default:
+		return false
+	}
+}
+
 func (scope RecipeScope) Valid() bool {
 	return scope == RecipeScopeUpstream || scope == RecipeScopeRoute
 }
