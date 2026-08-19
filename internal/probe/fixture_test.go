@@ -768,25 +768,47 @@ func TestClaudeCaptureScriptFailsClosedAndProtectsOutput(t *testing.T) {
 	if output, err := runPowerShellCommand(powerShell, repositoryRoot, ancestorCheck); err != nil {
 		t.Fatalf("neutral working directory rejected: %v (%s)", err, output)
 	}
-	missingHomeParent := filepath.Join(repositoryRoot, ".local", "p0")
-	if err := os.MkdirAll(missingHomeParent, 0o700); err != nil {
+	// HOME 边界用一条完全自建的祖先链验证，不依赖本机真实目录：
+	// 链是 boundary/home-boundary/inner，标记放在最外层 boundary。
+	//
+	// 原先这里把「中性 cwd」建在仓库的 .local/p0 下，然后一路查到文件系统根。
+	// 那是自相矛盾的：仓库自己就有 .claude/（.gitignore 第 37 行说明它是本机
+	// 状态），于是任何在本仓库用 Claude Code 的人都会撞到它，CI 只是因为
+	// 检出里没有该目录才是绿的。
+	boundaryRoot := filepath.Join(isolationRoot, "boundary")
+	homeBoundary := filepath.Join(boundaryRoot, "home-boundary")
+	innerWorkingDirectory := filepath.Join(homeBoundary, "inner")
+	if err := os.MkdirAll(innerWorkingDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	missingHomeWorkingDirectory, err := os.MkdirTemp(missingHomeParent, "home-unset-")
-	if err != nil {
+	boundaryMarker := filepath.Join(boundaryRoot, ".mcp.json")
+	if err := os.WriteFile(boundaryMarker, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(missingHomeWorkingDirectory) })
+	// HOME 落在标记之内：走到 HOME 就该停，绝不能继续看到 boundary 的标记。
+	// $HOME 在 PowerShell 里是只读变量，改它必须走 Set-Variable -Force。
+	stopsAtHomeCheck := fmt.Sprintf(
+		"Set-Variable HOME -Value '%s' -Force; . '%s'; Assert-NoClaudeProjectConfigAncestors -WorkingDirectory '%s'",
+		quotePowerShellLiteral(homeBoundary),
+		quotePowerShellLiteral(script),
+		quotePowerShellLiteral(innerWorkingDirectory),
+	)
+	if output, err := runPowerShellCommand(powerShell, repositoryRoot, stopsAtHomeCheck); err != nil {
+		t.Fatalf("ancestor walk should stop at HOME: %v (%s)", err, output)
+	}
+	// 同一条链、同一个 cwd，只是移除 HOME：必须继续往根走并撞上 boundary 标记。
+	// 这样就同时证明了「缺 HOME 不再报变量/规范化错误」和「确实越过了原 HOME」。
 	missingHomeCheck := fmt.Sprintf(
 		"Remove-Variable HOME -Force; . '%s'; Assert-NoClaudeProjectConfigAncestors -WorkingDirectory '%s'",
 		quotePowerShellLiteral(script),
-		quotePowerShellLiteral(missingHomeWorkingDirectory),
+		quotePowerShellLiteral(innerWorkingDirectory),
 	)
-	if output, err := runPowerShellCommand(powerShell, repositoryRoot, missingHomeCheck); err != nil {
-		t.Fatalf("neutral working directory with missing HOME rejected: %v (%s)", err, output)
+	output, err := runPowerShellCommand(powerShell, repositoryRoot, missingHomeCheck)
+	if err == nil || !strings.Contains(output, "claude_project_config_in_ancestor") {
+		t.Fatalf("missing HOME must keep walking past the former boundary: %v (%s)", err, output)
 	}
 
-	output, err := runCaptureScript(powerShell, repositoryRoot, script)
+	output, err = runCaptureScript(powerShell, repositoryRoot, script)
 	if err != nil {
 		t.Fatalf("default capture invocation: %v (%s)", err, output)
 	}
