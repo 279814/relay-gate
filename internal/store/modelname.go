@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
+	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
 )
@@ -37,6 +39,68 @@ func (s *Store) ListModelNames() ([]*model.ModelName, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListModelNamesPage(ctx context.Context, filter model.ModelNameFilter) (model.Page[*model.ModelName], error) {
+	limit, err := normalizePageLimit(filter.Limit)
+	if err != nil {
+		return model.Page[*model.ModelName]{}, err
+	}
+	cursorFilter := filter
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(filter.Cursor, "model-names", cursorFilter, 1)
+	if err != nil {
+		return model.Page[*model.ModelName]{}, err
+	}
+	conditions := []string{"1=1"}
+	args := make([]any, 0, 4)
+	if filter.Enabled != nil {
+		conditions = append(conditions, "enabled=?")
+		args = append(args, *filter.Enabled)
+	}
+	if filter.Protocol != "" {
+		if !filter.Protocol.Valid() {
+			return model.Page[*model.ModelName]{}, model.WrapValidation("protocol filter 无效")
+		}
+		conditions = append(conditions, "protocol=?")
+		args = append(args, filter.Protocol)
+	}
+	if len(keys) == 1 {
+		id, cursorErr := cursorID(keys[0])
+		if cursorErr != nil {
+			return model.Page[*model.ModelName]{}, cursorErr
+		}
+		conditions = append(conditions, "id>?")
+		args = append(args, id)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+modelNameCols+` FROM model_name WHERE `+
+		strings.Join(conditions, " AND ")+` ORDER BY id LIMIT ?`, args...)
+	if err != nil {
+		return model.Page[*model.ModelName]{}, err
+	}
+	defer rows.Close()
+	items := make([]*model.ModelName, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanModelName(rows)
+		if scanErr != nil {
+			return model.Page[*model.ModelName]{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.Page[*model.ModelName]{}, err
+	}
+	page := model.Page[*model.ModelName]{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.NextCursor, err = encodePageCursor("model-names", cursorFilter,
+			strconv.FormatInt(page.Items[len(page.Items)-1].ID, 10))
+		if err != nil {
+			return model.Page[*model.ModelName]{}, err
+		}
+	}
+	return page, nil
 }
 
 func (s *Store) GetModelName(id int64) (*model.ModelName, error) {

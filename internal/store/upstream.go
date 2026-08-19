@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -60,6 +61,68 @@ func (s *Store) ListUpstreams() ([]*model.Upstream, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error) {
+	limit, err := normalizePageLimit(filter.Limit)
+	if err != nil {
+		return model.Page[*model.Upstream]{}, err
+	}
+	cursorFilter := filter
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(filter.Cursor, "upstreams", cursorFilter, 1)
+	if err != nil {
+		return model.Page[*model.Upstream]{}, err
+	}
+	conditions := []string{"1=1"}
+	args := make([]any, 0, 4)
+	if filter.Enabled != nil {
+		conditions = append(conditions, "enabled=?")
+		args = append(args, *filter.Enabled)
+	}
+	if filter.ProbeMode != "" {
+		if !filter.ProbeMode.Valid() {
+			return model.Page[*model.Upstream]{}, model.WrapValidation("probe mode filter 无效")
+		}
+		conditions = append(conditions, "probe_mode=?")
+		args = append(args, filter.ProbeMode)
+	}
+	if len(keys) == 1 {
+		id, cursorErr := cursorID(keys[0])
+		if cursorErr != nil {
+			return model.Page[*model.Upstream]{}, cursorErr
+		}
+		conditions = append(conditions, "id>?")
+		args = append(args, id)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+upstreamCols+` FROM upstream WHERE `+
+		strings.Join(conditions, " AND ")+` ORDER BY id LIMIT ?`, args...)
+	if err != nil {
+		return model.Page[*model.Upstream]{}, err
+	}
+	defer rows.Close()
+	items := make([]*model.Upstream, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := s.scanUpstream(rows)
+		if scanErr != nil {
+			return model.Page[*model.Upstream]{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.Page[*model.Upstream]{}, err
+	}
+	page := model.Page[*model.Upstream]{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.NextCursor, err = encodePageCursor("upstreams", cursorFilter,
+			strconv.FormatInt(page.Items[len(page.Items)-1].ID, 10))
+		if err != nil {
+			return model.Page[*model.Upstream]{}, err
+		}
+	}
+	return page, nil
 }
 
 func (s *Store) GetUpstream(id int64) (*model.Upstream, error) {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 )
 
 var ErrInvalidCursor = errors.New("分页 cursor 或 limit 无效")
@@ -77,6 +78,16 @@ func decodePageCursor(encoded, resource string, filter any, keyCount int) ([]str
 		return nil, ErrInvalidCursor
 	}
 	return append([]string(nil), cursor.Keys...), nil
+}
+
+// cursorID 解析 cursor 里的一个正整数 ID 键。cursor 是客户端可见的，
+// 里面的数字未必还是数字 —— 解析不出来按坏 cursor 报，不能当成 0 继续查。
+func cursorID(key string) (int64, error) {
+	id, err := strconv.ParseInt(key, 10, 64)
+	if err != nil || id < 1 {
+		return 0, ErrInvalidCursor
+	}
+	return id, nil
 }
 
 func pageFilterFingerprint(filter any) (string, error) {

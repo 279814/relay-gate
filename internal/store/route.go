@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
 )
@@ -48,6 +50,72 @@ func (s *Store) ListRoutes(modelNameID int64) ([]*model.Route, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRoutesPage 按 id 分页，不沿用 ListRoutes 的 priority 排序：priority 可重复，
+// 且没有覆盖 (model_name_id, priority, id) 的索引，用它做 keyset 既要三段 cursor
+// 又得全表排序。管理端列表要的是「翻页不重不漏」，选路顺序由 ListRoutes 负责。
+func (s *Store) ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error) {
+	limit, err := normalizePageLimit(filter.Limit)
+	if err != nil {
+		return model.Page[*model.Route]{}, err
+	}
+	cursorFilter := filter
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(filter.Cursor, "routes", cursorFilter, 1)
+	if err != nil {
+		return model.Page[*model.Route]{}, err
+	}
+	conditions := []string{"1=1"}
+	args := make([]any, 0, 5)
+	if filter.ModelNameID > 0 {
+		conditions = append(conditions, "model_name_id=?")
+		args = append(args, filter.ModelNameID)
+	}
+	if filter.UpstreamID > 0 {
+		conditions = append(conditions, "upstream_id=?")
+		args = append(args, filter.UpstreamID)
+	}
+	if filter.Enabled != nil {
+		conditions = append(conditions, "enabled=?")
+		args = append(args, *filter.Enabled)
+	}
+	if len(keys) == 1 {
+		id, cursorErr := cursorID(keys[0])
+		if cursorErr != nil {
+			return model.Page[*model.Route]{}, cursorErr
+		}
+		conditions = append(conditions, "id>?")
+		args = append(args, id)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+routeCols+` FROM route WHERE `+
+		strings.Join(conditions, " AND ")+` ORDER BY id LIMIT ?`, args...)
+	if err != nil {
+		return model.Page[*model.Route]{}, err
+	}
+	defer rows.Close()
+	items := make([]*model.Route, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanRoute(rows)
+		if scanErr != nil {
+			return model.Page[*model.Route]{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.Page[*model.Route]{}, err
+	}
+	page := model.Page[*model.Route]{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.NextCursor, err = encodePageCursor("routes", cursorFilter,
+			strconv.FormatInt(page.Items[len(page.Items)-1].ID, 10))
+		if err != nil {
+			return model.Page[*model.Route]{}, err
+		}
+	}
+	return page, nil
 }
 
 func (s *Store) GetRoute(id int64) (*model.Route, error) {

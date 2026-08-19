@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -196,11 +197,86 @@ func (store *Store) CreateRecipe(scope model.RecipeScope, scopeID int64, endpoin
 	return result.LastInsertId()
 }
 
+const recipeCols = `id,upstream_id,route_id,endpoint,status,pinned,
+	COALESCE(draft_version_id,0),COALESCE(published_version_id,0),last_publish_forced,
+	COALESCE(last_test_execution_id,''),published_at,revision,active_binding_revision,created_at,updated_at`
+
 func (store *Store) GetRecipe(ctx context.Context, id int64) (*model.ProbeRecipe, error) {
-	return scanProbeRecipe(store.db.QueryRowContext(ctx, `SELECT id,upstream_id,route_id,endpoint,status,pinned,
-		COALESCE(draft_version_id,0),COALESCE(published_version_id,0),last_publish_forced,
-		COALESCE(last_test_execution_id,''),published_at,revision,active_binding_revision,created_at,updated_at
-		FROM probe_recipe WHERE id=?`, id))
+	return scanProbeRecipe(store.db.QueryRowContext(ctx, `SELECT `+recipeCols+
+		` FROM probe_recipe WHERE id=?`, id))
+}
+
+func (store *Store) ListRecipesPage(ctx context.Context, filter model.RecipeFilter) (model.Page[*model.ProbeRecipe], error) {
+	limit, err := normalizePageLimit(filter.Limit)
+	if err != nil {
+		return model.Page[*model.ProbeRecipe]{}, err
+	}
+	cursorFilter := filter
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(filter.Cursor, "recipes", cursorFilter, 1)
+	if err != nil {
+		return model.Page[*model.ProbeRecipe]{}, err
+	}
+	conditions := []string{"1=1"}
+	args := make([]any, 0, 6)
+	if filter.UpstreamID > 0 {
+		conditions = append(conditions, "upstream_id=?")
+		args = append(args, filter.UpstreamID)
+	}
+	if filter.RouteID > 0 {
+		conditions = append(conditions, "route_id=?")
+		args = append(args, filter.RouteID)
+	}
+	if filter.Endpoint != "" {
+		if !filter.Endpoint.Valid() {
+			return model.Page[*model.ProbeRecipe]{}, model.WrapValidation("endpoint filter 无效")
+		}
+		conditions = append(conditions, "endpoint=?")
+		args = append(args, filter.Endpoint)
+	}
+	if filter.Status != "" {
+		if !filter.Status.Valid() {
+			return model.Page[*model.ProbeRecipe]{}, model.WrapValidation("recipe status filter 无效")
+		}
+		conditions = append(conditions, "status=?")
+		args = append(args, filter.Status)
+	}
+	if len(keys) == 1 {
+		id, cursorErr := cursorID(keys[0])
+		if cursorErr != nil {
+			return model.Page[*model.ProbeRecipe]{}, cursorErr
+		}
+		conditions = append(conditions, "id>?")
+		args = append(args, id)
+	}
+	args = append(args, limit+1)
+	rows, err := store.db.QueryContext(ctx, `SELECT `+recipeCols+` FROM probe_recipe WHERE `+
+		strings.Join(conditions, " AND ")+` ORDER BY id LIMIT ?`, args...)
+	if err != nil {
+		return model.Page[*model.ProbeRecipe]{}, err
+	}
+	defer rows.Close()
+	items := make([]*model.ProbeRecipe, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanProbeRecipe(rows)
+		if scanErr != nil {
+			return model.Page[*model.ProbeRecipe]{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.Page[*model.ProbeRecipe]{}, err
+	}
+	page := model.Page[*model.ProbeRecipe]{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.NextCursor, err = encodePageCursor("recipes", cursorFilter,
+			strconv.FormatInt(page.Items[len(page.Items)-1].ID, 10))
+		if err != nil {
+			return model.Page[*model.ProbeRecipe]{}, err
+		}
+	}
+	return page, nil
 }
 
 func scanProbeRecipe(scanner interface{ Scan(...any) error }) (*model.ProbeRecipe, error) {
@@ -222,6 +298,99 @@ func scanProbeRecipe(scanner interface{ Scan(...any) error }) (*model.ProbeRecip
 	return &recipe, nil
 }
 
+const recipeVersionCols = `id,recipe_id,version,origin,method,fixed_raw_query,headers_json,
+	body,body_is_text,stream_expected,timeout_profile,created_at`
+
+func scanRecipeVersion(scanner interface{ Scan(...any) error }) (*model.ProbeRecipeVersion, error) {
+	var version model.ProbeRecipeVersion
+	var headersJSON string
+	if err := scanner.Scan(&version.ID, &version.RecipeID, &version.Version, &version.Origin,
+		&version.Method, &version.FixedRawQuery, &headersJSON, &version.Body, &version.BodyIsText,
+		&version.StreamExpected, &version.TimeoutProfile, &version.CreatedAt); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(headersJSON), &version.Headers); err != nil {
+		return nil, fmt.Errorf("recipe version %d 的 headers_json: %w", version.ID, err)
+	}
+	return &version, nil
+}
+
+func (store *Store) GetRecipeVersion(ctx context.Context, id int64) (*model.ProbeRecipeVersion, error) {
+	return scanRecipeVersion(store.db.QueryRowContext(ctx, `SELECT `+recipeVersionCols+
+		` FROM probe_recipe_version WHERE id=?`, id))
+}
+
+// ListRecipeVersionsPage 按 (version, id) 升序翻页，走 idx_recipe_version_recipe_version_id。
+// version 在同一 recipe 内唯一，但 filter 允许跨 recipe，故仍要 id 兜底做 tie-breaker。
+func (store *Store) ListRecipeVersionsPage(ctx context.Context, filter model.RecipeVersionFilter) (model.Page[*model.ProbeRecipeVersion], error) {
+	limit, err := normalizePageLimit(filter.Limit)
+	if err != nil {
+		return model.Page[*model.ProbeRecipeVersion]{}, err
+	}
+	cursorFilter := filter
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(filter.Cursor, "recipe-versions", cursorFilter, 2)
+	if err != nil {
+		return model.Page[*model.ProbeRecipeVersion]{}, err
+	}
+	conditions := []string{"1=1"}
+	args := make([]any, 0, 6)
+	if filter.RecipeID > 0 {
+		conditions = append(conditions, "recipe_id=?")
+		args = append(args, filter.RecipeID)
+	}
+	if filter.Origin != "" {
+		if !filter.Origin.Valid() {
+			return model.Page[*model.ProbeRecipeVersion]{}, model.WrapValidation("recipe origin filter 无效")
+		}
+		conditions = append(conditions, "origin=?")
+		args = append(args, filter.Origin)
+	}
+	if len(keys) == 2 {
+		version, parseErr := strconv.Atoi(keys[0])
+		if parseErr != nil || version < 1 {
+			return model.Page[*model.ProbeRecipeVersion]{}, ErrInvalidCursor
+		}
+		id, cursorErr := cursorID(keys[1])
+		if cursorErr != nil {
+			return model.Page[*model.ProbeRecipeVersion]{}, cursorErr
+		}
+		conditions = append(conditions, "(version>? OR (version=? AND id>?))")
+		args = append(args, version, version, id)
+	}
+	args = append(args, limit+1)
+	rows, err := store.db.QueryContext(ctx, `SELECT `+recipeVersionCols+` FROM probe_recipe_version WHERE `+
+		strings.Join(conditions, " AND ")+` ORDER BY version,id LIMIT ?`, args...)
+	if err != nil {
+		return model.Page[*model.ProbeRecipeVersion]{}, err
+	}
+	defer rows.Close()
+	items := make([]*model.ProbeRecipeVersion, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanRecipeVersion(rows)
+		if scanErr != nil {
+			return model.Page[*model.ProbeRecipeVersion]{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return model.Page[*model.ProbeRecipeVersion]{}, err
+	}
+	page := model.Page[*model.ProbeRecipeVersion]{Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor, err = encodePageCursor("recipe-versions", cursorFilter,
+			strconv.Itoa(last.Version), strconv.FormatInt(last.ID, 10))
+		if err != nil {
+			return model.Page[*model.ProbeRecipeVersion]{}, err
+		}
+	}
+	return page, nil
+}
+
 func (store *Store) AddRecipeVersion(version *model.ProbeRecipeVersion, expectedRecipeRevision int64) (err error) {
 	if version == nil || expectedRecipeRevision < 1 {
 		return model.WrapValidation("recipe version/expected revision 无效")
@@ -235,10 +404,8 @@ func (store *Store) AddRecipeVersion(version *model.ProbeRecipeVersion, expected
 			_ = tx.Rollback()
 		}
 	}()
-	recipe, err := scanProbeRecipe(tx.QueryRow(`SELECT id,upstream_id,route_id,endpoint,status,pinned,
-		COALESCE(draft_version_id,0),COALESCE(published_version_id,0),last_publish_forced,
-		COALESCE(last_test_execution_id,''),published_at,revision,active_binding_revision,created_at,updated_at
-		FROM probe_recipe WHERE id=?`, version.RecipeID))
+	recipe, err := scanProbeRecipe(tx.QueryRow(`SELECT ` + recipeCols +
+		` FROM probe_recipe WHERE id=?`, version.RecipeID))
 	if err != nil {
 		return err
 	}
