@@ -552,41 +552,6 @@ func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
 	}
 }
 
-func TestBuildOutboundURL(t *testing.T) {
-	cases := []struct {
-		name  string
-		up    model.Upstream
-		path  string
-		query string
-		want  string
-	}{
-		{"基本", model.Upstream{BaseURL: "https://a.com"}, "/v1/messages", "", "https://a.com/v1/messages"},
-		{"带 query", model.Upstream{BaseURL: "https://a.com"}, "/v1/messages", "beta=true",
-			"https://a.com/v1/messages?beta=true"},
-		{"base 带尾斜杠", model.Upstream{BaseURL: "https://a.com/"}, "/v1/messages", "",
-			"https://a.com/v1/messages"},
-		{"responses 端点", model.Upstream{BaseURL: "https://a.com"}, "/v1/responses", "",
-			"https://a.com/v1/responses"},
-		{"count_tokens", model.Upstream{BaseURL: "https://a.com"}, "/v1/messages/count_tokens", "",
-			"https://a.com/v1/messages/count_tokens"},
-		{"full_url_mode 不拼路径", model.Upstream{BaseURL: "https://a.com/custom/endpoint",
-			FullURLMode: true}, "/v1/messages", "", "https://a.com/custom/endpoint"},
-		{"full_url_mode 仍带 query", model.Upstream{BaseURL: "https://a.com/x",
-			FullURLMode: true}, "/v1/messages", "beta=true", "https://a.com/x?beta=true"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, err := BuildOutboundURL(&c.up, c.path, c.query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != c.want {
-				t.Errorf("want %q got %q", c.want, got)
-			}
-		})
-	}
-}
-
 func TestRealTimeouts(t *testing.T) {
 	s := model.DefaultSettings()
 	to := RealTimeouts(s)

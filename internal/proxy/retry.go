@@ -247,9 +247,17 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	outHeader := PrepareOutboundHeaders(r.Header, cand.Upstream.APIKey,
 		cand.Upstream.AuthStyle, proto)
 
-	outURL, err := BuildOutboundURL(cand.Upstream, r.URL.Path, r.URL.RawQuery)
+	// 出站 URL 只有一个来源（§7.1）。endpoint 由入站协议决定 ——
+	// 这三个透传端点与协议是一一对应的。
+	kind, ok := proto.Endpoint()
+	if !ok {
+		h.log.Error("协议没有对应的 Endpoint", "proto", proto, "route", cand.Route.ID)
+		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
+		return nil, false
+	}
+	target, err := h.resolveTarget(r, cand, kind)
 	if err != nil {
-		h.log.Error("拼接出站 URL 失败", "err", err, "upstream", cand.Upstream.ID)
+		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, false
 	}
@@ -267,7 +275,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	if budget < to.Total {
 		to.Total = budget
 	}
-	fwd := &Forwarder{Transport: tr, Timeouts: to}
+	fwd := &Forwarder{Transport: tr, Timeouts: to, RequestHost: target.RequestHost}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会
 	// 混进最终样本的 resp_body —— 样本就变成了两个站的响应拼起来的东西。
@@ -281,12 +289,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	// 而 Send 要靠这个 ctx 分辨「客户端走了」与「我们自己的时限到了」。
 	// 把带预算的 ctx 传进去，一个吃掉整份预算的慢站会被记成「客户端取消」
 	// （非上游故障），于是永远攒不够失败次数、永远不判死。
-	at := fwd.Send(r.Context(), r.Method, outURL, outHeader, outBody)
+	at := fwd.Send(r.Context(), r.Method, target.RawURL, outHeader, outBody)
 
 	return &liveAttempt{
 		cand: cand, at: at, tee: tee,
 		keys: h.credentialsOf(r, cand),
-		body: outBody, header: outHeader, url: outURL,
+		body: outBody, header: outHeader, url: target.RawURL,
 	}, true
 }
 

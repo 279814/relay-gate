@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -223,9 +225,64 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 	}
 	// 默认关掉半开，让旧测试不受影响。需要半开的测试自己开。
 	hs.cfg.settings.HalfOpenEnabled = false
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
+}
+
+// testTargets 造一个与生产同构的出站解析面：canonical Endpoint + 同一个
+// Resolver。
+//
+// 刻意不用「直接返回 base_url + path」的假实现：那样测试就绕开了 Resolver，
+// 而它正是三条出站路径共用的那份规则 —— 绕过它，本要防的分叉就重新回到
+// 测试覆盖之外了。
+func testTargets(cfg *fakeConfig) *outbound.Provider {
+	return outbound.NewProvider(testEndpoints{cfg: cfg}, nil, outbound.NewResolver(testHasher{}))
+}
+
+// testEndpoints 按 fakeConfig 里的 Upstream 现造 canonical Endpoint。
+//
+// url_override 走 model.EndpointURLOverride —— 与 Store 的
+// canonicalEndpointBundle 同一个函数，所以测试里的 Endpoint 与生产库里
+// 那条是同一套规则产出的。
+type testEndpoints struct {
+	cfg        *fakeConfig
+	fixedQuery string
+}
+
+func (source testEndpoints) Endpoint(_ context.Context, upstreamID int64,
+	kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
+
+	up := &model.Upstream{ID: upstreamID, L1Path: "/v1/models"}
+	if source.cfg != nil && source.cfg.snap != nil {
+		if found := source.cfg.snap.Upstreams[upstreamID]; found != nil {
+			up = found
+		}
+	}
+	return &model.UpstreamEndpoint{
+		ID: 1, UpstreamID: upstreamID, Kind: kind,
+		URLMode:            model.EndpointURLCanonical,
+		URLOverride:        up.EndpointURLOverride(kind),
+		FixedQueryTemplate: source.fixedQuery,
+		AuthProfile: model.EndpointAuthProfile{
+			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
+		},
+		Revision: 1,
+	}, nil
+}
+
+type testHasher struct{}
+
+func (testHasher) SumRequestURL(raw []byte) string {
+	return fmt.Sprintf("test:%x", len(raw))
+}
+
+// testTargetsWithQuery 给每个 Endpoint 配一个固定 query 模板。
+// 用于「key 放在 query 里」那类站（§3.2）。
+func testTargetsWithQuery(cfg *fakeConfig, template string) *outbound.Provider {
+	return outbound.NewProvider(testEndpoints{cfg: cfg, fixedQuery: template}, nil,
+		outbound.NewResolver(testHasher{}))
 }
 
 // serve 走完整的 mux 路由，确保端点注册也在测试范围内。
@@ -1025,13 +1082,15 @@ func TestSample_DisabledRecordsNothing(t *testing.T) {
 // base_url 正是为这类站准备的 —— 它会被整段存进 out_url。
 // 验收标准是「真 key 全表 grep 零命中」，漏一个字段就不成立。
 func TestSample_RedactsKeysInURL(t *testing.T) {
-	t.Run("full_url_mode 的 base_url 带上游 key", func(t *testing.T) {
+	t.Run("固定 query 里的上游 key", func(t *testing.T) {
 		const upKey = "sk-upstream-secret-in-url"
 		hs := newHarness(t, nil)
 		up := hs.cfg.snap.Upstreams[10]
 		up.APIKey = upKey
-		up.FullURLMode = true
-		up.BaseURL = hs.up.URL + "/v1/messages?key=" + upKey
+		// 「key 放在 query 里」的站在 schema 2 里由 Endpoint 的固定 query
+		// 模板表达（§7.1），而不是把 key 塞进 base_url —— 后者带 query
+		// 本就过不了 validateBaseURL。
+		hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 
 		hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
@@ -1082,23 +1141,25 @@ func TestSample_RedactionDoesNotAffectForwardedURL(t *testing.T) {
 		gotQuery = r.URL.RawQuery
 		w.Write([]byte(`{}`))
 	})
-	up := hs.cfg.snap.Upstreams[10]
-	up.APIKey = upKey
-	up.FullURLMode = true
-	up.BaseURL = hs.up.URL + "/v1/messages?key=" + upKey
+	hs.cfg.snap.Upstreams[10].APIKey = upKey
+	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 
 	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
 	if !strings.Contains(gotQuery, "key="+upKey) {
 		t.Errorf("上游应收到**明文** key，得到 %q", gotQuery)
 	}
-	// 同时验证 URL 拼接：base_url 已带 query 时必须用 & 续接，
-	// 用 ? 会拼出 ?key=x?beta=true —— 非法 URL，上游会拒或误解析
+	// 固定 query 与入站 query 之间只能有一个 &，且不能出现第二个 ? ——
+	// 拼出 ?key=x?beta=true 是非法 URL，上游会拒或把后半段当成 key 的一部分。
 	if strings.Count(gotQuery, "?") != 0 {
 		t.Errorf("query 里不该出现第二个 ?，得到 %q", gotQuery)
 	}
 	if !strings.Contains(gotQuery, "beta=true") {
 		t.Errorf("入站 query 应被续接上，得到 %q", gotQuery)
+	}
+	// 顺序是固定 query 在前、入站在后（§7.1）
+	if gotQuery != "key="+upKey+"&beta=true" {
+		t.Errorf("固定 query 应在前、入站在后，得到 %q", gotQuery)
 	}
 }
 

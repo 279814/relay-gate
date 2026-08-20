@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
@@ -45,6 +46,13 @@ type Handler struct {
 	health  router.HealthView
 	samples SampleSink
 	log     *slog.Logger
+
+	// targets 是唯一的出站 URL 来源（§7.1）。为 nil 时转发直接失败 ——
+	// 绝不回落到自己拼一个：那正是 P0-03 要消灭的第二套规则。
+	targets outbound.TargetProvider
+
+	// keys 提供出站渲染需要的 Secret 值（固定 query 里的占位符）。可为 nil。
+	keys outbound.SecretSource
 
 	// reporter 接收真实请求的健康结论。可为 nil（不做健康回写）。
 	reporter HealthReporter
@@ -104,6 +112,43 @@ func (h *Handler) WithHealthReporter(r HealthReporter) *Handler {
 func (h *Handler) WithLogSink(s LogSink) *Handler {
 	h.logs = s
 	return h
+}
+
+// WithTargets 注入唯一的出站目标解析器（§7.1）。
+//
+// 必须显式注入而不是内部 new 一个：Resolver 需要 digest key（来自 Cipher）
+// 与 Store 的 Endpoint/legacy 读取面，而 proxy 包不该知道这两样东西 ——
+// 知道了就成了 proxy → store 的依赖，而 store 侧的诊断又要用 proxy 的类型。
+//
+// keys 提供固定 query 里的 Probe Secret，可为 nil（没有 Secret 占位符时）。
+func (h *Handler) WithTargets(targets outbound.TargetProvider, keys outbound.SecretSource) *Handler {
+	h.targets = targets
+	h.keys = keys
+	return h
+}
+
+// resolveTarget 解析这次尝试的出站 URL。
+//
+// endpoint 由调用方按**入站端点**给出，不由 Protocol 推导：count_tokens 不是
+// 第四种协议，而是 Anthropic 协议下的一个附加端点，用 Protocol 推会把它
+// 解析成 /v1/messages。
+func (h *Handler) resolveTarget(r *http.Request, cand *router.Candidate,
+	kind model.EndpointKind) (outbound.ResolvedTarget, error) {
+
+	if h.targets == nil {
+		return outbound.ResolvedTarget{}, errors.New("未装配出站目标解析器")
+	}
+	return h.targets.ResolveTarget(r.Context(), outbound.TargetInput{
+		Upstream:         cand.Upstream.ProbeConfig(),
+		Endpoint:         kind,
+		IncomingRawQuery: r.URL.RawQuery,
+		Values: outbound.Values{
+			UpstreamAPIKey:     []byte(cand.Upstream.APIKey),
+			CredentialRevision: cand.Upstream.CredentialRevision,
+			Secrets:            h.keys,
+		},
+		Use: outbound.ResolveRealForward,
+	})
 }
 
 // Routes 注册透传端点。三个协议路径 1:1 对应上游同名路径（§3.1）。

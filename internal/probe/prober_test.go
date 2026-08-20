@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
 // drainBody 读完请求体。假上游**必须**这么做，否则断流相关的断言全是假的。
@@ -34,7 +36,59 @@ func fastSettings() model.Settings {
 }
 
 func testProber() *Prober {
-	return &Prober{Transport: http.DefaultTransport}
+	return &Prober{Transport: http.DefaultTransport, Targets: testTargets()}
+}
+
+// testTargets 造一个内存版 TargetProvider，行为与生产装配一致：
+// canonical Endpoint + 同一个 Resolver。
+//
+// 不用假的「直接回 base_url」实现：那样测试就不再覆盖 Resolver，而它正是
+// 探活与真实转发共用的那一份 URL 规则 —— 绕过它等于把本要防的分叉
+// 重新引进测试里。
+func testTargets() *outbound.Provider {
+	return outbound.NewProvider(testEndpoints{}, nil, outbound.NewResolver(testHasher{}))
+}
+
+// testEndpoints 为任意 (upstream, kind) 现造一条 canonical Endpoint。
+//
+// url_override 由 Upstream 的 l1_path/full_url_mode 翻译而来，与 Store 的
+// canonicalEndpointBundle 走同一个 model.EndpointURLOverride —— 这样测试里
+// 的 Endpoint 与生产库里的那条是同一套规则产出的。
+type testEndpoints struct{ upstream *model.Upstream }
+
+func (source testEndpoints) Endpoint(_ context.Context, upstreamID int64,
+	kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
+
+	upstream := source.upstream
+	if upstream == nil {
+		// 多数用例只关心 canonical path，不配 override。
+		upstream = &model.Upstream{ID: upstreamID, L1Path: "/v1/models"}
+	}
+	return &model.UpstreamEndpoint{
+		ID: 1, UpstreamID: upstreamID, Kind: kind,
+		URLMode:     model.EndpointURLCanonical,
+		URLOverride: upstream.EndpointURLOverride(kind),
+		AuthProfile: model.EndpointAuthProfile{
+			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
+		},
+		Revision: 1,
+	}, nil
+}
+
+type testHasher struct{}
+
+func (testHasher) SumRequestURL(raw []byte) string {
+	return fmt.Sprintf("test:%x", len(raw))
+}
+
+// proberFor 造一个 Endpoint 配置跟随该 Upstream 的 Prober。
+// 需要覆盖 l1_path / full_url_mode 行为的用例用它。
+func proberFor(up *model.Upstream) *Prober {
+	return &Prober{
+		Transport: http.DefaultTransport,
+		Targets: outbound.NewProvider(testEndpoints{upstream: up}, nil,
+			outbound.NewResolver(testHasher{})),
+	}
 }
 
 func upstreamFor(url string) *model.Upstream {

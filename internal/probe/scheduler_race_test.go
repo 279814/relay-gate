@@ -49,7 +49,7 @@ func TestScheduler_CoalescesL1PerUpstream_RaceDeterministic(t *testing.T) {
 	gate := health.NewUpstreamGate()
 
 	ct := &countingErrTransport{}
-	sched := NewScheduler(&fakeCfg{state: store.StateRunning}, ct, track, gate, discardLogger())
+	sched := NewScheduler(&fakeCfg{state: store.StateRunning}, ct, track, gate, discardLogger()).WithTargets(testTargets(), nil)
 
 	// 模拟一个 tick 内串行处理 5 条 Route，且每次 after-probe 都等到
 	// goroutine 跑完 —— 正是「第一个 L1 在 tick 遍历完成前结束」的竞态。

@@ -10,6 +10,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -54,6 +55,10 @@ type Scheduler struct {
 	track Tracker
 	gate  *health.UpstreamGate
 	log   *slog.Logger
+
+	// targets 与 secrets 是探活的出站目标解析面，与真实转发共用（§7.1）。
+	targets outbound.TargetProvider
+	secrets outbound.SecretSource
 
 	// cost 累计探活开销（§5.2d）。可以为 nil —— 测试里多数用例不关心计数，
 	// 而记账失败绝不该影响探活本身。
@@ -123,6 +128,25 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 func (s *Scheduler) WithCost(c *Cost) *Scheduler {
 	s.cost = c
 	return s
+}
+
+// WithTargets 注入与真实转发共用的出站目标解析器（§7.1）。
+//
+// 不注入时探活会在解析阶段失败，而不是自己拼一个地址 —— 这是刻意的：
+// 一个「探活打 A 地址、真实请求打 B 地址」的网关，它报出来的健康状态
+// 与实际可用性无关，比没有探活更糟。
+func (s *Scheduler) WithTargets(targets outbound.TargetProvider, secrets outbound.SecretSource) *Scheduler {
+	s.targets = targets
+	s.secrets = secrets
+	return s
+}
+
+// prober 造一个带完整出站解析面的 Prober。
+//
+// 每次探活现造：Prober 只是 Transport 与解析器的薄封装，没有跨探活的状态，
+// 而复用一个实例反而会让「哪次探活用的哪份配置」变得不确定。
+func (s *Scheduler) prober(tr http.RoundTripper) *Prober {
+	return &Prober{Transport: tr, Targets: s.targets, Secrets: s.secrets}
 }
 
 // Run 阻塞运行调度循环，直到 ctx 结束。
@@ -257,7 +281,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		return
 	}
 
-	out := (&Prober{Transport: tr}).L1(ctx, up, settings)
+	out := s.prober(tr).L1(ctx, up, settings)
 	if out.Verdict == health.VerdictIgnore {
 		return // 探活被取消（暂停/关闭），不是上游的问题
 	}
@@ -336,7 +360,7 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 		return
 	}
 
-	out := (&Prober{Transport: tr}).L2(ctx, up, mn, rt, settings)
+	out := s.prober(tr).L2(ctx, up, mn, rt, settings)
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
@@ -535,7 +559,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	if err != nil {
 		return l1, l2, err
 	}
-	p := &Prober{Transport: tr}
+	p := s.prober(tr)
 
 	l1 = p.L1(ctx, up, settings)
 	s.countL1(up.ID, l1.Verdict == health.VerdictOK)

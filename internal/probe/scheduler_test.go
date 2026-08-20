@@ -197,7 +197,7 @@ func newSchedHarness(t *testing.T, n int, handler http.HandlerFunc) *schedHarnes
 	gate := health.NewUpstreamGate()
 
 	return &schedHarness{
-		sched: NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()),
+		sched: NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil),
 		track: track, gate: gate, cfg: cfg,
 	}
 }
@@ -234,7 +234,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 	}
 	track := newRecordingTracker()
 	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger())
+	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil)
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
@@ -320,7 +320,7 @@ func TestScheduler_CoalescesL1PerUpstream(t *testing.T) {
 		state:    store.StateRunning,
 	}
 	sched := NewScheduler(cfg, fakeTransport{}, newRecordingTracker(),
-		health.NewUpstreamGate(), discardLogger())
+		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
@@ -373,7 +373,7 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 	track.states[100] = model.StateDead
 	track.states[101] = model.StateDead
 	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger())
+	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil)
 
 	// 第一轮：L1 失败，站级记为不通
 	sched.tick(context.Background())
@@ -456,7 +456,7 @@ func TestScheduler_SerializesL2PerUpstream(t *testing.T) {
 		state:    store.StateRunning,
 	}
 	sched := NewScheduler(cfg, fakeTransport{}, newRecordingTracker(),
-		health.NewUpstreamGate(), discardLogger())
+		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
 
 	// 连跑几轮，让被拒的 Route 有机会重试
 	for i := 0; i < 5; i++ {

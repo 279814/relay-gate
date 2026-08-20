@@ -12,6 +12,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/sample"
 )
@@ -20,6 +21,50 @@ import (
 // 与转发路径共用连接池 —— 探活顺带把连接热着，真实请求就省了 TLS 握手。
 type Prober struct {
 	Transport http.RoundTripper
+
+	// Targets 是唯一的出站 URL 来源（§7.1），与真实转发共用。
+	//
+	// 为 nil 时探活直接失败而**不是**自己拼一个：探活打的地址必须与真实请求
+	// 完全一致，各拼一套的话「探活通过」不代表真实请求能通 —— 而这个差异
+	// 只在生产流量上显形。
+	Targets outbound.TargetProvider
+
+	// Secrets 提供固定 query 里的 Probe Secret。可为 nil。
+	Secrets outbound.SecretSource
+}
+
+// resolve 解析一次探活的出站目标。
+//
+// use 必须由调用方明确给出：同一条 legacy 记录对真实流量与合成探活的处理
+// 完全不同（后者 fail closed），默认值会让这个区别静默消失。
+func (p *Prober) resolve(ctx context.Context, up *model.Upstream,
+	kind model.EndpointKind) (outbound.ResolvedTarget, error) {
+
+	if p.Targets == nil {
+		return outbound.ResolvedTarget{}, errors.New("探活未装配出站目标解析器")
+	}
+	return p.Targets.ResolveTarget(ctx, outbound.TargetInput{
+		Upstream: up.ProbeConfig(),
+		Endpoint: kind,
+		Values: outbound.Values{
+			UpstreamAPIKey:     []byte(up.APIKey),
+			CredentialRevision: up.CredentialRevision,
+			Secrets:            p.Secrets,
+		},
+		Use: outbound.ResolveSyntheticProbe,
+	})
+}
+
+// probeConfigOutcome 把解析失败翻译成 Outcome。
+//
+// legacy 待审核与普通配置错误分开：前者是「这个站的 URL 还没人审核过」，
+// 动作是提示用户去审核；后者是配置写错了。混成一类会让用户对着一个
+// 「配置错误」找不到该改什么。
+func probeConfigOutcome(err error) Outcome {
+	if errors.Is(err, outbound.ErrLegacyNeedsReview) {
+		return Outcome{Verdict: health.VerdictIgnore, Err: err}
+	}
+	return Outcome{Verdict: health.VerdictUnavailable, Err: err}
 }
 
 // redactOutcome 脱敏一个 Outcome 里可能含上游原文的错误。
@@ -62,21 +107,29 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L1TotalSec)*time.Second)
 	defer cancel()
 
-	path := strings.TrimSpace(up.L1Path)
-	method, target := http.MethodGet, strings.TrimRight(up.BaseURL, "/")
-	if path == "" {
-		// 只探连接层：HEAD 根地址，不关心状态码，能建立连接就算通。
-		method = http.MethodHead
-	} else {
-		target += path
+	// L1 的地址由 models Endpoint 解析（迁移已把 l1_path 落成它的 url_override）。
+	// 方法仍按 l1_path 决定：为空表示只探连接层（HEAD base_url），那是给
+	// 「连 /v1/models 都会报错的站」留的退路，而 URL 层表达不了这个区别。
+	target, err := p.resolve(ctx, up, model.EndpointModels)
+	if err != nil {
+		return probeConfigOutcome(err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, target, nil)
+	path := strings.TrimSpace(up.L1Path)
+	method := http.MethodGet
+	if path == "" {
+		method = http.MethodHead
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, target.RawURL, nil)
 	if err != nil {
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("构造 L1 请求: %w", err)}
 	}
 	req.Header = buildHeaders(up, model.ProtoAnthropic, false)
+	if target.RequestHost != "" {
+		req.Host = target.RequestHost
+	}
 
 	start := time.Now()
 	resp, err := p.Transport.RoundTrip(req)
@@ -130,20 +183,28 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		return Outcome{Verdict: health.VerdictUnavailable, Err: err}
 	}
 
-	// 出站 URL 与真实转发走同一个函数：探活打的必须是真实请求会打的那个
-	// 地址，包括 full_url_mode 这类逃生舱。两边各拼一套的话，
+	// 出站 URL 与真实转发走同一个 Resolver：探活打的必须是真实请求会打的
+	// 那个地址，包括 legacy 兼容记录这类逃生舱。两边各拼一套的话，
 	// 探活成功不代表真实请求能通。
-	target, err := proxy.BuildOutboundURL(up, mn.Protocol.Path(), "")
+	kind, ok := mn.Protocol.Endpoint()
+	if !ok {
+		return Outcome{Verdict: health.VerdictUnavailable,
+			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
+	}
+	target, err := p.resolve(ctx, up, kind)
 	if err != nil {
-		return Outcome{Verdict: health.VerdictUnavailable, Err: err}
+		return probeConfigOutcome(err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.RawURL, strings.NewReader(string(body)))
 	if err != nil {
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("构造 L2 请求: %w", err)}
 	}
 	req.Header = buildHeaders(up, mn.Protocol, true)
+	if target.RequestHost != "" {
+		req.Host = target.RequestHost
+	}
 	req.ContentLength = int64(len(body))
 
 	// 响应头阶段单独设时限，理由同转发路径（forward.go）：

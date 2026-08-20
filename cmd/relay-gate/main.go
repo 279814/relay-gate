@@ -18,6 +18,7 @@ import (
 	"github.com/279814/relay-gate/internal/config"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/sample"
@@ -96,9 +97,19 @@ func run() error {
 	logRecorder := sample.NewLogRecorder(st, settings, cfgSrc, log)
 	defer logRecorder.Close()
 
+	// 出站目标解析（§7.1）。真实转发、探活与 count_tokens 共用这一个
+	// Resolver —— 各拼一套 URL 的话，探活通过不代表真实请求能通，
+	// 而那个差异只在生产流量上显形。
+	//
+	// 在 main 里显式装配三样东西：Cipher 提供 keyed digest（URL 证据不能用
+	// 裸 SHA，见 §4.3），Store 提供 Endpoint 配置与 legacy URL 解密。
+	// P0-10 的原子 ConfigBundle 上线后只换 EndpointConfigSource，规则不动。
+	targets := outbound.NewProvider(st, st, outbound.NewResolver(cipher))
+
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
+		WithTargets(targets, st).
 		WithHealthReporter(probe.NewReporter(tracker)).
 		WithLogSink(logRecorder)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
@@ -113,7 +124,9 @@ func run() error {
 	costPersister := probe.NewCostPersister(cost, st, log)
 	costPersister.Restore()
 
-	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).WithCost(cost)
+	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
+		WithCost(cost).
+		WithTargets(targets, st)
 	persister := health.NewPersister(tracker, st, log)
 
 	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：

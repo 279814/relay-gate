@@ -254,9 +254,11 @@ func backfillLegacyEndpoints(ctx context.Context, db schemaTwoExecutor, cipher *
 		compatRealOnly := upstream.authStyle == model.AuthAuto
 		urlOverride := ""
 		if kind == model.EndpointModels {
-			if upstream.l1Path != "/v1/models" && upstream.l1Path != "" {
-				urlOverride = strings.TrimRight(upstream.baseURL, "/") + upstream.l1Path
-			}
+			// 与创建/更新路径共用同一个翻译函数。三处各写一份的话，
+			// 「迁移出来的站」与「新建的站」会得到不同的 models URL，
+			// 而那个差异只在探活结果上显形。
+			legacyUpstream := model.Upstream{BaseURL: upstream.baseURL, L1Path: upstream.l1Path}
+			urlOverride = legacyUpstream.EndpointURLOverride(model.EndpointModels)
 		} else if upstream.fullURLMode {
 			mode = model.EndpointURLLegacyExact
 			legacyID = legacyURLID

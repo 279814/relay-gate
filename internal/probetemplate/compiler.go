@@ -80,8 +80,17 @@ func Compile(endpoint model.EndpointKind, version model.ProbeRecipeVersion) (*Co
 	})
 }
 
+// CompileContent 编译一段不来自 ProbeRecipeVersion 的模板内容。
+//
+// EndpointResolver 用它编译 Endpoint 的固定 query：URL 里的占位符与转义规则
+// 必须与 Recipe 完全同一套。各写一份的话，同一个 Secret 在 header 与 query 里
+// 会得到不同的转义结果，而 query 侧的差异表现为上游 401 —— 排查方向完全是错的。
+func CompileContent(endpoint model.EndpointKind, content TemplateContent) (*CompiledRecipe, error) {
+	return compileContent(endpoint, content)
+}
+
 func ScanRequiredSecrets(endpoint model.EndpointKind, content TemplateContent) ([]string, error) {
-	compiled, err := compileContent(endpoint, content)
+	compiled, err := CompileContent(endpoint, content)
 	if err != nil {
 		return nil, err
 	}

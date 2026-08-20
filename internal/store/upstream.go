@@ -253,14 +253,24 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 			return err
 		}
 	}
-	if upstream.L1Path != current.L1Path {
-		override := ""
-		if upstream.L1Path != "" && upstream.L1Path != "/v1/models" {
-			override = strings.TrimRight(upstream.BaseURL, "/") + upstream.L1Path
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,revision=revision+1,
-			updated_at=? WHERE upstream_id=? AND endpoint='models'`, override, upstream.UpdatedAt, upstream.ID); err != nil {
-			return err
+	// base_url、full_url_mode 与 l1_path 任一改变，都要重新翻译受影响 Endpoint
+	// 的 url_override —— 它们三个共同决定 override 的值（EndpointURLOverride），
+	// 只盯 l1_path 的话，改 base_url 会留下一个指向旧域名的 override。
+	if upstream.L1Path != current.L1Path || upstream.BaseURL != current.BaseURL ||
+		upstream.FullURLMode != current.FullURLMode {
+
+		for _, kind := range []model.EndpointKind{
+			model.EndpointModels, model.EndpointMessages, model.EndpointResponses,
+			model.EndpointChatCompletions, model.EndpointCountTokens,
+		} {
+			// 只改 canonical Endpoint：legacy_exact 的 URL 存在加密记录里，
+			// 它的行为必须逐字节保持不变（§19.2），碰它就是改动线上语义。
+			if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,
+				revision=revision+1,updated_at=? WHERE upstream_id=? AND endpoint=? AND url_mode=?`,
+				upstream.EndpointURLOverride(kind), upstream.UpdatedAt, upstream.ID, kind,
+				model.EndpointURLCanonical); err != nil {
+				return err
+			}
 		}
 	}
 	if err = tx.Commit(); err != nil {
