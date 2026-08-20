@@ -68,22 +68,38 @@ echo "=== 3. chown 的目标必须是绝对路径 ==="
 # entrypoint.sh 的默认值被改成相对路径时它照样全绿。（实测：把默认值
 # 换成 relay-gate.db 后原版仍 PASS。）一个永远为真的断言不是防线。
 assign=$(grep -E '^DB_PATH=' "$script")
+# 后缀列表也必须从真实脚本里抠出来，不能在这里重抄一份 —— 上面那段注释
+# 讲的正是这个教训，而它当时只应用到了 DB_PATH。加 .lock 时检查器纹丝不动，
+# 说明「四个目标」这个硬编码数字既没发现漏项，也会在补齐后反过来误报。
+suffixes=$(sed -n 's/^[[:space:]]*for suffix in \(.*\); do$/\1/p' "$script" | head -n 1)
 if [ -z "$assign" ]; then
     fail 'entrypoint.sh 里找不到 DB_PATH= 赋值 —— 无法验证 chown 目标'
+elif [ -z "$suffixes" ]; then
+    fail 'entrypoint.sh 里找不到 chown 的后缀循环 —— 无法验证 chown 目标'
 else
     # 不带 RELAY_DB 跑，验的是**默认值**那条路径（真实部署里 compose
     # 不设 RELAY_DB 时走的就是它）。
     targets=$(env -u RELAY_DB sh -c "
         $assign
-        for suffix in \"\" -wal -shm -journal; do printf '%s\n' \"\${DB_PATH}\${suffix}\"; done")
+        for suffix in $suffixes; do printf '%s\n' \"\${DB_PATH}\${suffix}\"; done")
     abs=0
     total=0
     for t in $targets; do
         total=$((total + 1))
         case "$t" in /*) abs=$((abs + 1)) ;; esac
     done
-    if [ "$abs" -eq "$total" ] && [ "$total" -eq 4 ]; then
-        pass "4 个 chown 目标全是绝对路径"
+    # 逐个点名必须覆盖的文件，而不是数个数：数量对不上只说明「改了」，
+    # 点名才能说明「漏了哪个」。.lock 是生命周期独占锁，漏掉它的症状是
+    # 容器起不来而库文件权限看着全对。
+    missing=''
+    for required in '' '-wal' '-shm' '-journal' '.lock'; do
+        expected="/app/data/relay-gate.db${required}"
+        printf '%s\n' "$targets" | grep -qxF "$expected" || missing="$missing ${required:-<主库>}"
+    done
+    if [ -n "$missing" ]; then
+        fail "chown 漏了这些文件：$missing —— 非 root 进程会被权限挡在启动之前"
+    elif [ "$abs" -eq "$total" ]; then
+        pass "$total 个 chown 目标全是绝对路径，且覆盖主库/-wal/-shm/-journal/.lock"
     else
         fail "只有 $abs/$total 个目标是绝对路径 —— 其余是相对路径垃圾，chown 不到真实库文件"
     fi

@@ -404,7 +404,7 @@ func (store *Store) AddRecipeVersion(version *model.ProbeRecipeVersion, expected
 			_ = tx.Rollback()
 		}
 	}()
-	recipe, err := scanProbeRecipe(tx.QueryRow(`SELECT ` + recipeCols +
+	recipe, err := scanProbeRecipe(tx.QueryRow(`SELECT `+recipeCols+
 		` FROM probe_recipe WHERE id=?`, version.RecipeID))
 	if err != nil {
 		return err
