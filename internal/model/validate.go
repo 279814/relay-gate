@@ -29,6 +29,9 @@ func (u *Upstream) Validate() error {
 	if !u.AuthStyle.Valid() {
 		return invalid("auth_style 必须是 auto / x-api-key / bearer，收到 %q", u.AuthStyle)
 	}
+	if !u.ProbeMode.Valid() {
+		return invalid("probe_mode 必须是 active 或 lazy，收到 %q", u.ProbeMode)
+	}
 	if u.L1Path != "" && !strings.HasPrefix(u.L1Path, "/") {
 		return invalid("l1_path 必须以 / 开头，收到 %q", u.L1Path)
 	}
@@ -43,6 +46,57 @@ func (u *Upstream) Validate() error {
 		if IsAuthHeader(k) {
 			return invalid("probe_headers 不能包含鉴权头 %q，key 由 api_key 字段统一注入", k)
 		}
+	}
+	return nil
+}
+
+func (endpoint *UpstreamEndpoint) Validate() error {
+	if endpoint.UpstreamID <= 0 {
+		return invalid("upstream_id 必须指定")
+	}
+	if !endpoint.Kind.Valid() {
+		return invalid("endpoint 无效: %q", endpoint.Kind)
+	}
+	if !endpoint.URLMode.Valid() {
+		return invalid("url_mode 无效: %q", endpoint.URLMode)
+	}
+	switch endpoint.URLMode {
+	case EndpointURLCanonical:
+		if endpoint.LegacyFullURLID != 0 || endpoint.LegacyFullURLRevision != 0 {
+			return invalid("canonical endpoint 不能引用 legacy full URL")
+		}
+	case EndpointURLLegacyExact:
+		if endpoint.LegacyFullURLID <= 0 || endpoint.LegacyFullURLRevision <= 0 || !endpoint.NeedsReview {
+			return invalid("legacy_exact endpoint 必须引用待审核 legacy full URL")
+		}
+	}
+	if !endpoint.AuthProfile.Mode.Valid() {
+		return invalid("auth mode 无效: %q", endpoint.AuthProfile.Mode)
+	}
+	if endpoint.AuthProfile.Mode == AuthModeAutoCalibrated && endpoint.AuthProfile.CalibratedMode != "" &&
+		(endpoint.AuthProfile.CalibratedMode == AuthModeAutoCalibrated ||
+			endpoint.AuthProfile.CalibratedMode == AuthModeLegacyAutoRealOnly ||
+			!endpoint.AuthProfile.CalibratedMode.Valid()) {
+		return invalid("calibrated auth mode 无效: %q", endpoint.AuthProfile.CalibratedMode)
+	}
+	if endpoint.AuthProfile.Mode != AuthModeLegacyAutoRealOnly && endpoint.LegacyCompatRealOnly {
+		return invalid("legacy_compat_real_only 只允许 legacy auto endpoint")
+	}
+	if endpoint.AuthProfile.SecretRef == "" {
+		return invalid("auth secret_ref 不能为空")
+	}
+	for _, header := range endpoint.AuthProfile.ManualHeaders {
+		if strings.TrimSpace(header.Name) == "" || strings.ContainsAny(header.Name, "\r\n\x00") {
+			return invalid("manual auth header name 无效")
+		}
+		for _, value := range header.Values {
+			if strings.ContainsAny(value, "\r\n\x00") {
+				return invalid("manual auth header value 含控制字符")
+			}
+		}
+	}
+	if endpoint.Revision < 0 || endpoint.AuthProfile.Revision < 0 {
+		return invalid("revision 不能为负")
 	}
 	return nil
 }

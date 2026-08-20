@@ -369,7 +369,7 @@ func TestRetryStats(t *testing.T) {
 //
 // 后果是**恰恰在丢日志的高负载时段**，重试的效果被系统性低估，
 // 而度量那个效果正是这张表存在的理由。attempts 列的冗余就是为这种
-// 情形准备的（见 schema.sql），统计必须用它而不是数行数。
+// 情形准备的（见 0001_legacy.sql），统计必须用它而不是数行数。
 func TestRetryStatsSurvivesDroppedRows(t *testing.T) {
 	st := testStore(t)
 

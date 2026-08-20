@@ -13,8 +13,8 @@ import (
 // 于是老库会静默停在旧结构上，而症状是「新字段读出来永远是零值」——
 // 不报错、不失败，只是功能悄悄不工作。
 //
-// 这里模拟真实的升级路径：先建一个**没有** req_id 的 sample 表（M5 的结构），
-// 再走一次 Open，断言列被加上且旧数据还在。
+// 这里使用受支持的 M6 pre-column 精确 fixture，而不是从当前 schema 任意拆列。
+// 任意部分结构现在必须 fail closed，只有已知历史指纹允许 normalization。
 func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	c, err := NewCipher("test-passphrase-at-least-16-chars")
@@ -22,38 +22,19 @@ func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. 用当前 schema 建库，再把 M6 加的那一列**拆掉**，得到一个 M5 时代的结构。
-	//
-	//    不手抄一份旧表定义：手抄的副本会随 schema 演进而腐烂，而一个与真实
-	//    历史结构脱节的「旧库」测不出任何东西 —— 它只会证明「我抄的那张表能
-	//    被迁移」。从真实结构反向拆列，得到的旧库是精确的。
-	st, err := Open(path, c)
-	if err != nil {
+	legacy := openDatabaseAtPath(t, path)
+	loadLegacyVariantFixture(t, legacy, legacySchemaM6PreColumn)
+	if _, err := legacy.Exec(`INSERT INTO sample(ts_recv, endpoint, outcome) VALUES (1, '/v1/messages', 'ok')`); err != nil {
 		t.Fatal(err)
 	}
-	// 塞一条旧数据，验证迁移不丢数据
-	if err := st.InsertSample(&model.Sample{
-		TSRecv: 1, Endpoint: "/v1/messages", Outcome: model.OutcomeOK}); err != nil {
+	if has, _ := hasColumn(legacy, "sample", "req_id"); has {
+		t.Fatal("fixture 前提不成立：req_id 应不存在")
+	}
+	if err := legacy.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// 索引要先删：SQLite 不允许 DROP 一个被索引的列
-	if _, err := st.db.Exec(`DROP INDEX IF EXISTS idx_sample_req`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.Exec(`ALTER TABLE sample DROP COLUMN req_id`); err != nil {
-		t.Fatalf("拆列失败，测试前提不成立：%v", err)
-	}
-	if has, _ := hasColumn(st.db, "sample", "req_id"); has {
-		t.Fatal("前提不成立：req_id 应已被拆掉")
-	}
-	st.Close()
 
-	// 2. 用正常路径重新打开（schema.sql + migrate）。
-	//
-	//    这一步同时守着一个顺序陷阱：schema.sql 在 migrate 之前跑，而它的
-	//    CREATE TABLE IF NOT EXISTS 对已存在的表是空操作 —— 所以 req_id 的
-	//    索引**不能**写在 schema.sql 里，那会在这里因「no such column」
-	//    让整个启动失败。索引建在 migrate.go，在加列之后。
+	// 2. 正常 Open 先备份原 variant，再做 0→1 normalization 与 1→2 expand。
 	st2, err := Open(path, c)
 	if err != nil {
 		t.Fatalf("打开老库应成功（迁移要能处理它）：%v", err)
@@ -108,7 +89,7 @@ func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 	}
 }
 
-// 迁移必须幂等：schema.sql 每次启动都跑，migrate 也一样。
+// 迁移必须幂等：建表脚本每次启动都跑，migrate 也一样。
 //
 // 不幂等的表现是**第二次启动直接失败**（duplicate column name），
 // 也就是说升级后能跑，重启一次就起不来了。
@@ -128,10 +109,10 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 }
 
-// 新库走 schema.sql 就该带 req_id，不依赖迁移补。
+// 新库走 0001_legacy.sql 就该带 req_id，不依赖迁移补。
 //
-// 两条路径都要通：只靠迁移的话，schema.sql 与实际结构会越差越远，
-// 而 schema.sql 是唯一能一眼看全表结构的地方。
+// 两条路径都要通：只靠迁移的话，建表脚本与实际结构会越差越远，
+// 而建表脚本是唯一能一眼看全表结构的地方。
 func TestMigrate_FreshDBHasReqIDFromSchema(t *testing.T) {
 	st := testStore(t)
 	has, err := hasColumn(st.db, "sample", "req_id")
@@ -139,7 +120,7 @@ func TestMigrate_FreshDBHasReqIDFromSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !has {
-		t.Error("新库的 schema.sql 里就该有 req_id")
+		t.Error("新库的 0001_legacy.sql 里就该有 req_id")
 	}
 }
 

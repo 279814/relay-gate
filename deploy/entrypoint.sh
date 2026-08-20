@@ -40,7 +40,12 @@ if [ "$(id -u)" = "0" ]; then
         # SQLite 在 WAL 模式下会使用 db-wal / db-shm；回滚日志则叫
         # db-journal。它们都可能在容器重启时已经存在，必须和主库一起
         # 收归 relay，否则非 root 进程会在打开数据库前就被权限挡住。
-        for suffix in '' '-wal' '-shm' '-journal'; do
+        #
+        # .lock 是进程生命周期独占锁（internal/store/instance_lock.go），
+        # 拿不到它会在任何 DDL 与 listener 之前 fail closed。它和库文件
+        # 一样会被 `chown 0:0 relay-gate.db*` 这类恢复操作扫到，漏掉它
+        # 的症状是容器起不来而库文件权限看着全对。
+        for suffix in '' '-wal' '-shm' '-journal' '.lock'; do
             file="${DB_PATH}${suffix}"
             if [ -e "$file" ]; then
                 chown "$RELAY_UID:$RELAY_GID" "$file"

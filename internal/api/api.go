@@ -93,6 +93,13 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, model.ErrValidation):
 		msg := strings.TrimPrefix(err.Error(), "validation: ")
 		writeJSON(w, http.StatusBadRequest, errBody{msg})
+	case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrDependencyConflict),
+		errors.Is(err, store.ErrIdempotencyConflict):
+		// 409：这三类都是「请求本身合法，但与当前状态冲突」——
+		// 并发改同一行、还有依赖没清、或同 ID 换了内容重放。
+		// 落到 default 会回 500，把「重新读一遍再试」变成「服务器坏了」，
+		// 调用方无从判断该重试还是该改配置。
+		writeJSON(w, http.StatusConflict, errBody{err.Error()})
 	default:
 		s.log.Error("内部错误", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody{"internal error"})

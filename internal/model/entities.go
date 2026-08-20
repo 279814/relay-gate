@@ -10,10 +10,16 @@ type Upstream struct {
 	// 只有写入时才接受明文——避免管理接口把 key 回显出去。
 	APIKey string `json:"api_key,omitempty"`
 
-	AuthStyle   AuthStyle `json:"auth_style"`
-	FullURLMode bool      `json:"full_url_mode"` // true 时 BaseURL 即完整端点，不再拼路径
-	ProxyURL    string    `json:"proxy_url,omitempty"`
-	Enabled     bool      `json:"enabled"`
+	AuthStyle          AuthStyle `json:"auth_style"`
+	FullURLMode        bool      `json:"full_url_mode"` // true 时 BaseURL 即完整端点，不再拼路径
+	ProxyURL           string    `json:"proxy_url,omitempty"`
+	Enabled            bool      `json:"enabled"`
+	ProbeMode          ProbeMode `json:"probe_mode"`
+	HostOverride       string    `json:"host_override,omitempty"`
+	TLSServerName      string    `json:"tls_server_name,omitempty"`
+	Revision           int64     `json:"revision"`
+	NetworkRevision    int64     `json:"network_revision"`
+	CredentialRevision int64     `json:"credential_revision"`
 
 	// L1Path 为空表示只做 TCP/TLS 握手探测。M0 实测 6 站的 /v1/models 全部 200，
 	// 所以默认值可用，无需降级。
@@ -40,9 +46,11 @@ type ModelName struct {
 	ProbePrompt    string `json:"probe_prompt"`
 	ProbeMaxTokens int    `json:"probe_max_tokens"`
 
-	Enabled   bool  `json:"enabled"`
-	CreatedAt int64 `json:"created_at"`
-	UpdatedAt int64 `json:"updated_at"`
+	Enabled            bool  `json:"enabled"`
+	CreatedAt          int64 `json:"created_at"`
+	UpdatedAt          int64 `json:"updated_at"`
+	Revision           int64 `json:"revision"`
+	CapabilityRevision int64 `json:"capability_revision"`
 }
 
 // Route 把一个 ModelName 绑到一个 Upstream，带优先级与模型映射。
@@ -63,8 +71,10 @@ type Route struct {
 	MaxConcurrency int  `json:"max_concurrency"` // 0 = 不限
 	Enabled        bool `json:"enabled"`
 
-	CreatedAt int64 `json:"created_at"`
-	UpdatedAt int64 `json:"updated_at"`
+	CreatedAt          int64 `json:"created_at"`
+	UpdatedAt          int64 `json:"updated_at"`
+	Revision           int64 `json:"revision"`
+	CapabilityRevision int64 `json:"capability_revision"`
 }
 
 // HealthState 是 Route 的运行时健康状态。
@@ -85,6 +95,9 @@ func (u *Upstream) Defaults() {
 	}
 	if u.L1Path == "" {
 		u.L1Path = "/v1/models"
+	}
+	if u.ProbeMode == "" {
+		u.ProbeMode = ProbeModeActive
 	}
 }
 

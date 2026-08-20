@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -107,5 +109,50 @@ func TestMaskKey(t *testing.T) {
 	long := "sk-ThisIsAVeryLongSecretKeyValue123456"
 	if m := MaskKey(long); strings.Contains(m, long) {
 		t.Errorf("脱敏结果 %q 仍含完整 key", m)
+	}
+}
+
+func TestCipherDomainSeparatedFingerprints(t *testing.T) {
+	c, err := NewCipher("manifest-key-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.KeyID(), "211a8cd1e88bfe28"; got != want {
+		t.Fatalf("KeyID = %q, want %q", got, want)
+	}
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			name: "probe secret",
+			got:  c.Fingerprint("probe-secret", []byte("abc")),
+			want: "211a8cd1e88bfe28:52ce1a1ecdf2c2d1270d2612a4053412291016fc7ced18821b7b95dde540cc37",
+		},
+		{
+			name: "legacy full URL",
+			got:  c.Fingerprint("legacy-full-url", []byte("abc")),
+			want: "211a8cd1e88bfe28:1d217f77274f06a832edf25b7061cd19802009a2ffd29fe48916277791cbf0d8",
+		},
+		{
+			name: "request URL",
+			got:  c.SumRequestURL([]byte("https://example.com/v1/messages?a=1")),
+			want: "211a8cd1e88bfe28:c49e64d5e749fa1216a32f823dacf059493a5c9898d79b463aaf0294a9532deb",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Fatalf("digest = %q, want golden %q", tc.got, tc.want)
+			}
+		})
+	}
+
+	raw := sha256.Sum256([]byte("abc"))
+	rawHex := hex.EncodeToString(raw[:])
+	if strings.Contains(tests[0].got, rawHex) || tests[0].got == tests[1].got {
+		t.Fatal("fingerprint must be keyed and domain-separated")
 	}
 }

@@ -3,9 +3,11 @@ package store
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +19,8 @@ import (
 // 选 GCM 而不是 CBC：GCM 自带完整性校验，密文被改过会解密失败而不是静默返回垃圾。
 // 若返回垃圾 key，症状是上游 401，你会以为是站挂了 —— 那种排查方向完全是错的。
 type Cipher struct {
-	aead cipher.AEAD
+	aead    cipher.AEAD
+	rootKey [sha256.Size]byte
 }
 
 // ErrNoKey 表示未配置加密密钥。
@@ -41,7 +44,34 @@ func NewCipher(passphrase string) (*Cipher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化 GCM: %w", err)
 	}
-	return &Cipher{aead: aead}, nil
+	return &Cipher{aead: aead, rootKey: sum}, nil
+}
+
+// KeyID returns a short, irreversible identifier used to pair encrypted
+// backups with the configured ENCRYPTION_KEY. It never exposes key material.
+func (c *Cipher) KeyID() string {
+	return hex.EncodeToString(c.rootKey[:])[:16]
+}
+
+// SumRequestURL returns a keyed digest suitable for URL evidence. A plain
+// SHA-256 would be an oracle for low-entropy query secrets.
+func (c *Cipher) SumRequestURL(value []byte) string {
+	return c.domainDigest("request-url", value)
+}
+
+// Fingerprint returns a stable keyed digest separated by the caller's kind.
+func (c *Cipher) Fingerprint(kind string, plain []byte) string {
+	return c.domainDigest("fingerprint/"+kind, plain)
+}
+
+func (c *Cipher) domainDigest(domain string, value []byte) string {
+	derive := hmac.New(sha256.New, c.rootKey[:])
+	_, _ = derive.Write([]byte("relay-gate/hmac-key/v1\x00" + domain))
+	subkey := derive.Sum(nil)
+
+	digest := hmac.New(sha256.New, subkey)
+	_, _ = digest.Write(value)
+	return c.KeyID() + ":" + hex.EncodeToString(digest.Sum(nil))
 }
 
 // Encrypt 返回 base64(nonce || ciphertext)。
