@@ -53,8 +53,12 @@ func (s *Store) ListRoutes(modelNameID int64) ([]*model.Route, error) {
 }
 
 // ListRoutesPage 按 id 分页，不沿用 ListRoutes 的 priority 排序：priority 可重复，
-// 且没有覆盖 (model_name_id, priority, id) 的索引，用它做 keyset 既要三段 cursor
-// 又得全表排序。管理端列表要的是「翻页不重不漏」，选路顺序由 ListRoutes 负责。
+// 且 schema 2 只有 idx_route_model_name 单列索引，按 priority 做 keyset 会退化成
+// USE TEMP B-TREE FOR ORDER BY。管理端列表要的是「翻页不重不漏」，选路顺序由
+// ListRoutes 负责。
+//
+// P0-14 迁移管理端 Route 列表时要处理这个差异：直接换成本方法会把 UI 顺序从
+// 「按优先级」变成「按创建顺序」。两条路径见实施计划 §5.5。
 func (s *Store) ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error) {
 	limit, err := normalizePageLimit(filter.Limit)
 	if err != nil {

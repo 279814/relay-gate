@@ -203,8 +203,9 @@ func scanCapabilityRow(scanner interface{ Scan(...any) error }) (*model.Endpoint
 // 用 observed_at 排会在「同一轮 tick 写入多行」时撞上相同时间戳，
 // 而 id 是自增主键，本身就唯一且稳定。
 //
-// nowMS 由调用方通过 filter.Expired 隐式决定：Expired 需要与当前时间比较，
-// 所以在 SQL 里直接用参数化的当前毫秒，不依赖 SQLite 的时间函数。
+// Expired 需要与「当前时刻」比较，而这个时刻必须在首页固定下来并随 cursor
+// 传递：若每页都重新取当前时间，翻页途中过期状态改变的行会改变结果集，而
+// keyset 分页的后续页只读游标之后的行，那一行就永远读不到 —— 静默漏项。
 func (store *Store) ListCapabilities(ctx context.Context, filter model.CapabilityFilter) (model.Page[*model.EndpointCapability], error) {
 	limit, err := normalizePageLimit(filter.Limit)
 	if err != nil {
@@ -212,9 +213,12 @@ func (store *Store) ListCapabilities(ctx context.Context, filter model.Capabilit
 	}
 	cursorFilter := filter
 	cursorFilter.PageRequest = model.PageRequest{}
-	keys, err := decodePageCursor(filter.Cursor, "capabilities", cursorFilter, 1)
+	keys, evaluatedAtMS, err := decodePageCursorAt(filter.Cursor, "capabilities", cursorFilter, 1)
 	if err != nil {
 		return model.Page[*model.EndpointCapability]{}, err
+	}
+	if evaluatedAtMS == 0 {
+		evaluatedAtMS = nowMS()
 	}
 	conditions := []string{"1=1"}
 	args := make([]any, 0, 7)
@@ -244,7 +248,7 @@ func (store *Store) ListCapabilities(ctx context.Context, filter model.Capabilit
 		} else {
 			conditions = append(conditions, "(expires_at=0 OR expires_at>?)")
 		}
-		args = append(args, nowMS())
+		args = append(args, evaluatedAtMS)
 	}
 	if len(keys) == 1 {
 		id, cursorErr := cursorID(keys[0])
@@ -286,7 +290,7 @@ func (store *Store) ListCapabilities(ctx context.Context, filter model.Capabilit
 		page.Items = append(page.Items, row.value)
 	}
 	if hasMore {
-		page.NextCursor, err = encodePageCursor("capabilities", cursorFilter,
+		page.NextCursor, err = encodePageCursorAt("capabilities", cursorFilter, evaluatedAtMS,
 			strconv.FormatInt(scanned[len(scanned)-1].id, 10))
 		if err != nil {
 			return model.Page[*model.EndpointCapability]{}, err
