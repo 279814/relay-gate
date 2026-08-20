@@ -1,5 +1,7 @@
 package model
 
+import "strings"
+
 // EndpointKind identifies the upstream API surface without coupling it to a
 // particular logical model or route.
 type EndpointKind string
@@ -187,4 +189,48 @@ type ProbeUpstreamConfig struct {
 	Revision           int64
 	NetworkRevision    int64
 	CredentialRevision int64
+}
+
+// EndpointURLOverride 把旧的 full_url_mode 与 l1_path 两个站级开关，翻译成
+// 某个 Endpoint 的 url_override。返回空表示该 Endpoint 用 canonical path。
+//
+// 为什么必须有这个翻译：EndpointResolver 是唯一拼 URL 的地方，而它只认
+// Endpoint 上的 url_override。两个旧开关若不落到 Endpoint 上，就会静默失效 ——
+// full_url_mode 的站会被拼成 base+/v1/messages（旧行为是 base 本身），
+// 自定义 l1_path 的站会被探成 /v1/models。两者都表现为「配置还在、行为变了」。
+//
+// 创建与更新共用它，避免两条路径各写一份而分叉。
+func (u *Upstream) EndpointURLOverride(kind EndpointKind) string {
+	base := strings.TrimRight(u.BaseURL, "/")
+	if kind == EndpointModels {
+		switch u.L1Path {
+		case "/v1/models":
+			return "" // canonical，不需要 override
+		case "":
+			// 旧行为是 HEAD base_url（连接层探测）。URL 就是 base 本身，
+			// 方法由调用方按 l1_path 为空来决定，不在 URL 里表达。
+			return base
+		default:
+			return base + u.L1Path
+		}
+	}
+	if u.FullURLMode {
+		// full_url_mode 的语义就是「base_url 即完整端点，不再拼路径」。
+		return base
+	}
+	return ""
+}
+func (u *Upstream) ProbeConfig() *ProbeUpstreamConfig {
+	return &ProbeUpstreamConfig{
+		ID:                 u.ID,
+		BaseURL:            u.BaseURL,
+		ProxyURL:           u.ProxyURL,
+		Enabled:            u.Enabled,
+		ProbeMode:          u.ProbeMode,
+		HostOverride:       u.HostOverride,
+		TLSServerName:      u.TLSServerName,
+		Revision:           u.Revision,
+		NetworkRevision:    u.NetworkRevision,
+		CredentialRevision: u.CredentialRevision,
+	}
 }

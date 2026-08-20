@@ -117,7 +117,8 @@ func newMultiHarness(t *testing.T, responders ...http.HandlerFunc) *multiHarness
 		settings: s,
 		state:    store.StateRunning,
 	}
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
 }

@@ -31,9 +31,14 @@ func canonicalEndpointBundle(upstream *model.Upstream) []*model.UpstreamEndpoint
 		model.EndpointCountTokens,
 	} {
 		result = append(result, &model.UpstreamEndpoint{
-			UpstreamID:           upstream.ID,
-			Kind:                 kind,
-			URLMode:              model.EndpointURLCanonical,
+			UpstreamID: upstream.ID,
+			Kind:       kind,
+			URLMode:    model.EndpointURLCanonical,
+			// full_url_mode 与自定义 l1_path 必须在创建时就落到 url_override 上。
+			// 只在 UpdateUpstream 里翻译的话，一个**新建**的 full_url_mode 站
+			// 会被 Resolver 拼成 base+/v1/messages —— 而这个开关的全部用途
+			// 恰恰是「不要拼路径」。
+			URLOverride:          upstream.EndpointURLOverride(kind),
 			LegacyCompatRealOnly: realOnly,
 			AuthProfile: model.EndpointAuthProfile{
 				Mode:       authMode,
@@ -205,6 +210,21 @@ func (store *Store) CreateEndpoint(endpoint *model.UpstreamEndpoint) (err error)
 
 func (store *Store) GetEndpoint(id int64) (*model.UpstreamEndpoint, error) {
 	return scanEndpoint(store.db.QueryRow(`SELECT `+endpointColumns+` FROM upstream_endpoint WHERE id=?`, id))
+}
+
+// Endpoint 按 (upstream, kind) 取一条 Endpoint，满足 outbound.EndpointConfigSource。
+//
+// 与 GetEndpoint 分开是因为出站路径手上只有「哪个站的哪个端点」，没有行 ID；
+// 让它先 List 再筛会把一次点查变成一次全表扫，而这是每请求都走的路径。
+func (store *Store) Endpoint(ctx context.Context, upstreamID int64,
+	kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
+
+	if !kind.Valid() {
+		return nil, model.WrapValidation("endpoint 无效: %q", kind)
+	}
+	return scanEndpoint(store.db.QueryRowContext(ctx,
+		`SELECT `+endpointColumns+` FROM upstream_endpoint WHERE upstream_id=? AND endpoint=?`,
+		upstreamID, kind))
 }
 
 func scanEndpoint(scanner interface{ Scan(...any) error }) (*model.UpstreamEndpoint, error) {

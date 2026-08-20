@@ -78,11 +78,12 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	outHeader := PrepareOutboundHeaders(r.Header, cand.Upstream.APIKey,
 		cand.Upstream.AuthStyle, model.ProtoAnthropic)
 
-	// 路径与入站一致（/v1/messages/count_tokens）。count_tokens 不是第四种
-	// 协议，只是 Anthropic 协议下的一个附加端点，所以不走 Protocol.Path()。
-	outURL, err := BuildOutboundURL(cand.Upstream, r.URL.Path, r.URL.RawQuery)
+	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
+	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
+	// 所以显式给 EndpointCountTokens 而不是从 Protocol 推。
+	target, err := h.resolveTarget(r, cand, model.EndpointCountTokens)
 	if err != nil {
-		return fmt.Sprintf("拼接出站 URL 失败: %v", err)
+		return fmt.Sprintf("解析出站目标失败: %v", err)
 	}
 
 	tr, err := h.TransportFor(cand.Upstream, pre.settings)
@@ -94,11 +95,14 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		time.Duration(pre.settings.CountTokensSec)*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, outURL, bytes.NewReader(outBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.RawURL, bytes.NewReader(outBody))
 	if err != nil {
 		return fmt.Sprintf("构造请求失败: %v", err)
 	}
 	req.Header = outHeader
+	if target.RequestHost != "" {
+		req.Host = target.RequestHost
+	}
 	req.ContentLength = int64(len(outBody))
 
 	resp, err := tr.RoundTrip(req)

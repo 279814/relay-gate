@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -75,38 +74,6 @@ func NewTransport(proxyURL string, connectTimeout time.Duration) (*http.Transpor
 	return tr, nil
 }
 
-// BuildOutboundURL 拼出站 URL（§3.1）。
-//
-// 规则：base_url（去尾斜杠）+ 入站 path + 原样带上 RawQuery。
-// query 必须带：真实 Claude Code 打的是 /v1/messages?beta=true，
-// 丢掉 ?beta=true 会改变上游行为。
-//
-// full_url_mode 下 base_url 自己可能已经带了 query（`...?key=xxx` 是
-// 非标准站的常见形态，而这个开关正是为它们准备的）。这时必须用 `&` 续接，
-// 用 `?` 会拼出 `?key=xxx?beta=true` —— 两个问号是非法 URL，上游要么整个
-// 拒掉、要么把后半段当成 key 值的一部分，症状是「配了 key 却一直 401」。
-func BuildOutboundURL(up *model.Upstream, inPath, rawQuery string) (string, error) {
-	base := strings.TrimRight(up.BaseURL, "/")
-	var full string
-	if up.FullURLMode {
-		// 逃生舱：base_url 即完整端点，不拼路径（应对非标准路径的站）
-		full = base
-	} else {
-		full = base + inPath
-	}
-	if rawQuery != "" {
-		sep := "?"
-		if strings.Contains(full, "?") {
-			sep = "&"
-		}
-		full += sep + rawQuery
-	}
-	if _, err := url.Parse(full); err != nil {
-		return "", fmt.Errorf("拼接出站 URL 失败: %w", err)
-	}
-	return full, nil
-}
-
 // Result 是一次转发的结果，供健康判定与样本记录使用。
 type Result struct {
 	Status      int
@@ -169,6 +136,13 @@ type Forwarder struct {
 	// 也不改变 flush 时序 —— 采集是旁路，不是管线的一环。
 	// 它的写入错误一律忽略：丢一份样本远好过中断一次真实转发。
 	RespTee io.Writer
+
+	// RequestHost 覆盖 Host 头。空表示用 URL 自己的 host。
+	//
+	// 必须走 http.Request.Host 而不是 Header["Host"]：net/http 在写请求行时
+	// **只读 req.Host**，塞进 Header 的 Host 会被静默丢弃 —— 那正是
+	// 「配了 host_override 却完全没生效」这类问题的来源。
+	RequestHost string
 }
 
 // Attempt 是一次**尚未提交**的转发：请求已发出、响应头已拿到，
@@ -266,6 +240,10 @@ func (f *Forwarder) Send(ctx context.Context, method, outURL string,
 		return at
 	}
 	req.Header = header
+	// Host 覆盖必须写 req.Host：写进 Header 会被 net/http 静默忽略。
+	if f.RequestHost != "" {
+		req.Host = f.RequestHost
+	}
 	// ContentLength 显式设置，避免 http 库改用 chunked ——
 	// 部分上游对 chunked 的 POST 处理不一致。
 	req.ContentLength = int64(len(body))
