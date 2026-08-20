@@ -78,6 +78,12 @@ type ResolvedTarget struct {
 	RequestHost string
 	// OriginKey 是 scheme://authority，用于「同源」判断与连接池分组。
 	OriginKey string
+	// AuthProfile 是这个 Endpoint 的认证方式，交给 ApplyAuth 使用。
+	//
+	// 与 URL 一起返回而不是让调用方再查一次：两者来自**同一条** Endpoint
+	// 记录的同一个 revision。分两次读的话，中间一次配置更新就会让请求
+	// 「用新 URL 配旧认证」，而那种组合没有任何测试覆盖，症状是偶发 401。
+	AuthProfile model.EndpointAuthProfile
 	// ResolvedURLHash 是**配置语义**的 hash，进 Capability 身份。
 	// 不含每个客户端请求都不同的 IncomingRawQuery —— 含了的话，一个普通的
 	// ?beta=true 就会把同一个端点抖成两份全局能力状态。
@@ -206,7 +212,7 @@ func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,
 		requestHost,
 	}, "\x00")
 
-	return resolver.finish(&target, requestHost, configIdentity, in.Endpoint.Revision)
+	return resolver.finish(&target, requestHost, configIdentity, in.Endpoint)
 }
 
 // resolveLegacy 处理 schema 1→2 迁移出来的 exact URL。
@@ -262,11 +268,11 @@ func (resolver *Resolver) resolveLegacy(ctx context.Context, in ResolveInput,
 		requestHost,
 	}, "\x00")
 
-	return resolver.finish(&target, requestHost, configIdentity, endpoint.Revision)
+	return resolver.finish(&target, requestHost, configIdentity, endpoint)
 }
 
 func (resolver *Resolver) finish(target *url.URL, requestHost, configIdentity string,
-	endpointRevision int64) (ResolvedTarget, error) {
+	endpoint *model.UpstreamEndpoint) (ResolvedTarget, error) {
 
 	raw := target.String()
 	// 渲染后再验一次：Secret 明文可能带 CR/LF 或控制字符，而请求行注入
@@ -281,9 +287,10 @@ func (resolver *Resolver) finish(target *url.URL, requestHost, configIdentity st
 		RawURL:           raw,
 		RequestHost:      requestHost,
 		OriginKey:        target.Scheme + "://" + target.Host,
+		AuthProfile:      endpoint.AuthProfile,
 		ResolvedURLHash:  hex.EncodeToString(digest[:]),
 		RequestURLHash:   resolver.hasher.SumRequestURL([]byte(raw)),
-		EndpointRevision: endpointRevision,
+		EndpointRevision: endpoint.Revision,
 	}, nil
 }
 

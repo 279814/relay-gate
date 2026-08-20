@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
 )
@@ -22,7 +22,7 @@ import (
 // Claude Code 启动时与每轮对话前都会调它做上下文预算，不实现会报错。
 //
 // 与三个透传端点的差异（§10.3 已定，都是刻意的）：
-//   - **非流式**，超时独立（Settings.CountTokensSec，默认 60s）
+//   - **非流式**，超时独立（count_tokens_connect_sec / count_tokens_total_sec）
 //   - **失败不计入健康状态** —— 一个这么轻量的端点失败不该把站判死，
 //     它的噪声会淹没真实请求给出的信号
 //   - **上游不支持时本地粗算兜底**。M0 实测 4 个可用站只有 2 个支持
@@ -75,8 +75,6 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return fmt.Sprintf("替换 model 失败: %v", err)
 	}
-	outHeader := PrepareOutboundHeaders(r.Header, cand.Upstream.APIKey,
-		cand.Upstream.AuthStyle, model.ProtoAnthropic)
 
 	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
 	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
@@ -85,14 +83,21 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return fmt.Sprintf("解析出站目标失败: %v", err)
 	}
-
-	tr, err := h.TransportFor(cand.Upstream, pre.settings)
+	outHeader, err := h.outboundHeaders(r, cand, target, model.ProtoAnthropic)
 	if err != nil {
-		return fmt.Sprintf("构造 Transport 失败: %v", err)
+		return fmt.Sprintf("改写出站认证失败: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(),
-		time.Duration(pre.settings.CountTokensSec)*time.Second)
+	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
+	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，
+	// 而本地粗算本来就能立刻作答。
+	budget := outbound.CountTokensBudget(pre.settings)
+	tr, err := h.TransportFor(cand.Upstream, budget)
+	if err != nil {
+		return fmt.Sprintf("取连接池失败: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), budget.Total)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.RawURL, bytes.NewReader(outBody))

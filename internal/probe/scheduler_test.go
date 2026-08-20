@@ -12,6 +12,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -55,11 +56,20 @@ func (f *fakeCfg) setState(s store.RunState) {
 	f.state = s
 }
 
-// fakeTransport 直接用默认 Transport，靶站是真的 httptest 服务器。
-type fakeTransport struct{}
+// fakeTransport 用一个真实 Manager 造池，靶站是真的 httptest 服务器。
+//
+// 不返回 http.DefaultTransport：那样 connect 预算完全不参与，而
+// 「L1 与 L2 各取自己的池」正是这一层要能被测到的行为。
+type fakeTransport struct{ manager *outbound.Manager }
 
-func (fakeTransport) TransportFor(*model.Upstream, model.Settings) (*http.Transport, error) {
-	return http.DefaultTransport.(*http.Transport), nil
+func newFakeTransport() fakeTransport {
+	return fakeTransport{manager: outbound.NewManager()}
+}
+
+func (transport fakeTransport) TransportFor(up *model.Upstream,
+	budget outbound.Budget) (*outbound.Transport, error) {
+
+	return transport.manager.Transport(outbound.NetworkFor(up.ProbeConfig(), budget.Connect))
 }
 
 // recordingTracker 记录调度器对状态机的每次调用。
@@ -179,7 +189,7 @@ func newSchedHarness(t *testing.T, n int, handler http.HandlerFunc) *schedHarnes
 		t.Cleanup(srv.Close)
 		ups = append(ups, &model.Upstream{
 			ID: int64(i * 10), Name: "up" + string(rune('0'+i)), BaseURL: srv.URL,
-			APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthAuto,
+			APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
 			L1Path: "/v1/models", Enabled: true,
 		})
 		routes = append(routes, &model.Route{
@@ -197,7 +207,7 @@ func newSchedHarness(t *testing.T, n int, handler http.HandlerFunc) *schedHarnes
 	gate := health.NewUpstreamGate()
 
 	return &schedHarness{
-		sched: NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil),
+		sched: NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil),
 		track: track, gate: gate, cfg: cfg,
 	}
 }
@@ -217,7 +227,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 	defer srv.Close()
 
 	up := &model.Upstream{ID: 10, Name: "dead-station", BaseURL: srv.URL,
-		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthAuto,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
 		L1Path: "/v1/models", Enabled: true}
 	// 同一个站下挂 3 条 Route
 	routes := []*model.Route{
@@ -234,7 +244,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 	}
 	track := newRecordingTracker()
 	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil)
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
@@ -304,7 +314,7 @@ func TestScheduler_CoalescesL1PerUpstream(t *testing.T) {
 	defer srv.Close()
 
 	up := &model.Upstream{ID: 10, Name: "shared", BaseURL: srv.URL,
-		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthAuto,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
 		L1Path: "/v1/models", Enabled: true}
 	var routes []*model.Route
 	for i := 0; i < 5; i++ {
@@ -319,7 +329,7 @@ func TestScheduler_CoalescesL1PerUpstream(t *testing.T) {
 		settings: fastSettings(),
 		state:    store.StateRunning,
 	}
-	sched := NewScheduler(cfg, fakeTransport{}, newRecordingTracker(),
+	sched := NewScheduler(cfg, newFakeTransport(), newRecordingTracker(),
 		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
 
 	sched.tick(context.Background())
@@ -356,7 +366,7 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 	defer srv.Close()
 
 	up := &model.Upstream{ID: 10, Name: "flappy", BaseURL: srv.URL,
-		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthAuto,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
 		L1Path: "/v1/models", Enabled: true}
 	routes := []*model.Route{
 		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
@@ -373,7 +383,7 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 	track.states[100] = model.StateDead
 	track.states[101] = model.StateDead
 	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, fakeTransport{}, track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil)
 
 	// 第一轮：L1 失败，站级记为不通
 	sched.tick(context.Background())
@@ -440,7 +450,7 @@ func TestScheduler_SerializesL2PerUpstream(t *testing.T) {
 	defer srv.Close()
 
 	up := &model.Upstream{ID: 10, Name: "shared", BaseURL: srv.URL,
-		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthAuto,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
 		L1Path: "/v1/models", Enabled: true}
 	var routes []*model.Route
 	for i := 0; i < 5; i++ {
@@ -455,7 +465,7 @@ func TestScheduler_SerializesL2PerUpstream(t *testing.T) {
 		settings: fastSettings(),
 		state:    store.StateRunning,
 	}
-	sched := NewScheduler(cfg, fakeTransport{}, newRecordingTracker(),
+	sched := NewScheduler(cfg, newFakeTransport(), newRecordingTracker(),
 		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
 
 	// 连跑几轮，让被拒的 Route 有机会重试

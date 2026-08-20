@@ -115,9 +115,18 @@ func discardLog() *slog.Logger {
 func testSettings() model.Settings {
 	s := model.DefaultSettings()
 	s.RealConnectSec = 2
-	s.RealFirstTokenSec = 2
 	s.RealIdleSec = 2
 	s.RealTotalSec = 5
+	// 四个阶段上限都要设，不能只设旧的 real_first_token_sec。
+	//
+	// 生产路径上 store.SaveSettings 会把那个粗旋钮展开到这四个字段，所以从库里
+	// 读出来的配置两套都填好了。但这里是手工构造 Settings，只设旧字段的话
+	// 新字段仍是默认的 1200 秒 —— 于是「首 Token 超时 2 秒」静默变成 1200 秒，
+	// 被 total 兜住，而依赖它换站的重试用例会因为一个与本意无关的原因失败。
+	s.RealFirstTokenSec = 2
+	s.RealResponseHeaderSec = 2
+	s.RealFirstByteSec = 2
+	s.RealFirstSemanticSec = 2
 	return s
 }
 
@@ -243,9 +252,10 @@ func testTargets(cfg *fakeConfig) *outbound.Provider {
 
 // testEndpoints 按 fakeConfig 里的 Upstream 现造 canonical Endpoint。
 //
-// url_override 走 model.EndpointURLOverride —— 与 Store 的
-// canonicalEndpointBundle 同一个函数，所以测试里的 Endpoint 与生产库里
-// 那条是同一套规则产出的。
+// url_override 与 auth profile 都由 Upstream 的旧字段翻译而来，走的是
+// store.canonicalEndpointBundle 用的那同一套映射 —— 所以测试里的 Endpoint
+// 与生产库里那条是同一套规则产出的。auth 若在这里硬编码一种，
+// 「auth_style 落到 auth profile」这段翻译就再也没有测试覆盖。
 type testEndpoints struct {
 	cfg        *fakeConfig
 	fixedQuery string
@@ -254,22 +264,42 @@ type testEndpoints struct {
 func (source testEndpoints) Endpoint(_ context.Context, upstreamID int64,
 	kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
 
-	up := &model.Upstream{ID: upstreamID, L1Path: "/v1/models"}
+	up := &model.Upstream{ID: upstreamID, L1Path: "/v1/models", AuthStyle: model.AuthAuto}
 	if source.cfg != nil && source.cfg.snap != nil {
 		if found := source.cfg.snap.Upstreams[upstreamID]; found != nil {
 			up = found
 		}
 	}
+	mode, headerName := testAuthProfile(up.AuthStyle)
 	return &model.UpstreamEndpoint{
 		ID: 1, UpstreamID: upstreamID, Kind: kind,
-		URLMode:            model.EndpointURLCanonical,
-		URLOverride:        up.EndpointURLOverride(kind),
-		FixedQueryTemplate: source.fixedQuery,
+		URLMode:              model.EndpointURLCanonical,
+		URLOverride:          up.EndpointURLOverride(kind),
+		FixedQueryTemplate:   source.fixedQuery,
+		LegacyCompatRealOnly: mode == model.AuthModeLegacyAutoRealOnly,
 		AuthProfile: model.EndpointAuthProfile{
-			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
+			Mode: mode, HeaderName: headerName,
+			SecretRef: "upstream_api_key", Revision: 1,
 		},
 		Revision: 1,
 	}, nil
+}
+
+// testAuthProfile 与 store.legacyAuthProfile 同构。
+//
+// 两份而不是共用：store 侧那个是私有的，导出它只为测试用会把一个迁移期的
+// 内部细节变成公开契约。auth_style 只有三个值，且它在 P0-17 就会被删掉。
+func testAuthProfile(style model.AuthStyle) (model.AuthMode, string) {
+	switch style {
+	case model.AuthBearer:
+		return model.AuthModeBearer, "Authorization"
+	case model.AuthXAPIKey:
+		return model.AuthModeXAPIKey, "X-Api-Key"
+	default:
+		// auto → 迁移期的双发兼容。真实转发沿用旧行为（升级不改变线上语义），
+		// 合成探活则 fail closed（见 outbound.ApplyAuth）。
+		return model.AuthModeLegacyAutoRealOnly, ""
+	}
 }
 
 type testHasher struct{}
@@ -695,18 +725,18 @@ func TestHandler_ConfigErrorIsServerError(t *testing.T) {
 	}
 }
 
-// Transport 必须按 Upstream 缓存：每请求新建会丢掉连接复用，
+// 连接池必须按网络身份复用：每请求新建会丢掉连接复用，
 // 对高延迟的公益站来说每次都要重新 TLS 握手。
 func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
 	hs := newHarness(t, nil)
-	s := testSettings()
+	budget := outbound.RealBudget(testSettings())
 	up := hs.cfg.snap.Upstreams[10]
 
-	tr1, err := hs.h.TransportFor(up, s)
+	tr1, err := hs.h.TransportFor(up, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr2, err := hs.h.TransportFor(up, s)
+	tr2, err := hs.h.TransportFor(up, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +746,7 @@ func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
 
 	// 配置变更（尤其 proxy_url）后必须丢弃旧的，否则改了代理不生效
 	hs.h.InvalidateTransport(up.ID)
-	tr3, err := hs.h.TransportFor(up, s)
+	tr3, err := hs.h.TransportFor(up, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,8 +755,8 @@ func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
 	}
 }
 
-// 并发请求下 transports map 不能出现竞态或重复建 Transport。
-// （Windows 上没 cgo 跑不了 -race，这里至少验证功能正确。）
+// 并发请求下连接池不能出现竞态或重复建池。
+// （Windows 上没 cgo 跑不了 -race，这里至少验证功能正确；CI 的 Linux job 跑 race。）
 func TestHandler_ConcurrentRequests(t *testing.T) {
 	hs := newHarness(t, nil)
 
@@ -743,8 +773,8 @@ func TestHandler_ConcurrentRequests(t *testing.T) {
 			t.Errorf("第 %d 个并发请求失败：%d", i, code)
 		}
 	}
-	if len(hs.h.transports) != 1 {
-		t.Errorf("同一 Upstream 应只有 1 个 Transport，得到 %d", len(hs.h.transports))
+	if got := hs.h.transports.PoolCount(); got != 1 {
+		t.Errorf("同一 Upstream 的同一份预算应只有 1 个池，得到 %d", got)
 	}
 }
 

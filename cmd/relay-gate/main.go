@@ -106,14 +106,21 @@ func run() error {
 	// P0-10 的原子 ConfigBundle 上线后只换 EndpointConfigSource，规则不动。
 	targets := outbound.NewProvider(st, st, outbound.NewResolver(cipher))
 
+	// 连接池按网络身份分组（§7.3）。真实请求、L1、L2、count_tokens 各传自己
+	// 的 connect 预算，值不同必须不同池 —— 那正是「l1_connect_sec 真正生效」
+	// 的前提。同一个 Manager 由转发与探活共享：探活顺带把 TLS 连接热着，
+	// 真实请求就省掉一次握手，而各建一套会让空闲连接翻倍。
+	transports := outbound.NewManager()
+
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
 		WithTargets(targets, st).
+		WithTransports(transports).
 		WithHealthReporter(probe.NewReporter(tracker)).
 		WithLogSink(logRecorder)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
-	defer fwd.CloseIdleConnections()
+	defer transports.CloseIdleConnections()
 
 	// 探活（§4）。Transport 由 fwd 提供，与转发共用连接池 ——
 	// 探活顺带把连接热着，真实请求就省掉一次 TLS 握手。

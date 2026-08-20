@@ -52,10 +52,14 @@ const anthropicVersion = "2023-06-01"
 
 // buildHeaders 组装探活请求头。
 //
-// 三层叠加，后者覆盖前者：默认模板 → Upstream 级 probe_headers → 鉴权头。
-// 鉴权放最后且不可被覆盖：probe_headers 里若能塞进一个 Authorization，
-// 就等于给这个站开了第二个 key 来源，而那个 key 不受加密存储保护
-// （probe_headers 是明文 JSON）。
+// 两层叠加，后者覆盖前者：默认模板 → Upstream 级 probe_headers。
+// **不含认证** —— 那是 outbound.ApplyAuth 的唯一职责（§7.2）。原先这里有
+// 一份自己的 injectAuth，与转发路径那份是两套代码；而「探活用一种认证、
+// 真实请求用另一种」的故障表现为「探活说站活着，但用户一直 401」，
+// 极难定位，因为两条路径各自看起来都对。
+//
+// probe_headers 里的认证头仍然要挡掉：它是明文 JSON，让它能塞进一个
+// Authorization 就等于给这个站开了第二个 key 来源，绕过加密存储。
 func buildHeaders(up *model.Upstream, proto model.Protocol, stream bool) http.Header {
 	h := make(http.Header, len(defaultProbeHeaders)+4)
 	for k, v := range defaultProbeHeaders {
@@ -86,29 +90,7 @@ func buildHeaders(up *model.Upstream, proto model.Protocol, stream bool) http.He
 		}
 		h.Set(k, v)
 	}
-
-	injectAuth(h, up)
 	return h
-}
-
-// injectAuth 按 auth_style 注入上游 key，规则与转发路径一致（§3.2）。
-//
-// 复用同一套规则很重要：探活用一种鉴权、真实请求用另一种的话，
-// 探活成功不代表真实请求能通 —— 那种「探活说活着但用户一直 401」
-// 的故障极难定位。
-func injectAuth(h http.Header, up *model.Upstream) {
-	if up.APIKey == "" {
-		return
-	}
-	switch up.AuthStyle {
-	case model.AuthXAPIKey:
-		h.Set("X-Api-Key", up.APIKey)
-	case model.AuthBearer:
-		h.Set("Authorization", "Bearer "+up.APIKey)
-	default: // AuthAuto：两个都发，M0 实测 4 个可用站全部同时接受
-		h.Set("X-Api-Key", up.APIKey)
-		h.Set("Authorization", "Bearer "+up.APIKey)
-	}
 }
 
 // DefaultHeaderTemplate 返回默认探活头模板的副本，供管理界面展示与编辑。

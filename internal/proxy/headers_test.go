@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
 // 真实 Claude Code 的头集合（M0 抓包所得）。用它做基准，
@@ -32,12 +34,33 @@ func claudeCodeHeaders() http.Header {
 	return h
 }
 
-// 核心断言：出站头集合 = 入站头集合 - 黑名单 + 注入的鉴权头。
+// applyOutboundAuth 走完整的出站头构造：透传 + 唯一的认证改写。
+//
+// 认证注入已从 PrepareOutboundHeaders 搬到 outbound.ApplyAuth（§7.2），
+// 但「出站头集合恰好是什么」这条断言必须继续覆盖两者的**组合结果** ——
+// 只测其中一半的话，删头与写头之间的衔接就没人看着了，而漏删一个认证别名
+// 就是把用户的 relay key 送给公益站。
+func applyOutboundAuth(t *testing.T, in http.Header, key string,
+	mode model.AuthMode) http.Header {
+
+	t.Helper()
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
+	err := outbound.ApplyAuth(context.Background(), out, outbound.AuthInput{
+		Profile: model.EndpointAuthProfile{Mode: mode, SecretRef: "upstream_api_key", Revision: 1},
+		Values:  outbound.Values{UpstreamAPIKey: []byte(key), CredentialRevision: 1},
+	})
+	if err != nil {
+		t.Fatalf("ApplyAuth 失败: %v", err)
+	}
+	return out
+}
+
+// 核心断言：出站头集合 = 入站头集合 - 黑名单 + 恰好一个鉴权头。
 // 多出或少掉任何一个头都算失败 —— 不是「关键头都在就行」，
 // 那样会漏掉计划外的注入。
 func TestPrepareOutboundHeaders_ExactSetDiff(t *testing.T) {
 	in := claudeCodeHeaders()
-	out := PrepareOutboundHeaders(in, "sk-upstream-key", model.AuthAuto, model.ProtoAnthropic)
+	out := applyOutboundAuth(t, in, "sk-upstream-key", model.AuthModeXAPIKey)
 
 	// 入站有、出站也该有的（黑名单之外的全部）
 	wantKept := []string{
@@ -53,13 +76,13 @@ func TestPrepareOutboundHeaders_ExactSetDiff(t *testing.T) {
 		}
 	}
 
-	// 出站应有且仅有：wantKept + 注入的两个鉴权头
+	// 出站应有且仅有：wantKept + 那**一个**鉴权头。
+	// x_api_key profile 只写 X-Api-Key，不再双发（§7.2）。
 	wantSet := map[string]bool{}
 	for _, k := range wantKept {
 		wantSet[http.CanonicalHeaderKey(k)] = true
 	}
 	wantSet["X-Api-Key"] = true
-	wantSet["Authorization"] = true
 
 	var unexpected []string
 	for k := range out {
@@ -90,7 +113,7 @@ func TestPrepareOutboundHeaders_ReplacesKey(t *testing.T) {
 	in.Set("Authorization", "Bearer "+relayKey) // 两个位置都带
 	in.Set("Api-Key", relayKey)                 // 非标准位置也带
 
-	out := PrepareOutboundHeaders(in, upKey, model.AuthAuto, model.ProtoAnthropic)
+	out := applyOutboundAuth(t, in, upKey, model.AuthModeXAPIKey)
 
 	// 遍历所有头值，确认 relay key 一个字都没漏出去
 	for k, vs := range out {
@@ -103,52 +126,33 @@ func TestPrepareOutboundHeaders_ReplacesKey(t *testing.T) {
 	if out.Get("X-Api-Key") != upKey {
 		t.Errorf("X-Api-Key 应为上游 key，得到 %q", out.Get("X-Api-Key"))
 	}
-	if out.Get("Authorization") != "Bearer "+upKey {
-		t.Errorf("Authorization 应为上游 key，得到 %q", out.Get("Authorization"))
-	}
-	// 非标准的 Api-Key 头必须被删掉，不能带着 relay key 出去
-	if out.Get("Api-Key") != "" {
-		t.Errorf("Api-Key 头应被删除，得到 %q", out.Get("Api-Key"))
-	}
-}
-
-func TestInjectAuth_Styles(t *testing.T) {
-	const key = "sk-up"
-	cases := []struct {
-		style      model.AuthStyle
-		wantXKey   string
-		wantBearer string
-	}{
-		{model.AuthXAPIKey, key, ""},
-		{model.AuthBearer, "", "Bearer " + key},
-		{model.AuthAuto, key, "Bearer " + key}, // 双发
-	}
-	for _, c := range cases {
-		t.Run(string(c.style), func(t *testing.T) {
-			in := http.Header{}
-			in.Set("Content-Type", "application/json")
-			out := PrepareOutboundHeaders(in, key, c.style, model.ProtoAnthropic)
-			if got := out.Get("X-Api-Key"); got != c.wantXKey {
-				t.Errorf("X-Api-Key: want %q got %q", c.wantXKey, got)
-			}
-			if got := out.Get("Authorization"); got != c.wantBearer {
-				t.Errorf("Authorization: want %q got %q", c.wantBearer, got)
-			}
-		})
+	// 另两个位置必须为空：只发一种认证，且入站的 relay key 已删干净。
+	for _, name := range []string{"Authorization", "Api-Key"} {
+		if got := out.Get(name); got != "" {
+			t.Errorf("%s 应被删除，得到 %q", name, got)
+		}
 	}
 }
 
-// key 为空时不能静默发一个无鉴权请求 —— 那会得到难以归因的 401。
-func TestInjectAuth_EmptyKeyInjectsNothing(t *testing.T) {
-	in := http.Header{}
+// PrepareOutboundHeaders **自己**不写认证：认证只有 ApplyAuth 一个来源（§7.2）。
+//
+// 它仍必须把入站的认证别名全部删掉 —— 那是 relay key 不泄露的前提，
+// 而 ApplyAuth 是否被调用不该影响这一条。
+func TestPrepareOutboundHeaders_StripsInboundAuthWithoutInjecting(t *testing.T) {
+	in := claudeCodeHeaders()
 	in.Set("Authorization", "Bearer rk-client")
-	out := PrepareOutboundHeaders(in, "", model.AuthAuto, model.ProtoAnthropic)
-	if out.Get("Authorization") != "" || out.Get("X-Api-Key") != "" {
-		t.Error("上游 key 为空时不应注入任何鉴权头，也不应残留入站的")
+	in.Set("X-Api-Key", "rk-client")
+	in.Set("Api-Key", "rk-client")
+
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
+	for _, name := range model.AuthHeaders {
+		if got := out.Get(name); got != "" {
+			t.Errorf("入站认证头 %s 必须删除（否则 relay key 会漏给上游），得到 %q",
+				name, got)
+		}
 	}
 }
 
-// 逐跳头禁止跨连接转发（RFC 7230 §6.1）。
 func TestPrepareOutboundHeaders_StripsHopByHop(t *testing.T) {
 	in := claudeCodeHeaders()
 	in.Set("Connection", "keep-alive")
@@ -160,7 +164,7 @@ func TestPrepareOutboundHeaders_StripsHopByHop(t *testing.T) {
 	in.Set("Proxy-Authorization", "Basic abc")
 	in.Set("Proxy-Authenticate", "Basic")
 
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	for _, k := range hopByHopHeaders {
 		if out.Get(k) != "" {
 			t.Errorf("逐跳头 %s 不应转发，得到 %q", k, out.Get(k))
@@ -176,7 +180,7 @@ func TestPrepareOutboundHeaders_StripsConnectionListedHeaders(t *testing.T) {
 	in.Set("X-Another", "also-dropped")
 	in.Set("X-Kept", "should-survive")
 
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	if out.Get("X-Custom-Hop") != "" {
 		t.Error("Connection 中列出的 X-Custom-Hop 应被删除")
 	}
@@ -195,7 +199,7 @@ func TestPrepareOutboundHeaders_DropsLengthAndHost(t *testing.T) {
 	in.Set("Content-Length", "12345")
 	in.Set("Host", "relay.example.com")
 
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	if out.Get("Content-Length") != "" {
 		t.Error("Content-Length 应交给 http 库重算")
 	}
@@ -215,7 +219,7 @@ func TestPrepareOutboundHeaders_CaseInsensitiveBlacklist(t *testing.T) {
 		"transfer-encoding": {"chunked"},
 		"content-type":      {"application/json"},
 	}
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthBearer, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 
 	for k, vs := range out {
 		for _, v := range vs {
@@ -239,7 +243,7 @@ func TestPrepareOutboundHeaders_PreservesMultiValue(t *testing.T) {
 	in.Add("Anthropic-Beta", "feature-b")
 	in.Add("Anthropic-Beta", "feature-c")
 
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	got := out.Values("Anthropic-Beta")
 	if len(got) != 3 || got[0] != "feature-a" || got[2] != "feature-c" {
 		t.Errorf("多值头应全部保留且保持顺序，得到 %v", got)
@@ -249,7 +253,7 @@ func TestPrepareOutboundHeaders_PreservesMultiValue(t *testing.T) {
 // 出站头不能与入站共享底层数组：样本记录还要读入站请求。
 func TestPrepareOutboundHeaders_DoesNotAliasInput(t *testing.T) {
 	in := claudeCodeHeaders()
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 
 	out.Set("User-Agent", "mutated")
 	if in.Get("User-Agent") != "claude-cli/2.1.220 (external, sdk-cli)" {
@@ -267,7 +271,7 @@ func TestPrepareOutboundHeaders_DoesNotAliasInput(t *testing.T) {
 func TestPrepareOutboundHeaders_ForwardsAcceptEncoding(t *testing.T) {
 	in := claudeCodeHeaders()
 	in.Set("Accept-Encoding", "gzip, br, zstd")
-	out := PrepareOutboundHeaders(in, "sk-up", model.AuthAuto, model.ProtoAnthropic)
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	if out.Get("Accept-Encoding") != "gzip, br, zstd" {
 		t.Errorf("Accept-Encoding 应原样转发，得到 %q", out.Get("Accept-Encoding"))
 	}

@@ -46,20 +46,48 @@ func (p *Prober) resolve(ctx context.Context, up *model.Upstream,
 	return p.Targets.ResolveTarget(ctx, outbound.TargetInput{
 		Upstream: up.ProbeConfig(),
 		Endpoint: kind,
-		Values: outbound.Values{
-			UpstreamAPIKey:     []byte(up.APIKey),
-			CredentialRevision: up.CredentialRevision,
-			Secrets:            p.Secrets,
-		},
-		Use: outbound.ResolveSyntheticProbe,
+		Values:   p.values(up),
+		Use:      outbound.ResolveSyntheticProbe,
 	})
 }
 
-// probeConfigOutcome 把解析失败翻译成 Outcome。
+func (p *Prober) values(up *model.Upstream) outbound.Values {
+	return outbound.Values{
+		UpstreamAPIKey:     []byte(up.APIKey),
+		CredentialRevision: up.CredentialRevision,
+		Secrets:            p.Secrets,
+	}
+}
+
+// probeHeaders 组装探活请求头，认证走唯一的改写器（§7.2）。
 //
-// legacy 待审核与普通配置错误分开：前者是「这个站的 URL 还没人审核过」，
+// profile 来自 target：URL 与认证出自同一条 Endpoint 记录的同一个 revision。
+// 探活侧传 ResolveSyntheticProbe —— legacy 的双发认证对合成探活必须
+// fail closed，那条记录只是「历史上这么发过」，对探活而言仍是无依据地
+// 同时发两种认证。
+func (p *Prober) probeHeaders(ctx context.Context, up *model.Upstream,
+	target outbound.ResolvedTarget, proto model.Protocol, stream bool) (http.Header, error) {
+
+	header := buildHeaders(up, proto, stream)
+	err := outbound.ApplyAuth(ctx, header, outbound.AuthInput{
+		Profile: target.AuthProfile,
+		Values:  p.values(up),
+		Use:     outbound.ResolveSyntheticProbe,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return header, nil
+}
+
+// probeConfigOutcome 把「还没发出去就失败了」翻译成 Outcome。
+//
+// legacy 待审核与普通配置错误分开：前者是「这个站的 URL 或认证还没人审核过」，
 // 动作是提示用户去审核；后者是配置写错了。混成一类会让用户对着一个
 // 「配置错误」找不到该改什么。
+//
+// 两类都不发网络请求（§6.5 的 route-local 失败），所以都不该被计成
+// 「上游拒了我们」—— 那会让一个配置问题累计成上游判死。
 func probeConfigOutcome(err error) Outcome {
 	if errors.Is(err, outbound.ErrLegacyNeedsReview) {
 		return Outcome{Verdict: health.VerdictIgnore, Err: err}
@@ -126,7 +154,13 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("构造 L1 请求: %w", err)}
 	}
-	req.Header = buildHeaders(up, model.ProtoAnthropic, false)
+	header, err := p.probeHeaders(ctx, up, target, model.ProtoAnthropic, false)
+	if err != nil {
+		// 认证配错与 URL 配错走同一条翻译：两者都是「没发出去」，
+		// 而 legacy 待审核在两处都要区别于普通配置错误。
+		return probeConfigOutcome(err)
+	}
+	req.Header = header
 	if target.RequestHost != "" {
 		req.Host = target.RequestHost
 	}
@@ -201,7 +235,11 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("构造 L2 请求: %w", err)}
 	}
-	req.Header = buildHeaders(up, mn.Protocol, true)
+	header, err := p.probeHeaders(ctx, up, target, mn.Protocol, true)
+	if err != nil {
+		return probeConfigOutcome(err)
+	}
+	req.Header = header
 	if target.RequestHost != "" {
 		req.Host = target.RequestHost
 	}

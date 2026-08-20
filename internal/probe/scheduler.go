@@ -39,13 +39,18 @@ type ConfigSource interface {
 	RunState() (store.RunState, error)
 }
 
-// TransportSource 按 Upstream 提供出站 Transport。
+// TransportSource 按用途提供出站连接池。
 //
 // 与转发路径共用（proxy.Handler 实现它）：探活顺带把连接热着，
 // 真实请求就省掉一次 TLS 握手 —— 对高延迟的公益站，握手占首字节的
 // 可观比例。各建一套连接池的话这份收益就没了，还多一倍空闲连接。
+//
+// 收 Budget 而不是 Settings：connect 预算是连接池身份的一部分（§7.3），
+// L1 与 L2 的 connect 值不同就必须不同池。传 Settings 的话，取哪一个值
+// 就成了 TransportSource 实现方的决定 —— 而那正是「l1_connect_sec 配了
+// 却不生效」的来源。
 type TransportSource interface {
-	TransportFor(up *model.Upstream, s model.Settings) (*http.Transport, error)
+	TransportFor(up *model.Upstream, budget outbound.Budget) (*outbound.Transport, error)
 }
 
 // Scheduler 驱动两级探活（§4.6）。
@@ -275,9 +280,9 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 }
 
 func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings model.Settings) {
-	tr, err := s.tr.TransportFor(up, settings)
+	tr, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
 	if err != nil {
-		s.log.Error("探活构造 Transport 失败", "upstream", up.Name, "err", err)
+		s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
 		return
 	}
 
@@ -354,9 +359,9 @@ func (s *Scheduler) triggerDeadRoutes(upstreamID int64) int {
 func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	mn *model.ModelName, rt *model.Route, settings model.Settings) {
 
-	tr, err := s.tr.TransportFor(up, settings)
+	tr, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
 	if err != nil {
-		s.log.Error("探活构造 Transport 失败", "upstream", up.Name, "err", err)
+		s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
 		return
 	}
 
@@ -555,13 +560,15 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, errNoModelName
 	}
 
-	tr, err := s.tr.TransportFor(up, settings)
+	// L1 与 L2 各取自己的连接池：两者的 connect 预算不同，而 connect 预算是
+	// 池身份的一部分（§7.3）。共用一个池就意味着其中一个的 l*_connect_sec
+	// 是死的 —— 而「让 L1/L2 配置真正生效」正是 P0-04 的目标。
+	l1Transport, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
 	if err != nil {
 		return l1, l2, err
 	}
-	p := s.prober(tr)
 
-	l1 = p.L1(ctx, up, settings)
+	l1 = s.prober(l1Transport).L1(ctx, up, settings)
 	s.countL1(up.ID, l1.Verdict == health.VerdictOK)
 	s.gate.Report(up.ID, l1.Verdict == health.VerdictOK, l1.Err)
 
@@ -575,7 +582,11 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, nil
 	}
 
-	l2 = p.L2(ctx, up, mn, rt, settings)
+	l2Transport, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
+	if err != nil {
+		return l1, l2, err
+	}
+	l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
 	s.countL2(rt.ID, mn, l2.Verdict == health.VerdictOK)
 	s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,

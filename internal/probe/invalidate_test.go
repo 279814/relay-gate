@@ -37,7 +37,7 @@ func invHarness() (*Scheduler, *recordingTracker, *fakeCfg) {
 		state:    store.StateRunning,
 	}
 	track := newRecordingTracker()
-	sched := NewScheduler(cfg, fakeTransport{}, track, health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
+	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
 	return sched, track, cfg
 }
 

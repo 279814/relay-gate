@@ -51,9 +51,10 @@ func testTargets() *outbound.Provider {
 
 // testEndpoints 为任意 (upstream, kind) 现造一条 canonical Endpoint。
 //
-// url_override 由 Upstream 的 l1_path/full_url_mode 翻译而来，与 Store 的
-// canonicalEndpointBundle 走同一个 model.EndpointURLOverride —— 这样测试里
-// 的 Endpoint 与生产库里的那条是同一套规则产出的。
+// url_override 与 auth profile 都由 Upstream 的旧字段翻译而来，走的是
+// store.canonicalEndpointBundle 用的那同一套映射 —— 这样测试里的 Endpoint
+// 与生产库里的那条是同一套规则产出的。auth 若在这里硬编码一种，
+// 探活测试就再也覆盖不到「auth_style 落到 auth profile」这段翻译。
 type testEndpoints struct{ upstream *model.Upstream }
 
 func (source testEndpoints) Endpoint(_ context.Context, upstreamID int64,
@@ -62,17 +63,40 @@ func (source testEndpoints) Endpoint(_ context.Context, upstreamID int64,
 	upstream := source.upstream
 	if upstream == nil {
 		// 多数用例只关心 canonical path，不配 override。
-		upstream = &model.Upstream{ID: upstreamID, L1Path: "/v1/models"}
+		// 显式 x-api-key 而不是默认的 auto：auto 会映射成
+		// legacy_auto_real_only，而它对合成探活 fail closed（未校准的认证
+		// 不能猜）—— 那时用例会红在一个与它本意无关的地方。
+		upstream = &model.Upstream{ID: upstreamID, L1Path: "/v1/models",
+			AuthStyle: model.AuthXAPIKey}
 	}
+	mode, headerName := testAuthProfile(upstream.AuthStyle)
 	return &model.UpstreamEndpoint{
 		ID: 1, UpstreamID: upstreamID, Kind: kind,
-		URLMode:     model.EndpointURLCanonical,
-		URLOverride: upstream.EndpointURLOverride(kind),
+		URLMode:              model.EndpointURLCanonical,
+		URLOverride:          upstream.EndpointURLOverride(kind),
+		LegacyCompatRealOnly: mode == model.AuthModeLegacyAutoRealOnly,
 		AuthProfile: model.EndpointAuthProfile{
-			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
+			Mode: mode, HeaderName: headerName,
+			SecretRef: "upstream_api_key", Revision: 1,
 		},
 		Revision: 1,
 	}, nil
+}
+
+// testAuthProfile 与 store.legacyAuthProfile 同构。
+//
+// 两份而不是共用：store 侧那个是私有的，而导出它只为测试用会把一个
+// 迁移期的内部细节变成公开契约。同构的代价是这里要跟着改 ——
+// 但 auth_style 只有三个值，且它在 P0-17 就会被删掉。
+func testAuthProfile(style model.AuthStyle) (model.AuthMode, string) {
+	switch style {
+	case model.AuthBearer:
+		return model.AuthModeBearer, "Authorization"
+	case model.AuthXAPIKey:
+		return model.AuthModeXAPIKey, "X-Api-Key"
+	default:
+		return model.AuthModeLegacyAutoRealOnly, ""
+	}
 }
 
 type testHasher struct{}
@@ -94,7 +118,12 @@ func proberFor(up *model.Upstream) *Prober {
 func upstreamFor(url string) *model.Upstream {
 	return &model.Upstream{
 		ID: 1, Name: "test", BaseURL: url, APIKey: "sk-test-key-123456",
-		AuthStyle: model.AuthAuto, L1Path: "/v1/models", Enabled: true,
+		// **必须显式给 AuthStyle**。默认的 auto 会映射成
+		// legacy_auto_real_only，而它对合成探活是 fail closed 的
+		// （未校准的认证方式不能猜，见 outbound.ApplyAuth）—— 那时探活
+		// 一个请求都发不出去，测试会红在一个与本意无关的地方。
+		// 「auto 探活 fail closed」本身由 TestProbe_LegacyAutoFailsClosed 覆盖。
+		AuthStyle: model.AuthXAPIKey, L1Path: "/v1/models", Enabled: true,
 	}
 }
 
@@ -155,13 +184,15 @@ func TestL1_SendsAuthAndClaudeCodeFingerprint(t *testing.T) {
 	defer srv.Close()
 
 	up := upstreamFor(srv.URL)
-	testProber().L1(context.Background(), up, fastSettings())
+	proberFor(up).L1(context.Background(), up, fastSettings())
 
+	// 认证由 outbound.ApplyAuth 按 Endpoint 的 auth profile 写入 ——
+	// x_api_key 这一种就只发这一个头，不再双发（§7.2）。
 	if v := got.Get("X-Api-Key"); v != up.APIKey {
-		t.Errorf("auto 模式应发 x-api-key，得到 %q", v)
+		t.Errorf("x_api_key profile 应发 x-api-key，得到 %q", v)
 	}
-	if v := got.Get("Authorization"); v != "Bearer "+up.APIKey {
-		t.Errorf("auto 模式应同时发 Bearer，得到 %q", v)
+	if v := got.Get("Authorization"); v != "" {
+		t.Errorf("只该发一种认证方式，Authorization 应为空，得到 %q", v)
 	}
 	if ua := got.Get("User-Agent"); !contains(ua, "claude-cli/") {
 		t.Errorf("必须伪装成 Claude Code（有站按 UA 白名单拦截），得到 %q", ua)
@@ -172,6 +203,44 @@ func TestL1_SendsAuthAndClaudeCodeFingerprint(t *testing.T) {
 	// 真实 Claude Code 不发 context-1m，加上它反而与真实请求不一致
 	if b := got.Get("Anthropic-Beta"); contains(b, "context-1m") {
 		t.Errorf("不该带 context-1m（真实 CC 不发它），得到 %q", b)
+	}
+}
+
+// 旧 auth_style=auto 的站，合成探活必须 fail closed 且**不发网络请求**。
+//
+// 这是 P0-04 刻意引入的门禁（计划 §P0-04 第 11 条）：auto 映射成
+// legacy_auto_real_only，而「同时发两种认证」对探活是无依据的猜测。
+// 真实转发仍沿用旧的双发行为（升级不改变线上语义），探活则要求先校准。
+//
+// 代价是升级后所有未校准的旧站探活都会落到这里 —— 但那正是要显式暴露的
+// 状态，而不是让探活用一种认证、真实请求用另一种。
+func TestProbe_LegacyAutoFailsClosedWithoutSendingRequest(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	up := upstreamFor(srv.URL)
+	up.AuthStyle = model.AuthAuto // → legacy_auto_real_only
+
+	out := proberFor(up).L1(context.Background(), up, fastSettings())
+	if out.Verdict == health.VerdictOK {
+		t.Error("未校准的 auto 认证不该判成功")
+	}
+	if hits != 0 {
+		t.Errorf("必须在写 socket 前失败，上游收到了 %d 个请求", hits)
+	}
+	if out.Err == nil {
+		t.Fatal("应带上原因，否则用户看不出该去做什么")
+	}
+	if !contains(out.Err.Error(), "校准") {
+		t.Errorf("错误应引导用户去校准，得到 %v", out.Err)
+	}
+	// 错误里不得出现 key 明文：它会落进 route_health.last_error 并显示在 UI 上。
+	if contains(out.Err.Error(), up.APIKey) {
+		t.Errorf("错误文本泄露了 api_key: %v", out.Err)
 	}
 }
 
@@ -543,23 +612,46 @@ func TestBuildHeaders_EmptyValueDeletesHeader(t *testing.T) {
 // probe_headers 里的鉴权头必须被忽略。放行的话就是给这个站开了
 // 第二个 key 来源，而 probe_headers 是明文 JSON，不受加密存储保护。
 // 配置层已拒绝这种输入（model.Validate），这里是纵深防御。
-func TestBuildHeaders_IgnoresAuthHeaderOverride(t *testing.T) {
-	up := upstreamFor("http://x")
+//
+// 断言的是「注入的假 key 没有出现在出站请求里」：buildHeaders 自己不再写
+// 认证（那是 outbound.ApplyAuth 的职责），所以这条必须走完整条探活路径，
+// 否则它测不到真正要防的东西。
+func TestProbe_IgnoresAuthHeaderOverrideFromProbeHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	up := upstreamFor(srv.URL)
 	up.ProbeHeaders = map[string]string{
 		"authorization": "Bearer leaked-key",
 		"x-api-key":     "another-leaked-key",
 	}
 
-	h := buildHeaders(up, model.ProtoAnthropic, false)
-	if got := h.Get("Authorization"); got != "Bearer "+up.APIKey {
-		t.Errorf("鉴权头必须来自 api_key 字段，得到 %q", got)
+	proberFor(up).L1(context.Background(), up, fastSettings())
+
+	if got.Get("X-Api-Key") != up.APIKey {
+		t.Errorf("鉴权头必须来自 api_key 字段，得到 %q", got.Get("X-Api-Key"))
 	}
-	if got := h.Get("X-Api-Key"); got != up.APIKey {
-		t.Errorf("鉴权头必须来自 api_key 字段，得到 %q", got)
+	for _, leaked := range []string{"leaked-key", "another-leaked-key"} {
+		for name, values := range got {
+			for _, value := range values {
+				if contains(value, leaked) {
+					t.Errorf("probe_headers 里的假 key 漏进了出站请求头 %s: %q", name, value)
+				}
+			}
+		}
 	}
 }
 
-func TestBuildHeaders_AuthStyles(t *testing.T) {
+// auth_style 经 Endpoint 的 auth profile 决定发哪一种认证头。
+//
+// 这条覆盖的是「旧字段 → auth profile → ApplyAuth」这整条翻译链：只测
+// ApplyAuth 的话，翻译那一段错了照样全绿，而症状是「配了 bearer 却发
+// x-api-key」。
+func TestProbe_AuthStyleDecidesSingleAuthHeader(t *testing.T) {
 	tests := []struct {
 		style      model.AuthStyle
 		wantXKey   string
@@ -567,21 +659,40 @@ func TestBuildHeaders_AuthStyles(t *testing.T) {
 	}{
 		{model.AuthXAPIKey, "sk-test-key-123456", ""},
 		{model.AuthBearer, "", "Bearer sk-test-key-123456"},
-		{model.AuthAuto, "sk-test-key-123456", "Bearer sk-test-key-123456"},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.style), func(t *testing.T) {
-			up := upstreamFor("http://x")
-			up.AuthStyle = tc.style
-			h := buildHeaders(up, model.ProtoAnthropic, false)
+			var got http.Header
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Clone()
+				w.WriteHeader(200)
+			}))
+			defer srv.Close()
 
-			if got := h.Get("X-Api-Key"); got != tc.wantXKey {
-				t.Errorf("X-Api-Key：期望 %q，得到 %q", tc.wantXKey, got)
+			up := upstreamFor(srv.URL)
+			up.AuthStyle = tc.style
+			proberFor(up).L1(context.Background(), up, fastSettings())
+
+			if v := got.Get("X-Api-Key"); v != tc.wantXKey {
+				t.Errorf("X-Api-Key：期望 %q，得到 %q", tc.wantXKey, v)
 			}
-			if got := h.Get("Authorization"); got != tc.wantBearer {
-				t.Errorf("Authorization：期望 %q，得到 %q", tc.wantBearer, got)
+			if v := got.Get("Authorization"); v != tc.wantBearer {
+				t.Errorf("Authorization：期望 %q，得到 %q", tc.wantBearer, v)
 			}
 		})
+	}
+}
+
+// buildHeaders 自己不写任何认证头 —— 认证只有 ApplyAuth 一个来源（§7.2）。
+func TestBuildHeaders_WritesNoAuth(t *testing.T) {
+	up := upstreamFor("http://x")
+	h := buildHeaders(up, model.ProtoAnthropic, false)
+
+	for _, name := range model.AuthHeaders {
+		if got := h.Get(name); got != "" {
+			t.Errorf("buildHeaders 不该写认证头 %s（那会是第二份认证实现），得到 %q",
+				name, got)
+		}
 	}
 }
 
