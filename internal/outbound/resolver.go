@@ -180,7 +180,9 @@ func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,
 		joined := trimmed + in.Endpoint.Kind.CanonicalPath()
 		parsed, err := url.Parse(joined)
 		if err != nil {
-			return ResolvedTarget{}, model.WrapValidation("拼接 canonical path 失败: %v", err)
+			// 同 parseOrigin：不带 err 文本，它会附上完整 URL。
+			return ResolvedTarget{}, model.WrapValidation("拼接 %s 的 canonical path 失败",
+				in.Endpoint.Kind)
 		}
 		target.Path = parsed.Path
 		target.RawPath = parsed.RawPath
@@ -388,6 +390,14 @@ func joinQuery(fixed, incoming string) string {
 }
 
 // parseOrigin 解析并校验一个 URL 的 origin 部分。
+//
+// 错误里**绝不包含 raw**。这条不是洁癖：legacy full URL 解密后可能带
+// `?key=<secret>`（§3.2 明确提到这类站），而 url.Parse 的错误文本会原样附上
+// 完整 URL。这些错误一路流进 route_health.last_error（落库）并显示在管理
+// 界面上，所以带上 raw 就等于把明文 key 同时写进数据库和 UI。
+//
+// 只报字段名与失败原因，与 store 侧 maskLegacyURL 的口径一致（scheme+host
+// 之外一律不回显）。
 func parseOrigin(raw, field string) (*url.URL, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -398,7 +408,8 @@ func parseOrigin(raw, field string) (*url.URL, error) {
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return nil, model.WrapValidation("%s 不是合法 URL: %v", field, err)
+		// 刻意丢掉 err 的文本：net/url 会把完整 URL 拼进去。
+		return nil, model.WrapValidation("%s 不是合法 URL", field)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, model.WrapValidation("%s 必须是 http(s)，收到 %q", field, parsed.Scheme)
@@ -415,7 +426,8 @@ func parseOrigin(raw, field string) (*url.URL, error) {
 		return nil, model.WrapValidation("%s 不能包含 fragment", field)
 	}
 	if _, err := validateHostPort(parsed.Host); err != nil {
-		return nil, model.WrapValidation("%s 的 host 无效: %v", field, err)
+		// host 不含 query，可以安全回显，它对定位问题是必要的。
+		return nil, model.WrapValidation("%s 的 host %q 无效: %v", field, parsed.Host, err)
 	}
 	return parsed, nil
 }
@@ -471,6 +483,11 @@ func validateHostOverride(raw string) (string, error) {
 	return raw, nil
 }
 
+// validateHostPort 校验 host[:port] 形式。
+//
+// IPv6 必须单独处理：字面量本身含冒号（`[::1]`），直接交给 SplitHostPort 会
+// 报「missing port」—— 而 `https://[::1]` 是一个完全合法的 base_url，旧的
+// BuildOutboundURL 也接受它。不分这一支就是把 IPv6 上游整类拒之门外。
 func validateHostPort(value string) (string, error) {
 	if value == "" {
 		return "", errors.New("不能为空")
@@ -486,22 +503,50 @@ func validateHostPort(value string) (string, error) {
 	if strings.Contains(value, "://") || strings.ContainsAny(value, "/?#@\\") {
 		return "", errors.New("只允许 host[:port]")
 	}
-	if strings.Contains(value, ":") {
-		host, port, err := net.SplitHostPort(value)
-		if err != nil {
-			return "", err
+
+	// IPv6 字面量：`[::1]` 或 `[::1]:8443`。
+	if strings.HasPrefix(value, "[") {
+		end := strings.IndexByte(value, ']')
+		if end < 0 {
+			return "", errors.New("IPv6 字面量缺少 ]")
 		}
-		if host == "" || port == "" {
-			return "", errors.New("host 与 port 都不能为空")
+		inner := value[1:end]
+		if inner == "" || net.ParseIP(inner) == nil {
+			return "", errors.New("IPv6 字面量无效")
 		}
-		for _, character := range []byte(port) {
-			if character < '0' || character > '9' {
-				return "", errors.New("端口必须是数字")
-			}
+		switch rest := value[end+1:]; {
+		case rest == "":
+			return value, nil
+		case strings.HasPrefix(rest, ":"):
+			return value, validatePort(rest[1:])
+		default:
+			return "", errors.New("IPv6 字面量后只能跟 :port")
 		}
-		return value, nil
+	}
+	if strings.Contains(value, "]") {
+		return "", errors.New("] 只能用于 IPv6 字面量")
+	}
+
+	if index := strings.LastIndexByte(value, ':'); index >= 0 {
+		host, port := value[:index], value[index+1:]
+		if host == "" {
+			return "", errors.New("host 不能为空")
+		}
+		return value, validatePort(port)
 	}
 	return value, nil
+}
+
+func validatePort(port string) error {
+	if port == "" {
+		return errors.New("port 不能为空")
+	}
+	for _, character := range []byte(port) {
+		if character < '0' || character > '9' {
+			return errors.New("端口必须是数字")
+		}
+	}
+	return nil
 }
 
 // validateFinalURL 是发送前的最后一道校验。

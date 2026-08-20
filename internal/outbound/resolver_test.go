@@ -407,12 +407,72 @@ func TestResolve_RejectsBadHostOverride(t *testing.T) {
 		"real.example\x1f",
 		"real.example:notaport",
 		"real.example:",
+		"[::1",        // 缺 ]
+		"[not-an-ip]", // 括号里不是合法 IP
+		"[::1]x",      // ] 之后不是 :port
+		"[::1]:",      // 空端口
+		"a]b",         // ] 只能用于 IPv6 字面量
 	}
 	for _, override := range cases {
 		t.Run(override, func(t *testing.T) {
 			up := testUpstream()
 			up.HostOverride = override
 			resolveErr(t, ResolveInput{Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages)})
+		})
+	}
+}
+
+// IPv6 上游必须能用。
+//
+// 这条钉的是一个真实回归：IPv6 字面量本身含冒号（`[::1]`），若把它直接交给
+// net.SplitHostPort 会报「missing port」—— 而 `https://[::1]` 是完全合法的
+// base_url，旧的 BuildOutboundURL 也接受。不分这一支就是把 IPv6 上游整类
+// 拒之门外，而症状是「配置存进去了，一探活就报 host 无效」。
+func TestResolve_AcceptsIPv6Upstream(t *testing.T) {
+	cases := []struct {
+		base string
+		want string
+	}{
+		{"https://[::1]", "https://[::1]/v1/messages"},
+		{"https://[::1]:8443", "https://[::1]:8443/v1/messages"},
+		{"https://[2001:db8::1]", "https://[2001:db8::1]/v1/messages"},
+		{"http://[fe80::1]:8080/api", "http://[fe80::1]:8080/api/v1/messages"},
+	}
+	for _, c := range cases {
+		t.Run(c.base, func(t *testing.T) {
+			up := testUpstream()
+			up.BaseURL = c.base
+			got := resolve(t, ResolveInput{Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages)})
+			if got.RawURL != c.want {
+				t.Errorf("want %q got %q", c.want, got.RawURL)
+			}
+		})
+	}
+
+	// 同源判定也要认 IPv6：省略端口与显式默认端口等价
+	up := testUpstream()
+	up.BaseURL = "https://[::1]"
+	endpoint := canonicalEndpoint(model.EndpointMessages)
+	endpoint.URLOverride = "https://[::1]:443/custom"
+	if got := resolve(t, ResolveInput{Upstream: up, Endpoint: endpoint}); got.RawURL != "https://[::1]/custom" {
+		t.Errorf("IPv6 默认端口应与显式 443 同源，得到 %q", got.RawURL)
+	}
+
+	// 不同 IPv6 地址仍是跨 origin
+	endpoint.URLOverride = "https://[::2]/custom"
+	resolveErr(t, ResolveInput{Upstream: up, Endpoint: endpoint})
+}
+
+// HostOverride 侧同样要接受 IPv6。
+func TestResolve_AcceptsIPv6HostOverride(t *testing.T) {
+	for _, override := range []string{"[::1]", "[::1]:8443", "[2001:db8::1]"} {
+		t.Run(override, func(t *testing.T) {
+			up := testUpstream()
+			up.HostOverride = override
+			got := resolve(t, ResolveInput{Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages)})
+			if got.RequestHost != override {
+				t.Errorf("RequestHost want %q got %q", override, got.RequestHost)
+			}
 		})
 	}
 }
@@ -678,4 +738,46 @@ func TestResolve_RejectsMismatchedInputs(t *testing.T) {
 func TestValueResolverIsProbetemplateAlias(t *testing.T) {
 	var _ ValueResolver = probetemplate.ValueResolver(staticValues{})
 	var _ probetemplate.ResolvedValue = ResolvedValue{}
+}
+
+// 解析失败的错误文本绝不能带上 URL 原文。
+//
+// legacy full URL 解密后可能带 `?key=<secret>`（§3.2 提到这类站），而
+// net/url 的解析错误会原样附上完整 URL。这些错误一路流进
+// route_health.last_error（落库）并显示在管理界面上 —— 带上原文就等于把明文
+// key 同时写进数据库和 UI，与 store 侧 maskLegacyURL 只给 scheme+host 的
+// 口径也不一致。
+func TestResolve_ParseErrorNeverEchoesURL(t *testing.T) {
+	const secret = "sk-legacy-plaintext-key"
+
+	t.Run("legacy full URL", func(t *testing.T) {
+		bad := "https://a.example/v1?key=" + secret + "\x7f%zz"
+		err := resolveErr(t, ResolveInput{
+			Upstream: testUpstream(), Endpoint: legacyEndpoint(model.EndpointMessages, false),
+			LegacyURLs: &fakeLegacy{id: 55, revision: 2, plain: bad},
+		})
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("错误文本泄露了 legacy URL 明文：%v", err)
+		}
+	})
+
+	t.Run("base_url", func(t *testing.T) {
+		up := testUpstream()
+		up.BaseURL = "https://a.example/x?key=" + secret + "\x7f"
+		err := resolveErr(t, ResolveInput{
+			Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages),
+		})
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("错误文本泄露了 base_url 原文：%v", err)
+		}
+	})
+
+	t.Run("url_override", func(t *testing.T) {
+		endpoint := canonicalEndpoint(model.EndpointMessages)
+		endpoint.URLOverride = "https://a.example/x?key=" + secret + "\x7f"
+		err := resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint})
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("错误文本泄露了 url_override 原文：%v", err)
+		}
+	})
 }
