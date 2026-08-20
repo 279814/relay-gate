@@ -174,6 +174,17 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	if current.Revision != expectedRevision {
 		return ErrRevisionConflict
 	}
+	// 由停用转启用时必须先补齐五类 Endpoint。放行一个缺 Endpoint 的站，
+	// 症状是「界面看起来一切正常，客户端一调那个协议就报错」——
+	// 选路时才发现 URL 解析不出来，已经晚了。
+	//
+	// 检查放在读 current 的同一个事务里（DSN 带 _txlock=immediate，开事务即持写锁），
+	// 所以「删 Endpoint」与「enable」并发时只有一方能提交。
+	if upstream.Enabled && !current.Enabled {
+		if err := validateRouteEndpointCompleteness(tx, upstream.ID); err != nil {
+			return err
+		}
+	}
 	credentialChanged := upstream.APIKey != "" && upstream.APIKey != current.APIKey
 	networkChanged := upstream.BaseURL != current.BaseURL || upstream.ProxyURL != current.ProxyURL ||
 		upstream.HostOverride != current.HostOverride || upstream.TLSServerName != current.TLSServerName ||
