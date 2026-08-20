@@ -25,6 +25,10 @@ type pageCursor struct {
 	Resource          string   `json:"resource"`
 	FilterFingerprint string   `json:"filter"`
 	Keys              []string `json:"keys"`
+	// EvaluatedAtMS 固定本次翻页的判定时刻，供依赖「当前时间」的 filter 使用。
+	// 不参与 filter 指纹：它是同一次翻页的延续，不是 filter 变了。
+	// 0 表示该资源的 filter 与时间无关。
+	EvaluatedAtMS int64 `json:"at,omitempty"`
 }
 
 func normalizePageLimit(limit int) (int, error) {
@@ -38,6 +42,15 @@ func normalizePageLimit(limit int) (int, error) {
 }
 
 func encodePageCursor(resource string, filter any, keys ...string) (string, error) {
+	return encodePageCursorAt(resource, filter, 0, keys...)
+}
+
+// encodePageCursorAt 额外把判定时刻写进 cursor。
+//
+// 给依赖「当前时间」的 filter 用（如 Capability 的 Expired）：若每页都重新取
+// 当前时间，翻页途中状态改变的行会改变结果集 —— 分页是 keyset，后续页只读
+// 游标之后的行，于是那一行永远读不到，表现为静默漏项且不报错。
+func encodePageCursorAt(resource string, filter any, evaluatedAtMS int64, keys ...string) (string, error) {
 	fingerprint, err := pageFilterFingerprint(filter)
 	if err != nil {
 		return "", err
@@ -45,6 +58,7 @@ func encodePageCursor(resource string, filter any, keys ...string) (string, erro
 	payload, err := json.Marshal(pageCursor{
 		Version: pageCursorVersion, Resource: resource,
 		FilterFingerprint: fingerprint, Keys: append([]string(nil), keys...),
+		EvaluatedAtMS: evaluatedAtMS,
 	})
 	if err != nil {
 		return "", fmt.Errorf("编码分页 cursor: %w", err)
@@ -53,31 +67,39 @@ func encodePageCursor(resource string, filter any, keys ...string) (string, erro
 }
 
 func decodePageCursor(encoded, resource string, filter any, keyCount int) ([]string, error) {
+	keys, _, err := decodePageCursorAt(encoded, resource, filter, keyCount)
+	return keys, err
+}
+
+// decodePageCursorAt 同时取回判定时刻。首页（encoded 为空）返回 0，
+// 调用方据此取当前时间并写进下一页的 cursor。
+func decodePageCursorAt(encoded, resource string, filter any, keyCount int) ([]string, int64, error) {
 	if encoded == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("%w: base64: %v", ErrInvalidCursor, err)
+		return nil, 0, fmt.Errorf("%w: base64: %v", ErrInvalidCursor, err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var cursor pageCursor
 	if err := decoder.Decode(&cursor); err != nil {
-		return nil, fmt.Errorf("%w: JSON: %v", ErrInvalidCursor, err)
+		return nil, 0, fmt.Errorf("%w: JSON: %v", ErrInvalidCursor, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: cursor 含多余 JSON", ErrInvalidCursor)
+		return nil, 0, fmt.Errorf("%w: cursor 含多余 JSON", ErrInvalidCursor)
 	}
 	fingerprint, err := pageFilterFingerprint(filter)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if cursor.Version != pageCursorVersion || cursor.Resource != resource ||
-		cursor.FilterFingerprint != fingerprint || len(cursor.Keys) != keyCount {
-		return nil, ErrInvalidCursor
+		cursor.FilterFingerprint != fingerprint || len(cursor.Keys) != keyCount ||
+		cursor.EvaluatedAtMS < 0 {
+		return nil, 0, ErrInvalidCursor
 	}
-	return append([]string(nil), cursor.Keys...), nil
+	return append([]string(nil), cursor.Keys...), cursor.EvaluatedAtMS, nil
 }
 
 // cursorID 解析 cursor 里的一个正整数 ID 键。cursor 是客户端可见的，
