@@ -161,7 +161,7 @@ func TestAllOutboundPathsAgreeOnURL(t *testing.T) {
 	}
 }
 
-// 真实转发与探活打的必须是**同一个** messages 地址。
+// 真实转发与探活打的必须是**同一个** messages 地址，并带**同一种**认证。
 //
 // 这条断言与上面的表是互补的：表保证每条路径符合期望，这里直接比较两条
 // 路径的实际产出 —— 即使有人同时改错了期望值与实现，两者不一致仍会被抓住。
@@ -183,6 +183,60 @@ func TestRealForwardAndProbeHitIdenticalURL(t *testing.T) {
 			if real.query != probeTarget.query {
 				t.Errorf("真实转发与探活的 query 不一致：real=%q probe=%q",
 					real.query, probeTarget.query)
+			}
+			// 认证是 P0-04 引入的第二个不分叉维度（§7.2）。原先转发与探活
+			// 各有一份 injectAuth —— 那种「探活用一种认证、真实请求用另一种」
+			// 的故障表现为「探活说站活着，但用户一直 401」，极难定位。
+			for _, name := range model.AuthHeaders {
+				if real.header.Get(name) != probeTarget.header.Get(name) {
+					t.Errorf("真实转发与探活的认证头 %s 不一致：real=%q probe=%q",
+						name, real.header.Get(name), probeTarget.header.Get(name))
+				}
+			}
+		})
+	}
+}
+
+// 三条路径都只发**一种**认证方式，且带的是上游 key 而非入站 relay key。
+//
+// 与上一条的分工：上一条比较「两条路径是否一致」，这条钉住「一致的那个值
+// 本身是对的」—— 两者同时错成一样时，只有这条能抓住。
+func TestAllOutboundPathsSendExactlyOneAuthHeader(t *testing.T) {
+	fixture := newCrossPathFixture(t, crossPathCases()[0])
+
+	paths := map[string]func(*testing.T) recordedRequest{
+		"real_forward": fixture.driveRealForward,
+		"count_tokens": fixture.driveCountTokens,
+		"probe_l2":     fixture.driveProbeL2,
+		"probe_l1":     fixture.driveProbeL1,
+	}
+	for name, drive := range paths {
+		t.Run(name, func(t *testing.T) {
+			got := drive(t)
+			if !got.seen {
+				t.Fatal("上游没有收到请求")
+			}
+
+			var present []string
+			for _, header := range model.AuthHeaders {
+				if got.header.Get(header) != "" {
+					present = append(present, header)
+				}
+			}
+			// crossEndpoints 配的是 x_api_key，所以恰好一个头。
+			if len(present) != 1 || present[0] != "X-Api-Key" {
+				t.Errorf("应恰好发一个 X-Api-Key，实际带了 %v", present)
+			}
+			if got := got.header.Get("X-Api-Key"); got != crossUpstreamKey {
+				t.Errorf("应发上游 key，得到 %q", got)
+			}
+			// relay key 一个字节都不能漏给上游。
+			for header, values := range got.header {
+				for _, value := range values {
+					if strings.Contains(value, crossRelayKey) {
+						t.Errorf("relay key 泄露到出站头 %s: %q", header, value)
+					}
+				}
 			}
 		})
 	}
@@ -209,15 +263,18 @@ type recordedRequest struct {
 	method string
 	path   string
 	query  string
+	// header 是上游实际收到的请求头，用于断言三条路径的认证也不分叉。
+	header http.Header
 }
 
 type crossPathFixture struct {
-	testCase crossPathCase
-	server   *httptest.Server
-	upstream *model.Upstream
-	snapshot *router.Snapshot
-	settings model.Settings
-	targets  *outbound.Provider
+	testCase   crossPathCase
+	server     *httptest.Server
+	upstream   *model.Upstream
+	snapshot   *router.Snapshot
+	settings   model.Settings
+	targets    *outbound.Provider
+	transports *outbound.Manager
 
 	mu   sync.Mutex
 	last recordedRequest
@@ -231,7 +288,7 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 		_, _ = io.Copy(io.Discard, r.Body)
 		fixture.mu.Lock()
 		fixture.last = recordedRequest{seen: true, method: r.Method,
-			path: r.URL.Path, query: r.URL.RawQuery}
+			path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone()}
 		fixture.mu.Unlock()
 
 		// 回一个能让三条路径都判成功的响应：
@@ -270,10 +327,14 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 	fixture.settings.SampleEnabled = false
 	fixture.settings.HalfOpenEnabled = false
 
-	// 与 main.go 同构的装配：一个 Provider + 一个 Resolver，三条路径共用。
+	// 与 main.go 同构的装配：一个 Provider + 一个 Resolver + 一个 Manager，
+	// 三条路径共用。Manager 共用是必须的 —— 探活与真实请求各建一套连接池
+	// 就丢掉了「探活顺带把连接热着」这份收益，而那是首字节延迟的可观部分。
 	fixture.targets = outbound.NewProvider(
 		crossEndpoints{upstream: fixture.upstream, fixedQuery: testCase.fixedQuery},
 		nil, outbound.NewResolver(crossHasher{}))
+	fixture.transports = outbound.NewManager()
+	t.Cleanup(fixture.transports.CloseIdleConnections)
 	return fixture
 }
 
@@ -288,7 +349,8 @@ func (fixture *crossPathFixture) take() recordedRequest {
 func (fixture *crossPathFixture) handler() *proxy.Handler {
 	return proxy.NewHandler(fixture, alwaysAliveHealth{}, nil,
 		[]string{crossRelayKey}, discardLogger()).
-		WithTargets(fixture.targets, nil)
+		WithTargets(fixture.targets, nil).
+		WithTransports(fixture.transports)
 }
 
 func (fixture *crossPathFixture) driveRealForward(t *testing.T) recordedRequest {
@@ -304,7 +366,6 @@ func (fixture *crossPathFixture) driveCountTokens(t *testing.T) recordedRequest 
 func (fixture *crossPathFixture) serveHTTP(t *testing.T, path string) recordedRequest {
 	t.Helper()
 	handler := fixture.handler()
-	t.Cleanup(handler.CloseIdleConnections)
 
 	target := path
 	if fixture.testCase.incomingQuery != "" {
@@ -321,19 +382,32 @@ func (fixture *crossPathFixture) serveHTTP(t *testing.T, path string) recordedRe
 	return fixture.take()
 }
 
+// prober 造一个与真实转发共用同一份 Manager 的 Prober。
+//
+// 用 Manager 而不是 http.DefaultTransport：探活与真实请求必须共用连接池，
+// 而这条门禁的职责就是「三条路径不分叉」—— 连接池是其中一个维度。
+func (fixture *crossPathFixture) prober(t *testing.T) *probe.Prober {
+	t.Helper()
+	transport, err := fixture.transports.Transport(
+		outbound.NetworkFor(fixture.upstream.ProbeConfig(),
+			outbound.L2Budget(fixture.settings).Connect))
+	if err != nil {
+		t.Fatalf("取探活连接池: %v", err)
+	}
+	return &probe.Prober{Transport: transport, Targets: fixture.targets}
+}
+
 func (fixture *crossPathFixture) driveProbeL2(t *testing.T) recordedRequest {
 	t.Helper()
-	prober := &probe.Prober{Transport: http.DefaultTransport, Targets: fixture.targets}
 	modelName := fixture.snapshot.ModelNames[0]
 	route := fixture.snapshot.RoutesByModelName[modelName.ID][0]
-	prober.L2(context.Background(), fixture.upstream, modelName, route, fixture.settings)
+	fixture.prober(t).L2(context.Background(), fixture.upstream, modelName, route, fixture.settings)
 	return fixture.take()
 }
 
 func (fixture *crossPathFixture) driveProbeL1(t *testing.T) recordedRequest {
 	t.Helper()
-	prober := &probe.Prober{Transport: http.DefaultTransport, Targets: fixture.targets}
-	prober.L1(context.Background(), fixture.upstream, fixture.settings)
+	fixture.prober(t).L1(context.Background(), fixture.upstream, fixture.settings)
 	return fixture.take()
 }
 

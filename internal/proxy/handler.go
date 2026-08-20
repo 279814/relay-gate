@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -63,17 +61,9 @@ type Handler struct {
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
 
-	// transports 按 Upstream 缓存，避免每请求新建（那会丢掉连接复用，
-	// 每次都要重新 TLS 握手 —— 对高延迟的公益站代价很大）。
-	// 存 key 是为了在配置变更后能发现缓存已过期，见 TransportFor。
-	mu         sync.RWMutex
-	transports map[int64]transportEntry
-}
-
-// transportEntry 是一个缓存的 Transport 及其对应的配置指纹。
-type transportEntry struct {
-	key string
-	tr  *http.Transport
+	// transports 按网络身份（含 connect 预算）分组连接池（§7.3）。
+	// 与探活共用同一个 Manager —— 各建一套就丢掉了连接复用的收益。
+	transports *outbound.Manager
 }
 
 // NewHandler 组装透传处理器。
@@ -90,9 +80,24 @@ func NewHandler(cfg ConfigSource, health router.HealthView,
 	}
 	return &Handler{
 		cfg: cfg, health: health, samples: samples, log: log,
-		relayKeys:  keys,
-		transports: map[int64]transportEntry{},
+		relayKeys: keys,
+		// 默认自建一个：多数测试与冒烟脚本不关心连接池分组，而一个
+		// nil Manager 会让每条转发路径都要判空。main 会用 WithTransports
+		// 换成与探活共享的那一个。
+		transports: outbound.NewManager(),
 	}
+}
+
+// WithTransports 换成与探活共享的连接池管理器。
+//
+// 必须显式共享而不是各自 new：探活与真实请求打的是同一个上游，共用连接池
+// 能让探活顺带把 TLS 连接热着 —— 对高延迟公益站，那是首字节延迟里可观的
+// 一部分。各建一套还会让空闲连接数翻倍。
+func (h *Handler) WithTransports(manager *outbound.Manager) *Handler {
+	if manager != nil {
+		h.transports = manager
+	}
+	return h
 }
 
 // WithHealthReporter 接上真实请求的健康回写（§3.5）。
@@ -127,6 +132,40 @@ func (h *Handler) WithTargets(targets outbound.TargetProvider, keys outbound.Sec
 	return h
 }
 
+// outboundHeaders 构造出站请求头：透传入站头 + 唯一的认证改写。
+//
+// 两步分开是刻意的。PrepareOutboundHeaders 只做「哪些头不该转发」（逐跳头、
+// 认证别名、Host、Content-Length），ApplyAuth 只做「该发哪一种认证」。
+// 合成一个函数的话，认证规则就有了第二份实现 —— 而 P0-04 的目标之一
+// 正是让 ApplyAuth 成为唯一的认证改写器（§7.2）。
+//
+// profile 来自 target：URL 与认证出自同一条 Endpoint 记录的同一个 revision。
+func (h *Handler) outboundHeaders(r *http.Request, cand *router.Candidate,
+	target outbound.ResolvedTarget, proto model.Protocol) (http.Header, error) {
+
+	header := PrepareOutboundHeaders(r.Header, proto)
+	err := outbound.ApplyAuth(r.Context(), header, outbound.AuthInput{
+		Profile: target.AuthProfile,
+		Values:  h.authValues(cand),
+		Use:     outbound.ResolveRealForward,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return header, nil
+}
+
+// authValues 组出这次尝试可用的凭据。
+//
+// 每次现造：Secret 明文不该常驻在任何长生命周期对象里。
+func (h *Handler) authValues(cand *router.Candidate) outbound.Values {
+	return outbound.Values{
+		UpstreamAPIKey:     []byte(cand.Upstream.APIKey),
+		CredentialRevision: cand.Upstream.CredentialRevision,
+		Secrets:            h.keys,
+	}
+}
+
 // resolveTarget 解析这次尝试的出站 URL。
 //
 // endpoint 由调用方按**入站端点**给出，不由 Protocol 推导：count_tokens 不是
@@ -142,12 +181,8 @@ func (h *Handler) resolveTarget(r *http.Request, cand *router.Candidate,
 		Upstream:         cand.Upstream.ProbeConfig(),
 		Endpoint:         kind,
 		IncomingRawQuery: r.URL.RawQuery,
-		Values: outbound.Values{
-			UpstreamAPIKey:     []byte(cand.Upstream.APIKey),
-			CredentialRevision: cand.Upstream.CredentialRevision,
-			Secrets:            h.keys,
-		},
-		Use: outbound.ResolveRealForward,
+		Values:           h.authValues(cand),
+		Use:              outbound.ResolveRealForward,
 	})
 }
 
@@ -552,73 +587,36 @@ func (h *Handler) authOK(r *http.Request) bool {
 	return false
 }
 
-// TransportFor 按 Upstream 缓存 Transport，保住连接复用。
+// TransportFor 按用途取连接池，供探活共用同一份连接（probe.TransportSource）。
 //
-// 导出是为了让探活共用同一个连接池（probe.TransportSource）：探活顺带
-// 把连接热着，真实请求就省掉一次 TLS 握手 —— 对高延迟的公益站，
-// 握手占首字节的可观比例。各建一套连接池的话这份收益就没了，
-// 还会多出一倍空闲连接。
+// 导出是为了让探活与真实请求共享连接池：探活顺带把连接热着，真实请求就省掉
+// 一次 TLS 握手 —— 对高延迟的公益站，握手占首字节的可观比例。各建一套的话
+// 这份收益就没了，还会多出一倍空闲连接。
 //
-// 缓存键必须包含**所有影响 Transport 行为的配置**，不能只用 upstream ID：
-// 只按 ID 缓存的话，用户在管理界面改了 proxy_url，配置确实存进去了、
-// API 也回显了新值，但出站流量还是绕过代理 —— 直到重启为止。
-// 这类「看起来生效了其实没有」的问题排查成本极高。
-//
-// 旧 Transport 在被顶替时要关掉空闲连接，否则改一次配置就漏一批连接。
-func (h *Handler) TransportFor(up *model.Upstream, s model.Settings) (*http.Transport, error) {
-	key := transportKey(up, s)
-
-	h.mu.RLock()
-	ent, ok := h.transports[up.ID]
-	h.mu.RUnlock()
-	if ok && ent.key == key {
-		return ent.tr, nil
+// budget 决定用哪个池：connect 预算不同必须不同池（§7.3），因为它是
+// NetworkConfig 的一部分。真实请求、L1、L2、count_tokens 各传自己的预算。
+func (h *Handler) TransportFor(up *model.Upstream, budget outbound.Budget) (*outbound.Transport, error) {
+	if h.transports == nil {
+		return nil, errors.New("未装配连接池管理器")
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if ent, ok := h.transports[up.ID]; ok {
-		if ent.key == key {
-			return ent.tr, nil // 双检：可能在等锁期间已被别的请求建好
-		}
-		// 配置变了。关掉旧的空闲连接再丢弃 —— 在途请求持有自己的引用，
-		// 不受影响；空闲连接不关就永远漏在那里。
-		ent.tr.CloseIdleConnections()
-	}
-	tr, err := NewTransport(up.ProxyURL, time.Duration(s.RealConnectSec)*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	h.transports[up.ID] = transportEntry{key: key, tr: tr}
-	return tr, nil
+	return h.transports.Transport(outbound.NetworkFor(up.ProbeConfig(), budget.Connect))
 }
 
-// transportKey 把影响 Transport 构造的配置拼成一个可比较的键。
-// 加字段到 NewTransport 时**必须**同步加到这里，否则该配置就是死的。
-func transportKey(up *model.Upstream, s model.Settings) string {
-	return up.ProxyURL + "\x00" + strconv.Itoa(s.RealConnectSec)
-}
-
-// CloseIdleConnections 关闭所有缓存 Transport 的空闲连接，供优雅关闭调用。
+// CloseIdleConnections 关闭所有连接池的空闲连接，供优雅关闭调用。
 func (h *Handler) CloseIdleConnections() {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for _, ent := range h.transports {
-		ent.tr.CloseIdleConnections()
+	if h.transports != nil {
+		h.transports.CloseIdleConnections()
 	}
 }
 
-// InvalidateTransport 丢弃某个 Upstream 的 Transport。
+// InvalidateTransport 丢弃某个 Upstream 的连接池。
 //
-// 常规的配置变更不需要调它 —— TransportFor 的缓存键已经包含了
-// proxy_url 与连接超时，改了会自动重建。这个方法留给「配置没变但连接池
-// 本身要重置」的场景（例如探活判定整站不可用后主动断开所有连接）。
+// 常规的配置变更**不需要**调它 —— 池键已含 network_revision，改了会自动换池。
+// 这个方法留给「配置没变但连接池本身要重置」的场景（例如探活判定整站不可用
+// 后主动断开所有连接）。
 func (h *Handler) InvalidateTransport(upstreamID int64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if ent, ok := h.transports[upstreamID]; ok {
-		ent.tr.CloseIdleConnections()
-		delete(h.transports, upstreamID)
+	if h.transports != nil {
+		h.transports.Invalidate(upstreamID)
 	}
 }
 

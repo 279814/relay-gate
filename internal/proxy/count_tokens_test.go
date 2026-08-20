@@ -303,16 +303,19 @@ func TestCountTokens_ShortKeyRedactedInLog(t *testing.T) {
 	}
 }
 
-// 上游未配 key 时日志原文要完好。
+// 上游未配 key 时必须 fail closed，且降级路径仍能作答。
 //
-// 这条只钉住「不崩、不把原文吞掉」这个下限。原本我想测的是
-// 「ReplaceAll 用空串会在每个字节间插掩码」，但实测那不会发生 ——
-// MaskKey("") 返回空串，于是替换等于原地不动。所以代码里那个 k == ""
-// 的跳过是**防御性**的（防 MaskKey 日后改成返回固定掩码），
-// 而不是在修一个当前存在的 bug。这里如实写明，免得下一个人
-// 以为这条测试守着什么它其实守不住的东西。
-func TestCountTokens_EmptyKeyKeepsLogReadable(t *testing.T) {
+// 行为在 P0-04 变了，而新行为是对的：旧的 injectAuth 在 key 为空时静默
+// 不注入并把请求发出去，于是拿到一个难以归因的 401 —— 用户看到「认证失败」，
+// 真正的问题是「key 没配」。outbound.ApplyAuth 改成在写 socket 前报
+// config_error（§7.2），所以这里上游一个请求都收不到。
+//
+// count_tokens 的兜底不受影响：客户端仍拿到一个估算值，而不是错误 ——
+// Claude Code 拿不到 token 数就起不来（§5.1e）。
+func TestCountTokens_EmptyKeyFailsClosedAndFallsBackLocally(t *testing.T) {
+	var upstreamHits int
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"upstream exploded"}`))
 	})
@@ -323,10 +326,21 @@ func TestCountTokens_EmptyKeyKeepsLogReadable(t *testing.T) {
 	var logs bytes.Buffer
 	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
 
-	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+	rec := hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
 
-	if !strings.Contains(logs.String(), "upstream exploded") {
-		t.Errorf("空 key 把日志原文破坏了:\n%s", logs.String())
+	if upstreamHits != 0 {
+		t.Errorf("缺 key 必须在写 socket 前失败，上游收到了 %d 个请求", upstreamHits)
+	}
+	// 客户端照样拿到 token 数（本地粗算），不是错误。
+	if rec.Code != http.StatusOK {
+		t.Errorf("应降级到本地粗算并回 200，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Relay-Count-Tokens"); got != "estimated" {
+		t.Errorf("应标明这是估算值，得到 %q", got)
+	}
+	// 日志要说清是「认证配置」的问题，否则用户对着一个笼统的失败无从下手。
+	if !strings.Contains(logs.String(), "api_key") {
+		t.Errorf("日志应指出 api_key 未配置:\n%s", logs.String())
 	}
 }
 

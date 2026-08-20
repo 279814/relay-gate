@@ -29,14 +29,17 @@ var hopByHopHeaders = []string{
 // 一律 401），也有声明「只转发 Claude Code 流量」的站。请求头是能否被放行
 // 的关键，少一个或多一个都可能被拒。
 //
+// **不注入认证**：那是 outbound.ApplyAuth 的唯一职责（§7.2）。本函数只
+// 负责删掉入站的认证别名 —— 它必须删，否则用户的 relay key 会漏给上游；
+// 但「该发哪一种」由 Endpoint 的 auth profile 决定，而那份信息在这里拿不到。
+// 两件事各在一处，认证规则就只有一份实现。
+//
 // 已知残缺（§3.3.3）：Go 的 net/http 收到请求时即把头名规范化
 // （x-api-key → X-Api-Key），且 http.Header 是无序 map，入站头序无法保留。
 // 判断为可接受：HTTP/1.1 规范头名大小写不敏感，HTTP/2 更是强制全小写，
 // 真实 Claude Code 直连 Anthropic 走的就是 HTTP/2；且 M0 用 curl 探测
 // （头序与 Node 全然不同）各站照常放行，说明它们不做头序指纹校验。
-func PrepareOutboundHeaders(in http.Header, upstreamKey string,
-	style model.AuthStyle, proto model.Protocol) http.Header {
-
+func PrepareOutboundHeaders(in http.Header, proto model.Protocol) http.Header {
 	out := make(http.Header, len(in)+2)
 
 	// 1. Connection 里列出的头也是逐跳的，RFC 要求逐跳清理。
@@ -78,32 +81,9 @@ func PrepareOutboundHeaders(in http.Header, upstreamKey string,
 		out[ck] = cp
 	}
 
-	// 3. 注入上游鉴权。这是**必须**改的一项（§3.3.1）。
-	injectAuth(out, upstreamKey, style, proto)
+	// 3. 认证由 outbound.ApplyAuth 写入（§7.2）。这里只保证入站的认证头
+	//    已全部删除 —— 上面的 skip 表已经做到了。
 	return out
-}
-
-// injectAuth 按 auth_style 写入上游 key。
-//
-// auto 双发是刻意的：New API / One API 对 Anthropic 端点两种头都接受，
-// sub2api 的行为不一定。M0 实测 4 个可用站全部同时接受 x-api-key 与 Bearer，
-// 所以 auto 覆盖面最广。极少数严格校验的站显式配 auth_style 即可。
-func injectAuth(h http.Header, key string, style model.AuthStyle, proto model.Protocol) {
-	if key == "" {
-		// 不该发生（Upstream.APIKey 是必填），但绝不能静默发一个无鉴权请求 ——
-		// 那会得到一个难以归因的 401。留空让上游明确拒绝，日志里也能看出来。
-		return
-	}
-	switch style {
-	case model.AuthXAPIKey:
-		h.Set("X-Api-Key", key)
-	case model.AuthBearer:
-		h.Set("Authorization", "Bearer "+key)
-	default: // AuthAuto
-		// 两个都发。顺序无关，map 本来无序。
-		h.Set("X-Api-Key", key)
-		h.Set("Authorization", "Bearer "+key)
-	}
 }
 
 // StripHopByHopResponse 清理上游响应里的逐跳头。

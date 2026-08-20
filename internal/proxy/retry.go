@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
 )
@@ -244,8 +245,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			fmt.Sprintf("改写请求失败: %v", err))
 		return nil, false
 	}
-	outHeader := PrepareOutboundHeaders(r.Header, cand.Upstream.APIKey,
-		cand.Upstream.AuthStyle, proto)
 
 	// 出站 URL 只有一个来源（§7.1）。endpoint 由入站协议决定 ——
 	// 这三个透传端点与协议是一一对应的。
@@ -262,20 +261,26 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
-	tr, err := h.TransportFor(cand.Upstream, settings)
+	// 认证也只有一个来源（§7.2）。profile 跟着 target 一起来，两者出自
+	// 同一条 Endpoint 记录的同一个 revision —— 分两次读会让请求「用新 URL
+	// 配旧认证」，症状是偶发 401。
+	outHeader, err := h.outboundHeaders(r, cand, target, proto)
 	if err != nil {
-		h.log.Error("构造 Transport 失败", "err", err, "upstream", cand.Upstream.ID)
+		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, false
 	}
 
-	to := RealTimeouts(settings)
-	// 剩余预算比配置的总时限短时用剩余的。不夹这一下的话，每次尝试都拿一份
-	// 完整的 30 分钟，3 次尝试 = 客户端最坏等 90 分钟。
-	if budget < to.Total {
-		to.Total = budget
+	realBudget := outbound.RealBudget(settings).CapTotal(budget)
+	tr, err := h.TransportFor(cand.Upstream, realBudget)
+	if err != nil {
+		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
+		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
+		return nil, false
 	}
-	fwd := &Forwarder{Transport: tr, Timeouts: to, RequestHost: target.RequestHost}
+
+	fwd := &Forwarder{Transport: tr, Timeouts: TimeoutsFrom(realBudget),
+		RequestHost: target.RequestHost}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会
 	// 混进最终样本的 resp_body —— 样本就变成了两个站的响应拼起来的东西。

@@ -3,12 +3,12 @@ package probe
 import (
 	"context"
 	"errors"
-	"net/http"
 	"sync"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -72,7 +72,7 @@ type countingErrTransport struct {
 	n  int
 }
 
-func (c *countingErrTransport) TransportFor(*model.Upstream, model.Settings) (*http.Transport, error) {
+func (c *countingErrTransport) TransportFor(*model.Upstream, outbound.Budget) (*outbound.Transport, error) {
 	c.mu.Lock()
 	c.n++
 	c.mu.Unlock()

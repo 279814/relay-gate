@@ -3,23 +3,28 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"sync/atomic"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
-// Timeouts 是三段独立超时（§4.2）。
+// Timeouts 是转发路径用到的四段超时。
 //
-// 必须分开：只设一个总超时会杀掉 Opus 5 高 effort 的正常长思考。
-// FirstToken 由调用方保证 ≥ 300s（model.MinRealFirstTokenSec）。
+// 它是 outbound.Budget 的投影，只取 forward.go 实际用得到的那几段：
+// Connect 由连接池承载（不在这里用），Total 是最外层硬上限，FirstToken 管
+// 「响应头 + 首字节」，Idle 管首字节之后的流内静默。
+//
+// 为什么不直接用 outbound.Budget：Budget 的四个观察点（response_header /
+// first_byte / first_event / first_semantic）要到 P0-07 的增量 Decoder 落地
+// 之后才分得开 —— 现在没有「首语义」的判据，硬拆只会造出四个取同一个值的
+// 字段。TimeoutsFrom 是那次拆分的唯一入口。
 type Timeouts struct {
 	Connect    time.Duration
 	FirstToken time.Duration
@@ -27,51 +32,31 @@ type Timeouts struct {
 	Total      time.Duration
 }
 
-// TimeoutsFromSettings 按场景取值。
-func RealTimeouts(s model.Settings) Timeouts {
+// TimeoutsFrom 把 outbound.Budget 投影成转发路径用的四段。
+//
+// 各阶段上限取**最小的那个**：Budget 的四个观察点都从 SentAt 起算，而
+// forward.go 现在只有一个「首字节前」的计时器，能表达的只有其中最紧的那条。
+// 取最大值会让配得更紧的那个阶段静默失效。
+func TimeoutsFrom(budget outbound.Budget) Timeouts {
+	firstToken := budget.Total
+	for _, stage := range []time.Duration{
+		budget.ResponseHead, budget.FirstByte, budget.FirstEvent, budget.FirstSemantic,
+	} {
+		if stage > 0 && stage < firstToken {
+			firstToken = stage
+		}
+	}
 	return Timeouts{
-		Connect:    time.Duration(s.RealConnectSec) * time.Second,
-		FirstToken: time.Duration(s.RealFirstTokenSec) * time.Second,
-		Idle:       time.Duration(s.RealIdleSec) * time.Second,
-		Total:      time.Duration(s.RealTotalSec) * time.Second,
+		Connect:    budget.Connect,
+		FirstToken: firstToken,
+		Idle:       budget.IdleTimeout(),
+		Total:      budget.Total,
 	}
 }
 
-// NewTransport 构造出站 Transport。
-//
-// DisableCompression=true 是硬要求（§3.3.4）：Go 默认会偷偷加
-// Accept-Encoding: gzip 并自动解压响应。那样就必须删 Content-Encoding，
-// 等于改动了响应 —— 违反「响应完全不碰」。关掉后客户端的
-// Accept-Encoding 原样转发，响应体字节流原样回传，零解压零重压。
-func NewTransport(proxyURL string, connectTimeout time.Duration) (*http.Transport, error) {
-	tr := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: connectTimeout,
-		DisableCompression:  true,
-
-		// 公益站延迟高，连接复用能省掉每次 TLS 握手（实测握手占首字节的可观比例）
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-
-		// 不设 ResponseHeaderTimeout：首 Token 超时由 context 控制，
-		// 这里设了会与三段超时打架（它管的是响应头，而长思考期间
-		// 响应头早就回来了，卡住的是 body 的第一个 chunk）
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-	}
-
-	if proxyURL != "" {
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("解析 proxy_url %q: %w", proxyURL, err)
-		}
-		tr.Proxy = http.ProxyURL(u)
-	}
-	return tr, nil
+// RealTimeouts 是真实请求的四段超时。
+func RealTimeouts(s model.Settings) Timeouts {
+	return TimeoutsFrom(outbound.RealBudget(s))
 }
 
 // Result 是一次转发的结果，供健康判定与样本记录使用。
@@ -125,7 +110,10 @@ func (r *Result) TTFT() time.Duration {
 // 需要在读 body 的循环里切换 deadline，ReverseProxy 的 io.Copy 拿不到这个控制点。
 // 逐跳头与 Host 由 PrepareOutboundHeaders 处理，不依赖 ReverseProxy 的实现。
 type Forwarder struct {
-	Transport *http.Transport
+	// Transport 是这次转发用的连接池。由 outbound.Manager 按网络身份提供 ——
+	// 各建一套的话，探活与真实请求就各有一份空闲连接，而共享连接池正是
+	// 「探活顺带把连接热着」这份收益的来源。
+	Transport http.RoundTripper
 	Timeouts  Timeouts
 	// OnFirstByte 在收到首字节时回调（用于记录 TTFT、结束探活等）。可为 nil。
 	OnFirstByte func()
