@@ -101,6 +101,12 @@ func compileContent(endpoint model.EndpointKind, content TemplateContent) (*Comp
 	if err := validateContentMethod(endpoint, content.Method, content.Body); err != nil {
 		return nil, err
 	}
+	// 凭据门禁（§4.5）。放在编译入口而不是各写入路径：三条写入路径
+	// （管理 API、learner、migration）都经这里入库，放这里就覆盖了全部三条，
+	// 而各自调一次必然漏掉将来新增的那条。
+	if err := rejectLiteralCredentials(content); err != nil {
+		return nil, err
+	}
 	required := make(map[string]struct{})
 	query, err := compileRawQuery(content.RawQuery, required)
 	if err != nil {
@@ -111,9 +117,8 @@ func compileContent(endpoint model.EndpointKind, content TemplateContent) (*Comp
 		if !validHeaderName(header.Name) {
 			return nil, model.WrapValidation("header name 无效: %q", header.Name)
 		}
-		switch strings.ToLower(header.Name) {
-		case "content-length", "transfer-encoding", "connection", "host":
-			return nil, model.WrapValidation("recipe 不能设置受保护头 %q", header.Name)
+		if err := rejectProtectedHeader(header.Name); err != nil {
+			return nil, err
 		}
 		compiled := compiledHeader{name: header.Name, values: make([][]compiledPart, 0, len(header.Values))}
 		for _, value := range header.Values {
@@ -144,6 +149,35 @@ func compileContent(endpoint model.EndpointKind, content TemplateContent) (*Comp
 		body:            body,
 		requiredSecrets: requiredSecrets,
 	}, nil
+}
+
+// rejectProtectedHeader 挡住不能由模板提供的头。
+//
+// 三类，理由各不相同，所以错误信息也要分开 —— 「受保护头」一句话打包的话，
+// 用户看到 Host 被拒时不知道该去哪里配（答案是 Upstream 的 Host Override）。
+//
+// 关于「Connection 声明的逐跳头」（P0-05 第 6 条）：这里**刻意不**解析
+// Connection 的值再逐个拒。Connection 本身已被无条件拒绝，所以模板根本没有
+// 声明逐跳头的手段 —— 先拒 Connection 比解析它声明了什么更严格。
+//
+// 第一版真写了那个预扫描，然后发现它不可达：无论 Connection 排在自定义头
+// 前面还是后面，编译都先在 Connection 这一项上失败，那段代码永远跑不到。
+// 转发路径必须解析（proxy.PrepareOutboundHeaders），因为它收的是客户端发来的
+// 真实 Connection 头 —— 那是管不住的输入；模板不是。
+func rejectProtectedHeader(name string) error {
+	switch strings.ToLower(name) {
+	case "host":
+		return model.WrapValidation("recipe 不能设置 Host，"+
+			"它只能由 Upstream 的 host_override 提供并对该站全部 endpoint 一致生效（§8.5）；收到 %q", name)
+	case "content-length":
+		return model.WrapValidation("recipe 不能设置 Content-Length，"+
+			"它由 http 库按实际 body 重算；收到 %q", name)
+	}
+	if model.IsHopByHopHeader(name) {
+		return model.WrapValidation("recipe 不能设置逐跳头 %q，它由传输层管理（RFC 7230 §6.1）；"+
+			"模板因此也无法声明别的头为逐跳头", name)
+	}
+	return nil
 }
 
 func validateContentMethod(endpoint model.EndpointKind, method string, body []byte) error {

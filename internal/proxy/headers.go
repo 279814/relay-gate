@@ -9,16 +9,11 @@ import (
 
 // hopByHopHeaders 是 RFC 7230 §6.1 规定的逐跳头，**禁止**跨连接转发。
 // 转发它们会导致协议错误（如把上游的 keep-alive 参数当成客户端的）。
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"TE",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
+//
+// 取 model 的那份唯一清单，不在这里另抄一份：Recipe 的编译期拒绝
+// （probetemplate）用的是同一份，而两处各抄一份必然分叉 —— 分叉的那一半
+// 是「看起来在防、实际没防」。
+var hopByHopHeaders = model.HopByHopHeaders
 
 // PrepareOutboundHeaders 构造出站请求头。
 //

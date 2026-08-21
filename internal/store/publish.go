@@ -107,7 +107,69 @@ func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutio
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrRevisionConflict
 	}
+	// active ref 与 published 指针在**同一个事务**里换。分开做的话，中间那个
+	// 瞬间要么是「已发布但 Secret 没锁」（能被删掉，探活随即 config_error），
+	// 要么是「锁了但没发布」，两者都需要人来收拾。
+	if err = replaceRecipeSecretRefs(ctx, tx, recipeID, versionID); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// replaceRecipeSecretRefs 让 recipe_active_secret_ref 与刚发布的那个版本一致。
+//
+// 这张表是 schema 2 就建好的（secret_id 为 ON DELETE RESTRICT），但在 P0-05
+// 之前没有任何写入方 —— 于是那个 FK 约束在 recipe 路径上是死的，
+// DeleteProbeSecret 里的 FOREIGN KEY 分支永远走不到。后果是被 published
+// recipe 引用的 Secret 能被删掉，而那个站的探活随即变成无法归因的
+// config_error：模板还引用着 {{SECRET:name}}，值却没了。
+//
+// 只对 **published** 的版本建 ref。draft 不参与解析（publishedBinding 只认
+// published 与 legacy_compat），锁它只会让用户没法清理试错留下的草稿。
+//
+// 用 recipe_version_required_secret 的 snapshot 而不是重新编译模板：那张表
+// 记的是 AddRecipeVersion 当时绑定的 secret_id，与 BindSecrets 在渲染前校验
+// 的是同一份。重新编译再按名字查一次库的话，「同名新建」会悄悄绑上新 ID ——
+// 而 §4.5 明确要求同名新 Secret 不能自动满足旧引用。
+func replaceRecipeSecretRefs(ctx context.Context, tx *sql.Tx, recipeID, versionID int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM recipe_active_secret_ref WHERE recipe_id=?`, recipeID); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT name,bound_secret_id_snapshot,bound_revision_snapshot
+		FROM recipe_version_required_secret WHERE recipe_version_id=?`, versionID)
+	if err != nil {
+		return err
+	}
+	type secretRef struct {
+		name     string
+		id       int64
+		revision int64
+	}
+	// 先全部读出来再写：SQLite 在同一连接上边遍历 rows 边 Exec 会锁住。
+	var refs []secretRef
+	for rows.Next() {
+		var ref secretRef
+		if err := rows.Scan(&ref.name, &ref.id, &ref.revision); err != nil {
+			rows.Close()
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, ref := range refs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO recipe_active_secret_ref
+			(recipe_id,secret_id,name,revision) VALUES (?,?,?,?)`,
+			recipeID, ref.id, ref.name, ref.revision); err != nil {
+			return wrapConstraint(err, "recipe_active_secret_ref")
+		}
+	}
+	return nil
 }
 
 // requireRecipeTestExecution 重验这次测试打的就是要发布的这份内容。
