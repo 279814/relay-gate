@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	"github.com/279814/relay-gate/internal/probetemplate"
 )
 
 // drainBody 读完请求体。假上游**必须**这么做，否则断流相关的断言全是假的。
@@ -509,30 +511,64 @@ func TestL2_HTTPErrorStatuses(t *testing.T) {
 
 // ── 探活请求体 ────────────────────────────────────────────
 
-// 三种协议的参数名不同（§3.3.1），且必须 stream:true。
-func TestBuildProbeBody_PerProtocol(t *testing.T) {
+// captureL2 发一次 L2 并交出上游实际收到的请求。
+//
+// 断言实际发出去的字节而不是某个构造函数的返回值：请求内容现在由
+// 四级解析 + 模板渲染产出（execute.go），中间还有 Endpoint 固定 query、
+// 认证装配、Upstream 级头覆盖三步 —— 只验中间产物的话，「渲染对了但
+// 装配时被覆盖」这类问题测不出来。
+func captureL2(t *testing.T, proto model.Protocol, rt *model.Route) (*http.Request, []byte) {
+	t.Helper()
+
+	var got *http.Request
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		got = r.Clone(context.Background())
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(aliveSSE))
+	}))
+	defer srv.Close()
+
+	mn := modelNameFor(proto)
+	out := testProber().L2(context.Background(), upstreamFor(srv.URL), mn, rt, fastSettings())
+	if out.Verdict != health.VerdictOK {
+		t.Fatalf("探活未成功，无法断言请求内容: %s（err=%v）", out.Verdict, out.Err)
+	}
+	if got == nil {
+		t.Fatal("上游没收到请求")
+	}
+	return got, body
+}
+
+// 三种协议各用自己的字段名（§3.3.1），且都必须 stream:true。
+//
+// 内容出自内置 manifest（P0-06），所以这里验的是「解析到内置层并正确渲染」——
+// 字段名与最小输出上限本身由 builtin_test 的形状类断言钉住。
+func TestL2_BodyPerProtocol(t *testing.T) {
 	tests := []struct {
 		proto     model.Protocol
+		endpoint  string
 		wantField string
 		wantVal   float64
 	}{
-		{model.ProtoAnthropic, "max_tokens", 1},
-		{model.ProtoOpenAIChat, "max_tokens", 1},
-		// Responses 协议实测 max_output_tokens=1 会被部分站直接拒绝
-		{model.ProtoOpenAIResponses, "max_output_tokens", 16},
+		{model.ProtoAnthropic, "/v1/messages", "max_tokens", 1},
+		{model.ProtoOpenAIChat, "/v1/chat/completions", "max_tokens", 1},
+		// Responses 实测 max_output_tokens=1 会被部分站直接拒绝
+		{model.ProtoOpenAIResponses, "/v1/responses", "max_output_tokens", 16},
 	}
 
 	for _, tc := range tests {
 		t.Run(string(tc.proto), func(t *testing.T) {
-			mn := modelNameFor(tc.proto)
-			body, err := buildProbeBody(mn, &model.Route{ID: 1})
-			if err != nil {
-				t.Fatal(err)
-			}
+			request, body := captureL2(t, tc.proto, &model.Route{ID: 1})
 
+			if request.URL.Path != tc.endpoint {
+				t.Errorf("应打 %s，得到 %s", tc.endpoint, request.URL.Path)
+			}
 			var got map[string]any
 			if err := json.Unmarshal(body, &got); err != nil {
-				t.Fatal(err)
+				t.Fatalf("请求体不是合法 JSON: %v（%s）", err, body)
 			}
 			if got["stream"] != true {
 				t.Error("必须 stream:true —— 否则测不出首 Token 时间")
@@ -543,20 +579,23 @@ func TestBuildProbeBody_PerProtocol(t *testing.T) {
 			if v, ok := got[tc.wantField].(float64); !ok || v != tc.wantVal {
 				t.Errorf("%s 应为 %v，得到 %v", tc.wantField, tc.wantVal, got[tc.wantField])
 			}
+			// prompt 必须真的渲染进去，而不是留着占位符原文。
+			if bytes.Contains(body, []byte("{{")) {
+				t.Errorf("请求体里还有未渲染的占位符: %s", body)
+			}
+			if !bytes.Contains(body, []byte("1+1=?")) {
+				t.Errorf("probe_prompt 没渲染进请求体: %s", body)
+			}
 		})
 	}
 }
 
 // 配了映射就探映射后的名字。探的模型和真实请求打的不是同一个的话，
-// 探活通过但真实请求 model_not_found。
-func TestBuildProbeBody_UsesUpstreamModelMapping(t *testing.T) {
-	mn := modelNameFor(model.ProtoAnthropic)
+// 探活通过但真实请求 model_not_found（§3.3.2）。
+func TestL2_BodyUsesUpstreamModelMapping(t *testing.T) {
 	rt := &model.Route{ID: 1, UpstreamModel: "claude-opus-5-20260514"}
+	_, body := captureL2(t, model.ProtoAnthropic, rt)
 
-	body, err := buildProbeBody(mn, rt)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -566,46 +605,152 @@ func TestBuildProbeBody_UsesUpstreamModelMapping(t *testing.T) {
 	}
 }
 
-func TestBuildProbeBody_RejectsUnknownProtocol(t *testing.T) {
+// 未知协议在解析之前就失败，一个请求都不发。
+//
+// 发出去的话上游会回一个 400，而那个 400 会被归类成「这个站不支持这个形状」——
+// 归因落在站上，而真正的问题是本地配置里有个不存在的协议。
+func TestL2_RejectsUnknownProtocolWithoutSendingRequest(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
 	mn := &model.ModelName{Name: "x", Protocol: "telepathy", ProbeMaxTokens: 1, ProbePrompt: "1+1=?"}
-	if _, err := buildProbeBody(mn, nil); err == nil {
-		t.Error("未知协议应报错，而不是发一个上游看不懂的请求")
+	out := testProber().L2(context.Background(), upstreamFor(srv.URL), mn,
+		&model.Route{ID: 1}, fastSettings())
+	if out.Verdict == health.VerdictOK {
+		t.Error("未知协议不该判成功")
+	}
+	if hits != 0 {
+		t.Errorf("必须在出网之前失败，上游收到了 %d 个请求", hits)
 	}
 }
 
-// ── 探活头模板 ────────────────────────────────────────────
+// L2 的 query 来自内置模板的固定 query（§3.1 实测的 ?beta=true）。
+//
+// 这条钉住 Recipe 的 RawQuery 真的进了 URL：旧路径完全丢掉了它
+// （§3.3 列的「旧 L2 丢失真实请求中的 RawQuery」正是这条），
+// 而带不带 ?beta=true 在部分站上是能不能通的区别。
+func TestL2_SendsRecipeFixedQuery(t *testing.T) {
+	request, _ := captureL2(t, model.ProtoAnthropic, &model.Route{ID: 1})
+	if got := request.URL.Query().Get("beta"); got != "true" {
+		t.Errorf("应带内置模板的 ?beta=true（§3.1 实测路径），得到 query %q", request.URL.RawQuery)
+	}
+}
 
-// Upstream 级 probe_headers 覆盖全局模板（§3.6.4），
+// count_tokens 的内置模板不带 stream，也不该被 L2 的流式假设改写。
+//
+// 这条验的是「StreamExpected 由 Recipe 声明」这件事有实际效果：
+// 探活代码不能因为「L2 一定是流式」就往一个非流式端点塞 stream 字段。
+func TestCountTokensRenderedBodyHasNoStreamField(t *testing.T) {
+	set := loadBuiltins(t)
+	template, err := set.Compact(model.EndpointCountTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := template.Compiled().Render(context.Background(), TemplateValues{
+		UpstreamModel: probetemplate.ResolvedValue{Plain: []byte("m")},
+		ProbePrompt:   probetemplate.ResolvedValue{Plain: []byte("p")},
+		Timestamp:     time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(rendered.Body, []byte(`"stream"`)) {
+		t.Errorf("count_tokens 渲染后仍带 stream: %s", rendered.Body)
+	}
+}
+
+// 内置模板的估算成本要真的进 Cost，而不是被 ModelName 粗算取代。
+//
+// 这条钉住「记的是实际发出去那份内容的成本」。旧路径只有 ModelName 一个
+// 来源，而现在 body 来自 manifest —— 若记账仍按 ModelName 算，成本报告
+// 描述的是一个没发出去的请求。
+func TestL2_CostUsesBuiltinManifestEstimate(t *testing.T) {
+	set := loadBuiltins(t)
+	template, err := set.Compact(model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(aliveSSE))
+	}))
+	defer server.Close()
+
+	modelName := modelNameFor(model.ProtoAnthropic)
+	// 与按 ModelName 粗算的值必须可区分，否则这条断言证明不了来源。
+	if int64(estimateL2Tokens(modelName)) == template.EstimatedCost() {
+		t.Skip("两种估算值恰好相等，这条断言此刻无法区分来源")
+	}
+
+	out := testProber().L2(context.Background(), upstreamFor(server.URL), modelName,
+		&model.Route{ID: 1}, fastSettings())
+	if out.Verdict != health.VerdictOK {
+		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
+	}
+	if int64(out.EstTokens) != template.EstimatedCost() {
+		t.Errorf("成本应取 manifest 的声明值 %d，得到 %d",
+			template.EstimatedCost(), out.EstTokens)
+	}
+}
+
+// ── 探活头 ────────────────────────────────────────────────
+
+// Upstream 级 probe_headers 覆盖模板给的头（§3.6.4），
 // 给「按 UA 白名单拦截」这类站单独调指纹用。
-func TestBuildHeaders_UpstreamOverride(t *testing.T) {
-	up := upstreamFor("http://x")
+//
+// 断言上游实际收到的头，而不是某个构造函数的返回值：覆盖发生在渲染之后、
+// 认证装配之前（execute.go 的 applyProbeHeaders），只验中间产物测不到
+// 「覆盖了但随后被别的步骤改回去」。
+func TestProbeHeaders_UpstreamOverride(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	up := upstreamFor(srv.URL)
 	up.ProbeHeaders = map[string]string{
 		"user-agent": "custom-agent/1.0",
 		"x-custom":   "yes",
 	}
+	proberFor(up).L1(context.Background(), up, fastSettings())
 
-	h := buildHeaders(up, model.ProtoAnthropic, false)
-	if got := h.Get("User-Agent"); got != "custom-agent/1.0" {
-		t.Errorf("Upstream 级应覆盖默认 UA，得到 %q", got)
+	if value := got.Get("User-Agent"); value != "custom-agent/1.0" {
+		t.Errorf("Upstream 级应覆盖模板给的 UA，得到 %q", value)
 	}
-	if got := h.Get("X-Custom"); got != "yes" {
-		t.Errorf("应能加新头，得到 %q", got)
+	if value := got.Get("X-Custom"); value != "yes" {
+		t.Errorf("应能加新头，得到 %q", value)
 	}
-	// 没被覆盖的默认项要保留
-	if got := h.Get("X-App"); got != "cli" {
-		t.Errorf("未覆盖的默认头应保留，得到 %q", got)
+	// 没被覆盖的模板项要保留。
+	if value := got.Get("X-App"); value != "cli" {
+		t.Errorf("未覆盖的模板头应保留，得到 %q", value)
 	}
 }
 
 // 空值语义是「删掉这个头」。有站会因为多一个头而拒绝请求，
 // 需要一个能减头的手段。
-func TestBuildHeaders_EmptyValueDeletesHeader(t *testing.T) {
-	up := upstreamFor("http://x")
-	up.ProbeHeaders = map[string]string{"anthropic-beta": ""}
+func TestProbeHeaders_EmptyValueDeletesHeader(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
 
-	h := buildHeaders(up, model.ProtoAnthropic, false)
-	if got := h.Get("Anthropic-Beta"); got != "" {
-		t.Errorf("空值应删掉该头，得到 %q", got)
+	up := upstreamFor(srv.URL)
+	up.ProbeHeaders = map[string]string{"anthropic-beta": ""}
+	proberFor(up).L1(context.Background(), up, fastSettings())
+
+	if value := got.Get("Anthropic-Beta"); value != "" {
+		t.Errorf("空值应删掉该头，得到 %q", value)
 	}
 }
 
@@ -683,50 +828,84 @@ func TestProbe_AuthStyleDecidesSingleAuthHeader(t *testing.T) {
 	}
 }
 
-// buildHeaders 自己不写任何认证头 —— 认证只有 ApplyAuth 一个来源（§7.2）。
-func TestBuildHeaders_WritesNoAuth(t *testing.T) {
-	up := upstreamFor("http://x")
-	h := buildHeaders(up, model.ProtoAnthropic, false)
+// 探活请求里除 ApplyAuth 写的那一个之外没有别的认证头（§7.2）。
+//
+// 模板层与覆盖层都不该写认证：模板经 probetemplate 的凭据门禁（认证头必须是
+// 占位符），probe_headers 经 applyUpstreamHeaderOverrides 的静默跳过。这条
+// 走完整条路径，所以它同时覆盖那两道。
+func TestProbeHeaders_OnlyApplyAuthWritesCredentials(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
 
+	up := upstreamFor(srv.URL)
+	proberFor(up).L1(context.Background(), up, fastSettings())
+
+	var present []string
 	for _, name := range model.AuthHeaders {
-		if got := h.Get(name); got != "" {
-			t.Errorf("buildHeaders 不该写认证头 %s（那会是第二份认证实现），得到 %q",
-				name, got)
+		if got.Get(name) != "" {
+			present = append(present, name)
+		}
+	}
+	// upstreamFor 配的是 x_api_key，所以恰好一个头。
+	if len(present) != 1 || present[0] != "X-Api-Key" {
+		t.Errorf("应恰好一个认证头 X-Api-Key，实际带了 %v", present)
+	}
+}
+
+// anthropic-version 缺失会直接 400，Anthropic 端点的模板必须带它。
+//
+// 断言实际发出去的请求，而不是某个默认表：版本头现在来自 manifest，
+// 而「manifest 里有」与「真的发出去了」是两件事。
+func TestProbeHeaders_AnthropicVersionIsSent(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(aliveSSE))
+	}))
+	defer srv.Close()
+
+	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
+	if out.Verdict != health.VerdictOK {
+		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
+	}
+	if got.Get("Anthropic-Version") == "" {
+		t.Error("Anthropic 端点必须带 anthropic-version（缺失直接 400）")
+	}
+}
+
+// OpenAI 端点的模板不带 anthropic-version —— 跨协议串味。
+func TestProbeHeaders_NoAnthropicVersionOnOpenAIEndpoints(t *testing.T) {
+	set := loadBuiltins(t)
+	for _, endpoint := range []model.EndpointKind{
+		model.EndpointResponses, model.EndpointChatCompletions,
+	} {
+		template, err := set.Compact(endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value := template.Header("anthropic-version"); value != "" {
+			t.Errorf("%s 的内置模板不该带 anthropic-version，得到 %q", endpoint, value)
 		}
 	}
 }
 
-// anthropic-version 缺失会直接 400，只在 Anthropic 协议下发。
-func TestBuildHeaders_AnthropicVersionOnlyForAnthropic(t *testing.T) {
-	up := upstreamFor("http://x")
-
-	if got := buildHeaders(up, model.ProtoAnthropic, false).Get("Anthropic-Version"); got == "" {
-		t.Error("Anthropic 协议必须带 anthropic-version（缺失直接 400）")
-	}
-	if got := buildHeaders(up, model.ProtoOpenAIChat, false).Get("Anthropic-Version"); got != "" {
-		t.Errorf("OpenAI 协议不该带 anthropic-version，得到 %q", got)
-	}
-}
-
-func TestBuildHeaders_StreamChangesAccept(t *testing.T) {
-	up := upstreamFor("http://x")
-	if got := buildHeaders(up, model.ProtoAnthropic, true).Get("Accept"); got != "text/event-stream" {
-		t.Errorf("流式请求的 accept 应为 text/event-stream，得到 %q", got)
-	}
-	if got := buildHeaders(up, model.ProtoAnthropic, false).Get("Accept"); got != "application/json" {
-		t.Errorf("非流式应为 application/json，得到 %q", got)
-	}
-}
-
-// DefaultHeaderTemplate 是副本，改它不能污染全局默认。
+// DefaultHeaderTemplate 返回新 map，改它不影响后续调用。
 func TestDefaultHeaderTemplate_IsCopy(t *testing.T) {
 	tpl := DefaultHeaderTemplate()
+	if len(tpl) == 0 {
+		t.Fatal("默认头模板是空的")
+	}
 	tpl["user-agent"] = "tampered"
 
-	if defaultProbeHeaders["user-agent"] == "tampered" {
-		t.Error("修改返回值污染了全局默认模板")
-	}
-	if tpl2 := DefaultHeaderTemplate(); tpl2["user-agent"] == "tampered" {
+	if again := DefaultHeaderTemplate(); again["user-agent"] == "tampered" {
 		t.Error("修改返回值污染了后续调用")
 	}
 }

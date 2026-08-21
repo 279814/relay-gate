@@ -203,11 +203,10 @@ func TestEstimateL2Tokens_ScalesWithMaxTokens(t *testing.T) {
 }
 
 func TestEstimateL2Tokens_UsesDefaultsForZeroValues(t *testing.T) {
-	// 与 buildProbeBody 的兜底保持一致：prompt 空用 "1+1=?"，
-	// max_tokens 为 0 用 1。两处不一致的话，估算的是一个
-	// 根本没发出去的请求。
+	// 与 probePrompt 的兜底保持一致：prompt 空用 "1+1=?"，max_tokens 为 0 用 1。
+	// 两处不一致的话，估算的是一个根本没发出去的请求。
 	got := estimateL2Tokens(&model.ModelName{})
-	want := estimateL2Tokens(&model.ModelName{ProbePrompt: "1+1=?", ProbeMaxTokens: 1})
+	want := estimateL2Tokens(&model.ModelName{ProbePrompt: defaultProbePrompt, ProbeMaxTokens: 1})
 	if got != want {
 		t.Errorf("零值应回落到与显式默认值相同的估算：%d vs %d", got, want)
 	}
@@ -247,9 +246,9 @@ func TestEstimatePromptTokens_NonEmptyNeverZero(t *testing.T) {
 }
 
 func TestEstimatePromptTokens_EmptyIsHandledByCaller(t *testing.T) {
-	// 空 prompt 由 estimateL2Tokens 回落到 "1+1=?"，与 buildProbeBody 一致。
-	// 直接问 estimatePromptTokens("") 时返回 1 而不是 0 —— 那是下限保护，
-	// 不是一个有意义的值，所以这里只断言它不会 panic 或返回负数。
+	// 空 prompt 由 estimateL2Tokens 回落到 defaultProbePrompt，与渲染侧
+	// （probePrompt）一致。直接问 estimatePromptTokens("") 时返回 1 而不是 0 ——
+	// 那是下限保护，不是一个有意义的值，所以这里只断言它不会 panic 或返回负数。
 	if got := estimatePromptTokens(""); got < 0 {
 		t.Errorf("不该返回负数，得到 %d", got)
 	}

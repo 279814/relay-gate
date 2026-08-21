@@ -65,6 +65,10 @@ type Scheduler struct {
 	targets outbound.TargetProvider
 	secrets outbound.SecretSource
 
+	// recipes 是 Recipe 四级解析器（§8.2）。为 nil 时 Prober 退化成只用内置
+	// 模板 —— 那仍能发出正确的请求，但用户已发布的 Recipe 会被忽略。
+	recipes *RecipeResolver
+
 	// cost 累计探活开销（§5.2d）。可以为 nil —— 测试里多数用例不关心计数，
 	// 而记账失败绝不该影响探活本身。
 	cost *Cost
@@ -146,12 +150,22 @@ func (s *Scheduler) WithTargets(targets outbound.TargetProvider, secrets outboun
 	return s
 }
 
+// WithRecipes 注入 Recipe 四级解析器（§8.2）。
+//
+// 不注入时探活只用内置模板（第 4 级）—— 请求仍然发得出去且形状正确，
+// 但**用户已发布的 Recipe 会被忽略**，而那不会报错。所以生产装配必须传
+// （main.go）：漏传的症状是「配了 recipe 但探活没按它发」，而界面上看不出。
+func (s *Scheduler) WithRecipes(recipes *RecipeResolver) *Scheduler {
+	s.recipes = recipes
+	return s
+}
+
 // prober 造一个带完整出站解析面的 Prober。
 //
 // 每次探活现造：Prober 只是 Transport 与解析器的薄封装，没有跨探活的状态，
 // 而复用一个实例反而会让「哪次探活用的哪份配置」变得不确定。
 func (s *Scheduler) prober(tr http.RoundTripper) *Prober {
-	return &Prober{Transport: tr, Targets: s.targets, Secrets: s.secrets}
+	return &Prober{Transport: tr, Targets: s.targets, Secrets: s.secrets, Recipes: s.recipes}
 }
 
 // Run 阻塞运行调度循环，直到 ctx 结束。
@@ -369,7 +383,7 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
-	s.countL2(rt.ID, mn, out.Verdict == health.VerdictOK)
+	s.countL2(rt.ID, mn, out)
 
 	changed := s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: out.Verdict, Source: health.SourceL2,
@@ -587,7 +601,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, err
 	}
 	l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
-	s.countL2(rt.ID, mn, l2.Verdict == health.VerdictOK)
+	s.countL2(rt.ID, mn, l2)
 	s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
 		Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
@@ -604,10 +618,20 @@ func (s *Scheduler) countL1(upstreamID int64, ok bool) {
 	}
 }
 
-func (s *Scheduler) countL2(routeID int64, mn *model.ModelName, ok bool) {
-	if s.cost != nil {
-		s.cost.AddL2(routeID, ok, estimateL2Tokens(mn))
+// countL2 记一次 L2 及其估算 token。
+//
+// 优先用 Outcome 带回来的估算值：那是**实际发出去的那份内容**的估算
+// （内置模板的 manifest 声明值）。回落到按 ModelName 粗算只发生在探活
+// 根本没发出去的情况（配置错误），而那时确实没有内容可估。
+func (s *Scheduler) countL2(routeID int64, mn *model.ModelName, out Outcome) {
+	if s.cost == nil {
+		return
 	}
+	tokens := out.EstTokens
+	if tokens <= 0 {
+		tokens = estimateL2Tokens(mn)
+	}
+	s.cost.AddL2(routeID, out.Verdict == health.VerdictOK, tokens)
 }
 
 func findModelName(snap *router.Snapshot, id int64) *model.ModelName {

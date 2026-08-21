@@ -58,42 +58,57 @@ type crossPathCase struct {
 	wantModelsPath string
 	// wantRealQuery 是真实转发与 count_tokens 应发出的 query（固定 + 入站）。
 	wantRealQuery string
-	// wantProbeQuery 是探活应发出的 query（只有固定部分）。
-	wantProbeQuery string
+	// wantProbeL2Query 是 L2 应发出的 query：Endpoint 固定 query + **Recipe 的
+	// 固定 query**。后者来自内置 messages 模板的 `?beta=true` —— §3.1 抓包实测
+	// 真实 Claude Code 打的就是 /v1/messages?beta=true，而 §3.3 把「旧 L2 丢失
+	// 真实请求中的 RawQuery」列为必须废弃的结论。
+	wantProbeL2Query string
+	// wantProbeModelsQuery 是 L1 应发出的 query。内置 models 模板没有固定
+	// query（GET /v1/models 本来就不带），所以只有 Endpoint 那部分。
+	wantProbeModelsQuery string
 }
+
+// probeRecipeQuery 是内置 messages 模板声明的固定 query。
+//
+// 写成常量而不是从 manifest 读：这是一份**验收**期望值，从被测对象里取值
+// 会让「manifest 改错了」与「期望值跟着改错了」同时发生而测试仍绿。
+const probeRecipeQuery = "beta=true"
 
 func crossPathCases() []crossPathCase {
 	return []crossPathCase{
 		{
-			name:           "canonical",
-			l1Path:         "/v1/models",
-			incomingQuery:  "beta=true",
-			wantPath:       "/v1/messages",
-			wantCountPath:  "/v1/messages/count_tokens",
-			wantModelsPath: "/v1/models",
-			wantRealQuery:  "beta=true",
+			name:             "canonical",
+			l1Path:           "/v1/models",
+			incomingQuery:    "beta=true",
+			wantPath:         "/v1/messages",
+			wantCountPath:    "/v1/messages/count_tokens",
+			wantModelsPath:   "/v1/models",
+			wantRealQuery:    "beta=true",
+			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
 			// 这条钉住「不能用 ResolveReference」：吞掉前缀会让三条路径
 			// 全部打到根下的 /v1/*，表现为 404 而配置看起来完全正确。
-			name:           "base 带公共路径前缀",
-			basePath:       "/api",
-			l1Path:         "/v1/models",
-			incomingQuery:  "beta=true",
-			wantPath:       "/api/v1/messages",
-			wantCountPath:  "/api/v1/messages/count_tokens",
-			wantModelsPath: "/api/v1/models",
-			wantRealQuery:  "beta=true",
+			name:             "base 带公共路径前缀",
+			basePath:         "/api",
+			l1Path:           "/v1/models",
+			incomingQuery:    "beta=true",
+			wantPath:         "/api/v1/messages",
+			wantCountPath:    "/api/v1/messages/count_tokens",
+			wantModelsPath:   "/api/v1/models",
+			wantRealQuery:    "beta=true",
+			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
-			name:           "base 带尾斜杠",
-			basePath:       "/",
-			l1Path:         "/v1/models",
-			incomingQuery:  "beta=true",
-			wantPath:       "/v1/messages",
-			wantCountPath:  "/v1/messages/count_tokens",
-			wantModelsPath: "/v1/models",
-			wantRealQuery:  "beta=true",
+			name:             "base 带尾斜杠",
+			basePath:         "/",
+			l1Path:           "/v1/models",
+			incomingQuery:    "beta=true",
+			wantPath:         "/v1/messages",
+			wantCountPath:    "/v1/messages/count_tokens",
+			wantModelsPath:   "/v1/models",
+			wantRealQuery:    "beta=true",
+			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
 			// key 放在 query 里的站（§3.2）。三条路径都必须带上它，
@@ -106,8 +121,10 @@ func crossPathCases() []crossPathCase {
 			wantCountPath:  "/v1/messages/count_tokens",
 			wantModelsPath: "/v1/models",
 			// 固定在前、入站在后，只插一个 &（§7.1）
-			wantRealQuery:  "key=" + crossUpstreamKey + "&beta=true",
-			wantProbeQuery: "key=" + crossUpstreamKey,
+			wantRealQuery: "key=" + crossUpstreamKey + "&beta=true",
+			// 探活侧「入站」那一格由 Recipe 的固定 query 占据，拼接规则同上。
+			wantProbeL2Query:     "key=" + crossUpstreamKey + "&" + probeRecipeQuery,
+			wantProbeModelsQuery: "key=" + crossUpstreamKey,
 		},
 		{
 			name:           "固定 query 多参数保序",
@@ -118,17 +135,19 @@ func crossPathCases() []crossPathCase {
 			wantCountPath:  "/v1/messages/count_tokens",
 			wantModelsPath: "/v1/models",
 			// 不排序、不去重：同名 z 两份都保留，顺序原样
-			wantRealQuery:  "z=1&a=2&m=3&z=9",
-			wantProbeQuery: "z=1&a=2",
+			wantRealQuery:        "z=1&a=2&m=3&z=9",
+			wantProbeL2Query:     "z=1&a=2&" + probeRecipeQuery,
+			wantProbeModelsQuery: "z=1&a=2",
 		},
 		{
-			name:           "自定义 l1_path 只影响 models",
-			l1Path:         "/status",
-			incomingQuery:  "beta=true",
-			wantPath:       "/v1/messages",
-			wantCountPath:  "/v1/messages/count_tokens",
-			wantModelsPath: "/status",
-			wantRealQuery:  "beta=true",
+			name:             "自定义 l1_path 只影响 models",
+			l1Path:           "/status",
+			incomingQuery:    "beta=true",
+			wantPath:         "/v1/messages",
+			wantCountPath:    "/v1/messages/count_tokens",
+			wantModelsPath:   "/status",
+			wantRealQuery:    "beta=true",
+			wantProbeL2Query: probeRecipeQuery,
 		},
 	}
 }
@@ -151,11 +170,11 @@ func TestAllOutboundPathsAgreeOnURL(t *testing.T) {
 			})
 			t.Run("probe_l2", func(t *testing.T) {
 				got := fixture.driveProbeL2(t)
-				assertTarget(t, got, testCase.wantPath, testCase.wantProbeQuery)
+				assertTarget(t, got, testCase.wantPath, testCase.wantProbeL2Query)
 			})
 			t.Run("probe_l1", func(t *testing.T) {
 				got := fixture.driveProbeL1(t)
-				assertTarget(t, got, testCase.wantModelsPath, testCase.wantProbeQuery)
+				assertTarget(t, got, testCase.wantModelsPath, testCase.wantProbeModelsQuery)
 			})
 		})
 	}
@@ -165,13 +184,18 @@ func TestAllOutboundPathsAgreeOnURL(t *testing.T) {
 //
 // 这条断言与上面的表是互补的：表保证每条路径符合期望，这里直接比较两条
 // 路径的实际产出 —— 即使有人同时改错了期望值与实现，两者不一致仍会被抓住。
+//
+// 对比时给真实转发喂上 Recipe 那份固定 query：探活现在按内置模板发
+// `?beta=true`，而那正是 §3.1 抓包里真实 Claude Code 打的路径。也就是说
+// 「同一个地址」的含义没变 —— 变的是探活终于也带上了它，而旧 L2 会丢掉
+// （§3.3 把这条列为必须废弃的结论）。
 func TestRealForwardAndProbeHitIdenticalURL(t *testing.T) {
 	for _, testCase := range crossPathCases() {
 		t.Run(testCase.name, func(t *testing.T) {
-			// 探活不带客户端 query，所以只在无入站 query 时可直接对比全等。
-			bare := testCase
-			bare.incomingQuery = ""
-			fixture := newCrossPathFixture(t, bare)
+			// 让客户端发的 query 与探活模板的固定 query 相同，两条路径才可比。
+			aligned := testCase
+			aligned.incomingQuery = probeRecipeQuery
+			fixture := newCrossPathFixture(t, aligned)
 
 			real := fixture.driveRealForward(t)
 			probeTarget := fixture.driveProbeL2(t)

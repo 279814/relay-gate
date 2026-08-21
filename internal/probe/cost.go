@@ -187,10 +187,15 @@ func (c *Cost) Restore(snap CostSnapshot) {
 	}
 }
 
-// estimateL2Tokens 估算一次 L2 探活消耗的 token。
+// estimateL2Tokens 按 ModelName 估算一次 L2 探活消耗的 token。
 //
 // **是估算，不是账单。** 用途是判断策略是否过激（探活次数 × 每次的量级），
 // 那只需要正确的量级；要精确值得去看各站的计费页，而公益站多半也不提供。
+//
+// 这是**回落**路径。命中内置模板时用 manifest 里的声明值（见
+// preparedProbe.estimatedTokens）—— 那是模板作者按它实际的 body 写的。
+// 这里服务两种情况：用户自己配的 Recipe（manifest 之外，没有声明值），
+// 以及探活根本没发出去（配置错误，那时没有内容可估）。
 //
 // 输出按 max_tokens 的上限计：实际生成通常更少（判定一出就断流，§4.1），
 // 所以这是**上界**，用于成本估算时宁可高估。
@@ -209,9 +214,12 @@ func (c *Cost) Restore(snap CostSnapshot) {
 // 而 CJK 在真实 tokenizer 里恰恰是每字 1.5 个，方向正好错。
 // probe_prompt 是 UI 可改的配置项（§4.7），中文 prompt 完全可达。
 func estimateL2Tokens(mn *model.ModelName) int {
+	if mn == nil {
+		return 0
+	}
 	prompt := mn.ProbePrompt
 	if prompt == "" {
-		prompt = "1+1=?"
+		prompt = defaultProbePrompt
 	}
 	maxTok := mn.ProbeMaxTokens
 	if maxTok <= 0 {

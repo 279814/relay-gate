@@ -7,98 +7,73 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
-// defaultProbeHeaders 是探活请求的默认指纹，照抄真实 Claude Code 的头集合
-// （抓包所得，与 scripts/probe-upstream.sh 里 M0 用的是同一套）。
+// 探活头的来源（§3.6.4、§8.5）。
 //
-// 为什么探活要伪装成 Claude Code：M0 实测到**按 user-agent 前缀白名单拦截**
-// 的站 —— 非 `claude-cli/*` 一律 401。探活请求若长得不像 Claude Code，
-// 会把一个完全可用的站判成死站，而这正是本项目要避免的核心错误
-// （把好站踢出池子比发现不了死站更糟：后者只是没优化，前者是主动制造故障）。
+// 头集合本身**不在这个文件里** —— 它出自内置 manifest（builtin/）或用户配的
+// Recipe，由 execute.go 渲染。这里只剩两件事：Upstream 级覆盖，以及把
+// 「默认头长什么样」这个问题转给 manifest 回答。
 //
-// 注意 anthropic-beta **不含** context-1m：真实 Claude Code 不发这个开关，
-// 加上它反而与真实请求不一致。M0 有一站被脚本标为「需 1M」，
-// 已确认是误报（§9.1.1 复核点 2）。
-var defaultProbeHeaders = map[string]string{
-	"user-agent":     "claude-cli/2.1.220 (external, sdk-cli)",
-	"x-app":          "cli",
-	"accept":         "application/json",
-	"content-type":   "application/json",
-	"anthropic-beta": strings.Join(anthropicBetas, ","),
-	"anthropic-dangerous-direct-browser-access": "true",
-	// x-stainless-* 是 SDK 指纹，部分站据此识别客户端
-	"x-stainless-lang":            "js",
-	"x-stainless-package-version": "0.70.1",
-	"x-stainless-os":              "Windows",
-	"x-stainless-arch":            "x64",
-	"x-stainless-runtime":         "node",
-	"x-stainless-retry-count":     "0",
-}
+// P0-06 之前这里有一份硬编码的 defaultProbeHeaders 与 buildHeaders。删掉它们
+// 的理由不是清理癖：那份硬编码与 manifest 并存就是探活头的两份真相，而两份
+// 真相中「界面上展示的那一份」与「实际发出去的那一份」分叉时，用户会照着
+// 界面调指纹却看不到任何效果。计划原本把 buildHeaders 排到 P0-17 删除
+// （P0-05 验收条款），前提是它还有 DefaultHeaderTemplate 这个生产调用方；
+// 本次改动让它失去了那个调用方，于是提前删。
 
-// anthropicBetas 是真实 Claude Code 发送的特性开关集合（9 项，抓包所得）。
-var anthropicBetas = []string{
-	"claude-code-20250219",
-	"interleaved-thinking-2025-05-14",
-	"thinking-token-count-2026-05-13",
-	"context-management-2025-06-27",
-	"prompt-caching-scope-2026-01-05",
-	"mid-conversation-system-2026-04-07",
-	"advanced-tool-use-2025-11-20",
-	"effort-2025-11-24",
-	"fallback-credit-2026-06-01",
-}
-
-// anthropicVersion 是 Anthropic 协议必需的版本头，缺失直接 400。
-const anthropicVersion = "2023-06-01"
-
-// buildHeaders 组装探活请求头。
+// applyUpstreamHeaderOverrides 叠加 Upstream 级 probe_headers（§3.6.4）。
 //
-// 两层叠加，后者覆盖前者：默认模板 → Upstream 级 probe_headers。
-// **不含认证** —— 那是 outbound.ApplyAuth 的唯一职责（§7.2）。原先这里有
-// 一份自己的 injectAuth，与转发路径那份是两套代码；而「探活用一种认证、
-// 真实请求用另一种」的故障表现为「探活说站活着，但用户一直 401」，
-// 极难定位，因为两条路径各自看起来都对。
+// 给「按 UA 白名单拦截」这类站单独调指纹用。三条语义：
 //
-// probe_headers 里的认证头仍然要挡掉：它是明文 JSON，让它能塞进一个
-// Authorization 就等于给这个站开了第二个 key 来源，绕过加密存储。
-func buildHeaders(up *model.Upstream, proto model.Protocol, stream bool) http.Header {
-	h := make(http.Header, len(defaultProbeHeaders)+4)
-	for k, v := range defaultProbeHeaders {
-		h.Set(k, v)
+//   - 空值 = 删掉这个头。有站会因为多一个头而拒绝请求，所以需要一个能减头的
+//     手段，而不只是加和改。
+//   - 认证头静默跳过。这里在探活的热路径上，没有能把错误呈现给用户的位置；
+//     配置层已经拒绝了这种输入（model.Validate），这里是纵深防御 ——
+//     万一有人手改了库，也不能让明文 key 生效。
+//   - 其余 Set（覆盖而非追加）：probe_headers 是 map[string]string，
+//     一个名字只有一个值，追加会在重复调用时越积越多。
+//
+// 作用在渲染出的头上而不是在模板层：probe_headers 是**站级**开关，而模板
+// 可能来自 Route 级配方。放进模板编译的话，同一个站的两条 Route 会各自
+// 编译一遍同样的覆盖，而其中一条忘了就是「这个站有一半探活带错指纹」。
+func applyUpstreamHeaderOverrides(header http.Header, up *model.Upstream) {
+	if up == nil {
+		return
 	}
-	if proto == model.ProtoAnthropic {
-		h.Set("anthropic-version", anthropicVersion)
-	}
-	if stream {
-		// 流式请求的 accept 与非流式不同。真实 Claude Code 走 SSE 时
-		// 发的是 text/event-stream，跟着改能让探活更像真实流量。
-		h.Set("accept", "text/event-stream")
-	}
-
-	// Upstream 级覆盖：给「按 UA 白名单拦截」这类站单独调指纹用（§3.6.4）。
-	for k, v := range up.ProbeHeaders {
-		if model.IsAuthHeader(k) {
-			// 静默跳过而不是报错：这里在探活的热路径上，没有能把错误
-			// 呈现给用户的位置。配置层已经拒绝了这种输入（见 model.Validate），
-			// 这里是纵深防御 —— 万一有人手改了库，也不能让明文 key 生效。
+	for name, value := range up.ProbeHeaders {
+		if model.IsAuthHeader(name) {
 			continue
 		}
-		if v == "" {
-			// 空值语义是「删掉这个头」。有站会因为多一个头而拒绝请求，
-			// 需要一个能减头的手段，而不只是加和改。
-			h.Del(k)
+		if value == "" {
+			header.Del(name)
 			continue
 		}
-		h.Set(k, v)
+		header.Set(name, value)
 	}
-	return h
 }
 
-// DefaultHeaderTemplate 返回默认探活头模板的副本，供管理界面展示与编辑。
+// DefaultHeaderTemplate 返回默认探活头模板，供管理界面展示与编辑。
+//
+// 取自内置 messages compact 模板（P0-06 的 manifest）：界面上展示的「默认头」
+// 必须与探活实际发的是同一份。各列一份的后果是用户照着界面调指纹，而实际
+// 发出去的是另一套 —— 排查时对着界面完全看不出问题。
+//
+// manifest 加载失败时返回 nil 而不是一份退化的硬编码：那种「看起来有默认值」
+// 会掩盖真正的问题（embed 的数据文件坏了）。探活路径上同一个失败会以错误
+// 形式暴露（LoadBuiltinTemplates 的返回值），而那才是该失败的地方。
+//
+// 返回新 map，调用方改它不影响任何人。
 func DefaultHeaderTemplate() map[string]string {
-	out := make(map[string]string, len(defaultProbeHeaders)+1)
-	for k, v := range defaultProbeHeaders {
-		out[k] = v
+	set, err := LoadBuiltinTemplates()
+	if err != nil {
+		return nil
 	}
-	out["anthropic-version"] = anthropicVersion
+	compact, err := set.Compact(model.EndpointMessages)
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]string, len(compact.Headers))
+	for _, header := range compact.Headers {
+		out[strings.ToLower(header.Name)] = strings.Join(header.Values, ",")
+	}
 	return out
 }
