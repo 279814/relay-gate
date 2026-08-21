@@ -264,7 +264,7 @@ func requireRecipeTestExecution(ctx context.Context, tx *sql.Tx, recipe *model.P
 		return model.WrapValidation("execution %q 已被更新的观察结果取代，请重测", executionID)
 	}
 	if !success && !force {
-		return model.WrapValidation("execution %q 未成功；确认该形状可用可用 force 发布", executionID)
+		return model.WrapValidation("execution %q 未成功；确认该形状可用可以用 force 发布", executionID)
 	}
 	return nil
 }
