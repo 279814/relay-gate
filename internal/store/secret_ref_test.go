@@ -9,6 +9,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -188,6 +189,80 @@ func TestArchiveRecipeReleasesActiveSecretRefs(t *testing.T) {
 	}
 	if err := store.DeleteProbeSecret(secret.ID, secret.Revision); err != nil {
 		t.Errorf("archive 之后 Secret 应可删除: %v", err)
+	}
+}
+
+// snapshot 未记录的 required_secret 行不能被当成有效引用。
+//
+// 迁移路径（migrate_backfill.go:405）只写三列，bound_secret_id_snapshot 与
+// bound_revision_snapshot 都落默认 0。发布这样一个 legacy recipe 时，
+// replaceRecipeSecretRefs 会拿 0 去建 active ref，而那有两种坏结局：
+//
+//   - revision=0 撞 CHECK (revision >= 1)，整个发布事务失败，而错误文本
+//     说的是「约束冲突」—— 没人能从那句话看出问题在一条迁移遗留的行上
+//   - 假如哪天那个 CHECK 松了，secret_id=0 会成为一条指向不存在 Secret 的
+//     引用，于是那道「删除受 published 引用的 Secret 要报冲突」的 FK 边界
+//     在这个 recipe 上是空的
+//
+// 正确行为是明确拒绝并说清该做什么：那份 legacy 配置必须先经过一次
+// AddRecipeVersion（它会真正绑定 Secret 并写全 snapshot）。
+func TestPublishRejectsRequiredSecretRowWithoutSnapshot(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	upstream := mkUpstream(t, store, "legacy-snapshot-site")
+
+	recipeID, err := store.CreateRecipe(model.RecipeScopeUpstream, upstream.ID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 绕开 AddRecipeVersion 直接写库，复现迁移留下的那种行。
+	result, err := store.db.Exec(`INSERT INTO probe_recipe_version
+		(recipe_id,version,origin,method,fixed_raw_query,headers_json,body,body_is_text,
+		 stream_expected,timeout_profile,created_at)
+		VALUES (?,1,'legacy_migration','GET','','[]',NULL,0,0,'l1',?)`, recipeID, nowMS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO recipe_version_required_secret
+		(recipe_version_id,name,bound_name_snapshot) VALUES (?,'legacy_name','legacy_name')`,
+		versionID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 读取侧要拒。放过去的话 BindSecrets 会以「secret_id 已变（绑定 0，
+	// 当前 N）」失败，把用户引向「Secret 被重建过」这个错方向。
+	//
+	// 先验读取侧再开事务：replaceRecipeSecretRefs 里的 DELETE 会把事务升级成
+	// 写锁，而 RecipeVersionSecretRefs 走 store.db 的另一条连接 —— 持锁期间查
+	// 会死等到超时。
+	_, err = store.RecipeVersionSecretRefs(ctx, versionID)
+	if err == nil {
+		t.Fatal("RecipeVersionSecretRefs 必须拒绝没有绑定快照的引用")
+	}
+	if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "legacy_name") {
+		t.Errorf("读取侧的错误应是 validation 且指名引用，得到 %v", err)
+	}
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	err = replaceRecipeSecretRefs(ctx, tx, recipeID, versionID)
+	if err == nil {
+		t.Fatal("snapshot 为 0 的引用必须拒绝：那会建出一条指向不存在 Secret 的 active ref")
+	}
+	if !errors.Is(err, model.ErrValidation) {
+		t.Errorf("应是 validation 错误（用户能改），得到 %v", err)
+	}
+	// 错误必须指名是哪个引用，否则用户只看到「约束冲突」，无从下手。
+	if !strings.Contains(err.Error(), "legacy_name") {
+		t.Errorf("错误必须指名出问题的引用: %v", err)
 	}
 }
 
