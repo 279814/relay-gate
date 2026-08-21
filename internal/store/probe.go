@@ -474,35 +474,69 @@ func (store *Store) AddRecipeVersion(version *model.ProbeRecipeVersion, expected
 	return tx.Commit()
 }
 
+// ArchiveRecipe 归档一个 recipe，并原子释放它持有的 active secret ref（§P0-05 第 12 条）。
+//
+// 释放是必须的：归档的语义就是「这份配置不再参与任何解析」，而不释放会让
+// 一个已归档的 recipe 永久锁住它引用过的 Secret —— 用户删不掉那个 Secret，
+// 且界面上找不到任何还在用它的东西。
 func (store *Store) ArchiveRecipe(ctx context.Context, recipeID, expectedRevision int64) error {
-	result, err := store.db.ExecContext(ctx, `UPDATE probe_recipe SET status='archived',
-		revision=revision+1,active_binding_revision=active_binding_revision+1,updated_at=?
-		WHERE id=? AND revision=? AND status!='archived'`, nowMS(), recipeID, expectedRevision)
-	if err != nil {
-		return err
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		var exists int
-		if err := store.db.QueryRow(`SELECT COUNT(*) FROM probe_recipe WHERE id=?`, recipeID).Scan(&exists); err != nil {
-			return err
-		}
-		if exists == 0 {
-			return ErrNotFound
-		}
-		return ErrRevisionConflict
-	}
-	return nil
+	return store.retireRecipe(ctx, recipeID, expectedRevision, model.RecipeArchived)
 }
 
+// DisableRecipe 停用一个 recipe，同样释放 active secret ref。
+//
+// 与 archive 同理：disabled 不参与解析（publishedBinding 只认 published 与
+// legacy_compat），所以它也不该继续锁住 Secret。
 func (store *Store) DisableRecipe(ctx context.Context, recipeID, expectedRevision int64) error {
-	result, err := store.db.ExecContext(ctx, `UPDATE probe_recipe SET status='disabled',
+	return store.retireRecipe(ctx, recipeID, expectedRevision, model.RecipeDisabled)
+}
+
+// retireRecipe 是 archive 与 disable 的共同实现。
+//
+// 合成一个是因为两者的差别只有目标 status：状态更新与 ref 释放必须在同一个
+// 事务里，而那段事务样板各写一份迟早会有一份漏掉 ref 释放 —— 那正是本轮要修的
+// 缺口，没有理由为它留第二处。
+//
+// 保留各自的错误语义差异：archive 会区分 ErrNotFound 与 ErrRevisionConflict
+// （UI 上「这个 recipe 没了」与「有人先改了」是两种不同的提示），
+// disable 沿用原先只回 ErrRevisionConflict 的行为，不在本轮顺手改。
+func (store *Store) retireRecipe(ctx context.Context, recipeID, expectedRevision int64,
+	status model.RecipeStatus) (err error) {
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	result, err := tx.ExecContext(ctx, `UPDATE probe_recipe SET status=?,
 		revision=revision+1,active_binding_revision=active_binding_revision+1,updated_at=?
-		WHERE id=? AND revision=? AND status!='archived'`, nowMS(), recipeID, expectedRevision)
+		WHERE id=? AND revision=? AND status!='archived'`, status, nowMS(), recipeID, expectedRevision)
 	if err != nil {
 		return err
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
+		if status == model.RecipeArchived {
+			var exists int
+			if err = tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM probe_recipe WHERE id=?`, recipeID).Scan(&exists); err != nil {
+				return err
+			}
+			if exists == 0 {
+				return ErrNotFound
+			}
+		}
 		return ErrRevisionConflict
 	}
-	return nil
+	// 与状态同一个事务：分开做的话中间那个瞬间是「已停用但 Secret 仍锁着」，
+	// 而失败重试的话又可能停在「释放了 ref 但状态没变」。
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM recipe_active_secret_ref WHERE recipe_id=?`, recipeID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
