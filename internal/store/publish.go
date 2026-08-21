@@ -49,6 +49,37 @@ func (store *Store) PublishedUpstreamRecipe(ctx context.Context, upstreamID int6
 	return store.publishedBinding(ctx, model.RecipeScopeUpstream, upstreamID, endpoint)
 }
 
+// RecipeVersionSecretRefs 取该版本绑定时的 Secret 快照。
+//
+// 供 probe.RecipeResolver 交给 BindSecrets 校验用。返回的是**绑定时**的
+// secret_id，不是现在按名字查到的那个 —— 删掉一个 Secret 再建同名的会拿到
+// 不同 ID，而 §4.5 要求同名新 Secret 不能自动满足旧引用。
+//
+// 用 bound_secret_id_snapshot 而不是 resolved_secret_id：后者是
+// ON DELETE SET NULL 的，Secret 被删后会变成 NULL，而我们要的正是
+// 「原来绑的是哪一个」这个事实，好让 BindSecrets 报出身份不匹配。
+func (store *Store) RecipeVersionSecretRefs(ctx context.Context, versionID int64) ([]model.RequiredSecretRef, error) {
+	if versionID < 1 {
+		return nil, model.WrapValidation("recipe version id 无效")
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT name,bound_secret_id_snapshot
+		FROM recipe_version_required_secret WHERE recipe_version_id=? ORDER BY name`, versionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var refs []model.RequiredSecretRef
+	for rows.Next() {
+		var ref model.RequiredSecretRef
+		if err := rows.Scan(&ref.Name, &ref.BoundSecretID); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
 // PublishRecipeVersion 把一个 draft version 设为该 scope+endpoint 的 published binding。
 //
 // testExecutionID 必须是一次针对 (recipeID, versionID) 的显式测试且成功。
