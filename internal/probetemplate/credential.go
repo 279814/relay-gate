@@ -100,17 +100,51 @@ func requirePlaceholderAuthValue(name, value string) error {
 	}
 	// 整体是一个占位符就放行。要求「整体」而不是「含有」：
 	// `sk-live-{{SECRET:suffix}}` 那种拼法里前半段仍是明文凭据。
-	if strings.HasPrefix(remainder, "{{") && strings.HasSuffix(remainder, "}}") &&
-		strings.Count(remainder, "{{") == 1 {
+	//
+	// 问编译器而不是看字符串形状。曾用
+	// HasPrefix("{{") && HasSuffix("}}") && Count("{{")==1 判「整体」，
+	// 而 `{{UPSTREAM_API_KEY}}sk-ant-AAAA}}` 三条全中却含明文凭据 ——
+	// 形状判据永远会有下一个这样的构造，而 compileTemplate 已经把值精确切成
+	// literal / placeholder 两类，「除占位符外还剩别的」是它能直接回答的问题。
+	literal, placeholders, err := splitAuthValue(remainder)
+	if err != nil {
+		// 编译不过的值（未闭合占位符、未知占位符）交给后面的正式编译报错 ——
+		// 那里的错误信息更准确。这里只负责「编译得过但含明文凭据」。
 		return nil
 	}
-	if len(remainder) < minLiteralAuthValue {
-		// 短字面值放行：多半是协议常量。这里刻意留松 —— 见文件头
+	if literal == "" && placeholders == 1 {
+		return nil
+	}
+	if placeholders == 0 && len(remainder) < minLiteralAuthValue {
+		// 短纯字面值放行：多半是协议常量。这里刻意留松 —— 见文件头
 		// 「误报没有逃生舱」。高置信前缀仍会被下面那条兜住。
 		return rejectCredentialPrefix(value, "认证头 "+name)
 	}
 	return model.WrapValidation("认证头 %q 不能写字面凭据，"+
 		"请改用 {{UPSTREAM_API_KEY}} 或先创建 Probe Secret 再写 {{SECRET:name}}（§4.5）", name)
+}
+
+// splitAuthValue 把认证头的值切成「字面部分」与「占位符个数」。
+//
+// 复用 compileTemplate 而不是重写一个解析器：转义规则（`{{{{` → `{{`）
+// 与占位符白名单都在它那里，各写一份必然分叉 —— 而分叉的那一半正是旁路。
+//
+// required 收集的 Secret 名在这里丢掉：本函数只用于门禁判断，
+// 真正的 requiredSecrets 由 compileContent 那次编译产出。
+func splitAuthValue(value string) (literal string, placeholders int, err error) {
+	parts, err := compileTemplate([]byte(value), false, make(map[string]struct{}))
+	if err != nil {
+		return "", 0, err
+	}
+	var builder strings.Builder
+	for _, part := range parts {
+		if part.placeholder != "" {
+			placeholders++
+			continue
+		}
+		builder.Write(part.literal)
+	}
+	return strings.TrimSpace(builder.String()), placeholders, nil
 }
 
 // rejectCredentialPrefix 查高置信凭据前缀。

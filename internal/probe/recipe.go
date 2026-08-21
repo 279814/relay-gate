@@ -231,6 +231,21 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 		// 写入前必须经 learner sanitizer，读取后再次校验再参与 Recipe 解析」）。
 		return ResolvedRecipe{}, fmt.Errorf("编译 profile %d 的 shape: %w", profile.ID, err)
 	}
+	// profile 层不带 SecretRefs，所以它也不能引用 Secret。
+	//
+	// 引用了的话，编译结果要求那个 Secret 而 SecretRefs 是 nil —— BindSecrets
+	// 收不到任何 ref 可校验，于是这个 Secret 绕过了 §4.5 的「同名新建的 Secret
+	// 不自动满足旧引用」。那道边界靠的正是「绑定时的 secret_id 与当下解析出的
+	// 比对」，而 profile 从来没有过绑定这一步。
+	//
+	// 不给 profile 补一份 ref 表：learner 学的是**客户端发来的**请求形状，
+	// 认证由 Endpoint 的 auth profile 提供（§7.2）—— 一个从真实流量里学来的
+	// shape 本就不该声明凭据来源。
+	if secrets := compiled.RequiredSecrets(); len(secrets) > 0 {
+		return ResolvedRecipe{}, model.WrapValidation(
+			"profile %d 的 shape 引用了 Probe Secret %v，而 profile 层没有绑定快照可校验；"+
+				"需要 Secret 的请求形状请建成 Recipe 并发布（§4.5、§7.2）", profile.ID, secrets)
+	}
 
 	identity := model.RecipeIdentity{
 		Storage:         model.RecipeStorageProfile,
@@ -252,8 +267,8 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 			TestedProfileRevision: profile.Revision,
 		},
 		Compiled: compiled,
-		// profile 层没有 Secret 快照：learner 产出的 shape 只含安全头，
-		// 认证仍由 Endpoint 的 auth profile 提供（§7.2）。
+		// profile 层没有 Secret 快照，上面也已拒绝引用 Secret 的 shape：
+		// 认证由 Endpoint 的 auth profile 提供（§7.2）。
 		SecretRefs: nil,
 		// 超时档按 endpoint 推：profile 不存这一项。
 		TimeoutProfile: defaultTimeoutProfile(query.Endpoint),

@@ -75,6 +75,13 @@ func (store *Store) RecipeVersionSecretRefs(ctx context.Context, versionID int64
 		if err := rows.Scan(&ref.Name, &ref.BoundSecretID); err != nil {
 			return nil, err
 		}
+		// 与 replaceRecipeSecretRefs 同一条判断：snapshot 为 0 的行没经过绑定
+		// （迁移遗留）。放过去的话 BindSecrets 会以「secret_id 已变（绑定 0，
+		// 当前 N）」失败，而那句话把用户引向「Secret 被重建过」这个错方向。
+		if ref.BoundSecretID < 1 {
+			return nil, model.WrapValidation("recipe version %d 的 Secret 引用 %q 没有绑定快照："+
+				"这是 legacy 迁移遗留的配置，请先新增一个版本（会重新绑定 Secret）", versionID, ref.Name)
+		}
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
@@ -194,6 +201,16 @@ func replaceRecipeSecretRefs(ctx context.Context, tx *sql.Tx, recipeID, versionI
 	rows.Close()
 
 	for _, ref := range refs {
+		// snapshot 为 0 意味着这条引用从来没经过绑定：迁移路径
+		// （migrate_backfill.go）只写 name 三列，其余落默认 0。拿 0 去建 ref
+		// 会撞 CHECK (revision >= 1)，而那句「约束冲突」没人能看出问题在哪；
+		// 就算 CHECK 松了，secret_id=0 也只是一条指向不存在 Secret 的引用 ——
+		// 于是「删除受引用的 Secret 要报冲突」那道边界在这个 recipe 上是空的。
+		if ref.id < 1 || ref.revision < 1 {
+			return model.WrapValidation("recipe %d 的 Secret 引用 %q 没有绑定快照，"+
+				"无法发布：这是 legacy 迁移遗留的配置，请先新增一个版本（会重新绑定 Secret）再发布",
+				recipeID, ref.name)
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO recipe_active_secret_ref
 			(recipe_id,secret_id,name,revision) VALUES (?,?,?,?)`,
 			recipeID, ref.id, ref.name, ref.revision); err != nil {
@@ -247,7 +264,7 @@ func requireRecipeTestExecution(ctx context.Context, tx *sql.Tx, recipe *model.P
 		return model.WrapValidation("execution %q 已被更新的观察结果取代，请重测", executionID)
 	}
 	if !success && !force {
-		return model.WrapValidation("execution %q 未成功；确认该形状可用可用 force 发布", executionID)
+		return model.WrapValidation("execution %q 未成功；确认该形状可用可以用 force 发布", executionID)
 	}
 	return nil
 }

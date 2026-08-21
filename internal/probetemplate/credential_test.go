@@ -137,3 +137,35 @@ func TestScanDistinguishesBearerPrefixFromLiteralCredential(t *testing.T) {
 		}
 	})
 }
+
+// 占位符后面拼字面凭据必须拒绝。
+//
+// 这是「整体是一个占位符」那条判据的漏洞：原判据用
+// HasPrefix("{{") && HasSuffix("}}") && Count("{{")==1 认定「整体」，
+// 而 `{{UPSTREAM_API_KEY}}sk-ant-AAAAAAAAAAAA}}` 三条全满足 —— 它以 {{ 开头、
+// 以 }} 结尾、只含一个 {{，中间那段明文凭据却整个溜了过去。
+//
+// 后果与门禁完全失守等价：认证头明文进 probe_recipe_version，而那张表
+// 不可变（0002 的 no_update/no_delete 触发器），落进去就删不掉。
+func TestScanRejectsLiteralCredentialAfterPlaceholder(t *testing.T) {
+	const tail = "sk-ant-api03-AAAAAAAAAAAAAAAA"
+
+	cases := []string{
+		"{{UPSTREAM_API_KEY}}" + tail + "}}",
+		"Bearer {{SECRET:a}}" + tail + "}}",
+		"{{SECRET:a}}-" + tail + "}}",
+	}
+	for _, value := range cases {
+		t.Run(value, func(t *testing.T) {
+			content := TemplateContent{Method: "POST", Headers: []model.HeaderTemplate{
+				{Name: "Authorization", Values: []string{value}}}}
+			_, err := ScanRequiredSecrets(model.EndpointMessages, content)
+			if !errors.Is(err, model.ErrValidation) {
+				t.Fatalf("占位符后拼字面凭据必须拒绝，得到 %v", err)
+			}
+			if strings.Contains(err.Error(), tail) {
+				t.Errorf("错误文本回显了凭据原值: %v", err)
+			}
+		})
+	}
+}

@@ -404,6 +404,39 @@ func TestRecipeResolver_IgnoresUntestedProfile(t *testing.T) {
 	}
 }
 
+// profile 层不接受 Secret 占位符。
+//
+// profile 层不带 SecretRefs（learner 学的是安全头，认证由 Endpoint 的
+// auth profile 提供，§7.2）。若它的 shape 里混进 {{SECRET:x}}，编译结果会
+// 要求那个 Secret，而 SecretRefs 是 nil —— 于是 BindSecrets 收不到任何 ref
+// 可校验，那个 Secret 就绕过了 §4.5 的「同名新建不满足旧引用」这道边界。
+//
+// 症状还会往后拖：解析成功、渲染时才以「未装配」失败，而那时归因落在探活
+// 执行上，不在这份 profile 上。所以在解析阶段就拒。
+func TestRecipeResolver_RejectsSecretPlaceholderInProfile(t *testing.T) {
+	source := &fakeRecipeSource{
+		profile: &model.ClientProbeProfile{
+			ID: 9, Revision: 5, Status: model.ProfileTested,
+			Endpoint: model.EndpointModels,
+			SafeHeaders: []model.HeaderTemplate{
+				{Name: "X-Tenant", Values: []string{"{{SECRET:sneaky}}"}},
+			},
+		},
+	}
+
+	_, err := testResolver(source).Resolve(context.Background(), RecipeQuery{
+		UpstreamID: 1, Endpoint: model.EndpointModels,
+	})
+	if err == nil {
+		t.Fatal("引用 Secret 的 profile 必须在解析阶段拒绝：" +
+			"profile 层不带 SecretRefs，BindSecrets 无从校验那个引用")
+	}
+	if errors.Is(err, ErrNoRecipe) {
+		t.Error("不能报成 ErrNoRecipe —— 那会让调用方静默改用内置模板，" +
+			"而这份 profile 里的问题没有任何提示")
+	}
+}
+
 // 查询参数不合法时报错，不静默落到低优先级。
 func TestRecipeResolver_RejectsInvalidQuery(t *testing.T) {
 	cases := []struct {
