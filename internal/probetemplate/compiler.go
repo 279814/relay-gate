@@ -101,6 +101,12 @@ func compileContent(endpoint model.EndpointKind, content TemplateContent) (*Comp
 	if err := validateContentMethod(endpoint, content.Method, content.Body); err != nil {
 		return nil, err
 	}
+	// 凭据门禁（§4.5）。放在编译入口而不是各写入路径：三条写入路径
+	// （管理 API、learner、migration）都经这里入库，放这里就覆盖了全部三条，
+	// 而各自调一次必然漏掉将来新增的那条。
+	if err := rejectLiteralCredentials(content); err != nil {
+		return nil, err
+	}
 	required := make(map[string]struct{})
 	query, err := compileRawQuery(content.RawQuery, required)
 	if err != nil {
