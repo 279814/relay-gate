@@ -1,0 +1,18 @@
+{
+  "note": "不生成内容：没有 stream，也没有输出 token 字段。",
+  "headers": [
+    {"name": "user-agent", "values": ["claude-cli/2.1.220 (external, sdk-cli)"]},
+    {"name": "x-app", "values": ["cli"]},
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]},
+    {"name": "anthropic-version", "values": ["2023-06-01"]},
+    {"name": "anthropic-dangerous-direct-browser-access", "values": ["true"]},
+    {"name": "x-stainless-lang", "values": ["js"]},
+    {"name": "x-stainless-package-version", "values": ["0.70.1"]},
+    {"name": "x-stainless-os", "values": ["Windows"]},
+    {"name": "x-stainless-arch", "values": ["x64"]},
+    {"name": "x-stainless-runtime", "values": ["node"]},
+    {"name": "x-stainless-retry-count", "values": ["0"]}
+  ],
+  "body_text": "{\"model\":\"{{UPSTREAM_MODEL}}\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"{{PROBE_PROMPT}}\"}]}]}"
+}

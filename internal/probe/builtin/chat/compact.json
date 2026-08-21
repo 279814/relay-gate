@@ -1,0 +1,8 @@
+{
+  "note": "OpenAI Chat 用 max_tokens，与 Responses 的 max_output_tokens 不同名（§3.3.1）。",
+  "headers": [
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]}
+  ],
+  "body_text": "{\"model\":\"{{UPSTREAM_MODEL}}\",\"messages\":[{\"role\":\"user\",\"content\":\"{{PROBE_PROMPT}}\"}],\"max_tokens\":1,\"stream\":true}"
+}

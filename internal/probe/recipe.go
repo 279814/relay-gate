@@ -7,7 +7,7 @@ package probe
 //  1. Route 对该 Endpoint 的已发布配方
 //  2. Upstream 对该 Endpoint 的已发布配方
 //  3. ClientFingerprintLearner 产出的**已测试** profile
-//  4. 内置协议模板（P0-06 的 manifest，本层由调用方兜）
+//  4. 内置协议模板（P0-06 的 manifest）
 //
 // 为什么解析要单独一层而不是让探活自己挑：解析结果要连同「凭哪一层选中的」
 // 一起进 ProbeExecution，而 Store 会在写回时按那份记录重读并比较（§计划
@@ -23,13 +23,17 @@ import (
 	"github.com/279814/relay-gate/internal/probetemplate"
 )
 
-// ErrNoRecipe 表示四级里前三级都没有可用配方。
+// ErrNoRecipe 表示四级全无可用配方。
 //
-// 调用方据此走内置模板（第 4 级）。单独一个哨兵而不是返回 nil：
-// nil 会让「没有配方」与「解析出错」在调用点长得一样，而后者必须报出来 ——
-// 一份编译不过的 published recipe 静默改用内置模板的话，用户看不到任何提示，
-// 而他配的那份其实是坏的。
-var ErrNoRecipe = errors.New("该 endpoint 没有已发布配方或已测试 profile")
+// 接上内置模板（第 4 级）之后，这个错误只在**该 endpoint 连内置模板都没有**
+// 时出现 —— 也就是说它从「常规兜底路径」变成了「manifest 缺了一个 endpoint」
+// 这种发布事故。留着它而不是 panic：探活失败该报成一次 config_error，
+// 不该拖垮进程。
+//
+// 单独一个哨兵而不是返回 nil：nil 会让「没有配方」与「解析出错」在调用点
+// 长得一样，而后者必须报出来 —— 一份编译不过的 published recipe 静默改用
+// 内置模板的话，用户看不到任何提示，而他配的那份其实是坏的。
+var ErrNoRecipe = errors.New("该 endpoint 没有已发布配方、已测试 profile 或内置模板")
 
 // RecipeSource 是四级解析要读的三个来源，由 store.Store 实现。
 //
@@ -68,19 +72,33 @@ type ResolvedRecipe struct {
 	// StreamExpected 与 TimeoutProfile 是执行这份配方所需的两项，随解析一起
 	// 带出来 —— 它们存在 recipe version 里，而调用方拿不到那条记录。
 	//
-	// 尚无消费方：把 Prober 改成按解析结果发请求是下一步（本轮只到「解析出
-	// 可执行内容」）。带出来而不是等那一步再加，是因为它们与 Compiled 出自
-	// 同一条记录 —— 分两次读会让「用新模板配旧超时档」成为可能。
+	// 与 Compiled 出自同一条记录，所以必须一起带出：分两次读会让
+	// 「用新模板配旧超时档」成为可能。
 	//
 	// profile 层没有这两项：learner 学的是请求形状，而超时档按 endpoint 推。
 	StreamExpected bool
 	TimeoutProfile model.ProbeTimeoutProfile
+
+	// Builtin 只在命中第 4 级时非 nil，带出 token 估算与最小输出说明。
+	//
+	// 单独一个字段而不是把估算值抬到 ResolvedRecipe 上：前三级的成本要按
+	// ModelName 的 probe_max_tokens 估（那是用户配的），而内置模板的估算写在
+	// manifest 里。抬上来就得给前三级填一个「算出来的」值，于是两种来源在
+	// 同一个字段里，读的人无从知道手上这个是哪种。
+	Builtin *BuiltinTemplate
 }
 
 // RecipeResolver 按 §8.2 的优先级解析配方。
 type RecipeResolver struct {
 	source   RecipeSource
 	notFound func(error) bool
+	// builtins 是第 4 级。为 nil 表示用 embed 的那一份（LoadBuiltinTemplates
+	// 自带 sync.Once 缓存）。不在构造时加载是为了让 NewRecipeResolver 不返回
+	// error：manifest 是 embed 的常量数据，加载失败是发布事故，而把它变成
+	// 构造函数的 error 会让每个调用点都要处理一个生产里不可能出现的分支。
+	//
+	// 只在 WithBuiltins 里写，之后只读 —— Resolver 被并发探活共用。
+	builtins *BuiltinSet
 }
 
 func NewRecipeResolver(source RecipeSource) *RecipeResolver {
@@ -95,6 +113,14 @@ func (resolver *RecipeResolver) WithNotFound(isNotFound func(error) bool) *Recip
 	if isNotFound != nil {
 		resolver.notFound = isNotFound
 	}
+	return resolver
+}
+
+// WithBuiltins 换掉第 4 级用的内置模板集合，供测试注入。
+//
+// 生产不用调它：Resolve 会自己加载 embed 的那一份。
+func (resolver *RecipeResolver) WithBuiltins(set *BuiltinSet) *RecipeResolver {
+	resolver.builtins = set
 	return resolver
 }
 
@@ -142,10 +168,58 @@ func (resolver *RecipeResolver) Resolve(ctx context.Context, query RecipeQuery) 
 		return ResolvedRecipe{}, fmt.Errorf("读取 Upstream %d 的已测试 profile: %w", query.UpstreamID, err)
 	}
 
-	// 第 4 级由调用方兜（P0-06 的内置 manifest）。不在这里造一个内置模板：
-	// 那会让「内置模板长什么样」有两份定义。
-	return ResolvedRecipe{}, fmt.Errorf("%w: upstream=%d route=%d endpoint=%s",
-		ErrNoRecipe, query.UpstreamID, query.RouteID, query.Endpoint)
+	// 第 4 级：内置模板（P0-06 的 manifest）。
+	return resolver.fromBuiltin(query)
+}
+
+// fromBuiltin 取该 endpoint 的内置 compact 模板（第 4 级、§8.3）。
+//
+// 取 compact 而不是遍历全部候选：周期探活优先 compact-native（§8.3 明文），
+// 而带 requires 的候选（如 context-1m）不该被自动选中 —— 那会让所有站都发
+// 一个真实客户端不发的开关。挑选那些候选是 CalibrationRun 的事（§8.7）。
+func (resolver *RecipeResolver) fromBuiltin(query RecipeQuery) (ResolvedRecipe, error) {
+	// 不在这里把加载结果写回 resolver：一个 Resolver 被并发的探活共用
+	// （Scheduler 持有它），写字段就是数据竞争。LoadBuiltinTemplates 自己用
+	// sync.Once 缓存，重复调用只是一次 map 读。
+	set := resolver.builtins
+	if set == nil {
+		loaded, err := LoadBuiltinTemplates()
+		if err != nil {
+			// 不包成 ErrNoRecipe：manifest 坏了是发布事故，而 ErrNoRecipe
+			// 的语义是「这个 endpoint 本就没有兜底」。混起来会让一个数据文件
+			// 的问题看起来像配置缺失。
+			return ResolvedRecipe{}, fmt.Errorf("加载内置模板: %w", err)
+		}
+		set = loaded
+	}
+
+	template, err := set.Compact(query.Endpoint)
+	if err != nil {
+		return ResolvedRecipe{}, fmt.Errorf("%w: upstream=%d route=%d endpoint=%s: %v",
+			ErrNoRecipe, query.UpstreamID, query.RouteID, query.Endpoint, err)
+	}
+
+	identity := template.Identity()
+	if err := identity.Validate(); err != nil {
+		return ResolvedRecipe{}, fmt.Errorf("内置模板 %q 的 identity 不合法: %w", template.ID, err)
+	}
+
+	return ResolvedRecipe{
+		Layer:    model.ResolvedEmbedded,
+		Identity: identity,
+		Facts: model.RecipeBindingFacts{
+			Use:           model.BindingResolved,
+			ResolvedLayer: model.ResolvedEmbedded,
+			// 三个高优先级层都查过且都不存在，全部留零值 —— 「查过、不存在」
+			// 由 ResolvedLayer 表达（§8.2：高优先级的 absence 是受验证的事实）。
+		},
+		Compiled: template.Compiled(),
+		// 内置模板不引用 Secret（加载时已拒绝），所以没有 ref 可带。
+		SecretRefs:     nil,
+		StreamExpected: template.StreamExpected,
+		TimeoutProfile: template.TimeoutProfile,
+		Builtin:        template,
+	}, nil
 }
 
 // fromBinding 把一条 DB binding 变成可执行的解析结果。
