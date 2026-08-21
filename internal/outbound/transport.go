@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -54,9 +55,14 @@ type NetworkConfig struct {
 	// 各传自己的值，值不同必须不同池（§7.3）。
 	ConnectTimeout time.Duration
 
-	// dialer 与 tlsRoots 只给测试注入用，不来自配置。
-	dialer   dialFunc
-	tlsRoots *x509.CertPool
+	// dialer、tlsRoots 与 tlsHandshakeTimeout 只给测试注入用，不来自配置。
+	//
+	// tlsHandshakeTimeout 存在的唯一理由是让「内层那块表先响」变成可复现的：
+	// 生产里它与 ConnectTimeout 同值，谁先响看调度（那正是 CI 上的 flaky），
+	// 而测试要能稳定地构造出内层赢的那一半。
+	dialer              dialFunc
+	tlsRoots            *x509.CertPool
+	tlsHandshakeTimeout time.Duration
 }
 
 // NetworkFor 从 Upstream 的网络字段与本次用途的 connect 预算组出池身份。
@@ -147,15 +153,16 @@ func (transport *Transport) CloseIdleConnections() { transport.base.CloseIdleCon
 // 而不施加任何约束则让一个「TCP 通了但握手不完成」的站占住整份总预算。
 //
 // 手段是 httptrace 的 GotConn 回调 + 一个 timer：timer 到期就 cancel 这次请求
-// 的 context，GotConn 一到就 Stop timer。用一个 channel 而不是 timer.Stop 的
-// 返回值来判定「是否真的超时了」—— Stop 返回 false 只说明回调已被调度，
-// 不代表它跑完了，而错误分类要的是「cancel 确实是我们发的」。
+// 的 context，GotConn 一到就 Stop timer。
 func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if transport.connect <= 0 {
 		return transport.base.RoundTrip(request)
 	}
 
 	ctx, cancel := context.WithCancel(request.Context())
+	// gotConn 与 timedOut 一起把「失败发生在建连阶段」这件事变成可判定的，
+	// 而不依赖谁先响 —— 见 connectPhaseTimeout。
+	var gotConn atomic.Bool
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(transport.connect, func() {
 		close(timedOut)
@@ -165,7 +172,10 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 	// 已有的 trace（调用方装的观测）必须保留：httptrace.WithClientTrace 会
 	// 把两个 trace 合并（同名回调都调用），所以这里叠加而不是替换。
 	traced := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { timer.Stop() },
+		GotConn: func(httptrace.GotConnInfo) {
+			gotConn.Store(true)
+			timer.Stop()
+		},
 	})
 	response, err := transport.base.RoundTrip(request.WithContext(traced))
 	timer.Stop()
@@ -174,17 +184,63 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 		cancel()
 		// 区分「我们的 connect 预算到期」与「别的失败」：前者是站级
 		// Reachability 的证据，后者可能只是这一次的问题。
-		select {
-		case <-timedOut:
+		if transport.connectPhaseTimeout(request, err, gotConn.Load(), timedOut) {
 			return nil, fmt.Errorf("%w: 超过 %v", ErrConnectTimeout, transport.connect)
-		default:
-			return nil, err
 		}
+		return nil, err
 	}
 	// 拿到响应了就**不能**在这里 cancel：响应体还没读，cancel 会掐断流 ——
 	// 表现为「所有流式响应立刻断开」。释放挂到 body 关闭上。
 	response.Body = &bodyWithCancel{ReadCloser: response.Body, cancel: cancel}
 	return response, nil
+}
+
+// connectPhaseTimeout 判断这次失败是不是「建连阶段超了预算」。
+//
+// 为什么不能只看外层 timer 有没有开火：同一份 connect 预算有三个执行者 ——
+// 外层的 timer、http.Transport.TLSHandshakeTimeout、net.Dialer.Timeout。
+// 三块表几乎同时到期，谁先响看调度，而内层两条的路径都比外层短（外层要走
+// cancel → ctx.Done → 监听 goroutine 被调度 → 关连接 → 阻塞的 read 返回）。
+// 内层赢的那些次，错误是 net/http 的 "TLS handshake timeout" 或 net.DNSError，
+// 只看 timedOut 就会把它们判成「别的失败」—— 健康分类因此拿不到
+// 「是我们的预算截断了它」这个判据。这正是 CI 上那次 flaky 的根因：
+// 本机 Windows 的 loopback 稍慢，外层总是赢；CI 的共享 runner 上内层会赢。
+//
+// 判据换成三条，前两条任一成立且第三条不成立：
+//
+//  1. 外层 timer 开了火（timedOut 已关）—— 确定是我们发的 cancel。
+//  2. **连接还没建立**（GotConn 没到）且错误是个超时。此时无论哪块表赢，
+//     语义都是同一个：连接没建起来，而且是被时间限制截断的。
+//  3. 但**调用方自己的 ctx 先到期**时一律不算：那是「客户端不等了」或
+//     「上层的总预算用完了」，与「这个站连不上」完全是两件事。
+//
+// 第 2 条用 GotConn 而不是错误文本匹配：文本会随 Go 版本变，而「有没有拿到
+// 连接」是这个判断真正要问的东西。GotConn 之后的超时属于响应头/首字节阶段，
+// 由 Budget 管，绝不能归到 connect —— 那会把一个慢站误报成连不上。
+//
+// 第 3 条不能省。context.DeadlineExceeded 自己就满足 net.Error（Timeout()
+// 返回 true），而真实转发路径给的 ctx 带着 CapTotal 算出的总预算 ——
+// 少了这条，一次「客户端总预算在建连期间用完」会被报成站级不可达，
+// 而站级不可达会让该 Upstream 下**所有** Route 一并判死（§4.1）。
+func (transport *Transport) connectPhaseTimeout(request *http.Request,
+	err error, gotConn bool, timedOut <-chan struct{}) bool {
+
+	// 调用方的 ctx 先到期就不是我们的账。必须先判：它到期会连带取消
+	// 我们派生的 ctx，后判就把两者混为一谈了（与 classifyTransportErr
+	// 里「必须先判 clientCtx」是同一条理由）。
+	if request.Context().Err() != nil {
+		return false
+	}
+	select {
+	case <-timedOut:
+		return true
+	default:
+	}
+	if gotConn {
+		return false
+	}
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // bodyWithCancel 把 context 的释放挂到响应体关闭上。
@@ -321,10 +377,19 @@ func newTransport(network NetworkConfig) (*Transport, error) {
 	}
 
 	base := &http.Transport{
-		DialContext:         dialContextFor(network),
-		TLSHandshakeTimeout: network.ConnectTimeout,
-		TLSClientConfig:     tlsConfig,
-		DisableCompression:  true,
+		DialContext:        dialContextFor(network),
+		TLSClientConfig:    tlsConfig,
+		DisableCompression: true,
+
+		// TLSHandshakeTimeout 与外层 timer 是同一份预算的两个执行者，两块表
+		// 几乎同时到期，谁先响看调度 —— 内层赢时错误是 net/http 自己的
+		// "TLS handshake timeout"，不带我们的哨兵。
+		//
+		// 但**不能**靠删掉它来消除这个竞争：留着它，「握手卡住」在两条路径上
+		// 都会被截断；而 RoundTrip 的分类已改成不依赖谁先响（见那里的
+		// connectPhaseTimeout），所以两块表同时在反而更稳 —— 外层那条链
+		// （cancel → ctx.Done → 关连接）比内层长，多一道内层的保险没有坏处。
+		TLSHandshakeTimeout: handshakeTimeoutFor(network),
 
 		// 公益站延迟高，连接复用能省掉每次 TLS 握手（实测握手占首字节的
 		// 可观比例）。
@@ -352,6 +417,17 @@ func newTransport(network NetworkConfig) (*Transport, error) {
 	}
 
 	return &Transport{base: base, connect: network.ConnectTimeout}, nil
+}
+
+// handshakeTimeoutFor 取 TLS 握手的内层时限。
+//
+// 生产里恒等于 ConnectTimeout。只有测试会给一个更短的值，用来稳定地构造
+// 「内层那块表先响」—— 生产中那一半靠调度决定，本机复现不出来。
+func handshakeTimeoutFor(network NetworkConfig) time.Duration {
+	if network.tlsHandshakeTimeout > 0 {
+		return network.tlsHandshakeTimeout
+	}
+	return network.ConnectTimeout
 }
 
 // dialContextFor 造拨号函数。

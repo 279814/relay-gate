@@ -443,6 +443,125 @@ func TestTrace_ConcurrentRequestsShareTransportWithoutRace(t *testing.T) {
 	group.Wait()
 }
 
+// 建连超时的分类不得依赖「哪块表先响」。
+//
+// 这条钉的是一次真实的 CI flaky（PR #35 合并后 main 上那次红）：同一份
+// connect 预算有三个执行者 —— 外层 timer、TLSHandshakeTimeout、
+// net.Dialer.Timeout。三块表同值、几乎同时到期，而内层两条的路径都比外层短，
+// 于是「谁先响」由调度决定。内层赢时错误是 net/http 的 "TLS handshake
+// timeout"，不带 ErrConnectTimeout —— 健康分类拿不到「是我们的预算截断了它」
+// 这个判据。本机 Windows 的 loopback 稍慢，外层总赢，所以本地怎么跑都是绿的。
+//
+// 这里把内层时限显式配得远短于外层，让内层**必然**先响 —— 把那一半从
+// 「跑很多次也许能撞上」变成每次都验。
+func TestConnectTimeout_ClassifiesWhenInnerClockWins(t *testing.T) {
+	// 外层给足 5 秒且绝不开火，内层 80ms 必然先响。
+	network := netFor(netUpstream(), 5*time.Second)
+	network.tlsHandshakeTimeout = 80 * time.Millisecond
+
+	target := "https://" + listenAndHang(t) + "/v1/models"
+	transport := mustTransport(t, newTestManager(t), network)
+
+	request, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	response, err := transport.RoundTrip(request)
+	elapsed := time.Since(start)
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("握手不完成的站必须失败")
+	}
+
+	// 先确认这次确实是内层赢的：外层 5 秒没到，耗时应在内层时限量级。
+	// 不加这条的话，一次「外层莫名提前开火」会让本测试变成 CoversEveryPhase
+	// 的重复，而它要验的那一半其实没跑到。
+	if elapsed > 2*time.Second {
+		t.Fatalf("本测试要构造的是内层先响，但耗时 %v 说明是外层截断的", elapsed)
+	}
+	if !errors.Is(err, ErrConnectTimeout) {
+		t.Errorf("内层 TLSHandshakeTimeout 先响时同样要归成 connect 超时，"+
+			"否则健康分类会把「连不上」当成一次普通失败，得到 %v", err)
+	}
+}
+
+// GotConn 之后的超时**不得**归成 connect 超时。
+//
+// 这是上一条的反面，两条一起才把边界钉住：connectPhaseTimeout 的第二条判据
+// 是「没拿到连接 + 错误是超时」，若漏掉 GotConn 那一半，一个连上了但响应慢的
+// 站会被误报成「连不上」—— 而那两者对健康状态的含义完全相反（站级不可达
+// 会让该站下所有 Route 一并判死）。
+func TestConnectTimeout_SlowResponseIsNotAConnectTimeout(t *testing.T) {
+	const connect = 100 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 连接建立后长时间不回响应头。调用方的 ctx 会先到期。
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	upstream := &model.Upstream{ID: 9, BaseURL: server.URL, NetworkRevision: 1}
+	transport := mustTransport(t, newTestManager(t), netFor(upstream, connect))
+
+	// 用调用方的 ctx 施加一个「响应头阶段」的时限：真实路径上这一段由
+	// Budget 管，不由 connect 预算管。
+	ctx, cancel := context.WithTimeout(context.Background(), 4*connect)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(request)
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("调用方 ctx 到期后请求应失败")
+	}
+	if errors.Is(err, ErrConnectTimeout) {
+		t.Errorf("连接已建立，之后的慢响应绝不能归成 connect 超时 —— "+
+			"那会把一个慢站误报成整站不可达，得到 %v", err)
+	}
+}
+
+// 调用方自己的 ctx 在建连期间到期，**不得**归成 connect 超时。
+//
+// 这条与上一条的差别是时机：上一条在 GotConn 之后到期（被 gotConn 挡住），
+// 这条在建连**期间**到期 —— 那时 gotConn 还没置位，只靠「没拿到连接 + 错误
+// 是超时」会误判，因为 context.DeadlineExceeded 自己就满足 net.Error。
+//
+// 后果不是一条误导的日志：站级不可达会让该 Upstream 下所有 Route 一并判死
+// （§4.1）。真实转发给的 ctx 带着 CapTotal 算出的总预算，所以「客户端总预算
+// 在一次慢建连中用完」是条真实路径。
+func TestConnectTimeout_CallerDeadlineDuringConnectIsNotOurs(t *testing.T) {
+	// connect 预算给足 10 秒且不会开火；调用方的 ctx 100ms 后到期。
+	network := netFor(netUpstream(), 10*time.Second)
+	network.dialer = blockingDialer{phase: phaseTCP}
+	transport := mustTransport(t, newTestManager(t), network)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://192.0.2.1/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	response, err := transport.RoundTrip(request)
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("调用方 ctx 到期后请求应失败")
+	}
+	// 确认这次确实是调用方的 ctx 截断的，而不是我们的 10 秒预算。
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("本测试要构造的是调用方 ctx 先到期，但耗时 %v 说明是 connect 预算截断的", elapsed)
+	}
+	if errors.Is(err, ErrConnectTimeout) {
+		t.Errorf("调用方 ctx 到期是「上层不等了」，不是「这个站连不上」—— "+
+			"归错会让该站下所有 Route 一并判死，得到 %v", err)
+	}
+}
+
 func TestManager_RejectsBadProxyURL(t *testing.T) {
 	upstream := netUpstream()
 	upstream.ProxyURL = "http://[::1"
