@@ -87,6 +87,40 @@ func IsAuthHeader(name string) bool {
 	return false
 }
 
+// HopByHopHeaders 是 RFC 7230 §6.1 的逐跳头，**唯一**清单。
+//
+// 它们由传输层管，不得由配置提供。两条路径依赖这份清单：
+//   - 转发时逐跳清理（漏一个就是把上游连接的 keep-alive 参数当成客户端的）
+//   - Recipe/Endpoint 模板的编译期拒绝（配置写了、请求里却没有，且不报错）
+//
+// 集中在这里的理由与 AuthHeaders 相同：两处各抄一份必然分叉，而分叉的
+// 那一半是「看起来在防、实际没防」。
+//
+// Host、Content-Length 不在此列 —— 它们不是逐跳头，而是由 Transport 按
+// 请求本身重算的字段，各自有专门的拒绝理由（Host 走 Upstream Host Override，
+// Content-Length 由 http 库按 body 算）。
+var HopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// IsHopByHopHeader 判断一个头名是否是逐跳头（大小写不敏感）。
+func IsHopByHopHeader(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, h := range HopByHopHeaders {
+		if strings.ToLower(h) == name {
+			return true
+		}
+	}
+	return false
+}
+
 // MatchMode 决定入站 model 值如何匹配到 ModelName（§3.4）。
 type MatchMode string
 
