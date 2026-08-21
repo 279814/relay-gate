@@ -62,6 +62,13 @@ type Outcome struct {
 	RetryAfter time.Duration
 	// Status 是上游 HTTP 状态码，0 表示连响应头都没拿到。
 	Status int
+	// EstTokens 是这次探活的估算 token 上界，0 表示「按 ModelName 粗算」。
+	//
+	// 由内置模板的 manifest 声明值填（§5.2d）。带出来而不是让记账侧自己算：
+	// 记账侧只有 ModelName，而实际发出去的 body 来自解析出的 Recipe ——
+	// 两者可以完全不同（一份用户配的 recipe 想发多长就多长），于是按
+	// ModelName 算出的数与实际发的请求无关。
+	EstTokens int
 }
 
 // ClassifyHTTP 按 §4.3 把一次 HTTP 响应归类。

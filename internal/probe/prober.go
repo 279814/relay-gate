@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
@@ -29,28 +28,20 @@ type Prober struct {
 	// 只在生产流量上显形。
 	Targets outbound.TargetProvider
 
-	// Secrets 提供固定 query 里的 Probe Secret。可为 nil。
+	// Secrets 提供 Recipe 与固定 query 里的 Probe Secret。可为 nil ——
+	// 那时引用了 Secret 的 Recipe 会以 config_error 失败，而不引用的照常工作。
 	Secrets outbound.SecretSource
+
+	// Recipes 是四级解析器（§8.2）。为 nil 时退化成「只用内置模板」，
+	// 见 Prober.recipes 的说明。
+	Recipes *RecipeResolver
 }
 
-// resolve 解析一次探活的出站目标。
+// values 组装 URL 与认证要的占位符（UPSTREAM_API_KEY 与 SECRET:）。
 //
-// use 必须由调用方明确给出：同一条 legacy 记录对真实流量与合成探活的处理
-// 完全不同（后者 fail closed），默认值会让这个区别静默消失。
-func (p *Prober) resolve(ctx context.Context, up *model.Upstream,
-	kind model.EndpointKind) (outbound.ResolvedTarget, error) {
-
-	if p.Targets == nil {
-		return outbound.ResolvedTarget{}, errors.New("探活未装配出站目标解析器")
-	}
-	return p.Targets.ResolveTarget(ctx, outbound.TargetInput{
-		Upstream: up.ProbeConfig(),
-		Endpoint: kind,
-		Values:   p.values(up),
-		Use:      outbound.ResolveSyntheticProbe,
-	})
-}
-
+// 与 TemplateValues 的分工：这个只服务 URL 与认证头（outbound 侧），
+// 而 Recipe 的 header/query/body 用 TemplateValues —— 后者还要提供模型名、
+// prompt 这些属于 body 模板的值。见 outbound.Values 的说明。
 func (p *Prober) values(up *model.Upstream) outbound.Values {
 	return outbound.Values{
 		UpstreamAPIKey:     []byte(up.APIKey),
@@ -59,35 +50,19 @@ func (p *Prober) values(up *model.Upstream) outbound.Values {
 	}
 }
 
-// probeHeaders 组装探活请求头，认证走唯一的改写器（§7.2）。
-//
-// profile 来自 target：URL 与认证出自同一条 Endpoint 记录的同一个 revision。
-// 探活侧传 ResolveSyntheticProbe —— legacy 的双发认证对合成探活必须
-// fail closed，那条记录只是「历史上这么发过」，对探活而言仍是无依据地
-// 同时发两种认证。
-func (p *Prober) probeHeaders(ctx context.Context, up *model.Upstream,
-	target outbound.ResolvedTarget, proto model.Protocol, stream bool) (http.Header, error) {
-
-	header := buildHeaders(up, proto, stream)
-	err := outbound.ApplyAuth(ctx, header, outbound.AuthInput{
-		Profile: target.AuthProfile,
-		Values:  p.values(up),
-		Use:     outbound.ResolveSyntheticProbe,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return header, nil
-}
-
 // probeConfigOutcome 把「还没发出去就失败了」翻译成 Outcome。
 //
 // legacy 待审核与普通配置错误分开：前者是「这个站的 URL 或认证还没人审核过」，
 // 动作是提示用户去审核；后者是配置写错了。混成一类会让用户对着一个
 // 「配置错误」找不到该改什么。
 //
-// 两类都不发网络请求（§6.5 的 route-local 失败），所以都不该被计成
+// 三类都不发网络请求（§8.6 末段的 route-local 失败），所以都不该被计成
 // 「上游拒了我们」—— 那会让一个配置问题累计成上游判死。
+//
+// 模板/Secret 失败（ErrTemplateValue、ErrNoRecipe）走同一条：它们同样是
+// 「没发出去」，而 Unavailable 会累计健康失败。这在 P0 是刻意的粗粒度 ——
+// 精确的 config_error 状态要等 P0-08 的 ResponseClassifier 与 P0-09 的
+// ProbeExecution 落库，那时才有地方记「这次失败的类别」。
 func probeConfigOutcome(err error) Outcome {
 	if errors.Is(err, outbound.ErrLegacyNeedsReview) {
 		return Outcome{Verdict: health.VerdictIgnore, Err: err}
@@ -118,14 +93,15 @@ func redactOutcome(out Outcome, up *model.Upstream) Outcome {
 	return out
 }
 
-// L1 是传输层探测（§4.1）：GET {base_url}{l1_path}，零 token。
+// L1 是传输层探测（§4.1）：打 {base_url}{l1_path}，零 token。
 //
 // 判定规则里最关键的一条是 **404/405 视为通过**：很多站不提供 /v1/models，
 // 但 /v1/messages 完全正常。把 404 当失败会把这些站整站判死 ——
 // 而 L1 是 Upstream 粒度的，一次误判会连坐它下面所有 Route。
 //
-// l1_path 为空时只做连接层探测（HEAD base_url），给那些连 /v1/models
-// 都会报错的站留一条退路。
+// 请求内容出自四级解析（§8.2）：Route/Upstream 的已发布 models 配方、
+// 已测试 profile，或内置 compact 模板。l1_path 为空时方法改成 HEAD ——
+// 那是「只探连接层」的语义，见 prepare。
 func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (out Outcome) {
 	// 统一在出口脱敏，覆盖下面所有 return 路径（含 ClassifyHTTP 拼的上游原文）。
 	// 逐个 return 包一层的话，六条返回路径漏掉任何一条就是一个泄露口，
@@ -135,38 +111,13 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L1TotalSec)*time.Second)
 	defer cancel()
 
-	// L1 的地址由 models Endpoint 解析（迁移已把 l1_path 落成它的 url_override）。
-	// 方法仍按 l1_path 决定：为空表示只探连接层（HEAD base_url），那是给
-	// 「连 /v1/models 都会报错的站」留的退路，而 URL 层表达不了这个区别。
-	target, err := p.resolve(ctx, up, model.EndpointModels)
+	prepared, err := p.prepare(ctx, up, nil, nil, model.EndpointModels)
 	if err != nil {
 		return probeConfigOutcome(err)
-	}
-
-	path := strings.TrimSpace(up.L1Path)
-	method := http.MethodGet
-	if path == "" {
-		method = http.MethodHead
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, target.RawURL, nil)
-	if err != nil {
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("构造 L1 请求: %w", err)}
-	}
-	header, err := p.probeHeaders(ctx, up, target, model.ProtoAnthropic, false)
-	if err != nil {
-		// 认证配错与 URL 配错走同一条翻译：两者都是「没发出去」，
-		// 而 legacy 待审核在两处都要区别于普通配置错误。
-		return probeConfigOutcome(err)
-	}
-	req.Header = header
-	if target.RequestHost != "" {
-		req.Host = target.RequestHost
 	}
 
 	start := time.Now()
-	resp, err := p.Transport.RoundTrip(req)
+	resp, err := p.Transport.RoundTrip(prepared.request)
 	if err != nil {
 		if out, ok := ctxOutcome(ctx, err); ok {
 			return out
@@ -181,8 +132,8 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxClassifyBody))
 	ttft := time.Since(start)
 
-	// 连接层探测：能拿到任何响应就算通。
-	if path == "" {
+	// 连接层探测（空 l1_path → HEAD）：能拿到任何响应就算通。
+	if prepared.request.Method == http.MethodHead {
 		return Outcome{Verdict: health.VerdictOK, TTFT: ttft, Status: resp.StatusCode}
 	}
 
@@ -199,7 +150,10 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 // L2 是模型层探测（§4.1）：用 Route 的真实配置发一次最小的流式请求。
 //
 // 必须 stream:true —— 非流式只能测总时长，测不出首 Token 时间，
-// 而「首 Token 慢」正是公益站最典型的劣化形态。
+// 而「首 Token 慢」正是公益站最典型的劣化形态。这一项现在由解析出的
+// Recipe 声明（StreamExpected），而所有内置模型端点模板都声明了它；
+// 一个 StreamExpected=false 的用户配方会走同一条读流路径，只是拿不到
+// 首 Token 时间 —— 那是他自己的选择，不该被静默改写。
 //
 // 读到首个有效事件后立即返回并关闭响应体，不再消耗上游 token（§4.1）。
 func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName,
@@ -212,38 +166,19 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L2TotalSec)*time.Second)
 	defer cancel()
 
-	body, err := buildProbeBody(mn, rt)
-	if err != nil {
-		return Outcome{Verdict: health.VerdictUnavailable, Err: err}
-	}
-
-	// 出站 URL 与真实转发走同一个 Resolver：探活打的必须是真实请求会打的
-	// 那个地址，包括 legacy 兼容记录这类逃生舱。两边各拼一套的话，
-	// 探活成功不代表真实请求能通。
 	kind, ok := mn.Protocol.Endpoint()
 	if !ok {
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
 	}
-	target, err := p.resolve(ctx, up, kind)
+	prepared, err := p.prepare(ctx, up, mn, rt, kind)
 	if err != nil {
 		return probeConfigOutcome(err)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.RawURL, strings.NewReader(string(body)))
-	if err != nil {
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("构造 L2 请求: %w", err)}
-	}
-	header, err := p.probeHeaders(ctx, up, target, mn.Protocol, true)
-	if err != nil {
-		return probeConfigOutcome(err)
-	}
-	req.Header = header
-	if target.RequestHost != "" {
-		req.Host = target.RequestHost
-	}
-	req.ContentLength = int64(len(body))
+	req := prepared.request
+	// 把这次实际发出去的内容的估算成本带到每条返回路径上（§5.2d）。失败的
+	// 探活同样花钱（请求已经发出去了），所以不能只在成功分支填。
+	defer func() { out.EstTokens = prepared.estimatedTokens(mn) }()
 
 	// 响应头阶段单独设时限，理由同转发路径（forward.go）：
 	// 一个「收下请求但不回响应头」的站，只靠 Total 兜底会占满整个探测窗口。
@@ -366,64 +301,4 @@ func streamErrStatus(payload []byte) int {
 		}
 	}
 	return http.StatusInternalServerError
-}
-
-// buildProbeBody 按协议构造最小探活请求（§4.1）。
-//
-// 三种协议的参数名不同（§3.3.1），且 Responses 协议的 max_output_tokens
-// 不能给 1 —— 实测部分站直接拒绝，默认值里已按协议区分（model.Defaults）。
-func buildProbeBody(mn *model.ModelName, rt *model.Route) ([]byte, error) {
-	// 上游模型名：配了映射用映射后的，没配就用 ModelName 原名。
-	// 这与转发路径的规则一致（§3.3.2），否则探的模型和真实请求打的
-	// 不是同一个 —— 探活通过但真实请求 model_not_found。
-	name := mn.Name
-	if rt != nil && rt.UpstreamModel != "" {
-		name = rt.UpstreamModel
-	}
-
-	prompt := mn.ProbePrompt
-	if prompt == "" {
-		prompt = "1+1=?"
-	}
-	maxTok := mn.ProbeMaxTokens
-	if maxTok <= 0 {
-		maxTok = 1
-	}
-
-	var payload map[string]any
-	switch mn.Protocol {
-	case model.ProtoAnthropic:
-		payload = map[string]any{
-			"model":      name,
-			"max_tokens": maxTok,
-			"stream":     true,
-			"messages": []map[string]any{
-				{"role": "user", "content": prompt},
-			},
-		}
-	case model.ProtoOpenAIChat:
-		payload = map[string]any{
-			"model":      name,
-			"max_tokens": maxTok,
-			"stream":     true,
-			"messages": []map[string]any{
-				{"role": "user", "content": prompt},
-			},
-		}
-	case model.ProtoOpenAIResponses:
-		if maxTok < 16 {
-			// 实测 max_output_tokens=1 会被部分站直接拒绝
-			maxTok = 16
-		}
-		payload = map[string]any{
-			"model":             name,
-			"max_output_tokens": maxTok,
-			"stream":            true,
-			"input":             prompt,
-		}
-	default:
-		return nil, fmt.Errorf("未知协议 %q", mn.Protocol)
-	}
-
-	return json.Marshal(payload)
 }

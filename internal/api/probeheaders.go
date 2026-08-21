@@ -65,9 +65,9 @@ func probeHeadersFromSample(h http.Header) (tmpl map[string]string, skipped []st
 		// （probe/headers.go 的 injectAuth），而 probe_headers 是明文 JSON。
 		// 让它带 key 等于开了第二个不受加密保护的 key 来源。
 		//
-		// 这里自己过滤而不是依赖下游（buildHeaders 会跳过、model.Validate
-		// 会拒绝）：那两处是纵深防御，而这里是**语义**上的正确 ——
-		// 导出一个注定无效的头，本身就是错的。
+		// 这里自己过滤而不是依赖下游（applyUpstreamHeaderOverrides 会跳过、
+		// model.Validate 会拒绝）：那两处是纵深防御，而这里是**语义**上的
+		// 正确 —— 导出一个注定无效的头，本身就是错的。
 		//
 		// 用 sample.IsSensitiveHeader 而不是 model.IsAuthHeader：前者是
 		// 「样本里哪些头被脱敏过」的唯一来源，比后者多 Proxy-Authorization
@@ -96,10 +96,10 @@ func probeHeadersFromSample(h http.Header) (tmpl map[string]string, skipped []st
 //   - 由 Transport 管的：host、connection、accept-encoding、
 //     transfer-encoding —— 手工设这些会与 Go 的 http.Transport 打架
 //     （它会自己填，而重复的 Host 头是协议错误）
-//   - 由 buildHeaders 按协议设的：anthropic-version、accept。
-//     必须排除，因为 probe_headers 的覆盖发生在它们**之后**
-//     （probe/headers.go 的三层叠加），从样本抄来的值会赢 ——
-//     于是一个 Anthropic 样本导出的版本头会被带到 OpenAI 协议的探活上，
+//   - 由内置模板按端点设的：anthropic-version、accept。
+//     必须排除，因为 probe_headers 的覆盖发生在模板渲染**之后**
+//     （probe.applyUpstreamHeaderOverrides），从样本抄来的值会赢 ——
+//     于是一个 Anthropic 样本导出的版本头会被带到 OpenAI 端点的探活上，
 //     而 accept 会把流式探活的 text/event-stream 覆盖成 application/json，
 //     那会让 L2 收不到 SSE、判成假活
 //   - 本网关自己加的：不属于上游指纹

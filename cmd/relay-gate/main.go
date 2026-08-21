@@ -133,7 +133,13 @@ func run() error {
 
 	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
 		WithCost(cost).
-		WithTargets(targets, st)
+		WithTargets(targets, st).
+		WithRecipes(probe.NewRecipeResolver(st).WithNotFound(func(err error) bool {
+			// 「这一级没有」的判据（§8.2）。写错的后果是解析永远落不到低
+			// 优先级 —— 它会把 ErrNotFound 当成读库出错直接返回，于是每个
+			// 站的探活都以「读取配方失败」结束。
+			return errors.Is(err, store.ErrNotFound)
+		}))
 	persister := health.NewPersister(tracker, st, log)
 
 	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：

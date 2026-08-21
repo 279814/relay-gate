@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "capture_families": [
+    {
+      "id": "claude-code-2.1.220",
+      "client": "Claude Code",
+      "client_version": "2.1.220",
+      "metadata_redacted": true,
+      "note": "§3.1 隔离抓包所得。客户端版本是可更新的族元数据，模板固定实际版本；升级客户端时新增一个族，不改这一条。"
+    },
+    {
+      "id": "protocol-baseline",
+      "metadata_redacted": true,
+      "note": "协议文档的最小请求，没有客户端抓包。刻意不带任何客户端指纹 —— 凭空编一个 UA 等于伪造证据来源。"
+    }
+  ],
+  "templates": [
+    {
+      "id": "builtin:models:compact:1",
+      "revision": 1,
+      "file": "models/compact.json",
+      "family": "compact_native",
+      "capture_family": "claude-code-2.1.220",
+      "endpoint": "models",
+      "method": "GET",
+      "timeout_profile": "l1",
+      "estimated_input_tokens": 0,
+      "max_output_tokens": 0,
+      "minimal_output": "任意可解析的响应即算可达；模型列表本身不是判活证据（§8.7）",
+      "note": "零 token 的传输层探测。404/405 由调用方视为通过 —— 站不提供这个端点不等于站挂了。"
+    },
+    {
+      "id": "builtin:messages:compact:1",
+      "revision": 1,
+      "file": "anthropic/compact.json",
+      "family": "compact_native",
+      "capture_family": "claude-code-2.1.220",
+      "endpoint": "messages",
+      "method": "POST",
+      "timeout_profile": "l2_standard",
+      "stream_expected": true,
+      "estimated_input_tokens": 12,
+      "max_output_tokens": 1,
+      "minimal_output": "一个非空 content_block_delta，或非零 output_tokens",
+      "note": "周期探活用它。保留 §3.1 实测的 ?beta=true 与九项 beta，但不含 context-1m —— 真实客户端不发那个开关。"
+    },
+    {
+      "id": "builtin:messages:calibration:context-1m:1",
+      "revision": 1,
+      "file": "anthropic/calibration-context-1m.json",
+      "family": "calibration_native",
+      "capture_family": "claude-code-2.1.220",
+      "endpoint": "messages",
+      "method": "POST",
+      "timeout_profile": "l2_standard",
+      "stream_expected": true,
+      "estimated_input_tokens": 12,
+      "max_output_tokens": 1,
+      "requires": ["beta:context-1m-2025-08-07"],
+      "minimal_output": "一个非空 content_block_delta",
+      "note": "只在上游明确要求 context-1m 时作为校准候选（§3.2 的 anyrouter）。不进常规周期：M0 那次「需 1M」已复核为误报（§9.1.1 复核点 2）。"
+    },
+    {
+      "id": "builtin:messages:basic:1",
+      "revision": 1,
+      "file": "anthropic/basic.json",
+      "family": "basic_protocol",
+      "capture_family": "protocol-baseline",
+      "endpoint": "messages",
+      "method": "POST",
+      "timeout_profile": "l2_standard",
+      "stream_expected": true,
+      "estimated_input_tokens": 8,
+      "max_output_tokens": 1,
+      "minimal_output": "一个非空 content_block_delta",
+      "note": "兼容实现的最后基线：只有协议必需的字段，没有任何客户端指纹。按 UA 白名单拦截的站会拒它，但形状最保守。"
+    },
+    {
+      "id": "builtin:count_tokens:compact:1",
+      "revision": 1,
+      "file": "count_tokens/compact.json",
+      "family": "compact_native",
+      "capture_family": "claude-code-2.1.220",
+      "endpoint": "count_tokens",
+      "method": "POST",
+      "timeout_profile": "count_tokens",
+      "estimated_input_tokens": 12,
+      "max_output_tokens": 0,
+      "minimal_output": "一个正整数 input_tokens",
+      "note": "不生成内容，所以输出 token 为 0，body 里也不能带 stream —— 部分站会因为多一个不认识的字段拒绝整个请求。"
+    },
+    {
+      "id": "builtin:responses:compact:1",
+      "revision": 1,
+      "file": "responses/compact.json",
+      "family": "compact_native",
+      "capture_family": "protocol-baseline",
+      "endpoint": "responses",
+      "method": "POST",
+      "timeout_profile": "l2_standard",
+      "stream_expected": true,
+      "estimated_input_tokens": 10,
+      "max_output_tokens": 16,
+      "minimal_output": "一个非空 response.output_text.delta 或 response.refusal.delta",
+      "note": "max_output_tokens 取 16 而不是 1：实测部分站直接拒绝 1。这是本端点能接受的最小值。"
+    },
+    {
+      "id": "builtin:chat_completions:compact:1",
+      "revision": 1,
+      "file": "chat/compact.json",
+      "family": "compact_native",
+      "capture_family": "protocol-baseline",
+      "endpoint": "chat_completions",
+      "method": "POST",
+      "timeout_profile": "l2_standard",
+      "stream_expected": true,
+      "estimated_input_tokens": 10,
+      "max_output_tokens": 1,
+      "minimal_output": "一个非空 choices[].delta.content，或非零 completion_tokens",
+      "note": "OpenAI Chat 用 max_tokens（与 Responses 的 max_output_tokens 不同名，§3.3.1）。"
+    }
+  ]
+}

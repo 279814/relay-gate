@@ -1,0 +1,8 @@
+{
+  "note": "max_output_tokens 取 16：实测部分站直接拒绝 1，这是本端点能接受的最小值。",
+  "headers": [
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]}
+  ],
+  "body_text": "{\"model\":\"{{UPSTREAM_MODEL}}\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"{{PROBE_PROMPT}}\"}]}],\"max_output_tokens\":16,\"stream\":true}"
+}

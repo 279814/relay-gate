@@ -1,6 +1,13 @@
 # 默认按文本处理，行尾交给各平台
 * text=auto
 
+# 内置探活模板（P0-06）。这些是 embed 进二进制的数据文件，而 body_text 的
+# 内容会**逐字节**成为发出去的请求体。行尾按平台变化的话，同一份模板在
+# Windows 检出与 Linux 检出上会产生不同的字节 —— 而 `* text=auto` 恰恰
+# 允许那种变化。
+internal/probe/builtin/**/*.json text eol=lf
+internal/probe/builtin/*.json    text eol=lf
+
 # 这些必须是 LF：目标运行环境是 Linux + Docker，
 # CRLF 会让 shell 直接报 "bash: \r: command not found"
 *.sh   text eol=lf

@@ -1,0 +1,20 @@
+{
+  "note": "compact 加上 context-1m beta。只在上游明确要求它时作为校准候选（§3.2）。",
+  "raw_query": "beta=true",
+  "headers": [
+    {"name": "user-agent", "values": ["claude-cli/2.1.220 (external, sdk-cli)"]},
+    {"name": "x-app", "values": ["cli"]},
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]},
+    {"name": "anthropic-version", "values": ["2023-06-01"]},
+    {"name": "anthropic-beta", "values": ["claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,context-1m-2025-08-07"]},
+    {"name": "anthropic-dangerous-direct-browser-access", "values": ["true"]},
+    {"name": "x-stainless-lang", "values": ["js"]},
+    {"name": "x-stainless-package-version", "values": ["0.70.1"]},
+    {"name": "x-stainless-os", "values": ["Windows"]},
+    {"name": "x-stainless-arch", "values": ["x64"]},
+    {"name": "x-stainless-runtime", "values": ["node"]},
+    {"name": "x-stainless-retry-count", "values": ["0"]}
+  ],
+  "body_text": "{\"model\":\"{{UPSTREAM_MODEL}}\",\"max_tokens\":1,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"{{PROBE_PROMPT}}\"}]}]}"
+}

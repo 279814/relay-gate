@@ -1,0 +1,9 @@
+{
+  "note": "协议最小请求。刻意不带任何客户端指纹 —— 它属 protocol-baseline 族，没有抓包证据。",
+  "headers": [
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]},
+    {"name": "anthropic-version", "values": ["2023-06-01"]}
+  ],
+  "body_text": "{\"model\":\"{{UPSTREAM_MODEL}}\",\"max_tokens\":1,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"{{PROBE_PROMPT}}\"}]}"
+}

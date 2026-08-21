@@ -459,13 +459,13 @@ func TestProbeHeaders_ExcludesAllSensitiveHeadersNotJustAuthHeaders(t *testing.T
 	}
 }
 
-func TestProbeHeaders_ExcludesHeadersBuildHeadersOwns(t *testing.T) {
-	// probe/headers.go 的三层叠加里，probe_headers 的覆盖发生在
-	// anthropic-version 与 accept **之后**，所以从样本抄来的值会赢。
+func TestProbeHeaders_ExcludesHeadersTheRecipeOwns(t *testing.T) {
+	// probe_headers 的覆盖发生在 Recipe 渲染**之后**
+	// （probe.applyUpstreamHeaderOverrides），所以从样本抄来的值会赢。
 	//
-	// accept 是其中后果最实际的一个：探活流式请求需要
-	// text/event-stream，被样本里的 application/json 覆盖后 L2 收不到 SSE，
-	// 会被判成假活 —— 一个完全可用的站因此被判死。
+	// accept 是其中后果最实际的一个：探活流式请求需要 text/event-stream，
+	// 被样本里的 application/json 覆盖后 L2 收不到 SSE，会被判成假活 ——
+	// 一个完全可用的站因此被判死。
 	h := http.Header{}
 	h.Set("Anthropic-Version", "2023-06-01")
 	h.Set("Accept", "application/json")
@@ -473,10 +473,10 @@ func TestProbeHeaders_ExcludesHeadersBuildHeadersOwns(t *testing.T) {
 
 	tmpl, _ := probeHeadersFromSample(h)
 	if _, ok := tmpl["accept"]; ok {
-		t.Error("accept 由 buildHeaders 按 stream 设，从样本抄会让 L2 收不到 SSE")
+		t.Error("accept 由内置模板按端点设，从样本抄会让 L2 收不到 SSE")
 	}
 	if _, ok := tmpl["anthropic-version"]; ok {
-		t.Error("anthropic-version 由 buildHeaders 按协议设，抄了会跨协议串味")
+		t.Error("anthropic-version 由内置模板按端点设，抄了会跨协议串味")
 	}
 	if tmpl["x-app"] != "cli" {
 		t.Error("x-app 应保留")
@@ -507,9 +507,9 @@ func TestProbeHeaders_ExcludesTransportManagedHeaders(t *testing.T) {
 }
 
 func TestProbeHeaders_NormalizesToLowercase(t *testing.T) {
-	// probe/headers.go 的 buildHeaders 用 h.Set 逐个覆盖默认模板，
-	// 而默认模板的键全是小写。大小写不一致的话，从样本导出的
-	// "User-Agent" 不会覆盖默认的 "user-agent" —— 两个头都会发出去。
+	// probe.applyUpstreamHeaderOverrides 用 header.Set 逐个覆盖渲染出的头，
+	// 而内置模板的头名全是小写。大小写不一致时 Set 仍按规范化名匹配，
+	// 但模板里存的键是小写 —— 界面上的 diff 要能对上，就得同样小写。
 	h := http.Header{}
 	h.Set("X-Stainless-Lang", "js")
 	tmpl, _ := probeHeadersFromSample(h)

@@ -186,23 +186,63 @@ func TestRecipeResolver_FallsBackToTestedProfile(t *testing.T) {
 	}
 }
 
-// 四级全无时返回 ErrNoRecipe，供调用方走内置模板（P0-06）。
+// 三级都无时落到内置模板（第 4 级，P0-06 的 manifest）。
 //
-// 不在这里造一个内置模板：那会让「内置模板长什么样」有两份定义，
-// 而 P0-06 的 manifest 才是唯一来源。
-func TestRecipeResolver_ReturnsErrNoRecipeWhenAllLayersAbsent(t *testing.T) {
+// 内置模板不在这里另造一份：manifest 是唯一来源，而测试里手搓一个
+// 会让「内置模板长什么样」有两份定义。
+func TestRecipeResolver_FallsBackToBuiltinTemplate(t *testing.T) {
 	source := &fakeRecipeSource{}
 
-	_, err := testResolver(source).Resolve(context.Background(), RecipeQuery{
+	resolved, err := testResolver(source).Resolve(context.Background(), RecipeQuery{
 		UpstreamID: 1, RouteID: 2, Endpoint: model.EndpointModels,
 	})
-	if !errors.Is(err, ErrNoRecipe) {
-		t.Fatalf("四级全无时应回 ErrNoRecipe（调用方据此走内置模板），得到 %v", err)
+	if err != nil {
+		t.Fatalf("三级全无时应落到内置模板: %v", err)
 	}
-	// 三级都要查过才能断定「全无」。
+	if resolved.Layer != model.ResolvedEmbedded {
+		t.Errorf("layer want embedded got %q", resolved.Layer)
+	}
+	if resolved.Builtin == nil {
+		t.Fatal("命中内置层必须带出模板本身（成本估算要用它的声明值）")
+	}
+	if resolved.Identity.Storage != model.RecipeStorageEmbedded ||
+		resolved.Identity.TemplateID == "" || resolved.Identity.Revision < 1 {
+		t.Errorf("embedded identity 必须自述来源，得到 %+v", resolved.Identity)
+	}
+	if err := resolved.Identity.Validate(); err != nil {
+		t.Errorf("identity 不合法: %v", err)
+	}
+	if resolved.Compiled == nil {
+		t.Error("内置模板也要编译好后再交出去")
+	}
+	// 三级都要查过才能落到第 4 级。
 	want := []string{"route", "upstream", "profile"}
 	if len(source.queried) != 3 {
 		t.Errorf("应依次查完三级，实际 %v（want %v）", source.queried, want)
+	}
+	// 被遮蔽的层全零：内置层是「前三级都不存在」这个受验证事实的表达。
+	facts := resolved.Facts
+	if facts.RouteRecipeID != 0 || facts.UpstreamRecipeID != 0 || facts.TestedProfileID != 0 {
+		t.Errorf("命中内置层时前三级必须全零，得到 %+v", facts)
+	}
+	if facts.ResolvedLayer != model.ResolvedEmbedded || facts.Use != model.BindingResolved {
+		t.Errorf("facts 的 layer/use 不对: %+v", facts)
+	}
+}
+
+// 该 endpoint 连内置模板都没有时才回 ErrNoRecipe。
+//
+// 接上第 4 级之后这个错误的含义变了：它不再是常规兜底路径，而是
+// 「manifest 缺了一个 endpoint」这种发布事故。用一个空 BuiltinSet 复现。
+func TestRecipeResolver_ReturnsErrNoRecipeWhenBuiltinLayerIsEmpty(t *testing.T) {
+	source := &fakeRecipeSource{}
+	resolver := testResolver(source).WithBuiltins(&BuiltinSet{})
+
+	_, err := resolver.Resolve(context.Background(), RecipeQuery{
+		UpstreamID: 1, RouteID: 2, Endpoint: model.EndpointModels,
+	})
+	if !errors.Is(err, ErrNoRecipe) {
+		t.Fatalf("连内置模板都没有时应回 ErrNoRecipe，得到 %v", err)
 	}
 }
 

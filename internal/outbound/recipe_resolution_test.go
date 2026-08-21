@@ -220,24 +220,37 @@ func TestRecipeResolutionPrefersRoutePublishedInRealStore(t *testing.T) {
 	}
 }
 
-// 没有任何 recipe 时回 ErrNoRecipe —— 也就是 store.ErrNotFound 判据成立。
+// 没有任何 recipe 时落到内置模板 —— 也就是 store.ErrNotFound 判据成立。
 //
 // 这条钉的是 notFound 判据本身：判据写错的话，解析会把「这一级没有」
 // 当成「读库出错」并直接返回错误，于是**永远落不到低优先级**。
 // 那种 bug 在假实现里看不见。
-func TestRecipeResolutionReturnsNoRecipeOnEmptyStore(t *testing.T) {
+//
+// 断言落到 embedded 而不是断言 ErrNoRecipe：第 4 级接上之后，「三级全无」
+// 的正确结果就是内置模板。仍然是同一条判据 —— 判据坏了会在这里变成一个
+// 包了 store 错误的 error，而不是 embedded。
+func TestRecipeResolutionFallsBackToBuiltinOnEmptyStore(t *testing.T) {
 	fixture := newRecipeStoreFixture(t)
 
-	_, err := fixture.resolver().Resolve(context.Background(), probe.RecipeQuery{
+	resolved, err := fixture.resolver().Resolve(context.Background(), probe.RecipeQuery{
 		UpstreamID: fixture.upstream.ID, RouteID: fixture.routeID,
 		Endpoint: model.EndpointModels,
 	})
-	if !errors.Is(err, probe.ErrNoRecipe) {
-		t.Fatalf("空库应回 ErrNoRecipe（调用方据此走内置模板），得到 %v", err)
+	if err != nil {
+		t.Fatalf("空库应落到内置模板（notFound 判据成立的证据），得到 %v", err)
+	}
+	if resolved.Layer != model.ResolvedEmbedded {
+		t.Errorf("layer want embedded got %q", resolved.Layer)
+	}
+	if resolved.Identity.Storage != model.RecipeStorageEmbedded || resolved.Identity.TemplateID == "" {
+		t.Errorf("identity 应自述来自内置模板，得到 %+v", resolved.Identity)
 	}
 }
 
 // draft 不参与解析 —— 对着真库确认 publishedBinding 的 status 过滤。
+//
+// 断言落到内置层：draft 被误当成 published 的话，选中的会是那份 draft
+// （storage=db），而那是这条要挡的事。
 func TestRecipeResolutionIgnoresDraftInRealStore(t *testing.T) {
 	fixture := newRecipeStoreFixture(t)
 
@@ -255,12 +268,19 @@ func TestRecipeResolutionIgnoresDraftInRealStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fixture.resolver().Resolve(context.Background(), probe.RecipeQuery{
+	resolved, err := fixture.resolver().Resolve(context.Background(), probe.RecipeQuery{
 		UpstreamID: fixture.upstream.ID, RouteID: fixture.routeID,
 		Endpoint: model.EndpointModels,
 	})
-	if !errors.Is(err, probe.ErrNoRecipe) {
-		t.Fatalf("draft 不该参与解析，得到 %v", err)
+	if err != nil {
+		t.Fatalf("只有 draft 时应落到内置模板，得到 %v", err)
+	}
+	if resolved.Layer != model.ResolvedEmbedded {
+		t.Errorf("draft 不该参与解析，实际选中了 %s 层（version=%d）",
+			resolved.Layer, resolved.Identity.DBVersionID)
+	}
+	if resolved.Identity.DBVersionID == version.ID {
+		t.Error("选中了未发布的 draft version")
 	}
 }
 

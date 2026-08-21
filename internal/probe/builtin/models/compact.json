@@ -1,0 +1,18 @@
+{
+  "note": "零 token 的传输层探测（§4.1）。GET 不能带 body。头集合与 P0-06 之前那份硬编码逐项一致（含 content-type 与 anthropic-beta，尽管 GET 无 body）：这次改的是「头从 Go 搬到数据文件」，不是重新设计 L1 指纹。L1 失败会让整站连坐，而这份形状是 M0 在真实站上验过的 —— 精简它需要证据，目前没有。",
+  "headers": [
+    {"name": "user-agent", "values": ["claude-cli/2.1.220 (external, sdk-cli)"]},
+    {"name": "x-app", "values": ["cli"]},
+    {"name": "accept", "values": ["application/json"]},
+    {"name": "content-type", "values": ["application/json"]},
+    {"name": "anthropic-version", "values": ["2023-06-01"]},
+    {"name": "anthropic-beta", "values": ["claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01"]},
+    {"name": "anthropic-dangerous-direct-browser-access", "values": ["true"]},
+    {"name": "x-stainless-lang", "values": ["js"]},
+    {"name": "x-stainless-package-version", "values": ["0.70.1"]},
+    {"name": "x-stainless-os", "values": ["Windows"]},
+    {"name": "x-stainless-arch", "values": ["x64"]},
+    {"name": "x-stainless-runtime", "values": ["node"]},
+    {"name": "x-stainless-retry-count", "values": ["0"]}
+  ]
+}
