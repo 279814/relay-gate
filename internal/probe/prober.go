@@ -132,8 +132,13 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxClassifyBody))
 	ttft := time.Since(start)
 
-	// 连接层探测（空 l1_path → HEAD）：能拿到任何响应就算通。
-	if prepared.request.Method == http.MethodHead {
+	// 连接层探测（空 l1_path）：能拿到任何响应就算通。
+	//
+	// 判据是 prepared.connectionOnly 而不是「请求方法是 HEAD」：一份
+	// method=HEAD 的已发布 models 配方会冒充这个语义，而那种配方是迁移产物
+	// （见 preparedProbe.connectionOnly 的说明）。看方法的话，那个站的 L1
+	// 会对 500 判通，于是整站门禁放行而界面显示健康。
+	if prepared.connectionOnly {
 		return Outcome{Verdict: health.VerdictOK, TTFT: ttft, Status: resp.StatusCode}
 	}
 
@@ -178,7 +183,14 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 	req := prepared.request
 	// 把这次实际发出去的内容的估算成本带到每条返回路径上（§5.2d）。失败的
 	// 探活同样花钱（请求已经发出去了），所以不能只在成功分支填。
-	defer func() { out.EstTokens = prepared.estimatedTokens(mn) }()
+	//
+	// Sent 在这里就置 true：从下一行的 RoundTrip 起，请求已经交给 Transport，
+	// 出网与否不再由本函数决定。上面那些 return（协议无效、prepare 失败）
+	// 都在这之前，于是它们保持 Sent=false —— 那正是记账要区分的。
+	defer func() {
+		out.Sent = true
+		out.EstTokens = prepared.estimatedTokens(mn)
+	}()
 
 	// 响应头阶段单独设时限，理由同转发路径（forward.go）：
 	// 一个「收下请求但不回响应头」的站，只靠 Total 兜底会占满整个探测窗口。

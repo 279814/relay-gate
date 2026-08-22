@@ -620,16 +620,25 @@ func (s *Scheduler) countL1(upstreamID int64, ok bool) {
 
 // countL2 记一次 L2 及其估算 token。
 //
-// 优先用 Outcome 带回来的估算值：那是**实际发出去的那份内容**的估算
-// （内置模板的 manifest 声明值）。回落到按 ModelName 粗算只发生在探活
-// 根本没发出去的情况（配置错误），而那时确实没有内容可估。
+// 只有**真发出去了**才记 token（out.Sent）：一次在 prepare 阶段就失败的探活
+// 没有出网，也就没花钱。把它算进去会让一个配置写错的站看起来在持续烧 token，
+// 而成本视图存在的意义正是回答「探活策略是不是太激进」。
+//
+// 发出去了则优先用 Outcome 带回来的估算值 —— 那是**实际发出去的那份内容**的
+// 估算（内置模板的 manifest 声明值）。回落到按 ModelName 粗算只覆盖用户自己配的
+// Recipe：那种 recipe 没有「预计多少 token」这一项。
+//
+// 次数两种情况都记：那是「这个 Route 尝试过一次探活」的事实，
+// 而 L2Failed 占比高本身就是配置有问题的信号。
 func (s *Scheduler) countL2(routeID int64, mn *model.ModelName, out Outcome) {
 	if s.cost == nil {
 		return
 	}
-	tokens := out.EstTokens
-	if tokens <= 0 {
-		tokens = estimateL2Tokens(mn)
+	var tokens int
+	if out.Sent {
+		if tokens = out.EstTokens; tokens <= 0 {
+			tokens = estimateL2Tokens(mn)
+		}
 	}
 	s.cost.AddL2(routeID, out.Verdict == health.VerdictOK, tokens)
 }

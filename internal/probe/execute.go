@@ -33,6 +33,16 @@ import (
 type preparedProbe struct {
 	recipe  ResolvedRecipe
 	request *http.Request
+
+	// connectionOnly 表示这次 L1 只探连接层，任何响应都算通（§4.1）。
+	//
+	// 在这里定而不是让 L1 去看请求方法：那个判据会被一份 method=HEAD 的
+	// models 配方冒充。两者本来就会分开 —— 迁移在 l1_path 为空时物化了一份
+	// HEAD 配方（store/migrate_backfill.go 的 backfillLegacyModelsRecipe），
+	// 而用户之后把 l1_path 改回 /v1/models 时只有 url_override 被重译，
+	// 那份不可变的配方仍是 HEAD。于是「看方法」会让这个站的 L1 对 500 判通，
+	// 站级门禁放行、L2 继续往一个已死的站上烧 token，而界面显示健康。
+	connectionOnly bool
 }
 
 // prepare 解析并渲染出一次探活请求。
@@ -42,6 +52,17 @@ type preparedProbe struct {
 // 的 endpoint 上没有唯一的模型名，静默填一个会让探活打的模型与任何 Route 都无关。
 func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
 	rt *model.Route, endpoint model.EndpointKind) (*preparedProbe, error) {
+
+	// 没有出站解析器就地失败，**不自己拼一个地址**：探活打的地址必须与真实
+	// 请求完全一致，各拼一套的话「探活通过」不代表真实请求能通，而那个差异
+	// 只在生产流量上显形。
+	//
+	// 这道检查不能省成「反正装配时会传」：Prober 与它的字段都是导出的，
+	// 而这里跑在 Scheduler 起的 goroutine 里 —— 那里没有 recover，
+	// 一次 nil 解引用会带崩整个网关进程。
+	if p.Targets == nil {
+		return nil, errors.New("探活未装配出站目标解析器")
+	}
 
 	var routeID int64
 	if rt != nil {
@@ -82,10 +103,11 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	}
 
 	method := rendered.Method
-	if endpoint == model.EndpointModels && strings.TrimSpace(up.L1Path) == "" {
-		// 空 l1_path 的语义是「只探连接层」，也就是 HEAD base_url。这一项
-		// URL 层表达不了（EndpointURLOverride 只能给出地址），而 Recipe 里
-		// 写死 HEAD 也不行 —— 同一份内置模板要服务两种 l1_path 配置。
+	// 空 l1_path 的语义是「只探连接层」，也就是 HEAD base_url。这一项 URL 层
+	// 表达不了（EndpointURLOverride 只能给出地址），而 Recipe 里写死 HEAD
+	// 也不行 —— 同一份内置模板要服务两种 l1_path 配置。
+	connectionOnly := endpoint == model.EndpointModels && strings.TrimSpace(up.L1Path) == ""
+	if connectionOnly {
 		method = http.MethodHead
 	}
 
@@ -106,7 +128,7 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	}
 	request.ContentLength = int64(len(rendered.Body))
 
-	return &preparedProbe{recipe: resolved, request: request}, nil
+	return &preparedProbe{recipe: resolved, request: request, connectionOnly: connectionOnly}, nil
 }
 
 // estimatedTokens 是这次探活的估算 token 上界（§5.2d）。

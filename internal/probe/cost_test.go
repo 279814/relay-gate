@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 )
 
@@ -251,6 +252,57 @@ func TestEstimatePromptTokens_EmptyIsHandledByCaller(t *testing.T) {
 	// 那是下限保护，不是一个有意义的值，所以这里只断言它不会 panic 或返回负数。
 	if got := estimatePromptTokens(""); got < 0 {
 		t.Errorf("不该返回负数，得到 %d", got)
+	}
+}
+
+// 探活根本没发出去时不该记 token。
+//
+// countL2 用 `out.EstTokens <= 0` 判断「回落到按 ModelName 粗算」，而
+// config_error 的 Outcome 恰好也是 0 —— 于是一次**没有出网**的失败被记成了
+// 一次完整 L2 的开销。这个方向是错的：成本视图存在的意义是回答「探活策略是不是
+// 太激进」，而把没发出去的请求算进去会让一个配置写错的站看起来在持续烧 token，
+// 掩盖真正需要看的那些数字。
+//
+// 反过来同样不能容忍：真发出去了就必须记账，哪怕失败（请求已经出网了）。
+// 所以这里两个方向都断言。
+func TestScheduler_DoesNotChargeTokensWhenProbeNeverLeft(t *testing.T) {
+	cost := NewCost()
+	scheduler := &Scheduler{cost: cost}
+	modelName := modelNameFor(model.ProtoAnthropic)
+
+	// 没出网：Verdict 是 Unavailable 但 EstTokens 为 0（prepare 阶段就失败了）。
+	scheduler.countL2(10, modelName, Outcome{
+		Verdict: health.VerdictUnavailable,
+		Err:     errTestNotFound,
+	})
+	if snapshot := cost.Snapshot(); snapshot.EstTokens != 0 {
+		t.Errorf("没发出去的探活不该记 token，得到 %d", snapshot.EstTokens)
+	}
+	// 次数仍要记：那是「这个 Route 尝试过一次探活」的事实，
+	// 而 L2Failed 占比高正是配置有问题的信号。
+	if snapshot := cost.Snapshot(); snapshot.L2Count != 1 || snapshot.L2Failed != 1 {
+		t.Errorf("尝试次数仍要记，得到 %d 次 %d 失败",
+			snapshot.L2Count, snapshot.L2Failed)
+	}
+
+	// 发出去了：必须按实际内容记账。
+	scheduler.countL2(10, modelName, Outcome{
+		Verdict:   health.VerdictUnavailable,
+		Err:       errTestNotFound,
+		Sent:      true,
+		EstTokens: 13,
+	})
+	if snapshot := cost.Snapshot(); snapshot.EstTokens != 13 {
+		t.Errorf("已发出的探活要按实际内容记账（13），得到 %d", snapshot.EstTokens)
+	}
+
+	// 出网了但没带估算值（用户自己配的 Recipe）：回落到按 ModelName 粗算，
+	// 而不是记 0 —— 那份请求确实发出去了。
+	scheduler.countL2(11, modelName, Outcome{Verdict: health.VerdictOK, Sent: true})
+	want := int64(13 + estimateL2Tokens(modelName))
+	if snapshot := cost.Snapshot(); snapshot.EstTokens != want {
+		t.Errorf("没有声明值时应按 ModelName 粗算，总计应为 %d，得到 %d",
+			want, snapshot.EstTokens)
 	}
 }
 

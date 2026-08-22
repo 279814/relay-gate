@@ -62,6 +62,16 @@ type Outcome struct {
 	RetryAfter time.Duration
 	// Status 是上游 HTTP 状态码，0 表示连响应头都没拿到。
 	Status int
+	// Sent 表示这次探活的请求**已经写出去了**。
+	//
+	// 与 Status 不是一回事：连接被拒时请求发出去了但 Status 为 0。记账要的
+	// 恰好是这个区别 —— 出网了就花了钱（哪怕失败），没出网就没花。
+	//
+	// 靠 EstTokens 是否为 0 来推断不行：config_error 的 Outcome 与「用户配的
+	// recipe 要回落到按 ModelName 粗算」都是 0，于是一次没出网的失败会被记成
+	// 一次完整 L2 的开销。那让一个配置写错的站看起来在持续烧 token，
+	// 掩盖真正该看的数字。
+	Sent bool
 	// EstTokens 是这次探活的估算 token 上界，0 表示「按 ModelName 粗算」。
 	//
 	// 由内置模板的 manifest 声明值填（§5.2d）。带出来而不是让记账侧自己算：

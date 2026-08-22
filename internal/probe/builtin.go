@@ -158,7 +158,13 @@ func (set *BuiltinSet) Templates() []*BuiltinTemplate {
 	return append([]*BuiltinTemplate(nil), set.templates...)
 }
 
-// Endpoints 返回有内置模板的 endpoint，顺序稳定。
+// Endpoints 返回有 compact 内置模板的 endpoint，顺序稳定。
+//
+// 只数 compact 那一份，不是「出现过的全部 endpoint」：调用方要的是
+// 「哪些端点有周期探活可用的兜底」。名字里不写 compact 是因为
+// BuiltinSet 的其余方法（Compact、Requiring）已经把这层区分摊开了 ——
+// 但语义必须写清，否则将来加一个只有 calibration 候选的端点时，
+// 它会在这里静默缺席。
 func (set *BuiltinSet) Endpoints() []model.EndpointKind {
 	if set == nil {
 		return nil

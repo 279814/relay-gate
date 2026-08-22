@@ -99,9 +99,12 @@ func probeHeadersFromSample(h http.Header) (tmpl map[string]string, skipped []st
 //   - 由内置模板按端点设的：anthropic-version、accept。
 //     必须排除，因为 probe_headers 的覆盖发生在模板渲染**之后**
 //     （probe.applyUpstreamHeaderOverrides），从样本抄来的值会赢 ——
-//     于是一个 Anthropic 样本导出的版本头会被带到 OpenAI 端点的探活上，
-//     而 accept 会把流式探活的 text/event-stream 覆盖成 application/json，
-//     那会让 L2 收不到 SSE、判成假活
+//     于是一个 Anthropic 样本导出的版本头会被带到 OpenAI 端点的探活上。
+//     accept 的理由与 anthropic-version 同类而不是「怕覆盖成非 SSE」：
+//     内置模板发的就是 `application/json`（§3.1 实测真实 Claude Code
+//     即使流式也发它，流式开关在 body 的 `stream` 字段上）。要排除是因为
+//     accept 属于模板声明的协议形状，让样本盖掉它就等于用另一个端点的
+//     形状去探这个端点。
 //   - 本网关自己加的：不属于上游指纹
 var skipHeaderForProbe = map[string]bool{
 	"host":              true,
