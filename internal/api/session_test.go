@@ -463,9 +463,11 @@ func TestProbeHeaders_ExcludesHeadersTheRecipeOwns(t *testing.T) {
 	// probe_headers 的覆盖发生在 Recipe 渲染**之后**
 	// （probe.applyUpstreamHeaderOverrides），所以从样本抄来的值会赢。
 	//
-	// accept 是其中后果最实际的一个：探活流式请求需要 text/event-stream，
-	// 被样本里的 application/json 覆盖后 L2 收不到 SSE，会被判成假活 ——
-	// 一个完全可用的站因此被判死。
+	// 两个头都属于「模板声明的协议形状」：让样本盖掉它们，等于用一个端点的
+	// 形状去探另一个端点。anthropic-version 的后果最直接（带到 OpenAI 端点上
+	// 就是跨协议串味）；accept 同类 —— 注意内置模板发的本来就是
+	// application/json（§3.1 实测真实 Claude Code 即使流式也发它，流式开关在
+	// body 的 stream 字段上），所以这里防的不是「被覆盖成非 SSE」。
 	h := http.Header{}
 	h.Set("Anthropic-Version", "2023-06-01")
 	h.Set("Accept", "application/json")
@@ -473,7 +475,7 @@ func TestProbeHeaders_ExcludesHeadersTheRecipeOwns(t *testing.T) {
 
 	tmpl, _ := probeHeadersFromSample(h)
 	if _, ok := tmpl["accept"]; ok {
-		t.Error("accept 由内置模板按端点设，从样本抄会让 L2 收不到 SSE")
+		t.Error("accept 由内置模板按端点声明，从样本抄会让探活用错端点的形状")
 	}
 	if _, ok := tmpl["anthropic-version"]; ok {
 		t.Error("anthropic-version 由内置模板按端点设，抄了会跨协议串味")

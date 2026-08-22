@@ -698,6 +698,41 @@ func TestL2_CostUsesBuiltinManifestEstimate(t *testing.T) {
 		t.Errorf("成本应取 manifest 的声明值 %d，得到 %d",
 			template.EstimatedCost(), out.EstTokens)
 	}
+	// Sent 必须置位：countL2 用它区分「出网了所以花了钱」与「prepare 阶段就
+	// 失败了」。不钉这条的话，一个永不置位的 Sent 会让每次真实 L2 都记 0 token，
+	// 成本视图全是零 —— 而上面那条断言看的是 Outcome 而非 Cost，仍然全绿。
+	if !out.Sent {
+		t.Error("请求已经发出去了，Sent 必须为 true，否则记账会当成没花钱")
+	}
+}
+
+// 在 prepare 阶段失败的探活不置 Sent —— 它一个字节都没发出去。
+//
+// 与上一条互补：那条钉「发了要置位」，这条钉「没发不能置位」。少了这条，
+// 一个无条件 `out.Sent = true` 会让配置错误也被计入成本，而那正是要区分的。
+func TestL2_ConfigErrorLeavesSentFalse(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// 未知协议：在解析之前就失败。
+	modelName := &model.ModelName{Name: "x", Protocol: "telepathy",
+		ProbeMaxTokens: 1, ProbePrompt: "1+1=?"}
+	out := testProber().L2(context.Background(), upstreamFor(server.URL), modelName,
+		&model.Route{ID: 1}, fastSettings())
+
+	if hits != 0 {
+		t.Fatalf("前提不成立：这条用例要求探活没有出网，上游收到了 %d 个请求", hits)
+	}
+	if out.Sent {
+		t.Error("没有出网的探活不能置 Sent —— 那会让配置错误被算进探活成本")
+	}
+	if out.EstTokens != 0 {
+		t.Errorf("没有出网就没有 token 开销，得到 %d", out.EstTokens)
+	}
 }
 
 // ── 探活头 ────────────────────────────────────────────────

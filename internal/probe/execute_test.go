@@ -289,6 +289,95 @@ func TestL2_WithoutResolverFallsBackToBuiltin(t *testing.T) {
 	}
 }
 
+// 未装配出站目标解析器时，两级探活都以配置错误结束而**不是 panic**。
+//
+// Prober.Targets 的文档承诺「为 nil 时探活直接失败而不是自己拼一个」，理由是
+// 探活打的地址必须与真实请求完全一致。P0-06 之前这道检查在 Prober.resolve 里，
+// 随那个函数一起被删掉了 —— 于是承诺变成了一次空指针解引用。
+//
+// 为什么这条值得单独钉：探活跑在 Scheduler 起的 goroutine 里，那里没有
+// recover，一个 nil Targets 会**带崩整个网关进程**。而它是可达的 ——
+// probe.Prober 是导出类型，字段也是导出的（crosspath_test 就直接构造它），
+// 装配时漏一个 WithTargets 就是这个形态。
+func TestProbeWithoutTargetsFailsAsConfigErrorNotPanic(t *testing.T) {
+	prober := &Prober{Transport: http.DefaultTransport}
+	upstream := upstreamFor("http://127.0.0.1:1")
+
+	t.Run("L1", func(t *testing.T) {
+		out := prober.L1(context.Background(), upstream, fastSettings())
+		if out.Verdict == health.VerdictOK {
+			t.Error("没有出站解析器不该判成功")
+		}
+		if out.Err == nil {
+			t.Fatal("应带上原因，否则用户看不出漏配了什么")
+		}
+	})
+
+	t.Run("L2", func(t *testing.T) {
+		out := prober.L2(context.Background(), upstream,
+			modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
+		if out.Verdict == health.VerdictOK {
+			t.Error("没有出站解析器不该判成功")
+		}
+		if out.Err == nil {
+			t.Fatal("应带上原因")
+		}
+	})
+}
+
+// 已发布的 HEAD models 配方**不能**把 L1 变成「任何响应都算通」。
+//
+// 「只探连接层」这个语义由 l1_path 为空定义（§4.1 给那些连 /v1/models 都会
+// 报错的站留的退路），而不是由请求方法定义。两者在迁移出来的站上会分开：
+// `backfillLegacyModelsRecipe` 在 l1_path 为空时物化一份 method=HEAD 的
+// models 配方，而用户之后在界面上把 l1_path 改成 /v1/models 时，
+// `UpdateUpstream` 只重译 url_override —— 那份不可变的配方仍然是 HEAD。
+//
+// 于是若判据看的是方法，这个站的 L1 会对 500 / 401 一律判通：站级门禁
+// （gate.OK）放行，L2 接着往一个明显已死的站上烧 token，而界面显示健康。
+// ModelName 与 Route 全都正常，没有任何地方能看出问题。
+func TestL1_HeadRecipeStillClassifiesStatusWhenL1PathIsSet(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	binding := testBinding(8, 80, 4, "HEAD")
+	binding.Recipe.Endpoint = model.EndpointModels
+	source := &fakeRecipeSource{upstreamBinding: binding}
+
+	upstream := upstreamFor(server.URL) // L1Path = "/v1/models"
+	out := proberWithRecipes(source, nil).L1(context.Background(), upstream, fastSettings())
+
+	if out.Verdict == health.VerdictOK {
+		t.Error("l1_path 非空时 500 必须判不可用 —— " +
+			"「只探连接层」由 l1_path 为空定义，不由配方的方法定义")
+	}
+}
+
+// l1_path 为空时仍然是连接层探测：任何响应都算通。
+//
+// 与上一条互为反向：判据换成 l1_path 之后，这条必须仍然成立，
+// 否则那些「连 /v1/models 都报错」的站会被判死（§4.1 的退路）。
+func TestL1_EmptyL1PathIgnoresStatusEvenWithGetRecipe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	binding := testBinding(8, 80, 4, "GET")
+	binding.Recipe.Endpoint = model.EndpointModels
+	source := &fakeRecipeSource{upstreamBinding: binding}
+
+	upstream := upstreamFor(server.URL)
+	upstream.L1Path = ""
+	out := proberWithRecipes(source, nil).L1(context.Background(), upstream, fastSettings())
+
+	if out.Verdict != health.VerdictOK {
+		t.Errorf("空 l1_path 只探连接层，500 也算通，得到 %s（err=%v）", out.Verdict, out.Err)
+	}
+}
+
 // SESSION_ID 每次探活都不同（§8.3 禁止写死会话 ID）。
 func TestProbeSessionIDDiffersPerProbe(t *testing.T) {
 	server, taken := recordUpstream(t)
