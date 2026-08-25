@@ -113,21 +113,25 @@ func compileContent(endpoint model.EndpointKind, content TemplateContent) (*Comp
 		return nil, err
 	}
 	headers := make([]compiledHeader, 0, len(content.Headers))
-	for _, header := range content.Headers {
+	for index, header := range content.Headers {
+		// 报第几个 header 而不是它的名字。名字也是用户输入，而合法的 header 名
+		// 恰好与不透明凭据串同一个字符集（`glpat-ZZZZ` 是合法 header 名）——
+		// 于是「只回显合法的名字」不成立。用户手里有那份模板，序号足以定位。
 		if !validHeaderName(header.Name) {
-			return nil, model.WrapValidation("header name 无效: %q", header.Name)
+			return nil, model.WrapValidation("第 %d 个 header 的名称（长度 %d）无效；"+
+				"只允许 RFC 7230 token 字符（§4.5）", index+1, len(header.Name))
 		}
 		if err := rejectProtectedHeader(header.Name); err != nil {
 			return nil, err
 		}
 		compiled := compiledHeader{name: header.Name, values: make([][]compiledPart, 0, len(header.Values))}
-		for _, value := range header.Values {
+		for valueIndex, value := range header.Values {
 			if err := validateHeaderValue([]byte(value)); err != nil {
-				return nil, model.WrapValidation("header %q: %v", header.Name, err)
+				return nil, model.WrapValidation("第 %d 个 header 的第 %d 个值: %v", index+1, valueIndex+1, err)
 			}
 			parts, err := compileTemplate([]byte(value), false, required)
 			if err != nil {
-				return nil, model.WrapValidation("header %q: %v", header.Name, err)
+				return nil, model.WrapValidation("第 %d 个 header 的第 %d 个值: %v", index+1, valueIndex+1, err)
 			}
 			compiled.values = append(compiled.values, parts)
 		}
@@ -217,7 +221,7 @@ func compileRawQuery(raw string, required map[string]struct{}) ([]compiledPart, 
 			name, value, hasEquals = segment[:separator], segment[separator+1:], true
 		}
 		if strings.Contains(name, "{{") {
-			return nil, model.WrapValidation("query 参数名不能包含占位符")
+			return nil, model.WrapValidation("第 %d 个 query 参数的名称里不能有占位符（§4.5）", index+1)
 		}
 		compiled = append(compiled, compiledPart{literal: []byte(name)})
 		if !hasEquals {
@@ -226,14 +230,15 @@ func compileRawQuery(raw string, required map[string]struct{}) ([]compiledPart, 
 		compiled = append(compiled, compiledPart{literal: []byte("=")})
 		parts, err := compileTemplate([]byte(value), true, required)
 		if err != nil {
-			return nil, model.WrapValidation("query 参数 %q: %v", name, err)
+			return nil, model.WrapValidation("第 %d 个 query 参数: %v", index+1, err)
 		}
 		hasPlaceholder := false
 		for _, part := range parts {
 			hasPlaceholder = hasPlaceholder || part.placeholder != ""
 		}
 		if hasPlaceholder && (len(parts) != 1 || parts[0].placeholder == "") {
-			return nil, model.WrapValidation("query 占位符必须占据完整参数值: %q", name)
+			return nil, model.WrapValidation("第 %d 个 query 参数的占位符必须占据完整参数值，"+
+				"不能与字面量拼接（§4.5）", index+1)
 		}
 		compiled = append(compiled, parts...)
 	}
@@ -261,7 +266,7 @@ func compileTemplate(input []byte, percentEncode bool, required map[string]struc
 		}
 		end := start + 2 + endRelative
 		name := string(input[start+2 : end])
-		if err := validatePlaceholder(name, required); err != nil {
+		if err := validatePlaceholder(name, start, required); err != nil {
 			return nil, err
 		}
 		parts = append(parts, compiledPart{placeholder: name, percentEncode: percentEncode})
@@ -282,20 +287,45 @@ func appendLiteralPart(parts *[]compiledPart, value []byte) {
 	*parts = append(*parts, compiledPart{literal: copyValue})
 }
 
-func validatePlaceholder(name string, required map[string]struct{}) error {
+// validatePlaceholder 校验一个占位符名，**按偏移报错而不回显名字**。
+//
+// 回显是真实的泄漏路径：一个把凭据误写成 `{{glpat-...}}` 的用户，那份凭据会
+// 原样进 API 响应和日志（§4.5 第 13 条明确要求错误文本不含输入 Secret）。
+// 凭据门禁（credential.go）挡不住这条路 —— 它只认 10 个已知厂商前缀，
+// 而 GitLab、自建中转站、企业网关的 key 都会直接走到这里。
+//
+// 偏移加长度足以定位：用户手里就有那份模板，「第 N 字节处的占位符」他能自己
+// 数到；而错误消息是要进日志的，那里不该出现模板的任何一个字节。
+func validatePlaceholder(name string, offset int, required map[string]struct{}) error {
 	if _, ok := builtInPlaceholders[name]; ok {
 		return nil
 	}
 	const prefix = "SECRET:"
 	if !strings.HasPrefix(name, prefix) {
-		return model.WrapValidation("未知占位符 %q", name)
+		return model.WrapValidation("字节偏移 %d 处的占位符（长度 %d）既不是内置占位符，"+
+			"也不是 SECRET: 引用；内置占位符为 %s（§4.5）",
+			offset, len(name), strings.Join(builtInPlaceholderNames(), " / "))
 	}
 	secretName := strings.TrimPrefix(name, prefix)
 	if !validSecretName(secretName) {
-		return model.WrapValidation("Secret 名称无效: %q", secretName)
+		return model.WrapValidation("字节偏移 %d 处的 Secret 名（长度 %d）含非法字符；"+
+			"只允许字母、数字、- _ .（§4.5）", offset, len(secretName))
 	}
 	required[secretName] = struct{}{}
 	return nil
+}
+
+// builtInPlaceholderNames 列出内置占位符，供错误消息给出可选值。
+//
+// 排序后返回：map 遍历顺序随机，而一条每次运行都换顺序的错误消息无法搜索，
+// 也没法在测试里钉住。
+func builtInPlaceholderNames() []string {
+	names := make([]string, 0, len(builtInPlaceholders))
+	for name := range builtInPlaceholders {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func validSecretName(name string) bool {

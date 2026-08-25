@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 type fixtureManifest struct {
@@ -150,8 +152,8 @@ func validateFixtureManifest(root string, manifest *fixtureManifest) error {
 				return fmt.Errorf("case %q has empty expected event type", fixture.ID)
 			}
 		}
-		if !fixtureCapabilityValid(fixture.ExpectedDecision.Capability) || fixture.ExpectedDecision.ErrorClass == "" {
-			return fmt.Errorf("case %q has invalid expected decision", fixture.ID)
+		if err := validateFixtureDecision(fixture.ExpectedDecision); err != nil {
+			return fmt.Errorf("case %q has invalid expected decision: %w", fixture.ID, err)
 		}
 		if err := validateFixtureChunkPlan(fixture.ChunkPlan); err != nil {
 			return fmt.Errorf("case %q: %w", fixture.ID, err)
@@ -184,13 +186,24 @@ func validateFixtureEndpoint(protocol, endpoint string) error {
 	return nil
 }
 
-func fixtureCapabilityValid(capability string) bool {
-	switch capability {
-	case "unknown", "supported", "unsupported", "transient_error", "config_error":
-		return true
-	default:
-		return false
+// validateFixtureDecision 校验 expected_decision 的两个枚举字段。
+//
+// 必须对着 model 的真枚举查，不能只判非空。原先那版判「capability 在一份
+// 手抄的清单里 && error_class != ""」，于是 manifest 里三个不存在的
+// error_class（protocol_incomplete / upstream_error / upstream_unavailable）
+// 一直是绿的 —— P0-08 的 Classifier 永远产不出这些值，而 fixture 声称期望
+// 它们，那 19 个 case 里就有 4 个是「期望一个不可能的结果」。
+//
+// capability 也改成问 model：手抄清单与真枚举是两份真相，加一个新状态时
+// 只改一处就会分叉，而分叉的表现是「fixture 说这个状态合法，Store 拒绝落库」。
+func validateFixtureDecision(decision fixtureDecision) error {
+	if !model.CapabilityState(decision.Capability).Valid() {
+		return fmt.Errorf("capability %q is not a model.CapabilityState", decision.Capability)
 	}
+	if !model.ErrorClass(decision.ErrorClass).Valid() {
+		return fmt.Errorf("error class %q is not a model.ErrorClass", decision.ErrorClass)
+	}
+	return nil
 }
 
 func validateFixtureChunkPlan(plan fixtureChunkPlan) error {
@@ -381,6 +394,7 @@ func TestFixtureManifestDeclaresInitialCases(t *testing.T) {
 		"anthropic_multiline_sse",
 		"anthropic_200_error_event",
 		"anthropic_eof_without_semantic",
+		"anthropic_usage_only_no_content",
 		"anthropic_context_1m_required",
 		"responses_output_text_delta",
 		"responses_refusal_delta",
@@ -391,6 +405,7 @@ func TestFixtureManifestDeclaresInitialCases(t *testing.T) {
 		"count_tokens_supported",
 		"count_tokens_404",
 		"models_200",
+		"models_200_arbitrary_object",
 		"models_404",
 		"models_401",
 		"models_503",

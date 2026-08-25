@@ -7,6 +7,24 @@
 // 本包只负责「探一次、给出判定」，状态与调度归 health 包。
 package probe
 
+// 本文件是**旧兼容路径**，P0-17 删除。新判定在 classifier.go
+// （ResponseClassifier / Decision）。
+//
+// 为什么两套并存而不是一次换掉：`ClassifyHTTP` 与 `ClassifyTransportErr` 的
+// 唯一生产调用方是 prober.go 的旧 L1/L2，而那条链同时承载错误正文、TTFT 口径
+// 和主动断流时机 —— 三样都影响健康判定。一次提交同时改它们的话，出问题无法
+// 二分。生产路径的切换在 P0-09（Executor），届时这两个导出与 sse.go 的
+// scanStream 一并删除（计划 §P0-17 的清理条件已列明）。
+//
+// 两套判定的关键差异，迁移时必须对齐（新的那套是对的）：
+//   - 旧的把一切归成 health.Verdict 三态，**给不出作用范围**，于是调用方
+//     按错误字符串猜「站挂了还是这个 Route 配错了」。实测后果是一个模型名
+//     手误让整站 Route 一起判死。新的由 Decision.Scope 明确表达。
+//   - 旧的在响应体里搜关键词（modelNotFoundMarkers 之类），会把一个正常回答里
+//     提到模型名的响应判成配置错误。新的只认 Decoder 规范化过的结构化字段。
+//   - 旧的经 errFromBody 把上游正文拼进 Err（靠 redactOutcome 在出口脱敏）。
+//     新的从不接触正文：Decoder 压根不把 message 放进 ProtocolEvent。
+
 import (
 	"bytes"
 	"context"
