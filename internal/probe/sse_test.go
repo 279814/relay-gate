@@ -1,5 +1,15 @@
 package probe
 
+// 这些测试保护的是**旧兼容路径**（sse.go 的 scanStream），不是 P0-07 的
+// Decoder。新协议语义的测试在 stream_test.go 与 stream_fixture_test.go。
+//
+// 为什么还留着：Prober.L2 仍在调 scanStream，而它的 errPayload 原文契约
+// 是 ClassifyHTTP 现在依赖的东西。P0-09 迁走生产路径、P0-17 删除本文件时，
+// 这里仍有效的 case 一并迁到 stream_test.go。
+//
+// 注意本文件里的断言与新 Decoder 有意不同（空 delta、zero usage 的处理），
+// 那是旧实现的既有行为，不要照它去改 stream.go。
+
 import (
 	"strings"
 	"testing"

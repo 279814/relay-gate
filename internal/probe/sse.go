@@ -1,5 +1,25 @@
 package probe
 
+// 旧 SSE 子串扫描路径。**新代码不要用它**，用 stream.go 的 Decoder。
+//
+// 为什么两套规则并存：P0-07 交付了结构化 Decoder，但生产路径的切换在 P0-09
+// （Executor）与 P0-08（Classifier）—— 那两步要同时改「发送、超时、主动断流、
+// 错误分类」四件事。在这里就把 Prober.L2 切过去的话，一次提交会同时改变
+// 错误正文（新 Decoder 不保留原文）、TTFT 口径和断流时机，而这三样都影响
+// 站点的健康判定，出问题无法二分。
+//
+// 两者的规则**确实不同**，这不是重复实现：
+//
+//   - 这里靠子串匹配，因此 `"output_tokens"` 出现即判活，空 delta 也算；
+//     新 Decoder 要求正数 usage 与非空 delta（§8.8）。
+//   - 这里把整份 error payload 原文带出来（errPayload）给 ClassifyHTTP 用；
+//     新 Decoder 只保留结构化 type/code/param，原文交给 Sample 旁路。
+//   - 这里的多行 data 是逐行匹配，可能在半个 JSON 上就判活；
+//     新 Decoder 按事件边界合并后才解析。
+//
+// P0-17 连同 proxy/errorpayload.go 一起删除本文件，届时把仍有效的回归
+// case 迁到 stream_test.go。
+
 import (
 	"bufio"
 	"bytes"
