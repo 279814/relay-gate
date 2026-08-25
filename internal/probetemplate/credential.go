@@ -1,6 +1,7 @@
 package probetemplate
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -59,8 +60,13 @@ var authSchemes = []string{"bearer", "basic"}
 // 对认证头用「必须是占位符」这条强规则，对其余位置只查高置信前缀：
 // 认证头的值本来就只该是凭据，所以「不是占位符」即可判定；而 body 与 query
 // 里绝大多数内容是正常载荷，只能靠明确的前缀。
+//
+// 位置标识用序号而不是 header 名：本函数跑在 validHeaderName **之前**
+// （compileContent 先调门禁再逐个校验 header），所以这里的 header.Name 是
+// 未经校验的原始输入 —— 一份被误配成 header 名的 key 会随错误进日志。
+// 认证头是唯一的例外，见 authHeaderLabel。
 func rejectLiteralCredentials(content TemplateContent) error {
-	for _, header := range content.Headers {
+	for index, header := range content.Headers {
 		for _, value := range header.Values {
 			if model.IsAuthHeader(header.Name) {
 				if err := requirePlaceholderAuthValue(header.Name, value); err != nil {
@@ -68,7 +74,7 @@ func rejectLiteralCredentials(content TemplateContent) error {
 				}
 				continue
 			}
-			if err := rejectCredentialPrefix(value, "header "+header.Name); err != nil {
+			if err := rejectCredentialPrefix(value, fmt.Sprintf("第 %d 个 header 的值", index+1)); err != nil {
 				return err
 			}
 		}
@@ -77,6 +83,24 @@ func rejectLiteralCredentials(content TemplateContent) error {
 		return err
 	}
 	return rejectCredentialPrefix(string(content.Body), "body 模板")
+}
+
+// authHeaderLabel 给出认证头在错误里的名字。
+//
+// 这一处**刻意回显**，与 rejectLiteralCredentials 的其余位置相反：能走到这里
+// 说明 model.IsAuthHeader 已经匹配上了，也就是说这个名字来自
+// model.AuthHeaders 那份固定清单，是常量而不是游散输入。而这条错误的全部价值
+// 就是告诉用户「哪个认证头要改成占位符」—— 配了多个头的用户否则不知道改哪个。
+//
+// 大小写按清单里的规范写法输出，不用用户传进来的那份：`AUTHORIZATION` 与
+// `authorization` 都会匹配，而错误里出现用户的大小写变体等于回显了输入的一部分。
+func authHeaderLabel(name string) string {
+	for _, known := range model.AuthHeaders {
+		if strings.EqualFold(known, strings.TrimSpace(name)) {
+			return known
+		}
+	}
+	return "认证头"
 }
 
 // requirePlaceholderAuthValue 要求认证头的值由占位符提供。
@@ -118,10 +142,11 @@ func requirePlaceholderAuthValue(name, value string) error {
 	if placeholders == 0 && len(remainder) < minLiteralAuthValue {
 		// 短纯字面值放行：多半是协议常量。这里刻意留松 —— 见文件头
 		// 「误报没有逃生舱」。高置信前缀仍会被下面那条兜住。
-		return rejectCredentialPrefix(value, "认证头 "+name)
+		return rejectCredentialPrefix(value, "认证头 "+authHeaderLabel(name))
 	}
-	return model.WrapValidation("认证头 %q 不能写字面凭据，"+
-		"请改用 {{UPSTREAM_API_KEY}} 或先创建 Probe Secret 再写 {{SECRET:name}}（§4.5）", name)
+	return model.WrapValidation("认证头 %s 不能写字面凭据，"+
+		"请改用 {{UPSTREAM_API_KEY}} 或先创建 Probe Secret 再写 {{SECRET:name}}（§4.5）",
+		authHeaderLabel(name))
 }
 
 // splitAuthValue 把认证头的值切成「字面部分」与「占位符个数」。
