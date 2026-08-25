@@ -90,6 +90,21 @@ const (
 	CapabilityConfigError    CapabilityState = "config_error"
 )
 
+// Valid 判断是否为这五个持久状态之一。
+//
+// 存在的理由是让「合法状态有哪些」只有一份真相。§8.13 的 stale/expired 是
+// 由 `ExpiresAt <= now` **派生**的展示态，不是第六个可保存的值 —— 加一个
+// 手抄清单的地方就多一处会把 stale 当成可落库状态的机会。
+func (state CapabilityState) Valid() bool {
+	switch state {
+	case CapabilityUnknown, CapabilitySupported, CapabilityUnsupported,
+		CapabilityTransientError, CapabilityConfigError:
+		return true
+	default:
+		return false
+	}
+}
+
 type ErrorClass string
 
 const (
@@ -106,6 +121,23 @@ const (
 	ErrorPartial       ErrorClass = "partial_failure"
 	ErrorIgnored       ErrorClass = "ignored"
 )
+
+// Valid 判断是否为这 12 个固定分类之一。
+//
+// §4.1 把这份清单定为契约，而 P0-08 的 Classifier 只能产出其中的值。
+// 加这个方法的直接起因：fixture manifest 里曾有三个不存在的分类
+// （protocol_incomplete / upstream_error / upstream_unavailable），
+// 而当时的校验只判「非空」，于是那几个 case 期望的是一个永远不会出现的结果。
+func (class ErrorClass) Valid() bool {
+	switch class {
+	case ErrorNone, ErrorUnreachable, ErrorAuthRejected, ErrorShapeRejected,
+		ErrorConfig, ErrorUnsupported, ErrorModelNotFound, ErrorRateLimited,
+		ErrorTransient, ErrorFakeAlive, ErrorPartial, ErrorIgnored:
+		return true
+	default:
+		return false
+	}
+}
 
 type ObservationScope string
 

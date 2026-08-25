@@ -83,7 +83,7 @@
       "response_file": "responses/anthropic_eof_without_semantic.bin",
       "chunk_plan": {"name": "whole"},
       "expected_events": [{"type": "message_start"}],
-      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "protocol_incomplete"}
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "fake_alive"}
     },
     {
       "id": "anthropic_context_1m_required",
@@ -135,7 +135,7 @@
       "response_file": "responses/responses_200_error_json.bin",
       "chunk_plan": {"name": "whole"},
       "expected_events": [{"type": "error", "error": true}],
-      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "upstream_error"}
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "transient_error"}
     },
     {
       "id": "chat_chunk_delta",
@@ -252,7 +252,7 @@
       "response_file": "responses/models_503.bin",
       "chunk_plan": {"name": "whole"},
       "expected_events": [{"type": "error", "error": true}],
-      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "upstream_unavailable"}
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "transient_error"}
     }
   ]
 }
