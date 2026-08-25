@@ -453,6 +453,45 @@ func TestWireAutoDetectsSSEJSONAndNDJSON(t *testing.T) {
 	}
 }
 
+// JSON null 不是模型列表。
+//
+// `json.Unmarshal([]byte("null"), &slice)` **返回 nil error** 并把 slice 置为
+// nil —— JSON null 对任何 Go 类型都是合法的。于是 `{"data":null}` 与
+// `{"data":[]}`（§4.6 明说合法的空列表）在解析结果上完全相同，
+// 一个回 `data:null` 的站会被判成 models supported。
+//
+// 这不是理论形态：中转站在后端尚未就绪时常常回
+// `{"status":"ok","data":null}` 带 200 —— 正是「假活」的定义，而 §8.9 要求
+// 只有「结构可读的模型列表」才能算 supported。判错的后果是站级 models 能力
+// 显示可用，L2 于是持续往一个没有任何模型的站上烧 token。
+func TestModelsRejectsNullAndNonArrayDataFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"data null", `{"status":"ok","message":"gateway is running","data":null}`},
+		{"data string", `{"data":"not-a-list"}`},
+		{"data object", `{"data":{"id":"fixture-model"}}`},
+		{"data number", `{"data":7}`},
+		{"top level null", `null`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events, err := decodeChunks(t, eventSpec(model.EndpointModels, ""), WireJSON, tc.body)
+			if err != nil {
+				// 顶层 null 报协议错误也是可接受的结论 —— 要挡住的是
+				// 「静默判成 supported」，而不是要求某个特定错误。
+				return
+			}
+			for _, event := range events {
+				if event.ModelListRecognized || event.Kind == EventModelList {
+					t.Fatalf("%s was recognized as a model list: %#v", tc.name, events)
+				}
+			}
+		})
+	}
+}
+
 func TestJSONModelsDirectArrayAndArbitraryObject(t *testing.T) {
 	events, err := decodeChunks(t, eventSpec(model.EndpointModels, ""), WireJSON, `[]`)
 	if err != nil {

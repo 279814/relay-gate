@@ -658,8 +658,7 @@ func (d *incrementalDecoder) decodePayload(eventName string, payload []byte) ([]
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &object); err != nil {
 		if d.spec.Endpoint == model.EndpointModels && d.spec.Protocol == "" {
-			var list []json.RawMessage
-			if arrayErr := json.Unmarshal(payload, &list); arrayErr == nil {
+			if list, isList := decodeJSONArray(payload); isList {
 				return []ProtocolEvent{{Kind: EventModelList, EventName: "model_list", Semantic: true,
 					ModelListRecognized: true, ModelCount: len(list)}}, nil
 			}
@@ -669,19 +668,56 @@ func (d *incrementalDecoder) decodePayload(eventName string, payload []byte) ([]
 	return d.eventFromObject(eventName, object, payload)
 }
 
+// modelListEventName 给 models 端点的事件一个非空名字。
+//
+// SSE/NDJSON 有自己的事件名就用它；普通 JSON 没有（顶层对象不带 event 行），
+// 回落到 model_list。
+func modelListEventName(eventName string) string {
+	if eventName != "" {
+		return eventName
+	}
+	return "model_list"
+}
+
+// decodeJSONArray 解出一个 JSON 数组，并把 null 与「不是数组」一同拒掉。
+//
+// 必须显式排除 null：`json.Unmarshal([]byte("null"), &slice)` **返回 nil
+// error** 并把 slice 置为 nil —— JSON null 对任何 Go 类型都合法。于是
+// `{"data":null}` 与 `{"data":[]}`（§4.6 明说合法的空列表）在解析结果上
+// 完全相同，而一个回 `{"status":"ok","data":null}` 带 200 的站（后端尚未
+// 就绪时的常见形态）会被判成 models supported，L2 随后持续往一个没有任何
+// 模型的站上烧 token。
+//
+// 判据用「首个非空白字节是 [」而不是「解出来非 nil」：`[]` 解出的也是空
+// slice，两者无法靠结果区分，只能看输入的形状。
+func decodeJSONArray(raw json.RawMessage) ([]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, false
+	}
+	var list []json.RawMessage
+	if json.Unmarshal(trimmed, &list) != nil {
+		return nil, false
+	}
+	return list, true
+}
+
 func (d *incrementalDecoder) eventFromObject(eventName string, object map[string]json.RawMessage, payload []byte) ([]ProtocolEvent, error) {
 	if raw, ok := object["error"]; ok && carriesError(raw) {
 		return []ProtocolEvent{remoteErrorEvent(eventName, raw)}, nil
 	}
 	if d.spec.Endpoint == model.EndpointModels {
 		if raw, ok := object["data"]; ok {
-			var list []json.RawMessage
-			if json.Unmarshal(raw, &list) == nil {
+			if list, isList := decodeJSONArray(raw); isList {
 				return []ProtocolEvent{{Kind: EventModelList, EventName: "model_list", Semantic: true,
 					ModelListRecognized: true, ModelCount: len(list)}}, nil
 			}
 		}
-		return []ProtocolEvent{{Kind: EventMetadata, EventName: eventName}}, nil
+		// 名字用 model_list 而不是留空：普通 JSON 没有 event 名，而一个空名字
+		// 的事件在诊断里说明不了任何事（「这个站的 /models 返回了什么」是排查
+		// 第一个要问的问题）。ModelListRecognized 为 false 已经表达了「不是
+		// 一份可用的列表」，两者合起来才是完整事实。
+		return []ProtocolEvent{{Kind: EventMetadata, EventName: modelListEventName(eventName)}}, nil
 	}
 	if d.spec.Endpoint == model.EndpointCountTokens {
 		if value := tokenCount(object, "input_tokens"); value > 0 {
