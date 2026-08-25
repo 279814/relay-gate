@@ -76,6 +76,7 @@ var (
 	ErrTrailingJSON       = errors.New("trailing JSON bytes")
 	ErrEventTooLarge      = errors.New("protocol event exceeds limit")
 	ErrDecoderWorkBudget  = errors.New("decoder work budget exceeded")
+	ErrDecoderFinished    = errors.New("decoder already finished")
 )
 
 type decoderError struct {
@@ -120,7 +121,17 @@ func makeDecoderError(base error, format WireFormat, offset int64, eventType str
 		eventType: eventType, length: length, limit: limit}
 }
 
+// defaultDecoderWorkMultiplier 把工作预算定为「总字节数的若干倍」。
+//
+// 用工作量而不是 CPU 时间：Go 没有可移植的单 goroutine CPU 时间接口，而基于
+// 墙上时钟的预算会让测试与 fuzz 的结果随机器负载漂移。
 const defaultDecoderWorkMultiplier = int64(32)
+
+// maxAutoPrefixScan 是 WireAuto 尚无换行时参与格式判定的前缀长度。
+//
+// 判 SSE/NDJSON/JSON 只看开头那几个字节（`event:`、`data:`、`{`、`[`），
+// 扫更多没有额外信息，却会在逐字节到达时把每次重判变成一次全缓冲扫描。
+const maxAutoPrefixScan = 64
 
 type incrementalDecoder struct {
 	spec   DecoderSpec
@@ -144,7 +155,14 @@ type incrementalDecoder struct {
 	finishEvents []ProtocolEvent
 
 	// pending 是 WireAuto 尚未定型时攒下的字节。
-	pending []byte
+	//
+	// pendingScanned/Depth/InString/Escaped 是括号配平的增量状态：只有在配平
+	// 时才值得重判格式，而增量维护让「已扫到哪」不必每次从头再数。
+	pending         []byte
+	pendingScanned  int
+	pendingDepth    int
+	pendingInString bool
+	pendingEscaped  bool
 
 	// jsonBody 只用于普通 JSON；SSE/NDJSON 只保留当前事件或当前行。
 	jsonBody []byte
@@ -268,7 +286,13 @@ func (d *incrementalDecoder) BytesSeen() int64 { return d.bytesSeen }
 
 func (d *incrementalDecoder) Feed(chunk []byte) ([]ProtocolEvent, error) {
 	if d.finished {
-		return nil, d.terminal
+		// Finish 之后到达的字节要报错，不能静默丢掉：静默返回空序列的话，
+		// 一个把 Finish 提前调用了的调用方会看到「流里什么都没有」，而字节
+		// 其实到了、只是被扔了 —— 排查方向从一开始就是错的。
+		if d.terminal != nil {
+			return nil, d.terminal
+		}
+		return nil, makeDecoderError(ErrDecoderFinished, d.effectiveFormat(), d.offset, "", 0, 0)
 	}
 	if d.terminal != nil {
 		return nil, d.terminal
@@ -280,10 +304,9 @@ func (d *incrementalDecoder) Feed(chunk []byte) ([]ProtocolEvent, error) {
 		return nil, d.fail(makeDecoderError(ErrDecodedBodyTooLarge, d.effectiveFormat(), d.offset, "", d.bytesSeen+int64(len(chunk)), d.maxTotalBytes))
 	}
 	d.bytesSeen += int64(len(chunk))
-	if int64(len(chunk)) > d.maxWorkUnits-d.workUnits {
-		return nil, d.fail(makeDecoderError(ErrDecoderWorkBudget, d.effectiveFormat(), d.offset, "", d.workUnits+int64(len(chunk)), d.maxWorkUnits))
+	if err := d.spendWork(int64(len(chunk))); err != nil {
+		return nil, err
 	}
-	d.workUnits += int64(len(chunk))
 
 	payload, ready := d.consumePrefix(chunk)
 	if !ready {
@@ -297,7 +320,10 @@ func (d *incrementalDecoder) Feed(chunk []byte) ([]ProtocolEvent, error) {
 				"", int64(len(d.pending)+len(payload)), d.maxEventBytes))
 		}
 		d.pending = append(d.pending, payload...)
-		format := DetectWireFormat("", d.pending)
+		format, err := d.detectPendingFormat()
+		if err != nil {
+			return nil, err
+		}
 		// WireJSON 的定型推迟到 Finish：此刻「一个完整值且没有尾随」只说明
 		// 到目前为止如此，下一个 chunk 可能带来第二行 —— 那就是 NDJSON。
 		// 提前定成 JSON 的话，第二行会被当成尾随垃圾报 ErrTrailingJSON。
@@ -309,6 +335,60 @@ func (d *incrementalDecoder) Feed(chunk []byte) ([]ProtocolEvent, error) {
 		d.pending = nil
 	}
 	return d.feedPayload(payload)
+}
+
+// detectPendingFormat 对已攒下的 pending 重判一次格式，并把重扫成本记进预算。
+//
+// 重判要扫整个已攒缓冲，所以逐字节到达时它本身是平方复杂度：一份攒到上限的
+// 正文能把一次探活变成几十秒的纯 CPU，而探活跑在调度器起的 goroutine 里、
+// 每 30 秒一轮、站有几十个。工作预算就是为这个准备的 —— 计入的必须是**扫过的
+// 字节数**而不是收到的字节数，否则预算恒等于 maxTotalBytes 的倍数，永远不触发。
+//
+// 只在「刚刚收尾了一个顶层值」时才重扫。判据是括号已配平：不配平就不可能
+// 出现第二个顶层值，NDJSON 与 JSON 还没有分歧，重扫必然得到同一个答案。
+// 少了这层短路，缩进过的 JSON（models 列表常常是）会在每个字节上重扫全缓冲，
+// 于是一份完全合法的正文撞上预算 —— 症状是「这个站的响应解析不了」，而站是好的。
+func (d *incrementalDecoder) detectPendingFormat() (WireFormat, error) {
+	if !d.pendingClosedAValue() {
+		return DetectWireFormat("", d.pending[:min(len(d.pending), maxAutoPrefixScan)]), nil
+	}
+	if err := d.spendWork(int64(len(d.pending))); err != nil {
+		return WireAuto, err
+	}
+	return DetectWireFormat("", d.pending), nil
+}
+
+// pendingClosedAValue 增量维护括号深度，回答「已攒的字节是否刚好收尾了一个
+// 顶层值」。增量是关键：每次重新数一遍就又是平方复杂度。
+func (d *incrementalDecoder) pendingClosedAValue() bool {
+	for ; d.pendingScanned < len(d.pending); d.pendingScanned++ {
+		switch c := d.pending[d.pendingScanned]; {
+		case d.pendingInString:
+			if d.pendingEscaped {
+				d.pendingEscaped = false
+			} else if c == '\\' {
+				d.pendingEscaped = true
+			} else if c == '"' {
+				d.pendingInString = false
+			}
+		case c == '"':
+			d.pendingInString = true
+		case c == '{' || c == '[':
+			d.pendingDepth++
+		case c == '}' || c == ']':
+			d.pendingDepth--
+		}
+	}
+	return d.pendingDepth <= 0 && !d.pendingInString
+}
+
+func (d *incrementalDecoder) spendWork(units int64) error {
+	if units > d.maxWorkUnits-d.workUnits {
+		return d.fail(makeDecoderError(ErrDecoderWorkBudget, d.effectiveFormat(), d.offset, "",
+			d.workUnits+units, d.maxWorkUnits))
+	}
+	d.workUnits += units
+	return nil
 }
 
 // consumePrefix 只负责剥掉一次开头的 UTF-8 BOM。
@@ -553,11 +633,12 @@ func (d *incrementalDecoder) finishJSON() ([]ProtocolEvent, error) {
 	}
 	reader := bytes.NewReader(body)
 	decoder := json.NewDecoder(reader)
-	decoder.UseNumber()
 	var raw json.RawMessage
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, makeDecoderError(ErrMalformedWire, WireJSON, d.offset, "", int64(len(body)), 0)
 	}
+	// json.Decoder 会为解析首个值**预读**尾随字节，所以只看底层 reader 是不够的：
+	// `{...} garbage` 里的 garbage 留在 decoder 自己的缓冲里，尾随检查会静默失效。
 	remaining, _ := io.ReadAll(decoder.Buffered())
 	tail, _ := io.ReadAll(reader)
 	remaining = append(remaining, tail...)
@@ -589,7 +670,7 @@ func (d *incrementalDecoder) decodePayload(eventName string, payload []byte) ([]
 }
 
 func (d *incrementalDecoder) eventFromObject(eventName string, object map[string]json.RawMessage, payload []byte) ([]ProtocolEvent, error) {
-	if raw, ok := object["error"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if raw, ok := object["error"]; ok && carriesError(raw) {
 		return []ProtocolEvent{remoteErrorEvent(eventName, raw)}, nil
 	}
 	if d.spec.Endpoint == model.EndpointModels {
@@ -603,8 +684,7 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 		return []ProtocolEvent{{Kind: EventMetadata, EventName: eventName}}, nil
 	}
 	if d.spec.Endpoint == model.EndpointCountTokens {
-		value, ok := integerField(object, "input_tokens")
-		if ok && value > 0 {
+		if value := tokenCount(object, "input_tokens"); value > 0 {
 			return []ProtocolEvent{{Kind: EventSemantic, EventName: "count_tokens", Semantic: true,
 				InputTokens: value}}, nil
 		}
@@ -649,7 +729,6 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 	} else if event.OutputTokens > 0 {
 		event.Kind = EventUsage
 	}
-	_ = payload
 	return []ProtocolEvent{event}, nil
 }
 
@@ -659,7 +738,7 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 			var value map[string]json.RawMessage
 			if json.Unmarshal(usage, &value) == nil {
 				// 只记数，不设 Semantic：token 数不是内容证据（§8.8）。
-				event.OutputTokens, _ = integerField(value, "output_tokens")
+				event.OutputTokens = tokenCount(value, "output_tokens")
 			}
 		}
 		return
@@ -692,14 +771,17 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 	}
 }
 
+// responsesSemanticFields 把 Responses 的 delta 事件名映射到内容类别。
+// 提到包级：每个事件都重建一次这张表会在解析热路径上白分配一次 map。
+var responsesSemanticFields = map[string]string{
+	"response.output_text.delta":             "text",
+	"response.reasoning_summary_text.delta":  "reasoning",
+	"response.refusal.delta":                 "refusal",
+	"response.function_call_arguments.delta": "function_args",
+}
+
 func classifyResponses(event *ProtocolEvent, name string, object map[string]json.RawMessage) {
-	fields := map[string]string{
-		"response.output_text.delta":             "text",
-		"response.reasoning_summary_text.delta":  "reasoning",
-		"response.refusal.delta":                 "refusal",
-		"response.function_call_arguments.delta": "function_args",
-	}
-	if semanticKind, ok := fields[name]; ok {
+	if semanticKind, ok := responsesSemanticFields[name]; ok {
 		if nonEmptyString(object["delta"]) {
 			event.Semantic = true
 			event.SemanticKind = semanticKind
@@ -712,12 +794,27 @@ func classifyResponses(event *ProtocolEvent, name string, object map[string]json
 				if usage, ok := body["usage"]; ok {
 					var values map[string]json.RawMessage
 					if json.Unmarshal(usage, &values) == nil {
-						event.OutputTokens, _ = integerField(values, "output_tokens")
+						event.OutputTokens = tokenCount(values, "output_tokens")
 					}
 				}
 			}
 		}
 	}
+}
+
+// chatSemanticFields 是 Chat delta 里的内容字段，**按优先级排列**。
+//
+// 用切片而不是 map：map 的遍历顺序是随机的，而一个 chunk 里同时出现 content
+// 和 refusal 是真实形态（拒答时个别站两个都填）。用 map 挑字段的话，同一份
+// 字节在两次运行里给出不同的 SemanticKind，而 P0-08 要按它分流「真内容」与
+// 「拒答」—— 于是同一个站会随机地被判成两种结果，且复现不了。
+var chatSemanticFields = []struct {
+	field string
+	kind  string
+}{
+	{"content", "text"},
+	{"reasoning_content", "reasoning"},
+	{"refusal", "refusal"},
 }
 
 func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawMessage) {
@@ -740,24 +837,22 @@ func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawM
 		if raw, ok := choice["message"]; ok {
 			_ = json.Unmarshal(raw, &message)
 		}
-		for field, kind := range map[string]string{
-			"content": "text", "reasoning_content": "reasoning", "refusal": "refusal",
-		} {
-			value := delta[field]
+		for _, candidate := range chatSemanticFields {
+			value := delta[candidate.field]
 			if len(value) == 0 {
-				value = message[field]
+				value = message[candidate.field]
 			}
 			if nonEmptyString(value) {
 				event.Semantic = true
-				event.SemanticKind = kind
+				event.SemanticKind = candidate.kind
 				break
 			}
 		}
-		if raw, ok := delta["tool_calls"]; ok && bytes.Contains(raw, []byte("arguments")) {
+		if nonEmptyToolArguments(delta["tool_calls"]) {
 			event.Semantic = true
 			event.SemanticKind = "tool"
 		}
-		if raw, ok := delta["function_call"]; ok && bytes.Contains(raw, []byte("arguments")) {
+		if nonEmptyCallArguments(delta["function_call"]) {
 			event.Semantic = true
 			event.SemanticKind = "function_args"
 		}
@@ -765,9 +860,9 @@ func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawM
 	if usage, ok := object["usage"]; ok {
 		var values map[string]json.RawMessage
 		if json.Unmarshal(usage, &values) == nil {
-			event.OutputTokens, _ = integerField(values, "completion_tokens")
+			event.OutputTokens = tokenCount(values, "completion_tokens")
 			if event.OutputTokens == 0 {
-				event.OutputTokens, _ = integerField(values, "output_tokens")
+				event.OutputTokens = tokenCount(values, "output_tokens")
 			}
 		}
 	}
@@ -775,6 +870,32 @@ func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawM
 		event.Kind = EventProtocolEnd
 		event.Semantic = false
 	}
+}
+
+// nonEmptyToolArguments 检查 tool_calls 里是否真的有非空 arguments。
+//
+// 不能用 `bytes.Contains(raw, "arguments")`：`"arguments":""` 与
+// `{"name":"arguments"}` 都会命中，于是空 delta 被算成「模型在生成」——
+// 与 §8.8 对空 delta 的要求正好相反，而这两种形态恰恰是假活站的典型输出。
+func nonEmptyToolArguments(raw json.RawMessage) bool {
+	var calls []map[string]json.RawMessage
+	if json.Unmarshal(raw, &calls) != nil {
+		return false
+	}
+	for _, call := range calls {
+		if nonEmptyCallArguments(call["function"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func nonEmptyCallArguments(raw json.RawMessage) bool {
+	var call map[string]json.RawMessage
+	if json.Unmarshal(raw, &call) != nil {
+		return false
+	}
+	return nonEmptyString(call["arguments"])
 }
 
 func remoteErrorEvent(eventName string, raw json.RawMessage) ProtocolEvent {
@@ -837,12 +958,39 @@ func integerField(object map[string]json.RawMessage, name string) (int64, bool) 
 	return value, err == nil
 }
 
+// tokenCount 读一个 token 计数，负数按「没有可信数字」丢掉。
+//
+// P0-08 要把 usage 事件单调累加成 Decision 的 token 总数。让 -5 流进去的话
+// 总和会往回走，于是「这次探活比上次少花了 token」这种不可能的结论会进数据库，
+// 而源头在这里 —— 到那一层已经查不出是哪个站发的。
+func tokenCount(object map[string]json.RawMessage, name string) int64 {
+	value, ok := integerField(object, name)
+	if !ok || value < 0 {
+		return 0
+	}
+	return value
+}
+
 func nonEmptyString(raw json.RawMessage) bool {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return false
 	}
 	var value string
 	return json.Unmarshal(raw, &value) == nil && value != ""
+}
+
+// carriesError 回答「这个 error 字段里真的有错误吗」。
+//
+// 中转站表达「本次无错误」的拼法不统一：null、false、空串、空对象都见过。
+// 把它们当成真错误的话，一个正常工作的站会被判成「上游报错」，而正文里根本
+// 没有错误信息可展示 —— UI 上只会出现一个没有原因的失败。
+func carriesError(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	switch string(trimmed) {
+	case "", "null", "false", `""`, "{}", "[]":
+		return false
+	}
+	return true
 }
 
 func (d *incrementalDecoder) effectiveFormat() WireFormat {

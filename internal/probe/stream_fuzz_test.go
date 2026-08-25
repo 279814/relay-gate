@@ -64,20 +64,20 @@ func FuzzDecoderNeverPanicsOrGrowsUnbounded(f *testing.F) {
 			t.Fatalf("NewDecoder rejected a valid spec: %v", err)
 		}
 
-		for start := 0; start < len(body); start += chunkSize {
-			end := min(start+chunkSize, len(body))
-			if _, err := decoder.Feed(body[start:end]); err != nil {
-				break
+		// 出错后继续喂不能让内部缓冲继续增长：一个已经判失败的流仍可能有大量
+		// 在途字节，Executor 关闭连接前它们都会到达。这里在 Finish **之前**
+		// 反复喂 —— Finish 之后 Feed 会直接报 ErrDecoderFinished，那条路径
+		// 走不到缓冲里去，测不出增长。
+		for range 4 {
+			for start := 0; start < len(body); start += chunkSize {
+				end := min(start+chunkSize, len(body))
+				if _, err := decoder.Feed(body[start:end]); err != nil {
+					break
+				}
 			}
 		}
 		_, _ = decoder.Finish()
-
-		// 出错后继续喂不能让内部缓冲继续增长：一个已经判失败的流仍可能
-		// 有大量在途字节，Executor 关闭连接前它们都会到达。
-		for range 4 {
-			_, _ = decoder.Feed(body)
-			_, _ = decoder.Finish()
-		}
+		_, _ = decoder.Finish()
 
 		if seen := decoder.BytesSeen(); seen > maxTotalBytes {
 			t.Fatalf("BytesSeen() = %d, want at most %d", seen, maxTotalBytes)

@@ -2,6 +2,7 @@ package probe
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -508,6 +509,238 @@ func TestDecoderNamedLimitsAndExactBoundaries(t *testing.T) {
 			t.Fatalf("exact limit Finish: %v", err)
 		}
 	})
+}
+
+// SemanticKind 必须是确定的，不能取决于 map 遍历顺序。
+//
+// 一个 chunk 里同时出现 content 和 refusal 是真实形态（拒答时个别站两个都填）。
+// 用 map 遍历挑字段的话，同一份字节在两次运行里会给出不同的 SemanticKind，
+// 而 P0-08 要按它分流「真内容」与「拒答」—— 于是同一个站会随机地被判成
+// 两种不同结果，且复现不了。
+func TestChatSemanticKindIsDeterministicWhenSeveralFieldsArePresent(t *testing.T) {
+	wire := "data: {\"choices\":[{\"delta\":{\"refusal\":\"no\",\"content\":\"2\",\"reasoning_content\":\"think\"}}]}\n\n"
+	for range 16 {
+		events, err := decodeChunks(t, eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat), WireSSE, wire)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(events) != 1 || events[0].SemanticKind != "text" {
+			t.Fatalf("events = %#v, want SemanticKind \"text\" (content outranks refusal)", events)
+		}
+	}
+}
+
+// 空的 tool/function arguments 不是内容证据。
+//
+// 用 `bytes.Contains(raw, "arguments")` 判定的话，`"arguments":""` 与
+// `{"name":"arguments"}` 都会被算成「模型在生成」—— 与 §8.8 对空 delta 的
+// 要求正好相反，而这两种形态恰恰是假活站的典型输出。
+func TestEmptyToolArgumentsAreNotSemantic(t *testing.T) {
+	cases := []struct {
+		name string
+		wire string
+	}{
+		{"empty tool arguments", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\"}}]}}]}\n\n"},
+		{"empty function arguments", "data: {\"choices\":[{\"delta\":{\"function_call\":{\"arguments\":\"\"}}}]}\n\n"},
+		{"arguments only as an index", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events, err := decodeChunks(t, eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat), WireSSE, tc.wire)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, event := range events {
+				if event.Semantic {
+					t.Fatalf("empty arguments became semantic: %#v", event)
+				}
+			}
+		})
+	}
+}
+
+// 负数 token 数必须当作「没有可信数字」丢掉，而不是原样带出。
+//
+// P0-08 要把 usage 事件单调累加成 Decision 的 token 总数。让 -5 流进去的话
+// 总和会往回走，于是「这次探活比上次少花了 token」这种不可能的结论会进数据库，
+// 而源头在这里 —— 到那一层已经查不出是哪个站发的。
+func TestNegativeTokenCountsAreDiscarded(t *testing.T) {
+	cases := []struct {
+		name string
+		spec DecoderSpec
+		wire string
+	}{
+		{
+			name: "anthropic output tokens",
+			spec: eventSpec(model.EndpointMessages, model.ProtoAnthropic),
+			wire: "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":-5}}\n\n",
+		},
+		{
+			name: "chat completion tokens",
+			spec: eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat),
+			wire: "data: {\"choices\":[],\"usage\":{\"completion_tokens\":-1}}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events, err := decodeChunks(t, tc.spec, WireSSE, tc.wire)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, event := range events {
+				if event.OutputTokens != 0 || event.InputTokens != 0 || event.Kind == EventUsage {
+					t.Fatalf("negative usage leaked into the event: %#v", event)
+				}
+			}
+		})
+	}
+}
+
+func TestNegativeCountTokensInputIsNotSemantic(t *testing.T) {
+	events, err := decodeChunks(t, eventSpec(model.EndpointCountTokens, model.ProtoAnthropic), WireJSON,
+		`{"input_tokens":-3}`)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, event := range events {
+		if event.Semantic || event.InputTokens != 0 {
+			t.Fatalf("negative input_tokens leaked: %#v", event)
+		}
+	}
+}
+
+// `"error"` 字段的这几种「没有错误」写法不能当成流内错误。
+//
+// 中转站表达「本次无错误」的拼法不统一：null、false、空串、空对象都见过。
+// 把它们当成真错误的话，一个正常工作的站会被判成「上游报错」，而正文里
+// 根本没有错误信息可展示 —— UI 上只会出现一个没有原因的失败。
+func TestEmptyErrorFieldSpellingsAreNotRemoteErrors(t *testing.T) {
+	for _, spelling := range []string{"null", "false", `""`, "{}"} {
+		t.Run(spelling, func(t *testing.T) {
+			wire := "data: {\"type\":\"message_delta\",\"error\":" + spelling + "}\n\n"
+			events, err := decodeChunks(t, eventSpec(model.EndpointMessages, model.ProtoAnthropic), WireSSE, wire)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, event := range events {
+				if event.Kind == EventRemoteError {
+					t.Fatalf("%s was treated as a remote error: %#v", spelling, event)
+				}
+			}
+		})
+	}
+}
+
+// Finish 之后再 Feed 必须报错，不能静默丢字节。
+//
+// 静默返回空序列的话，一个把 Finish 提前调用了的调用方会看到「流里什么都没有」，
+// 而字节其实到了、只是被扔了。这与 scanStream 当年把读错误藏进 Err() 是同一类
+// 问题：失败没有出口，于是排查方向从一开始就是错的。
+func TestFeedAfterFinishIsRejected(t *testing.T) {
+	decoder, err := NewDecoder(eventSpec(model.EndpointMessages, model.ProtoAnthropic), WireSSE, 1024, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.Feed([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.Feed([]byte("data: {\"type\":\"ping\"}\n\n")); !errors.Is(err, ErrDecoderFinished) {
+		t.Fatalf("Feed after Finish = %v, want ErrDecoderFinished", err)
+	}
+}
+
+// WireAuto 的格式重判不能是 O(n²)。
+//
+// 重判要扫整个已攒缓冲，而「一直定不了型」的正文会让每个字节都触发一次重扫，
+// 也就是平方复杂度。最现实的这种正文是 HTML 错误页：公益站被网关拦下时常常
+// 回一整页 HTML，它既不是 SSE 也不是 JSON，于是格式永远定不下来。
+// 一份攒到上限的这种正文能把一次探活变成几十秒的纯 CPU，而探活跑在调度器起的
+// goroutine 里、每 30 秒一轮、站有几十个。
+// 工作预算就是为这个准备的 —— 它必须真的能触发，否则只是个没接线的开关。
+func TestWireAutoScanWorkIsBounded(t *testing.T) {
+	const size = 8 << 10
+	adversarial := []byte("<!DOCTYPE html><html><body>" +
+		strings.Repeat("upstream gateway error ", size/16) + "</body></html>")
+
+	decoder, err := NewDecoder(eventSpec(model.EndpointResponses, model.ProtoOpenAIResponses),
+		WireAuto, int64(len(adversarial))*2, int64(len(adversarial))*2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var feedErr error
+	for _, b := range adversarial {
+		if _, feedErr = decoder.Feed([]byte{b}); feedErr != nil {
+			break
+		}
+	}
+	if feedErr == nil {
+		_, feedErr = decoder.Finish()
+	}
+	if !errors.Is(feedErr, ErrDecoderWorkBudget) {
+		t.Fatalf("error = %v, want ErrDecoderWorkBudget", feedErr)
+	}
+}
+
+// 逐字节到达的**正常** JSON 正文不能被工作预算误杀。
+//
+// 上一条的预算是给恶意形状准备的。一份合法的大 JSON 也会逐字节走同一条路径，
+// 如果重判照样扫全缓冲，它会先撞上预算 —— 症状是「这个站的响应解析不了」，
+// 而站是好的。所以在还不可能出现第二个值时（缓冲里没有换行）根本不必重扫。
+func TestWireAutoAcceptsLargeSingleValueJSONFedByteByByte(t *testing.T) {
+	const size = 8 << 10
+	body := `{"input_tokens":8,"padding":"` + strings.Repeat("p", size) + `"}`
+
+	decoder, err := NewDecoder(eventSpec(model.EndpointCountTokens, model.ProtoAnthropic),
+		WireAuto, int64(len(body)), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < len(body); index++ {
+		if _, err := decoder.Feed([]byte{body[index]}); err != nil {
+			t.Fatalf("Feed byte %d: %v", index, err)
+		}
+	}
+	events, err := decoder.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if len(events) != 1 || events[0].InputTokens != 8 {
+		t.Fatalf("events = %#v, want one count_tokens event with 8 input tokens", events)
+	}
+}
+
+// 缩进过的 JSON 也要能逐字节走完 WireAuto。
+//
+// 这类正文里到处是换行，而换行正是「可能出现第二个值」的信号 —— 天真的实现
+// 会在每个字节上重扫全缓冲，于是一份合法的 models 列表（非流式端点常常是
+// 缩进过的）会撞上工作预算，症状是「这个站的响应解析不了」，而站是好的。
+func TestWireAutoAcceptsPrettyPrintedJSONFedByteByByte(t *testing.T) {
+	body := "{\n  \"data\": [\n"
+	for index := range 40 {
+		body += fmt.Sprintf("    {\"id\": \"model-%02d\"},\n", index)
+	}
+	body += "    {\"id\": \"model-last\"}\n  ]\n}\n"
+
+	decoder, err := NewDecoder(eventSpec(model.EndpointModels, ""), WireAuto,
+		int64(len(body)), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < len(body); index++ {
+		if _, err := decoder.Feed([]byte{body[index]}); err != nil {
+			t.Fatalf("Feed byte %d of %d: %v", index, len(body), err)
+		}
+	}
+	events, err := decoder.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if len(events) != 1 || !events[0].ModelListRecognized || events[0].ModelCount != 41 {
+		t.Fatalf("events = %#v, want one model list of 41", events)
+	}
 }
 
 func TestDecoderFinishReturnsSameEOFEventOnRepeat(t *testing.T) {
