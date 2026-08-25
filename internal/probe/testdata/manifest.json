@@ -86,6 +86,19 @@
       "expected_decision": {"success": false, "capability": "transient_error", "error_class": "fake_alive"}
     },
     {
+      "id": "anthropic_usage_only_no_content",
+      "protocol": "anthropic",
+      "endpoint": "messages",
+      "wire_format": "sse",
+      "status": 200,
+      "headers": {"content-type": ["text/event-stream"]},
+      "request_file": "requests/anthropic_messages.json",
+      "response_file": "responses/anthropic_usage_only_no_content.bin",
+      "chunk_plan": {"name": "single_byte"},
+      "expected_events": [{"type": "message_delta"}, {"type": "message_stop"}],
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "fake_alive"}
+    },
+    {
       "id": "anthropic_context_1m_required",
       "protocol": "anthropic",
       "endpoint": "messages",
@@ -214,6 +227,19 @@
       "chunk_plan": {"name": "whole"},
       "expected_events": [{"type": "model_list", "semantic": true}],
       "expected_decision": {"success": true, "capability": "supported", "error_class": "none"}
+    },
+    {
+      "id": "models_200_arbitrary_object",
+      "protocol": "",
+      "endpoint": "models",
+      "wire_format": "json",
+      "status": 200,
+      "headers": {"content-type": ["application/json"]},
+      "request_file": "requests/models.json",
+      "response_file": "responses/models_200_arbitrary_object.bin",
+      "chunk_plan": {"name": "single_byte"},
+      "expected_events": [{"type": "model_list"}],
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "fake_alive"}
     },
     {
       "id": "models_404",
