@@ -14,7 +14,15 @@ import (
 type ContentCodingLimits struct {
 	MaxEncodedBytes int64
 	MaxDecodedBytes int64
-	MaxWorkUnits    int64
+
+	// MaxWorkUnits 是允许的 Read 次数上限，不是字节数。
+	//
+	// 必须与 MaxDecodedBytes 计不同的东西，否则它只是后者的别名。真正要防的是
+	// 「一直返回 (0, nil) 的源」：那种流一个字节都不产出，字节预算永远不减，
+	// 而 io.ReadAll 会原地空转 —— 实测每 2 秒十亿次。探活跑在调度器起的
+	// goroutine 里，这比 panic 更糟：panic 至少会留下栈，空转只是把一个核吃满，
+	// 看起来像「这个站很慢」。
+	MaxWorkUnits int64
 }
 
 var (
@@ -22,6 +30,7 @@ var (
 	ErrEncodedBodyTooLarge      = errors.New("encoded body exceeds limit")
 	ErrDecodedBodyTooLarge      = errors.New("decoded body exceeds limit")
 	ErrContentEncodingTruncated = errors.New("content encoding is truncated")
+	ErrMalformedContentEncoding = errors.New("malformed content encoding")
 	ErrContentDecoderWorkBudget = errors.New("content decoder work budget exceeded")
 )
 
@@ -61,10 +70,7 @@ func NewContentDecoder(encoding string, src io.Reader, limits ContentCodingLimit
 	case "gzip":
 		reader, err := gzip.NewReader(encoded)
 		if err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil, fmt.Errorf("%w: gzip", ErrContentEncodingTruncated)
-			}
-			return nil, fmt.Errorf("%w: gzip", ErrContentEncodingTruncated)
+			return nil, wrapContentEncodingErr(encoding, err)
 		}
 		decoded = reader
 		closeFn = reader.Close
@@ -133,25 +139,30 @@ func (r *boundedContentReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	remaining := r.maxDecoded - r.decodedN
-	if remaining <= 0 {
-		return 0, r.fail(fmt.Errorf("%w: encoding=%s limit=%d", ErrDecodedBodyTooLarge,
-			r.encoding, r.maxDecoded))
-	}
-	if int64(len(p)) > remaining {
-		p = p[:remaining]
-	}
-	workRemaining := r.maxWork - r.workN
-	if workRemaining <= 0 {
+	if r.workN >= r.maxWork {
 		return 0, r.fail(fmt.Errorf("%w: encoding=%s limit=%d", ErrContentDecoderWorkBudget,
 			r.encoding, r.maxWork))
 	}
-	if int64(len(p)) > workRemaining {
-		p = p[:workRemaining]
+	r.workN++
+
+	// 额度用尽后仍要再读一次，只读 1 字节：一份**正好**等于上限的正文与一份
+	// 真正超限的正文，区别只在「后面还有没有字节」。到额度就直接报超限会拒掉
+	// 前者，而报出来是「解压输出超限」—— 与真正的解压炸弹无法区分。
+	// 这与 encoded 侧的「到上限后再探一个字节」是同一套语义。
+	atBudget := false
+	if remaining := r.maxDecoded - r.decodedN; remaining <= 0 {
+		atBudget = true
+		p = p[:1]
+	} else if int64(len(p)) > remaining {
+		p = p[:remaining]
 	}
+
 	n, err := r.decoded.Read(p)
+	if n > 0 && atBudget {
+		return 0, r.fail(fmt.Errorf("%w: encoding=%s limit=%d", ErrDecodedBodyTooLarge,
+			r.encoding, r.maxDecoded))
+	}
 	r.decodedN += int64(n)
-	r.workN += int64(n)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			r.finished = true
@@ -159,30 +170,33 @@ func (r *boundedContentReader) Read(p []byte) (int, error) {
 				return n, r.fail(ErrEncodedBodyTooLarge)
 			}
 			if r.encoding == "gzip" && r.encoded.seen == 0 {
-				return n, r.fail(ErrContentEncodingTruncated)
+				return n, r.fail(fmt.Errorf("%w: encoding=%s", ErrContentEncodingTruncated, r.encoding))
 			}
 			return n, io.EOF
 		}
 		if errors.Is(err, ErrEncodedBodyTooLarge) {
 			return n, r.fail(err)
 		}
-		if errors.Is(err, io.ErrUnexpectedEOF) || r.encoding == "gzip" {
-			return n, r.fail(fmt.Errorf("%w: encoding=%s", ErrContentEncodingTruncated, r.encoding))
-		}
-		return n, r.fail(err)
-	}
-	if n == 0 {
-		return 0, nil
-	}
-	if r.decodedN >= r.maxDecoded {
-		return n, r.fail(fmt.Errorf("%w: encoding=%s limit=%d", ErrDecodedBodyTooLarge,
-			r.encoding, r.maxDecoded))
-	}
-	if r.workN >= r.maxWork {
-		return n, r.fail(fmt.Errorf("%w: encoding=%s limit=%d", ErrContentDecoderWorkBudget,
-			r.encoding, r.maxWork))
+		return n, r.fail(wrapContentEncodingErr(r.encoding, err))
 	}
 	return n, nil
+}
+
+// wrapContentEncodingErr 把压缩库的错误分成「流被截断」与「声明的编码与实际
+// 字节不符」两类。
+//
+// 都报成截断的话，排查会从「连接为什么断了」开始，而真正该看的是「这个站的
+// Content-Encoding 头是不是在撒谎」—— P0-08 对两者的处置也相反：截断是瞬时
+// 故障可重试，声明不符是站点能力问题。
+//
+// compress/gzip 与 brotli 恰好都用 io.ErrUnexpectedEOF 表示「字节没给完」，
+// 各自的具体错误（gzip: invalid header/checksum、brotli: CL_SPACE 等）表示
+// 「给的字节根本不是这个格式」，所以一条规则就够，不需要按 encoding 分支。
+func wrapContentEncodingErr(encoding string, err error) error {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: encoding=%s", ErrContentEncodingTruncated, encoding)
+	}
+	return fmt.Errorf("%w: encoding=%s", ErrMalformedContentEncoding, encoding)
 }
 
 func (r *boundedContentReader) Close() error {
