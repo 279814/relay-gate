@@ -103,6 +103,12 @@ type ExecutionRequest struct {
 	ObservationOrder int64
 	CalibrationRunID string
 	CandidateOrdinal int
+
+	// ExplicitRecipe / AuthOverride 供 CalibrationRun 使用（§P0-11）：
+	// 必须测已经物化的 DB version，并用候选的单一 AuthMode，不能走四级解析后再
+	// 声称另一个 version 已通过。二者都非 nil 时 prepare 走显式路径。
+	ExplicitRecipe *ResolvedRecipe
+	AuthOverride   *model.EndpointAuthProfile
 }
 
 // ExecutionResult 是一次执行的产出。
@@ -186,7 +192,14 @@ func (e *Executor) Execute(ctx context.Context, req ExecutionRequest) (Execution
 	// config_error，**不出网**（§8.6）。这里刻意不传 Transport 构造 Prober ——
 	// 它只借用 prepare，不发送。
 	preparer := &Prober{Targets: e.resolver, Secrets: e.secrets, Recipes: e.recipes}
-	prepared, resolved, err := preparer.prepare(ctx, req.Upstream, req.ModelName, req.Route, req.Endpoint)
+	var prepared *preparedProbe
+	var resolved ResolvedRecipe
+	var err error
+	if req.ExplicitRecipe != nil {
+		prepared, resolved, err = preparer.prepareExplicit(ctx, req)
+	} else {
+		prepared, resolved, err = preparer.prepare(ctx, req.Upstream, req.ModelName, req.Route, req.Endpoint)
+	}
 	if err != nil {
 		// resolved 可能是零值（解析本身就失败）：finishConfigError 会兜一份
 		// 合法的 identity，好让 config_error 行也能落库（成本证据要求
