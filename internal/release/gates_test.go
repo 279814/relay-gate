@@ -120,6 +120,47 @@ func TestTransformUnboundPassthrough(t *testing.T) {
 	}
 }
 
+func TestTransformPersistSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relay.db")
+	cipher, err := store.NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := transform.NewRegistry(8).WithPersist(st)
+	set, err := reg.CreateSet("release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-P5", Value: "1"}}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, ver, err := reg.PublishSnapshot(set.ID, 2, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st2, err := store.Open(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	reg2 := transform.NewRegistry(8).WithPersist(st2)
+	if err := reg2.LoadFromPersist(); err != nil {
+		t.Fatal(err)
+	}
+	c, id, err := reg2.PublishedCompiled(2, 5)
+	if err != nil || c == nil || id != ver.ID {
+		t.Fatalf("after reopen: c=%v id=%d want=%d err=%v", c != nil, id, ver.ID, err)
+	}
+}
+
 func TestRecoveryGateSingleFlight(t *testing.T) {
 	g := health.NewRecoveryGate()
 	release1, ok1 := g.TryAcquire(99)
