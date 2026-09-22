@@ -92,6 +92,13 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("POST /admin/api/security/scan", s.postSecurityScan)
 	mux.HandleFunc("POST /admin/api/security/canary", s.postSecurityCanary)
 
+	mux.HandleFunc("GET /admin/api/credentials", s.getCredentialsStatus)
+	mux.HandleFunc("POST /admin/api/credentials/reveal-master", s.postRevealMasterKey)
+	mux.HandleFunc("POST /admin/api/credentials/rotate-relay", s.postRotateRelayKey)
+	mux.HandleFunc("POST /admin/api/credentials/revoke-relay-grace", s.postRevokeRelayGrace)
+	mux.HandleFunc("POST /admin/api/credentials/reset-admin", s.postResetAdminPassword)
+	mux.HandleFunc("POST /admin/api/credentials/rotate-master", s.postBeginMasterRotation)
+
 	mux.HandleFunc("GET /admin/api/transforms", s.listTransformSets)
 	mux.HandleFunc("POST /admin/api/transforms", s.createTransformSet)
 	mux.HandleFunc("GET /admin/api/transforms/{id}", s.getTransformSet)

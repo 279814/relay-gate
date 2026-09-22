@@ -9,6 +9,7 @@ import { createApiClient } from './api.mjs';
 import { createProbeFeature, mergeProbeTabs } from './probes.mjs';
 import { createRecentErrorsFeature } from './errors.mjs';
 import { createMigrationFeature } from './migration.mjs';
+import { createCredentialsFeature, mergeCredentialsTab } from './credentials.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -36,6 +37,8 @@ if (typeof base !== 'function') {
       mergeProbeTabs(shell);
       createRecentErrorsFeature(shell, api);
       createMigrationFeature(shell, api);
+      createCredentialsFeature(shell, api);
+      mergeCredentialsTab(shell);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -101,6 +104,8 @@ if (typeof base !== 'function') {
         this.loadCalibrations(true);
       } else if (tab === 'probe-runtime') {
         this.loadProbeRuntime();
+      } else if (tab === 'credentials') {
+        this.loadCredentials();
       } else if (tab === 'health') {
         this.refreshHealthSide();
       }

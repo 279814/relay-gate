@@ -139,6 +139,13 @@ func (s *sessionStore) revoke(tok string) {
 	delete(s.toks, tok)
 }
 
+// revokeAll drops every session (admin password reset §12.5).
+func (s *sessionStore) revokeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toks = map[string]time.Time{}
+}
+
 // gcLocked 清理过期令牌。调用方必须已持有锁。
 //
 // 挂在 issue 上而不是起一个后台 goroutine：会话表最多几十项，

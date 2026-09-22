@@ -28,6 +28,8 @@ type document struct {
 	Pending       string         `json:"pending,omitempty"`
 	UpdatedAt     string         `json:"updated_at"`
 	History       []historyEntry `json:"history,omitempty"`
+	Phase         RotationPhase  `json:"phase,omitempty"`
+	RotationID    string         `json:"rotation_id,omitempty"`
 }
 
 type historyEntry struct {

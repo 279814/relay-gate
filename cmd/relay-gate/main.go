@@ -17,7 +17,9 @@ import (
 
 	"github.com/279814/relay-gate/internal/api"
 	"github.com/279814/relay-gate/internal/config"
+	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/observationseq"
@@ -87,6 +89,19 @@ func runServer() error {
 	cipher, err := store.NewCipher(cfg.EncKey)
 	if err != nil {
 		return err
+	}
+	dataDir := filepath.Dir(cfg.DBPath)
+	if dataDir == "." || dataDir == "" {
+		dataDir = "data"
+	}
+	kr := keyring.Open(dataDir)
+	if err := kr.EnsureInitialized(cipher.KeyID(), cfg.EncKey); err != nil {
+		return fmt.Errorf("初始化 keyring: %w", err)
+	}
+	credSvc := credential.New()
+	for _, k := range cfg.RelayKeys {
+		credSvc.SetActiveRelayKey(k)
+		break
 	}
 	st, err := store.Open(cfg.DBPath, cipher)
 	if err != nil {
@@ -277,6 +292,7 @@ func runServer() error {
 		WithProbeAdmin(probeAdmin).
 		WithSecurityCenter(security.NewCenter(500)).
 		WithTransformRegistry(transform.NewRegistry(500)).
+		WithCredentials(credSvc, kr).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 

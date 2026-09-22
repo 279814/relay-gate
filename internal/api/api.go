@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/credential"
+	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
@@ -62,6 +64,10 @@ type Server struct {
 
 	// transforms 是 P4 声明式转换注册表。未注入时 list 返回空。
 	transforms *transform.Registry
+
+	// creds / keyring 是 P2 凭据与 Master Key 管理。未注入时 credentials 端点 503。
+	creds   *credential.Service
+	keyring *keyring.File
 
 	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
 	adminPW  string
