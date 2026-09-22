@@ -565,6 +565,53 @@ func TestCalibration_PreparedCrashResumesOnce(t *testing.T) {
 	}
 }
 
+func TestCalibration_CredentialChangeAfterExecution_RequiresRetest(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	svc, _ := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		return respFrom(200, "text/event-stream", anthropicSemanticBody()), nil
+	})
+	svc.WithCrashAt(CrashAfterExecutionCommit, func(CalibrationCrashPoint) {
+		panic("injected crash after execution commit")
+	})
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := svc.Start(context.Background(), run.ID, run.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = svc.advanceRun(context.Background(), &started)
+	}()
+	svc.crashAt = ""
+	svc.crashFn = nil
+
+	// RoundTrip 已成功落库后改凭据：恢复 commit 必须 revision conflict，不能 succeed。
+	freshUp, err := st.GetUpstream(up.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshUp.APIKey = "sk-cal-rotated-after-probe"
+	if err := st.UpdateUpstream(freshUp); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := st.GetCalibrationRun(context.Background(), started.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = svc.advanceRun(context.Background(), fresh)
+	if !errors.Is(err, store.ErrRevisionConflict) {
+		t.Fatalf("凭据变更后 resume error=%v, want ErrRevisionConflict", err)
+	}
+	final, _ := st.GetCalibrationRun(context.Background(), started.ID)
+	if final.State == model.CalibrationSucceeded {
+		t.Fatal("不得在凭据已变时 commit success")
+	}
+}
+
 func TestExecutor_ExplicitRecipeUsesAuthOverride(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, mn, rt := seedCalibrationRoute(t, st)
