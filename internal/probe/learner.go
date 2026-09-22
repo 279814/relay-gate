@@ -123,4 +123,3 @@ func (l *Learner) ForgetUpstream(upstreamID int64) {
 		}
 	}
 }
-

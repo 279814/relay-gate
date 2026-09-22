@@ -265,7 +265,6 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 	}), true
 }
 
-
 // dispatch 重建全部出站产物并发出请求。
 //
 // 只收入站原文与候选 —— 见文件头「为什么每次尝试都必须重建」。

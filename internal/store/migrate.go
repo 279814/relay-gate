@@ -55,9 +55,9 @@ const (
 	schemaV3FreshFingerprint           = "463fd48fd95efcccd7d8bb4ef2a3ede76768dbbbb8ae1b386c186f4002ea73e7"
 	schemaV3M2UpgradeFingerprint       = "209a946cc1b189eeb025434ea276c566738dd561ba0ca0f8f7fa5578b63178f5"
 	schemaV3M6UpgradeFingerprint       = "cef417c838c9a0c6430839f61f90308df793f5b540c963915b36c8345b9d2d1d"
-	schemaV4FreshFingerprint     = "2c4f9a880c02ffcfebec73c6191481a83375a144f65b80b3e5ea6b7a4b91f942"
-	schemaV4M2UpgradeFingerprint = "210529487639a9dac3b8d1fc7e656e8beef8c69d1171b731d877d3483bf7e7f4"
-	schemaV4M6UpgradeFingerprint = "69a0b4d01cb56ce9df5fe6bfef5bf9b56240a9463bf80092bf28ecb7ba27ad2d"
+	schemaV4FreshFingerprint           = "2c4f9a880c02ffcfebec73c6191481a83375a144f65b80b3e5ea6b7a4b91f942"
+	schemaV4M2UpgradeFingerprint       = "210529487639a9dac3b8d1fc7e656e8beef8c69d1171b731d877d3483bf7e7f4"
+	schemaV4M6UpgradeFingerprint       = "69a0b4d01cb56ce9df5fe6bfef5bf9b56240a9463bf80092bf28ecb7ba27ad2d"
 )
 
 type schemaQuerier interface {

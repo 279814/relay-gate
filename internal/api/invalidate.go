@@ -25,7 +25,7 @@ type SemanticConfigInvalidator struct {
 		InvalidateRoute(routeID int64)
 		InvalidateUpstream(upstreamID int64, routeIDs []int64)
 	}
-	Inner          ConfigInvalidator
+	Inner            ConfigInvalidator
 	RoutesOfUpstream func(upstreamID int64) []int64
 }
 
