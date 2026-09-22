@@ -4,6 +4,10 @@
 // 不再依赖 livecfg 的 2 秒 TTL。pause 后由绑定的 SyntheticController
 // 关闭 admission 并 drain 全部合成 context；resume 在 Current 仍为 paused
 // 时先 PrepareResume，再发布 running，避免旧正结论被并发消费。
+//
+// P2 Runtime Controller 扩展（§4.4 / §12.7 / §13.5）：maintenance 是内存
+// 叠加态，不覆盖持久化 paused；暖机进度在 resume 后供 UI 展示，不暗示
+// 全部 Route 已立即验证。
 package runstate
 
 import (
@@ -21,19 +25,58 @@ const (
 	// PauseDrainPendingCode 是 DB 已提交 paused、但 drain 尚未完成时的诊断码。
 	PauseDrainPendingCode = "pause_drain_pending"
 
+	// MaintenanceActiveCode 表示已在 maintenance，拒绝重复进入凭据轮换。
+	MaintenanceActiveCode = "maintenance_active"
+
 	// defaultDrainRetry 是后台幂等 drain 的重试间隔上界。
 	defaultDrainRetry = 2 * time.Second
+
+	// defaultWarmupMax 是 resume 后暖机展示的最长窗口（超时后 UI 不再标 active）。
+	defaultWarmupMax = 30 * time.Minute
 )
 
 // Snapshot 是运行态与独立 revision 的对外视图。
+//
+// State/Revision 是持久化用户意图（仅 running|paused）。Maintenance 是内部
+// 叠加态（§4.4），不写库、不覆盖 paused。
 type Snapshot struct {
-	State    model.RunState `json:"state"`
-	Revision int64          `json:"revision"`
+	State             model.RunState  `json:"state"`
+	Revision          int64           `json:"revision"`
+	Maintenance       bool            `json:"maintenance"`
+	MaintenanceReason string          `json:"maintenance_reason,omitempty"`
+	Warmup            *WarmupProgress `json:"warmup,omitempty"`
+}
+
+// WarmupProgress 是 resume 后的暖机视图（§13.5）。
+type WarmupProgress struct {
+	Active   bool `json:"active"`
+	Pending  int  `json:"pending"` // 仍为 unknown、待复核
+	Alive    int  `json:"alive"`
+	Negative int  `json:"negative"` // dead/recovering/cooldown 等负状态
+	Total    int  `json:"total"`
+}
+
+// Effective 返回 UI/代理可见态：maintenance 优先于持久化 state。
+func (s Snapshot) Effective() string {
+	if s.Maintenance {
+		return "maintenance"
+	}
+	return string(s.State)
+}
+
+// Admitting 为 true 时才接受新模型流量 / count_tokens。
+func (s Snapshot) Admitting() bool {
+	return !s.Maintenance && s.State == model.RunStateRunning
 }
 
 // Reader 是热路径只读面（proxy / Scheduler / count_tokens）。
 type Reader interface {
 	Current() Snapshot
+}
+
+// WarmupSource 提供 Route 健康计数；由 health.Tracker 实现。
+type WarmupSource interface {
+	RouteHealthCounts() (unknown, alive, negative, total int)
 }
 
 // StateStore 持久化运行态（乐观并发）。由 store.Store 实现。
@@ -84,6 +127,9 @@ var ErrNotBound = errors.New("runstate: SyntheticController 未绑定")
 // ErrAlreadyBound 表示重复绑定。
 var ErrAlreadyBound = errors.New("runstate: SyntheticController 已绑定")
 
+// ErrMaintenanceActive 表示已在 maintenance（拒绝重复进入轮换）。
+var ErrMaintenanceActive = errors.New("runstate: maintenance already active")
+
 // Controller 持有原子快照，并协调 pause/resume 副作用。
 type Controller struct {
 	store StateStore
@@ -99,6 +145,17 @@ type Controller struct {
 	drainPending atomic.Bool
 	drainOnce    sync.Once
 	drainStop    chan struct{}
+
+	// maintenance 叠加态（§4.4）：不写库，不覆盖 persisted paused。
+	maintenance       atomic.Bool
+	maintenanceReason atomic.Value // string
+
+	// warmup：resume 后展示进度；不暗示全部 Route 已验证。
+	warmupMu      sync.Mutex
+	warmupActive  bool
+	warmupStarted time.Time
+	warmupSource  WarmupSource
+	warmupMax     time.Duration
 
 	// 测试可注入。
 	drainRetry time.Duration
@@ -121,10 +178,22 @@ func NewController(st StateStore) (*Controller, error) {
 		store:      st,
 		drainStop:  make(chan struct{}),
 		drainRetry: defaultDrainRetry,
+		warmupMax:  defaultWarmupMax,
 		now:        time.Now,
 	}
+	c.maintenanceReason.Store("")
 	c.snap.Store(Snapshot{State: state, Revision: rev})
 	return c, nil
+}
+
+// BindWarmupSource 可选绑定暖机计数源（通常为 health.Tracker）。
+func (c *Controller) BindWarmupSource(src WarmupSource) {
+	if c == nil {
+		return
+	}
+	c.warmupMu.Lock()
+	c.warmupSource = src
+	c.warmupMu.Unlock()
 }
 
 // BindSyntheticController 恰好绑定一次；nil 或重复失败。
@@ -151,6 +220,13 @@ func (c *Controller) Current() Snapshot {
 		return Snapshot{State: model.RunStatePaused, Revision: 0}
 	}
 	v, _ := c.snap.Load().(Snapshot)
+	v.Maintenance = c.maintenance.Load()
+	if v.Maintenance {
+		if reason, _ := c.maintenanceReason.Load().(string); reason != "" {
+			v.MaintenanceReason = reason
+		}
+	}
+	v.Warmup = c.warmupProgressLocked(v)
 	return v
 }
 
@@ -161,6 +237,62 @@ func (c *Controller) Get(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, errors.New("runstate: Controller 为空")
 	}
 	return c.Current(), nil
+}
+
+// InMaintenance 报告叠加态。
+func (c *Controller) InMaintenance() bool {
+	return c != nil && c.maintenance.Load()
+}
+
+// EnterMaintenance 进入内部维护叠加态（§4.4 / §12.7）。
+//
+// 不修改持久化 running/paused；拒绝新模型流量；取消合成作业。
+// 已在 maintenance 时返回 ErrMaintenanceActive（禁止重复触发凭据轮换）。
+func (c *Controller) EnterMaintenance(reason string) error {
+	if c == nil {
+		return errors.New("runstate: Controller 为空")
+	}
+	if reason == "" {
+		reason = "maintenance"
+	}
+	if !c.maintenance.CompareAndSwap(false, true) {
+		return ErrMaintenanceActive
+	}
+	c.maintenanceReason.Store(reason)
+
+	c.mu.Lock()
+	synth := c.synth
+	bound := c.bound
+	c.mu.Unlock()
+	if bound && synth != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = safeCancel(synth, ctx)
+		cancel()
+	}
+	return nil
+}
+
+// ExitMaintenance 退出维护叠加态。若持久化为 running，先 PrepareResume 再渐进复核并开启暖机。
+func (c *Controller) ExitMaintenance() error {
+	if c == nil {
+		return errors.New("runstate: Controller 为空")
+	}
+	if !c.maintenance.CompareAndSwap(true, false) {
+		return nil // 幂等
+	}
+	c.maintenanceReason.Store("")
+
+	c.mu.Lock()
+	synth := c.synth
+	bound := c.bound
+	c.mu.Unlock()
+	base, _ := c.snap.Load().(Snapshot)
+	if bound && synth != nil && base.State == model.RunStateRunning {
+		safePrepareResume(synth)
+		safeResumeGradually(synth)
+		c.markWarmup()
+	}
+	return nil
 }
 
 // PauseDrainPending 报告是否仍有后台 drain。
@@ -227,17 +359,18 @@ func (c *Controller) Set(ctx context.Context, state model.RunState, expectedRevi
 	case model.RunStatePaused:
 		c.snap.Store(persisted)
 		drainErr := safeCancel(synth, ctx)
+		out := c.enrich(persisted)
 		if drainErr != nil {
 			c.drainPending.Store(true)
 			c.startBackgroundDrain(synth)
-			return persisted, &TransitionPendingError{
+			return out, &TransitionPendingError{
 				Code:      PauseDrainPendingCode,
-				Persisted: persisted,
+				Persisted: out,
 				Cause:     drainErr,
 			}
 		}
 		c.drainPending.Store(false)
-		return persisted, nil
+		return out, nil
 
 	case model.RunStateRunning:
 		// 关键：Current 仍为 paused，先 PrepareResume。
@@ -245,9 +378,63 @@ func (c *Controller) Set(ctx context.Context, state model.RunState, expectedRevi
 		c.snap.Store(persisted)
 		safeResumeGradually(synth)
 		c.drainPending.Store(false)
-		return persisted, nil
+		c.markWarmup()
+		return c.Current(), nil
 	}
-	return persisted, nil
+	return c.enrich(persisted), nil
+}
+
+func (c *Controller) enrich(base Snapshot) Snapshot {
+	base.Maintenance = c.maintenance.Load()
+	if base.Maintenance {
+		if reason, _ := c.maintenanceReason.Load().(string); reason != "" {
+			base.MaintenanceReason = reason
+		}
+	}
+	base.Warmup = c.warmupProgressLocked(base)
+	return base
+}
+
+func (c *Controller) markWarmup() {
+	c.warmupMu.Lock()
+	c.warmupActive = true
+	c.warmupStarted = c.now()
+	c.warmupMu.Unlock()
+}
+
+func (c *Controller) warmupProgressLocked(base Snapshot) *WarmupProgress {
+	c.warmupMu.Lock()
+	active := c.warmupActive
+	started := c.warmupStarted
+	src := c.warmupSource
+	max := c.warmupMax
+	c.warmupMu.Unlock()
+
+	if !active || base.State != model.RunStateRunning || base.Maintenance {
+		return nil
+	}
+	if max <= 0 {
+		max = defaultWarmupMax
+	}
+	now := c.now()
+	if !started.IsZero() && now.Sub(started) > max {
+		c.warmupMu.Lock()
+		c.warmupActive = false
+		c.warmupMu.Unlock()
+		return nil
+	}
+	out := &WarmupProgress{Active: true}
+	if src != nil {
+		u, a, n, total := src.RouteHealthCounts()
+		out.Pending, out.Alive, out.Negative, out.Total = u, a, n, total
+		if total > 0 && u == 0 {
+			c.warmupMu.Lock()
+			c.warmupActive = false
+			c.warmupMu.Unlock()
+			return nil
+		}
+	}
+	return out
 }
 
 // errRevisionConflict 与 store.ErrRevisionConflict 同语义；api 层用 errors.Is 映射 409。

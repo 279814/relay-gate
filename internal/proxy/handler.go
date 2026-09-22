@@ -296,25 +296,35 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
-	// 2. 服务总闸（§4.8 / §P0-12）。暂停时拒绝新请求，但不影响已建立的流。
-	var state store.RunState
+	// 2. 服务总闸（§4.8 / §P0-12 / §4.4 maintenance）。
+	//    暂停或维护时拒绝新请求，但不影响已建立的流。
 	if h.runState != nil {
-		state = store.RunState(h.runState.Current().State)
+		snap := h.runState.Current()
+		if !snap.Admitting() {
+			eff := snap.Effective()
+			w.Header().Set("X-Relay-State", eff)
+			w.Header().Set("Retry-After", "60")
+			msg := "服务已暂停。在管理界面点「启动」后恢复"
+			if snap.Maintenance {
+				msg = "服务维护中（Master Key 轮换等）。完成后自动恢复"
+			}
+			writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error", msg)
+			return nil, false
+		}
 	} else {
-		var err error
-		state, err = h.cfg.RunState()
+		state, err := h.cfg.RunState()
 		if err != nil {
 			h.log.Error("读取运行状态失败", "err", err)
 			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
 			return nil, false
 		}
-	}
-	if state == store.StatePaused {
-		w.Header().Set("X-Relay-State", "paused")
-		w.Header().Set("Retry-After", "60")
-		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
-			"服务已暂停。在管理界面点「启动」后恢复")
-		return nil, false
+		if state == store.StatePaused {
+			w.Header().Set("X-Relay-State", "paused")
+			w.Header().Set("Retry-After", "60")
+			writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
+				"服务已暂停。在管理界面点「启动」后恢复")
+			return nil, false
+		}
 	}
 
 	settings, err := h.cfg.Settings()

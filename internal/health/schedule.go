@@ -168,6 +168,29 @@ func (t *Tracker) DemotePositiveConclusions() {
 	}
 }
 
+// RouteHealthCounts 按状态汇总已知 Route（§13.5 暖机进度）。
+//
+// unknown 计为 pending；alive 单独；其余（dead/recovering 等）归 negative。
+func (t *Tracker) RouteHealthCounts() (unknown, alive, negative, total int) {
+	if t == nil {
+		return 0, 0, 0, 0
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, rs := range t.state {
+		total++
+		switch rs.state {
+		case model.StateUnknown:
+			unknown++
+		case model.StateAlive:
+			alive++
+		default:
+			negative++
+		}
+	}
+	return
+}
+
 // CompleteL1 在探活完成后从完成时刻计算下次到期（§8.10）。
 func (t *Tracker) CompleteL1(routeID int64, completedAt time.Time, jitter float64) {
 	s := t.currentSettings()

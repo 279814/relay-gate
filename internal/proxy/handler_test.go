@@ -17,6 +17,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -495,6 +496,32 @@ func TestHandler_PausedRejectsNewRequests(t *testing.T) {
 	}
 	if hs.gotReq.method != "" {
 		t.Error("暂停时不该转发到上游")
+	}
+}
+
+type maintSnap struct {
+	snap runstate.Snapshot
+}
+
+func (m maintSnap) Current() runstate.Snapshot { return m.snap }
+
+func TestHandler_MaintenanceRejectsNewRequests(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.cfg.state = store.StateRunning
+	hs.h.WithRunState(maintSnap{snap: runstate.Snapshot{
+		State: model.RunStateRunning, Revision: 1, Maintenance: true,
+		MaintenanceReason: "master_key_rotation",
+	}})
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+	if rec.Code != 503 {
+		t.Errorf("maintenance 应回 503，得到 %d", rec.Code)
+	}
+	if rec.Header().Get("X-Relay-State") != "maintenance" {
+		t.Errorf("X-Relay-State=%q want maintenance", rec.Header().Get("X-Relay-State"))
+	}
+	if hs.gotReq.method != "" {
+		t.Error("maintenance 时不该转发到上游")
 	}
 }
 

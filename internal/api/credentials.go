@@ -2,12 +2,14 @@ package api
 
 import (
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/runstate"
 )
 
 // WithCredentials wires credential + keyring services for the admin credentials page.
@@ -70,6 +72,13 @@ func (s *Server) postRevealMasterKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) postRotateRelayKey(w http.ResponseWriter, r *http.Request) {
 	if s.creds == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"credentials 未装配"})
+		return
+	}
+	if s.runState != nil && s.runState.InMaintenance() {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  runstate.MaintenanceActiveCode,
+			"error": "maintenance 期间禁止凭据轮换",
+		})
 		return
 	}
 	var body struct {
@@ -157,6 +166,13 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"keyring 未装配"})
 		return
 	}
+	if s.runState != nil && s.runState.InMaintenance() {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":  runstate.MaintenanceActiveCode,
+			"error": "maintenance 期间禁止重复触发 Master Key 轮换",
+		})
+		return
+	}
 	var body struct {
 		Password  string `json:"password"`
 		NewMaster string `json:"new_master"`
@@ -173,14 +189,64 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, model.WrapValidation("new_master 至少 16 字符"))
 		return
 	}
+	if s.runState != nil {
+		if err := s.runState.EnterMaintenance("master_key_rotation"); err != nil {
+			if errors.Is(err, runstate.ErrMaintenanceActive) {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"code":  runstate.MaintenanceActiveCode,
+					"error": err.Error(),
+				})
+				return
+			}
+			s.writeErr(w, err)
+			return
+		}
+		exitMaint := true
+		defer func() {
+			if exitMaint {
+				_ = s.runState.ExitMaintenance()
+			}
+		}()
+		rid, err := s.keyring.BeginRotation(body.NewMaster)
+		if err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		// Local/dev path: mark db committed without full secret rewrite when Store
+		// rotation helper is unavailable; production wiring re-encrypts then calls
+		// MarkDBCommitted separately.
+		if err := s.keyring.MarkDBCommitted(rid); err != nil {
+			_ = s.keyring.AbortPrepared(rid)
+			s.writeErr(w, err)
+			return
+		}
+		newID, err := s.keyring.ActivatePending(rid)
+		if err != nil {
+			exitMaint = false // db_committed+：保持 maintenance 直至恢复（§12.7）
+			s.writeErr(w, err)
+			return
+		}
+		if err := s.keyring.MarkCleaned(rid); err != nil {
+			exitMaint = false
+			s.writeErr(w, err)
+			return
+		}
+		if s.creds != nil {
+			s.creds.ClearMasterReveal()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"rotation_id": rid,
+			"new_key_id":  newID,
+			"phase":       keyring.PhaseCleaned,
+			"note":        "Keyring active 已切换；信封密文需用新 key-id 重加密（EncryptEnvelope）",
+		})
+		return
+	}
 	rid, err := s.keyring.BeginRotation(body.NewMaster)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	// Local/dev path: mark db committed without full secret rewrite when Store
-	// rotation helper is unavailable; production wiring re-encrypts then calls
-	// MarkDBCommitted separately.
 	if err := s.keyring.MarkDBCommitted(rid); err != nil {
 		_ = s.keyring.AbortPrepared(rid)
 		s.writeErr(w, err)
