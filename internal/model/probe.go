@@ -456,20 +456,20 @@ const (
 )
 
 type ProbeCostDaily struct {
-	DayUTC                string        `json:"day_utc"`
-	Trigger               ProbeTrigger  `json:"trigger"`
-	Origin                RecipeSource  `json:"origin"`
-	Endpoint              EndpointKind  `json:"endpoint"`
-	RouteID               int64         `json:"route_id"`
-	UpstreamID            int64         `json:"upstream_id"`
-	Requests              int64         `json:"requests"`
-	Succeeded             int64         `json:"succeeded"`
-	Failed                int64         `json:"failed"`
-	Canceled              int64         `json:"canceled"`
-	EstimatedInputTokens  int64         `json:"estimated_input_tokens"`
-	ObservedOutputTokens  int64         `json:"observed_output_tokens"`
-	CanceledAfterSemantic int64         `json:"canceled_after_semantic"`
-	PiggybackL2Saved      int64         `json:"piggyback_l2_saved"`
+	DayUTC                string       `json:"day_utc"`
+	Trigger               ProbeTrigger `json:"trigger"`
+	Origin                RecipeSource `json:"origin"`
+	Endpoint              EndpointKind `json:"endpoint"`
+	RouteID               int64        `json:"route_id"`
+	UpstreamID            int64        `json:"upstream_id"`
+	Requests              int64        `json:"requests"`
+	Succeeded             int64        `json:"succeeded"`
+	Failed                int64        `json:"failed"`
+	Canceled              int64        `json:"canceled"`
+	EstimatedInputTokens  int64        `json:"estimated_input_tokens"`
+	ObservedOutputTokens  int64        `json:"observed_output_tokens"`
+	CanceledAfterSemantic int64        `json:"canceled_after_semantic"`
+	PiggybackL2Saved      int64        `json:"piggyback_l2_saved"`
 }
 
 type ProbeCostEvidenceV1 struct {
