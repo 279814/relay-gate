@@ -18,6 +18,7 @@ import (
 	"github.com/279814/relay-gate/internal/config"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
+	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
@@ -131,20 +132,47 @@ func run() error {
 	costPersister := probe.NewCostPersister(cost, st, log)
 	costPersister.Restore()
 
+	// Recipe 四级解析器（§8.2）。探活与 Executor 共用这一份。
+	recipes := probe.NewRecipeResolver(st).WithNotFound(func(err error) bool {
+		// 「这一级没有」的判据（§8.2）。写错的后果是解析永远落不到低
+		// 优先级 —— 它会把 ErrNotFound 当成读库出错直接返回，于是每个
+		// 站的探活都以「读取配方失败」结束。
+		return errors.Is(err, store.ErrNotFound)
+	})
+
+	// P0-09 的单发执行器：L1/L2/ProbeNow 都经它发送并落一行 ProbeExecution。
+	//
+	// ExecutionOnlyRecorder 只写 execution 行、不推进任何状态（状态机是 P0-10）。
+	// AlwaysOpenAdmission 是这一版的占坑器（P0-12 换成进程级 Coordinator）。
+	// WallClock 是生产时钟，测试用 ManualClock 拨快。连接池经 ManagerTransports
+	// 复用与转发同一个 Manager（§7.3）。
+	executor := probe.NewExecutor(targets, st, recipes,
+		probe.ManagerTransports{Manager: transports},
+		probe.NewExecutionOnlyRecorder(st), probe.AlwaysOpenAdmission(),
+		probe.WallClock(), log)
+
 	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
 		WithCost(cost).
 		WithTargets(targets, st).
-		WithRecipes(probe.NewRecipeResolver(st).WithNotFound(func(err error) bool {
-			// 「这一级没有」的判据（§8.2）。写错的后果是解析永远落不到低
-			// 优先级 —— 它会把 ErrNotFound 当成读库出错直接返回，于是每个
-			// 站的探活都以「读取配方失败」结束。
-			return errors.Is(err, store.ErrNotFound)
-		}))
+		WithRecipes(recipes).
+		WithExecutor(executor)
 	persister := health.NewPersister(tracker, st, log)
 
 	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：
 	// 关闭期间在途的真实请求仍会回写健康状态，Persister 还要把它刷进库。
 	bgCtx, stopBG := context.WithCancel(context.Background())
+
+	// observation order 分配器（§P0-06）。用 bgCtx 作为生命周期：进程关闭时
+	// 停止预留，在飞的号可以留空档但不复用。Open 先预留第一块 —— 失败即拒绝
+	// 启动，因为一个发不出序号的进程会让所有合成探活在写 socket 前失败。
+	seq, err := observationseq.Open(bgCtx, st)
+	if err != nil {
+		stopBG()
+		return fmt.Errorf("打开 observation sequencer: %w", err)
+	}
+	defer seq.Close()
+	sched.WithSequencer(seq)
+
 	var bg sync.WaitGroup
 	bg.Add(3)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()

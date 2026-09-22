@@ -111,7 +111,7 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L1TotalSec)*time.Second)
 	defer cancel()
 
-	prepared, err := p.prepare(ctx, up, nil, nil, model.EndpointModels)
+	prepared, _, err := p.prepare(ctx, up, nil, nil, model.EndpointModels)
 	if err != nil {
 		return probeConfigOutcome(err)
 	}
@@ -176,7 +176,7 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
 	}
-	prepared, err := p.prepare(ctx, up, mn, rt, kind)
+	prepared, _, err := p.prepare(ctx, up, mn, rt, kind)
 	if err != nil {
 		return probeConfigOutcome(err)
 	}

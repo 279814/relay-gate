@@ -6,6 +6,9 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/observationseq"
 )
 
 func TestReserveObservationOrdersIsConcurrentAndPersistent(t *testing.T) {
@@ -42,6 +45,35 @@ func TestReserveObservationOrdersIsConcurrentAndPersistent(t *testing.T) {
 	}
 	if start != 32*17+1 || end != start {
 		t.Fatalf("persistent next block = %d..%d", start, end)
+	}
+}
+
+func TestSequencerPersistsAcrossReopenWithoutReusingOrders(t *testing.T) {
+	store := testStore(t)
+	first, err := observationseq.Open(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := first.Next(context.Background(), model.TriggerManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order != 1 {
+		t.Fatalf("first order = %d", order)
+	}
+	first.Close()
+
+	second, err := observationseq.Open(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	order, err = second.Next(context.Background(), model.TriggerManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order != observationseq.BlockSize+1 {
+		t.Fatalf("reopened sequencer issued %d, want %d", order, observationseq.BlockSize+1)
 	}
 }
 
