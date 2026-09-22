@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestSchemaFiveLegacyVariants(t *testing.T) {
+func TestSchemaSixLegacyVariants(t *testing.T) {
 	cipher, err := NewCipher("test-passphrase-at-least-16-chars")
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +28,7 @@ func TestSchemaFiveLegacyVariants(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if state.Version != 5 {
+			if state.Version != 6 {
 				t.Fatalf("version=%d fp=%s", state.Version, state.Fingerprint)
 			}
 			t.Logf("fp=%s", state.Fingerprint)
