@@ -20,19 +20,28 @@ export function createTransformsFeature(shell, api) {
     previewBody: '',
     previewResult: '',
     loading: false,
+    budgetRequestMs: 50,
+    budgetSSEMs: 10,
+    budgetAudit: [],
   };
 
   shell.loadTransforms = async function loadTransforms() {
     try {
       this.transforms.loading = true;
-      const [sets, bindings, executions] = await Promise.all([
+      const [sets, bindings, executions, budgets] = await Promise.all([
         api.get('/transforms'),
         api.get('/transform-bindings'),
         api.get('/transform-executions?limit=50'),
+        api.get('/transforms/budgets'),
       ]);
       this.transforms.sets = sets.sets || [];
       this.transforms.bindings = bindings.bindings || [];
       this.transforms.executions = executions.executions || [];
+      if (budgets && budgets.budgets) {
+        this.transforms.budgetRequestMs = budgets.budgets.request_ms;
+        this.transforms.budgetSSEMs = budgets.budgets.sse_event_ms;
+        this.transforms.budgetAudit = budgets.audit || [];
+      }
       if (this.transforms.selectedId) {
         const still = this.transforms.sets.find((s) => s.id === this.transforms.selectedId);
         if (still) this.selectTransformSet(still);
@@ -148,6 +157,49 @@ export function createTransformsFeature(shell, api) {
       });
       this.msg = '已 shadow version=' + (data.version && data.version.id);
       await this.loadTransforms();
+    } catch (e) {
+      this.err = e && e.message ? e.message : String(e);
+    }
+  };
+
+  shell.saveTransformBudgets = async function saveTransformBudgets() {
+    try {
+      const requestMs = Number(this.transforms.budgetRequestMs);
+      const sseMs = Number(this.transforms.budgetSSEMs);
+      const curReq = Number(this.transforms._lastReqMs || 50);
+      const curSSE = Number(this.transforms._lastSSEMs || 10);
+      // Prefer last loaded values for raise detection; fall back to defaults.
+      let raising = false;
+      try {
+        const cur = await api.get('/transforms/budgets');
+        const b = (cur && cur.budgets) || {};
+        raising = requestMs > Number(b.request_ms) || sseMs > Number(b.sse_event_ms);
+      } catch (_) {
+        raising = requestMs > curReq || sseMs > curSSE;
+      }
+      let confirmRaise = false;
+      if (raising) {
+        confirmRaise = window.confirm(
+          '提高转换执行预算需要二次确认并写入审计。确定将 request_ms=' +
+            requestMs +
+            '、sse_event_ms=' +
+            sseMs +
+            '？'
+        );
+        if (!confirmRaise) {
+          this.msg = '已取消提高预算';
+          return;
+        }
+      }
+      const data = await api.put('/transforms/budgets', {
+        request_ms: requestMs,
+        sse_event_ms: sseMs,
+        confirm_raise: confirmRaise,
+      });
+      this.transforms.budgetRequestMs = data.budgets.request_ms;
+      this.transforms.budgetSSEMs = data.budgets.sse_event_ms;
+      this.transforms.budgetAudit = data.audit || [];
+      this.msg = raising ? '已提高执行预算并记录审计' : '已更新执行预算';
     } catch (e) {
       this.err = e && e.message ? e.message : String(e);
     }

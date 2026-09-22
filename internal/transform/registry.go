@@ -284,6 +284,10 @@ func (r *Registry) PublishedCompiled(routeID, endpointID int64) (*Compiled, int6
 	for i := range s.History {
 		if s.History[i].ID == b.PublishedID {
 			c, err := Compile(s.History[i])
+			if c != nil {
+				c.reqBudget = time.Duration(r.requestMs) * time.Millisecond
+				c.sseBudget = time.Duration(r.sseMs) * time.Millisecond
+			}
 			return c, b.PublishedID, err
 		}
 	}
@@ -305,6 +309,10 @@ func (r *Registry) ShadowCompiled(routeID, endpointID int64) (*Compiled, int64, 
 	for i := range s.History {
 		if s.History[i].ID == b.ShadowID {
 			c, err := Compile(s.History[i])
+			if c != nil {
+				c.reqBudget = time.Duration(r.requestMs) * time.Millisecond
+				c.sseBudget = time.Duration(r.sseMs) * time.Millisecond
+			}
 			return c, b.ShadowID, err
 		}
 	}

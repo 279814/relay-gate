@@ -55,6 +55,9 @@ const (
 	MaxSSEEventBytes   = 1 << 20
 	MaxAddedBytes      = 1 << 20
 	MaxBodyBuffer      = 8 << 20
+
+	DefaultRequestBudgetMs = 50
+	DefaultSSEBudgetMs     = 10
 )
 
 // Protected hop-by-hop / auth / transport headers rules must not finally control.
@@ -140,22 +143,44 @@ type ExecutionRecord struct {
 
 // Compiled is a validated, ready-to-apply Version.
 type Compiled struct {
-	Version Version
-	regex   map[int]*regexp.Regexp // rule index → compiled RE2
+	Version   Version
+	regex     map[int]*regexp.Regexp // rule index → compiled RE2
+	reqBudget time.Duration
+	sseBudget time.Duration
 }
 
 // Registry holds in-process sets, bindings, and execution records.
 // Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
-	mu       sync.RWMutex
-	sets     map[int64]*Set
-	bindings map[string]*Binding // key route:endpoint
-	execs    []ExecutionRecord
-	nextSet  atomic.Int64
-	nextVer  atomic.Int64
-	execSeq  atomic.Uint64
-	execCap  int
-	persist  PersistSink
+	mu         sync.RWMutex
+	sets       map[int64]*Set
+	bindings   map[string]*Binding // key route:endpoint
+	execs      []ExecutionRecord
+	nextSet    atomic.Int64
+	nextVer    atomic.Int64
+	execSeq    atomic.Uint64
+	execCap    int
+	persist    PersistSink
+	requestMs  int
+	sseMs      int
+	budgetLog  []BudgetAudit
+	budgetCap  int
+}
+
+// BudgetLimits is the mutable execution time budget (§15.3).
+type BudgetLimits struct {
+	RequestMs  int `json:"request_ms"`
+	SSEEventMs int `json:"sse_event_ms"`
+}
+
+// BudgetAudit records a confirmed raise (or any set) of execution budgets.
+type BudgetAudit struct {
+	At         time.Time `json:"at"`
+	Action     string    `json:"action"` // set_budget | raise_budget
+	Detail     string    `json:"detail"` // plain text, no secrets
+	RequestMs  int       `json:"request_ms"`
+	SSEEventMs int       `json:"sse_event_ms"`
+	Confirmed  bool      `json:"confirmed_raise"`
 }
 
 // NewRegistry constructs an empty transform registry.
@@ -164,9 +189,12 @@ func NewRegistry(execCap int) *Registry {
 		execCap = 200
 	}
 	r := &Registry{
-		sets:     make(map[int64]*Set),
-		bindings: make(map[string]*Binding),
-		execCap:  execCap,
+		sets:      make(map[int64]*Set),
+		bindings:  make(map[string]*Binding),
+		execCap:   execCap,
+		requestMs: DefaultRequestBudgetMs,
+		sseMs:     DefaultSSEBudgetMs,
+		budgetCap: 100,
 	}
 	r.nextSet.Store(1)
 	r.nextVer.Store(1)

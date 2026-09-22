@@ -228,6 +228,43 @@ func (s *Server) listTransformExecutions(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"executions": s.transforms.ListExecutions(int(limit))})
 }
 
+func (s *Server) getTransformBudgets(w http.ResponseWriter, r *http.Request) {
+	if s.transforms == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"transform registry unavailable"})
+		return
+	}
+	b := s.transforms.Budgets()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"budgets": b,
+		"audit":   s.transforms.BudgetAudits(20),
+	})
+}
+
+func (s *Server) putTransformBudgets(w http.ResponseWriter, r *http.Request) {
+	if s.transforms == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"transform registry unavailable"})
+		return
+	}
+	var body struct {
+		RequestMs    int  `json:"request_ms"`
+		SSEEventMs   int  `json:"sse_event_ms"`
+		ConfirmRaise bool `json:"confirm_raise"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	out, err := s.transforms.SetBudgets(body.RequestMs, body.SSEEventMs, body.ConfirmRaise)
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"budgets": out,
+		"audit":   s.transforms.BudgetAudits(20),
+	})
+}
+
 func storeNotFound(err error) error {
 	return fmt.Errorf("%w: %s", store.ErrNotFound, err.Error())
 }
