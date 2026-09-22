@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -54,6 +55,9 @@ type Server struct {
 
 	// probeAdmin 是 P0-14 探活管理服务。未注入时新探活端点 503。
 	probeAdmin ProbeAdmin
+
+	// security 是 P3 Security Center。未注入时 list 返回空。
+	security *security.Center
 
 	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
 	adminPW  string
