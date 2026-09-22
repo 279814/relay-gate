@@ -77,14 +77,15 @@ var protectedHeaders = map[string]struct{}{
 // Rule is one declarative transform step.
 type Rule struct {
 	Kind      string `json:"kind"`
-	Name      string `json:"name,omitempty"`      // header name / JSON pointer / event type
-	Value     string `json:"value,omitempty"`     // new value / replacement / status text
-	From      string `json:"from,omitempty"`      // rename source / find bytes
-	To        string `json:"to,omitempty"`        // rename target
-	Match     string `json:"match,omitempty"`     // SSE event type filter
-	Regex     string `json:"regex,omitempty"`     // RE2 only; compile-time bound
-	FailOpen  bool   `json:"fail_open,omitempty"` // per-rule override (response default)
-	Synthetic bool   `json:"synthetic,omitempty"` // mark synthetic_completion
+	Name      string `json:"name,omitempty"`       // header name / JSON pointer / event type
+	Value     string `json:"value,omitempty"`      // new value / replacement / status text
+	From      string `json:"from,omitempty"`       // rename source / find bytes
+	To        string `json:"to,omitempty"`         // rename target
+	Match     string `json:"match,omitempty"`      // SSE event type filter
+	Regex     string `json:"regex,omitempty"`      // RE2 only; compile-time bound
+	SecretRef string `json:"secret_ref,omitempty"` // resolve at apply; value is tainted (§15.3)
+	FailOpen  bool   `json:"fail_open,omitempty"`  // per-rule override (response default)
+	Synthetic bool   `json:"synthetic,omitempty"`  // mark synthetic_completion
 }
 
 // Version is an immutable compiled snapshot once published/shadowed.

@@ -326,11 +326,21 @@ func (r *Registry) record(rec ExecutionRecord) ExecutionRecord {
 	if rec.At.IsZero() {
 		rec.At = time.Now().UTC()
 	}
+	// Defense in depth: never persist obvious secret-shaped payloads in diagnostics.
+	rec.DiffSummary = stripSecretPlaceholders(rec.DiffSummary)
+	rec.Error = stripSecretPlaceholders(rec.Error)
 	r.execs = append([]ExecutionRecord{rec}, r.execs...)
 	if len(r.execs) > r.execCap {
 		r.execs = r.execs[:r.execCap]
 	}
 	return rec
+}
+
+func stripSecretPlaceholders(s string) string {
+	if s == "" {
+		return s
+	}
+	return secretPlaceholderRE.ReplaceAllString(s, "{{SECRET:[REDACTED]}}")
 }
 
 // ListExecutions returns newest-first records.
