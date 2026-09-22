@@ -94,6 +94,24 @@ func validateRule(i int, rule Rule) error {
 		if rule.Name == "" {
 			return fmt.Errorf("rule %d: json pointer required", i)
 		}
+	case KindJSONPatchAdd:
+		if err := requireJSONPointer(i, rule.Name); err != nil {
+			return err
+		}
+		if strings.TrimSpace(rule.Value) == "" {
+			return fmt.Errorf("rule %d: json_patch_add requires value", i)
+		}
+	case KindJSONPatchRemove:
+		if err := requireJSONPointer(i, rule.Name); err != nil {
+			return err
+		}
+	case KindJSONPatchCopy:
+		if strings.TrimSpace(rule.From) == "" || !strings.HasPrefix(strings.TrimSpace(rule.From), "/") {
+			return fmt.Errorf("rule %d: json_patch_copy requires from pointer starting with /", i)
+		}
+		if strings.TrimSpace(rule.To) == "" || !strings.HasPrefix(strings.TrimSpace(rule.To), "/") {
+			return fmt.Errorf("rule %d: json_patch_copy requires to pointer starting with /", i)
+		}
 	case KindSetStatus:
 		if rule.Value == "" {
 			return fmt.Errorf("rule %d: status value required", i)
@@ -137,4 +155,15 @@ func looksLikeScript(s string) bool {
 		return true
 	}
 	return false
+}
+
+func requireJSONPointer(i int, pointer string) error {
+	pointer = strings.TrimSpace(pointer)
+	if pointer == "" {
+		return fmt.Errorf("rule %d: json pointer required", i)
+	}
+	if !strings.HasPrefix(pointer, "/") {
+		return fmt.Errorf("rule %d: json pointer must start with /", i)
+	}
+	return nil
 }

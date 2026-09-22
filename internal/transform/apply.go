@@ -68,7 +68,8 @@ func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
 
 	for i, rule := range c.Version.Rules {
 		switch rule.Kind {
-		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer:
+		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
+			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy:
 			if err := c.applyOneRequest(i, rule, &out); err != nil {
 				out.Err = err
 				// Both policies must not hand callers a half-mutated request:
@@ -131,6 +132,13 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult) error {
 		}
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
+	case KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy:
+		next, err := applyJSONPatch(out.Body, rule)
+		if err != nil {
+			return err
+		}
+		out.Body = next
+		out.HitRules = append(out.HitRules, name)
 	}
 	return nil
 }
@@ -158,7 +166,8 @@ func (c *Compiled) ApplyResponse(in ResponseInput) ResponseResult {
 	saved := snapshotProtected(out.Header)
 	for i, rule := range c.Version.Rules {
 		switch rule.Kind {
-		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer, KindSetStatus:
+		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
+			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindSetStatus:
 			if err := c.applyOneResponse(i, rule, &out); err != nil {
 				out.Err = err
 				out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
@@ -203,6 +212,13 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult) error
 		out.HitRules = append(out.HitRules, name)
 	case KindSetJSONPointer:
 		next, err := setJSONPointerOffset(out.Body, rule.Name, rule.Value)
+		if err != nil {
+			return err
+		}
+		out.Body = next
+		out.HitRules = append(out.HitRules, name)
+	case KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy:
+		next, err := applyJSONPatch(out.Body, rule)
 		if err != nil {
 			return err
 		}

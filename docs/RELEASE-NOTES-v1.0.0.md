@@ -16,7 +16,7 @@
 | P1 | docs/05 | RecoveryGate、RetryPolicy、duplicate_risk DB 列、重复 model、语义失效、count_tokens 多 Route、Lazy 恢复（PR #58 / #64） |
 | P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；**未**签发真实公网证书 |
 | P3 | docs/07 | 被动扫描旁路、SMTP 假服务器、Active 手动 canary、finding 持久化、Security Center 模块（PR #60 / #66） |
-| P4 | docs/08 | 声明式编译器/API（PR #61）；schema 6 持久化 + proxy 请求/响应/SSE 已发布绑定（PR #67 / #68 / #71）；Transform 管理 UI（PR #73） |
+| P4 | docs/08 | 声明式编译器/API（PR #61）；schema 6 持久化 + proxy 请求/响应/SSE 已发布绑定（PR #67 / #68 / #71）；Transform 管理 UI（PR #73）；JSON Patch add/remove/copy |
 | P5 | docs/09 | 离线发布门禁 `check-p5` + 本说明；旧 sample 信封迁移（PR #69 / #72） |
 
 ## 部署入口
@@ -36,8 +36,8 @@
 - 公网 IP HTTPS / Certbot **真实公网证书签发与容器 smoke**（本地状态机与 fake Certbot 已测；**不得**声称已签发公网证书；docs/03 / Caddyfile / deploy-nginx.sh 保留）
 - 多日生产 soak / 长流压测（本仓库与 CI 时长不允许伪称完成）
 - 确认后的旧 sample 明文 dual-read 清理（信封迁移已交付；去掉明文回退需运维确认）
-- Transform JSON Patch / body 模板 / Secret 污点；提高执行预算的二次确认审计
-- Runtime Controller 扩展与 README 替换 docs/03 后的删除清单
+- Transform body 模板 / Secret 污点；提高执行预算的二次确认审计
+- Runtime Controller 扩展与 README 替换 docs/03 后的删除清单（Caddyfile、deploy-nginx.sh；**真实公网证书验证前不得删**）
 
 ## 最终审查记录
 
