@@ -66,8 +66,10 @@ func validateRule(i int, rule Rule) error {
 			return fmt.Errorf("rule %d: cannot control protected header %q", i, rule.Name)
 		}
 		if kind == KindSetHeader {
-			if err := rejectCRLFinHeaderValue(rule.Value); err != nil {
-				return fmt.Errorf("rule %d: %w", i, err)
+			if strings.TrimSpace(rule.SecretRef) == "" {
+				if err := rejectCRLFinHeaderValue(rule.Value); err != nil {
+					return fmt.Errorf("rule %d: %w", i, err)
+				}
 			}
 		}
 	case KindRenameHeader:
@@ -137,6 +139,25 @@ func validateRule(i int, rule Rule) error {
 	}
 	if looksLikeScript(rule.Value) || looksLikeScript(rule.To) || looksLikeScript(rule.From) {
 		return fmt.Errorf("rule %d: script-like payloads rejected", i)
+	}
+	if ref := strings.TrimSpace(rule.SecretRef); ref != "" {
+		if !kindAllowsSecretRef(kind) {
+			return fmt.Errorf("rule %d: secret_ref not allowed on kind %q", i, kind)
+		}
+		if err := validateSecretRefName(ref); err != nil {
+			return fmt.Errorf("rule %d: %w", i, err)
+		}
+		if strings.TrimSpace(rule.Value) != "" && kind != KindBodyTemplate {
+			return fmt.Errorf("rule %d: secret_ref and value are mutually exclusive", i)
+		}
+	}
+	for _, name := range secretRefsInValue(rule.Value) {
+		if !kindAllowsSecretRef(kind) {
+			return fmt.Errorf("rule %d: SECRET placeholder not allowed on kind %q", i, kind)
+		}
+		if err := validateSecretRefName(name); err != nil {
+			return fmt.Errorf("rule %d: %w", i, err)
+		}
 	}
 	return nil
 }

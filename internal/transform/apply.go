@@ -24,6 +24,7 @@ type RequestResult struct {
 	Synthetic  bool
 	Err        error
 	PolicyUsed string
+	Taint      *TaintBag // rendered secrets; redact diagnostics with Taint.Redact
 }
 
 // ResponseInput is a non-streaming upstream response before Commit.
@@ -43,6 +44,7 @@ type ResponseResult struct {
 	Synthetic  bool
 	Err        error
 	PolicyUsed string
+	Taint      *TaintBag
 }
 
 // SSEEvent is one complete SSE event (name + data lines joined).
@@ -55,14 +57,22 @@ type SSEEvent struct {
 // ApplyRequest runs compiled request rules. Protected headers present before
 // apply are restored afterward (auth/model protection layer §15.3).
 func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
+	return c.ApplyRequestSecrets(in, nil)
+}
+
+// ApplyRequestSecrets is ApplyRequest with optional secret resolution for
+// secret_ref / {{SECRET:name}} rules. Rendered secrets are tainted.
+func (c *Compiled) ApplyRequestSecrets(in RequestInput, secrets SecretMap) RequestResult {
 	policy := c.Version.ReqFailPolicy
 	if policy == "" {
 		policy = FailClosed
 	}
+	sec := &applySecrets{lookup: secrets}
 	out := RequestResult{
 		Header:     cloneHeader(in.Header),
 		Body:       append([]byte(nil), in.Body...),
 		PolicyUsed: policy,
+		Taint:      &sec.taint,
 	}
 	savedAuth := snapshotProtected(out.Header)
 
@@ -70,10 +80,8 @@ func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate:
-			if err := c.applyOneRequest(i, rule, &out); err != nil {
-				out.Err = err
-				// Both policies must not hand callers a half-mutated request:
-				// fail_closed discards the Attempt; fail_open falls back to original.
+			if err := c.applyOneRequest(i, rule, &out, sec); err != nil {
+				out.Err = sec.taint.RedactErr(err)
 				out.Header = cloneHeader(in.Header)
 				out.Body = append([]byte(nil), in.Body...)
 				out.Changed = false
@@ -91,11 +99,18 @@ func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
 	return out
 }
 
-func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult) error {
+func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult, sec *applySecrets) error {
 	name := "r" + strconv.Itoa(i) + ":" + rule.Kind
 	switch rule.Kind {
 	case KindSetHeader:
-		out.Header.Set(rule.Name, rule.Value)
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		if err := rejectCRLFinHeaderValue(val); err != nil {
+			return err
+		}
+		out.Header.Set(rule.Name, val)
 		out.HitRules = append(out.HitRules, name)
 	case KindDeleteHeader:
 		out.Header.Del(rule.Name)
@@ -123,7 +138,11 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult) error {
 		out.Body = bytes.ReplaceAll(out.Body, []byte(rule.From), repl)
 		out.HitRules = append(out.HitRules, name)
 	case KindSetJSONPointer:
-		next, err := setJSONPointerOffset(out.Body, rule.Name, rule.Value)
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		next, err := setJSONPointerOffset(out.Body, rule.Name, val)
 		if err != nil {
 			return err
 		}
@@ -133,14 +152,27 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult) error {
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
 	case KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy:
-		next, err := applyJSONPatch(out.Body, rule)
+		patched := rule
+		if rule.Kind == KindJSONPatchAdd {
+			val, err := sec.resolveRuleValue(rule)
+			if err != nil {
+				return err
+			}
+			patched.Value = val
+			patched.SecretRef = ""
+		}
+		next, err := applyJSONPatch(out.Body, patched)
 		if err != nil {
 			return err
 		}
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
 	case KindBodyTemplate:
-		next, err := applyBodyTemplate(out.Body, []byte(rule.Value))
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		next, err := applyBodyTemplate(out.Body, []byte(val))
 		if err != nil {
 			return err
 		}
@@ -152,15 +184,22 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult) error {
 
 // ApplyResponse runs non-streaming response rules before Commit.
 func (c *Compiled) ApplyResponse(in ResponseInput) ResponseResult {
+	return c.ApplyResponseSecrets(in, nil)
+}
+
+// ApplyResponseSecrets is ApplyResponse with optional secret resolution.
+func (c *Compiled) ApplyResponseSecrets(in ResponseInput, secrets SecretMap) ResponseResult {
 	policy := c.Version.ResFailPolicy
 	if policy == "" {
 		policy = FailOpen
 	}
+	sec := &applySecrets{lookup: secrets}
 	out := ResponseResult{
 		Status:     in.Status,
 		Header:     cloneHeader(in.Header),
 		Body:       append([]byte(nil), in.Body...),
 		PolicyUsed: policy,
+		Taint:      &sec.taint,
 	}
 	if len(out.Body) > MaxBodyBuffer {
 		out.Err = fmt.Errorf("response body exceeds %d byte buffer", MaxBodyBuffer)
@@ -175,8 +214,8 @@ func (c *Compiled) ApplyResponse(in ResponseInput) ResponseResult {
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate, KindSetStatus:
-			if err := c.applyOneResponse(i, rule, &out); err != nil {
-				out.Err = err
+			if err := c.applyOneResponse(i, rule, &out, sec); err != nil {
+				out.Err = sec.taint.RedactErr(err)
 				out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
 				out.Changed = false
 				out.HitRules = nil
@@ -192,11 +231,18 @@ func (c *Compiled) ApplyResponse(in ResponseInput) ResponseResult {
 	return out
 }
 
-func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult) error {
+func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *applySecrets) error {
 	name := "r" + strconv.Itoa(i) + ":" + rule.Kind
 	switch rule.Kind {
 	case KindSetHeader:
-		out.Header.Set(rule.Name, rule.Value)
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		if err := rejectCRLFinHeaderValue(val); err != nil {
+			return err
+		}
+		out.Header.Set(rule.Name, val)
 		out.HitRules = append(out.HitRules, name)
 	case KindDeleteHeader:
 		out.Header.Del(rule.Name)
@@ -218,21 +264,38 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult) error
 		out.Body = bytes.ReplaceAll(out.Body, []byte(rule.From), []byte(rule.To))
 		out.HitRules = append(out.HitRules, name)
 	case KindSetJSONPointer:
-		next, err := setJSONPointerOffset(out.Body, rule.Name, rule.Value)
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		next, err := setJSONPointerOffset(out.Body, rule.Name, val)
 		if err != nil {
 			return err
 		}
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
 	case KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy:
-		next, err := applyJSONPatch(out.Body, rule)
+		patched := rule
+		if rule.Kind == KindJSONPatchAdd {
+			val, err := sec.resolveRuleValue(rule)
+			if err != nil {
+				return err
+			}
+			patched.Value = val
+			patched.SecretRef = ""
+		}
+		next, err := applyJSONPatch(out.Body, patched)
 		if err != nil {
 			return err
 		}
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
 	case KindBodyTemplate:
-		next, err := applyBodyTemplate(out.Body, []byte(rule.Value))
+		val, err := sec.resolveRuleValue(rule)
+		if err != nil {
+			return err
+		}
+		next, err := applyBodyTemplate(out.Body, []byte(val))
 		if err != nil {
 			return err
 		}
@@ -307,15 +370,34 @@ func (c *Compiled) AppendSyntheticEnd() (SSEEvent, bool) {
 
 // ShadowDiff applies on a copy and returns a redacted summary without mutating live.
 func (c *Compiled) ShadowDiff(phase string, req RequestInput, res ResponseInput) string {
+	return c.ShadowDiffSecrets(phase, req, res, nil)
+}
+
+// ShadowDiffSecrets is ShadowDiff with secret resolution; summaries never include plaintext.
+func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res ResponseInput, secrets SecretMap) string {
 	switch phase {
 	case "request":
-		r := c.ApplyRequest(req)
+		r := c.ApplyRequestSecrets(req, secrets)
+		errMsg := ""
+		if r.Err != nil {
+			errMsg = r.Err.Error()
+		}
+		if r.Taint != nil {
+			errMsg = r.Taint.Redact(errMsg)
+		}
 		return fmt.Sprintf("request changed=%v hits=%v in=%s out=%s err=%v",
-			r.Changed, r.HitRules, HashBytes(req.Body), HashBytes(r.Body), r.Err)
+			r.Changed, r.HitRules, HashBytes(req.Body), HashBytes(r.Body), errMsg)
 	case "response":
-		r := c.ApplyResponse(res)
+		r := c.ApplyResponseSecrets(res, secrets)
+		errMsg := ""
+		if r.Err != nil {
+			errMsg = r.Err.Error()
+		}
+		if r.Taint != nil {
+			errMsg = r.Taint.Redact(errMsg)
+		}
 		return fmt.Sprintf("response changed=%v hits=%v status %d→%d in=%s out=%s err=%v",
-			r.Changed, r.HitRules, res.Status, r.Status, HashBytes(res.Body), HashBytes(r.Body), r.Err)
+			r.Changed, r.HitRules, res.Status, r.Status, HashBytes(res.Body), HashBytes(r.Body), errMsg)
 	default:
 		return "unknown phase"
 	}
