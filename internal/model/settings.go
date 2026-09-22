@@ -155,7 +155,7 @@ func DefaultSettings() Settings {
 
 		L1IntervalAliveSec: 60,
 		L1IntervalDeadSec:  20, // 固定短周期，不做指数退避（§4.4）
-		L2IntervalAliveSec: 300,
+		L2IntervalAliveSec: 600, // §8.10 alive Route L2
 		L2IntervalDeadSec:  30,
 
 		FailThreshold: 2,

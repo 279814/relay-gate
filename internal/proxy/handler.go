@@ -12,6 +12,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -64,6 +65,9 @@ type Handler struct {
 	// transports 按网络身份（含 connect 预算）分组连接池（§7.3）。
 	// 与探活共用同一个 Manager —— 各建一套就丢掉了连接复用的收益。
 	transports *outbound.Manager
+
+	// runState 是 P0-12 热路径总闸；非 nil 时优先于 cfg.RunState（避 livecfg TTL）。
+	runState runstate.Reader
 }
 
 // NewHandler 组装透传处理器。
@@ -129,6 +133,12 @@ func (h *Handler) WithLogSink(s LogSink) *Handler {
 func (h *Handler) WithTargets(targets outbound.TargetProvider, keys outbound.SecretSource) *Handler {
 	h.targets = targets
 	h.keys = keys
+	return h
+}
+
+// WithRunState 注入热路径总闸（优先于 livecfg 的 2s TTL）。
+func (h *Handler) WithRunState(r runstate.Reader) *Handler {
+	h.runState = r
 	return h
 }
 
@@ -230,15 +240,22 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
-	// 2. 服务总闸（§4.8）。暂停时拒绝新请求，但不影响已建立的流。
-	state, err := h.cfg.RunState()
-	if err != nil {
-		h.log.Error("读取运行状态失败", "err", err)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-		return nil, false
+	// 2. 服务总闸（§4.8 / §P0-12）。暂停时拒绝新请求，但不影响已建立的流。
+	var state store.RunState
+	if h.runState != nil {
+		state = store.RunState(h.runState.Current().State)
+	} else {
+		var err error
+		state, err = h.cfg.RunState()
+		if err != nil {
+			h.log.Error("读取运行状态失败", "err", err)
+			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
+			return nil, false
+		}
 	}
 	if state == store.StatePaused {
 		w.Header().Set("X-Relay-State", "paused")
+		w.Header().Set("Retry-After", "60")
 		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
 			"服务已暂停。在管理界面点「启动」后恢复")
 		return nil, false

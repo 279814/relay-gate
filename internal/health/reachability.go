@@ -91,6 +91,20 @@ func (tracker *ReachabilityTracker) Invalidate(upstreamID int64) {
 	delete(tracker.rows, upstreamID)
 }
 
+// DemotePositive 丢弃 reachable 正结论，保留 unreachable。
+func (tracker *ReachabilityTracker) DemotePositive() {
+	if tracker == nil {
+		return
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	for id, row := range tracker.rows {
+		if row.State == model.ReachabilityReachable {
+			delete(tracker.rows, id)
+		}
+	}
+}
+
 // InvalidateAll 清空（暂停恢复 / 测试）。
 func (tracker *ReachabilityTracker) InvalidateAll() {
 	tracker.mu.Lock()

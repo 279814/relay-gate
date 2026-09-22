@@ -2,7 +2,7 @@
 
 欢迎 issue 与 PR。这是个人维护的项目，回应速度取决于我的空闲时间。
 
-改 v1.0.0 之前先读两份文档，不要只看 README：`docs/01-需求与设计.md` 是需求基线，`docs/04-P0-探活基础门禁实施计划.md` 文首是当前做到哪一步。README 和 `docs/03-部署与配置.md` 描述的是今天已经能部署的行为。生产 L1/L2/ProbeNow 经 ProbeExecutor，并由 ResultRecorder 写入可达性与端点能力；P0-11 校准服务已接线 `calibrator.Run`（管理 Plan/Start API 仍属 P0-14）。下一步是 P0-12。
+改 v1.0.0 之前先读两份文档，不要只看 README：`docs/01-需求与设计.md` 是需求基线，`docs/04-P0-探活基础门禁实施计划.md` 文首是当前做到哪一步。README 和 `docs/03-部署与配置.md` 描述的是今天已经能部署的行为。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`（不经 livecfg TTL）；P0-11 校准服务已接线 `calibrator.Run`（管理 Plan/Start API 仍属 P0-14）。本分支含 P0-12；下一步是 P0-13。
 
 ## 提 issue
 

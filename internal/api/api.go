@@ -49,6 +49,9 @@ type Server struct {
 	// 那只意味着回到「等下一个探活周期」，不是错误。
 	invalidator ConfigInvalidator
 
+	// runState 是 P0-12 服务总闸。未注入时 state GET/SET fail closed 503。
+	runState RunStateAdmin
+
 	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
 	adminPW  string
 	sessions *sessionStore

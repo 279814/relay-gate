@@ -1,29 +1,33 @@
 package probe
 
+// P0-12 成本权威：保留窗内 probe_cost_daily；piggyback 经独立 event kind 幂等落库。
+// 旧内存 Cost 仍作快速快照；Restore 优先从 daily rollup 加载。
+
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
-// costFlushInterval 是成本快照落库周期。
-//
-// 60 秒，比健康状态的 5 秒宽松得多：这个数据只用于「今天探了多少次」
-// 这种回顾性判断，晚一分钟毫无影响。而 SQLite 只有一条连接，
-// 与样本落库和健康快照共用 —— 没必要为一个粗粒度的计数器去挤它。
-//
-// 丢失至多一分钟的计数是可接受的：估算 token 本身就是量级判断（见
-// estimateL2Tokens），少算几次不改变「策略是否过激」的结论。
 const costFlushInterval = time.Minute
 
-// CostStore 读写成本快照。由 store.Store 实现。
+// CostStore 读写成本快照与 daily rollup。
 type CostStore interface {
 	GetProbeCostRaw() (string, error)
 	SaveProbeCostRaw(raw string) error
 }
 
-// CostPersister 定期把成本计数刷进库，让「今日」的语义跨重启成立。
+// CostDailyStore 是可选的 daily rollup 面；Store 实现它。
+type CostDailyStore interface {
+	ListProbeCostDaily(ctx context.Context, filter model.ProbeCostFilter) (model.Page[*model.ProbeCostDaily], error)
+	RecordProbePiggybackSaving(ctx context.Context, eventID string, value model.ProbeCostDaily) error
+}
+
+// CostPersister 定期把成本计数刷进库，并支持从 daily 恢复。
 type CostPersister struct {
 	cost *Cost
 	st   CostStore
@@ -34,11 +38,13 @@ func NewCostPersister(cost *Cost, st CostStore, log *slog.Logger) *CostPersister
 	return &CostPersister{cost: cost, st: st, log: log}
 }
 
-// Restore 从库里恢复当日计数，供启动时调用一次。
-//
-// 失败只记日志：计数恢复不了就从零开始，那不该阻止服务启动 ——
-// 一个观测功能没有资格让网关起不来。
+// Restore 从库恢复。优先 daily rollup（730 日权威），再回落旧 JSON 快照。
 func (p *CostPersister) Restore() {
+	if daily, ok := p.st.(CostDailyStore); ok {
+		if p.restoreFromDaily(daily) {
+			return
+		}
+	}
 	raw, err := p.st.GetProbeCostRaw()
 	if err != nil {
 		p.log.Error("读取探活成本快照失败，本次从零开始计数", "err", err)
@@ -52,20 +58,54 @@ func (p *CostPersister) Restore() {
 		p.log.Error("探活成本快照不是合法 JSON，本次从零开始计数", "err", err)
 		return
 	}
-	// 跨天时 Restore 自己会忽略（库里是昨天的数据，「今日」应从零开始）。
 	p.cost.Restore(snap)
 }
 
-// Run 阻塞运行落库循环，直到 ctx 结束。退出前会再刷一次。
+func (p *CostPersister) restoreFromDaily(daily CostDailyStore) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	today := time.Now().UTC().Format("2006-01-02")
+	page, err := daily.ListProbeCostDaily(ctx, model.ProbeCostFilter{
+		DayFrom: today, DayTo: today,
+		PageRequest: model.PageRequest{Limit: 500},
+	})
+	if err != nil || len(page.Items) == 0 {
+		return false
+	}
+	snap := CostSnapshot{Day: today}
+	for _, item := range page.Items {
+		if item == nil {
+			continue
+		}
+		// 只把 synthetic trigger 计入探活成本；real_traffic 永不进入此表。
+		snap.L1Count += item.Requests // 粗聚合；明细仍以 daily 为准
+		snap.EstTokens += item.EstimatedInputTokens + item.ObservedOutputTokens
+	}
+	p.cost.Restore(snap)
+	p.log.Info("已从 probe_cost_daily 恢复当日成本快照", "rows", len(page.Items))
+	return true
+}
+
+// RecordPiggybackSkip 幂等记录一次 L2 piggyback 节省。
+func (p *CostPersister) RecordPiggybackSkip(ctx context.Context, eventID string, value model.ProbeCostDaily) error {
+	daily, ok := p.st.(CostDailyStore)
+	if !ok {
+		return fmt.Errorf("CostStore 不支持 RecordProbePiggybackSaving")
+	}
+	return daily.RecordProbePiggybackSaving(ctx, eventID, value)
+}
+
+// StablePiggybackEventID 为一次 skip 生成稳定 event ID（同日同维度幂等）。
+func StablePiggybackEventID(dayUTC string, endpoint model.EndpointKind, routeID, upstreamID int64, token string) string {
+	return fmt.Sprintf("piggyback_l2:%s:%s:%d:%d:%s", dayUTC, endpoint, routeID, upstreamID, token)
+}
+
 func (p *CostPersister) Run(ctx context.Context) {
 	t := time.NewTicker(costFlushInterval)
 	defer t.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			// 关闭前再刷一次，否则最后一分钟的计数会丢 —— 而重启前的
-			// 那段时间恰好常是在排查问题、手动点探活的时候。
 			p.flush()
 			return
 		case <-t.C:
