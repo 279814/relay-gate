@@ -21,6 +21,7 @@ async function main() {
   const { createMigrationFeature } = await import(pathToFileURL(path.join(dir, 'js', 'migration.mjs')).href);
   const { createCredentialsFeature, mergeCredentialsTab } = await import(pathToFileURL(path.join(dir, 'js', 'credentials.mjs')).href);
   const { createSecurityFeature, mergeSecurityTab } = await import(pathToFileURL(path.join(dir, 'js', 'security.mjs')).href);
+  const { createTransformsFeature, mergeTransformsTab } = await import(pathToFileURL(path.join(dir, 'js', 'transforms.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
@@ -32,6 +33,8 @@ async function main() {
   mergeCredentialsTab(inst);
   createSecurityFeature(inst, api);
   mergeSecurityTab(inst);
+  createTransformsFeature(inst, api);
+  mergeTransformsTab(inst);
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([
@@ -39,7 +42,7 @@ async function main() {
     'true', 'false', 'null', 'undefined', 'JSON', 'Object', 'Math', 'Date', 'String',
     'Number', 'Array', 'confirm', 'window', 'console',
     'r', 'u', 'm', 's', 't', 'rc', 'uc', 'c', 'e', 'i', 'v', 'n', 'x', 'p', 'k', 'd',
-    'g', 'l', 'row', 'ep', 'ex', 'run', 'cand', 'idx', 'a', 'ev', 'f',
+    'g', 'l', 'row', 'ep', 'ex', 'run', 'cand', 'idx', 'a', 'ev', 'f', 'b',
   ]);
 
   const exprs = [];
