@@ -98,3 +98,28 @@ func ShapeHash(shape model.ClientRequestShape) string {
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// ForgetUpstream drops in-memory learned shapes for one Upstream (§9.2).
+func (l *Learner) ForgetUpstream(upstreamID int64) {
+	if l == nil || upstreamID <= 0 {
+		return
+	}
+	prefix := fmt.Sprintf("%d:", upstreamID)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for hash, profile := range l.byShape {
+		if profile != nil && profile.UpstreamID == upstreamID {
+			delete(l.byShape, hash)
+			l.global--
+		}
+	}
+	for scope := range l.perScope {
+		if len(scope) >= len(prefix) && scope[:len(prefix)] == prefix {
+			l.global -= l.perScope[scope]
+			if l.global < 0 {
+				l.global = 0
+			}
+			delete(l.perScope, scope)
+		}
+	}
+}

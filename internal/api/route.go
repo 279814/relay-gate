@@ -89,6 +89,7 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 	// 从停用变启用也要探：那是「重新启用它，想知道还通不通」的时刻。
 	if before.UpstreamModel != cur.UpstreamModel ||
 		before.UpstreamID != cur.UpstreamID ||
+		before.ModelNameID != cur.ModelNameID ||
 		(!before.Enabled && cur.Enabled) {
 		s.invalidateRoute(id)
 	}

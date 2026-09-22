@@ -146,11 +146,14 @@ func runServer() error {
 
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
+	sharedRecovery := health.NewRecoveryGate()
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
 		WithTargets(targets, st).
 		WithTransports(transports).
 		WithHealthReporter(probe.NewReporter(tracker)).
-		WithLogSink(logRecorder)
+		WithLogSink(logRecorder).
+		WithCountTokensCapability(capRegistry).
+		WithRecoveryGate(sharedRecovery)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer transports.CloseIdleConnections()
 
@@ -247,11 +250,29 @@ func runServer() error {
 	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
 	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
 	// 只是慢一点，不会变成「改了不生效」。
+	semanticInv := health.NewSemanticInvalidator(tracker, sharedRecovery, capRegistry, sched, nil)
+	inv := &api.SemanticConfigInvalidator{
+		Semantic: semanticInv,
+		Inner:    sched,
+		RoutesOfUpstream: func(upstreamID int64) []int64 {
+			routes, err := st.ListRoutes(0)
+			if err != nil {
+				return nil
+			}
+			var ids []int64
+			for _, rt := range routes {
+				if rt.UpstreamID == upstreamID {
+					ids = append(ids, rt.ID)
+				}
+			}
+			return ids
+		},
+	}
 	mux.Handle("/admin/api/", api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).
 		WithCost(cost).
-		WithInvalidator(sched).
+		WithInvalidator(inv).
 		WithRunState(runCtrl).
 		WithProbeAdmin(probeAdmin).
 		WithSecurityCenter(security.NewCenter(500)).

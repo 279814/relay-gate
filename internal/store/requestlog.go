@@ -16,13 +16,13 @@ func (s *Store) InsertRequestLog(l *model.RequestLog) error {
 		ts_recv, ts_sent, ts_first_byte, ts_done,
 		endpoint, model_in, model_out, model_name_id, route_id, upstream_id, upstream_name,
 		resp_status, ttft_ms, bytes_written,
-		outcome, retried, half_open, error
-	) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?, ?,?,?, ?,?,?,?)`,
+		outcome, retried, half_open, error, duplicate_risk, retry_reason
+	) VALUES (?,?,?, ?,?,?,?, ?,?,?,?,?,?,?, ?,?,?, ?,?,?,?,?,?)`,
 		l.ReqID, l.Attempt, l.Attempts,
 		l.TSRecv, l.TSSent, l.TSFirstByte, l.TSDone,
 		l.Endpoint, l.ModelIn, l.ModelOut, l.ModelNameID, l.RouteID, l.UpstreamID, l.UpstreamName,
 		l.RespStatus, l.TTFTMs, l.BytesWritten,
-		string(l.Outcome), l.Retried, l.HalfOpen, l.Error)
+		string(l.Outcome), l.Retried, l.HalfOpen, l.Error, l.DuplicateRisk, l.RetryReason)
 	if err != nil {
 		return fmt.Errorf("写入请求日志: %w", err)
 	}
@@ -34,7 +34,7 @@ const requestLogCols = `id, req_id, attempt, attempts,
 	ts_recv, ts_sent, ts_first_byte, ts_done,
 	endpoint, model_in, model_out, model_name_id, route_id, upstream_id, upstream_name,
 	resp_status, ttft_ms, bytes_written,
-	outcome, retried, half_open, error`
+	outcome, retried, half_open, error, duplicate_risk, COALESCE(retry_reason,'')`
 
 func scanRequestLog(sc interface{ Scan(...any) error }) (*model.RequestLog, error) {
 	var l model.RequestLog
@@ -44,7 +44,7 @@ func scanRequestLog(sc interface{ Scan(...any) error }) (*model.RequestLog, erro
 		&l.Endpoint, &l.ModelIn, &l.ModelOut, &l.ModelNameID, &l.RouteID,
 		&l.UpstreamID, &l.UpstreamName,
 		&l.RespStatus, &l.TTFTMs, &l.BytesWritten,
-		&outcome, &l.Retried, &l.HalfOpen, &l.Error); err != nil {
+		&outcome, &l.Retried, &l.HalfOpen, &l.Error, &l.DuplicateRisk, &l.RetryReason); err != nil {
 		return nil, err
 	}
 	l.Outcome = model.Outcome(outcome)

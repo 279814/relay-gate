@@ -46,6 +46,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/upstream-endpoints/{id}", s.getUpstreamEndpoint)
 	mux.HandleFunc("PUT /admin/api/upstream-endpoints/{id}", s.updateUpstreamEndpoint)
 	mux.HandleFunc("DELETE /admin/api/upstream-endpoints/{id}", s.deleteUpstreamEndpoint)
+	mux.HandleFunc("POST /admin/api/upstream-endpoints/{id}/confirm-review", s.postConfirmEndpointReview)
 
 	mux.HandleFunc("GET /admin/api/probe-secrets", s.listProbeSecrets)
 	mux.HandleFunc("POST /admin/api/probe-secrets", s.createProbeSecret)

@@ -113,7 +113,7 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaThree(ctx, db)
+			return initializeEmptySchemaFour(ctx, db)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
@@ -124,6 +124,10 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 			}
 		case state.Version == 2:
 			if _, err := migrateSchemaTwoToThree(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
+		case state.Version == 3:
+			if _, err := migrateSchemaThreeToFour(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
 			}
 		case state.Version == developmentSchemaVersion:

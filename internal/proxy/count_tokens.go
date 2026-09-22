@@ -17,46 +17,134 @@ import (
 	"github.com/279814/relay-gate/internal/sample"
 )
 
-// handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1）。
+// handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1 / §10.3）。
 //
-// Claude Code 启动时与每轮对话前都会调它做上下文预算，不实现会报错。
+// 选路顺序：
+//  1. 健康且已知 supported 的 Route（按优先级）；
+//  2. supported 临时失败时尝试下一个 supported；
+//  3. 没有 supported 时，对一个健康 unknown Route 观察一次；
+//  4. 均失败或全部 unsupported → 本地估算。
 //
-// 与三个透传端点的差异（§10.3 已定，都是刻意的）：
-//   - **非流式**，超时独立（count_tokens_connect_sec / count_tokens_total_sec）
-//   - **失败不计入健康状态** —— 一个这么轻量的端点失败不该把站判死，
-//     它的噪声会淹没真实请求给出的信号
-//   - **上游不支持时本地粗算兜底**。M0 实测 4 个可用站只有 2 个支持
-//     （另 2 个 404），而同一个 ModelName 下不同 Route 的支持情况不同，
-//     所以兜底不能按站开关，只能统一本地兜底（§5.1e）
-//
-// 先转发后兜底而不是直接本地算：上游给的是真实 tokenizer 的结果，
-// 本地粗算有 ±20% 误差。能拿到准确值时就不该用估算值。
-//
-// 不记样本：Claude Code 每轮都调它，而样本是 500 条的滚动窗口 ——
-// 记进去会把真正有诊断价值的对话样本挤出去（§3.6.3c）。
+// 失败不计入 Route 模型健康，不触发模型 L2。不记样本（§3.6.3c）。
 func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	pre, ok := h.preamble(w, r, model.ProtoAnthropic)
 	if !ok {
 		return
 	}
 
-	// 选路失败不回错误，直接本地粗算 —— 本地兜底是设计要求（§5.1e）。
-	// 这里也包括「模型没配」与「协议不是 anthropic」：客户端要的只是一个
-	// token 数，为此回 404 会让 Claude Code 直接起不来。
-	cand, selErr := router.Select(pre.snapshot, h.health, pre.inModel, model.ProtoAnthropic)
-	if selErr != nil {
-		h.log.Info("count_tokens 无可用上游，本地粗算",
-			"model", pre.inModel, "err", selErr)
+	mn, err := router.MatchModelName(pre.snapshot, pre.inModel, model.ProtoAnthropic)
+	if err != nil || mn.Protocol != model.ProtoAnthropic {
+		h.log.Info("count_tokens 无匹配 ModelName，本地粗算", "model", pre.inModel, "err", err)
 		h.localCountTokens(w, pre.body)
 		return
 	}
-	defer cand.Release()
 
-	if reason := h.proxyCountTokens(w, r, pre, cand); reason != "" {
-		h.log.Info("count_tokens 转发未成功，本地粗算",
-			"model", pre.inModel, "upstream", cand.Upstream.Name, "reason", reason)
-		h.localCountTokens(w, pre.body)
+	tried := map[int64]bool{}
+	if h.tryCountTokensPass(w, r, pre, mn, tried, preferSupported) {
+		return
 	}
+	if h.tryCountTokensPass(w, r, pre, mn, tried, preferUnknown) {
+		return
+	}
+
+	h.log.Info("count_tokens 无可用上游，本地粗算", "model", pre.inModel)
+	h.localCountTokens(w, pre.body)
+}
+
+type countTokensPrefer int
+
+const (
+	preferSupported countTokensPrefer = iota
+	preferUnknown
+)
+
+func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
+	pre *preambleResult, mn *model.ModelName, tried map[int64]bool, prefer countTokensPrefer) bool {
+
+	for {
+		cand, err := h.selectCountTokensCandidate(pre.snapshot, mn, tried, prefer)
+		if err != nil || cand == nil {
+			return false
+		}
+		tried[cand.Route.ID] = true
+		reason := h.proxyCountTokens(w, r, pre, cand)
+		cand.Release()
+		if reason == "" {
+			return true
+		}
+		h.log.Info("count_tokens 转发未成功，尝试下一 Route",
+			"model", pre.inModel, "upstream", cand.Upstream.Name, "reason", reason)
+		if prefer == preferUnknown {
+			return false
+		}
+	}
+}
+
+func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, mn *model.ModelName,
+	exclude map[int64]bool, prefer countTokensPrefer) (*router.Candidate, error) {
+
+	all := snap.RoutesByModelName[mn.ID]
+	type scored struct {
+		rt    *model.Route
+		score int
+	}
+	var pool []scored
+	for _, rt := range all {
+		if rt == nil || !rt.Enabled || exclude[rt.ID] {
+			continue
+		}
+		up := snap.Upstreams[rt.UpstreamID]
+		if up == nil || !up.Enabled {
+			continue
+		}
+		if h.health != nil {
+			if h.health.State(rt.ID) == model.StateDead {
+				continue
+			}
+			if h.health.CoolingDown(rt.ID) {
+				continue
+			}
+		}
+		capState := model.CapabilityUnknown
+		if h.countCaps != nil {
+			capState = h.countCaps.Effective(model.RecipeScopeRoute, rt.ID, model.EndpointCountTokens, "")
+		}
+		switch prefer {
+		case preferSupported:
+			if capState != model.CapabilitySupported {
+				continue
+			}
+		case preferUnknown:
+			if capState == model.CapabilityUnsupported ||
+				capState == model.CapabilityConfigError ||
+				capState == model.CapabilitySupported {
+				continue
+			}
+		}
+		pool = append(pool, scored{rt: rt, score: rt.Priority})
+	}
+	if len(pool) == 0 {
+		return nil, router.ErrNoRouteAvailable
+	}
+	best := pool[0]
+	for _, p := range pool[1:] {
+		if p.score < best.score || (p.score == best.score && p.rt.ID < best.rt.ID) {
+			best = p
+		}
+	}
+	up := snap.Upstreams[best.rt.UpstreamID]
+	var release func()
+	if h.health != nil {
+		var ok bool
+		release, ok = h.health.TryAcquire(best.rt.ID, best.rt.MaxConcurrency)
+		if !ok {
+			exclude[best.rt.ID] = true
+			return h.selectCountTokensCandidate(snap, mn, exclude, prefer)
+		}
+	} else {
+		release = func() {}
+	}
+	return router.NewCandidate(best.rt, up, mn, release), nil
 }
 
 // proxyCountTokens 把 count_tokens 转发给上游。
