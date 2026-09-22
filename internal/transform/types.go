@@ -36,6 +36,7 @@ const (
 	KindJSONPatchAdd    = "json_patch_add"
 	KindJSONPatchRemove = "json_patch_remove"
 	KindJSONPatchCopy   = "json_patch_copy"
+	KindBodyTemplate    = "body_template" // full body replacement; declarative literal only
 	KindSetStatus       = "set_status"
 	KindSSEMatch        = "sse_match"
 	KindSSEAppendEnd    = "sse_append_end" // synthetic completion
