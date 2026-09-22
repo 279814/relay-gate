@@ -12,6 +12,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/transform"
 )
 
 // InFlightView 暴露每个 Route 的在途请求数。由 health.Tracker 实现。
@@ -58,6 +59,9 @@ type Server struct {
 
 	// security 是 P3 Security Center。未注入时 list 返回空。
 	security *security.Center
+
+	// transforms 是 P4 声明式转换注册表。未注入时 list 返回空。
+	transforms *transform.Registry
 
 	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
 	adminPW  string

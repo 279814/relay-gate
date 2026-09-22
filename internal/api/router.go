@@ -91,6 +91,17 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("POST /admin/api/security/scan", s.postSecurityScan)
 	mux.HandleFunc("POST /admin/api/security/canary", s.postSecurityCanary)
 
+	mux.HandleFunc("GET /admin/api/transforms", s.listTransformSets)
+	mux.HandleFunc("POST /admin/api/transforms", s.createTransformSet)
+	mux.HandleFunc("GET /admin/api/transforms/{id}", s.getTransformSet)
+	mux.HandleFunc("PUT /admin/api/transforms/{id}/draft", s.putTransformDraft)
+	mux.HandleFunc("POST /admin/api/transforms/{id}/preview", s.postTransformPreview)
+	mux.HandleFunc("POST /admin/api/transforms/{id}/publish", s.postTransformPublish)
+	mux.HandleFunc("POST /admin/api/transforms/{id}/shadow", s.postTransformShadow)
+	mux.HandleFunc("POST /admin/api/transforms/rollback", s.postTransformRollback)
+	mux.HandleFunc("GET /admin/api/transform-bindings", s.listTransformBindings)
+	mux.HandleFunc("GET /admin/api/transform-executions", s.listTransformExecutions)
+
 	guarded := s.requireAdmin(mux)
 
 	// 会话端点挂在鉴权**之外**。

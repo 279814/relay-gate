@@ -28,6 +28,7 @@ import (
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/transform"
 	"github.com/279814/relay-gate/internal/web"
 )
 
@@ -254,6 +255,7 @@ func runServer() error {
 		WithRunState(runCtrl).
 		WithProbeAdmin(probeAdmin).
 		WithSecurityCenter(security.NewCenter(500)).
+		WithTransformRegistry(transform.NewRegistry(500)).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 
