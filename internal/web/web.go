@@ -9,6 +9,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"path"
 	"strings"
 )
 
@@ -33,10 +34,10 @@ func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// /admin 与 /admin/ 都给 index.html。少一个斜杠就 404
 		// 是这类界面最没必要的挫折。
-		path := strings.TrimPrefix(r.URL.Path, "/admin")
-		path = strings.TrimPrefix(path, "/")
+		reqPath := strings.TrimPrefix(r.URL.Path, "/admin")
+		reqPath = strings.TrimPrefix(reqPath, "/")
 
-		if path == "" || path == "index.html" {
+		if reqPath == "" || reqPath == "index.html" {
 			// 不缓存 HTML：升级后用户不该还看着旧界面，而 index.html
 			// 里带着与后端 API 契约相关的逻辑。静态资源（带版本的 js/css）
 			// 由 FileServer 自己按 ETag 处理。
@@ -51,8 +52,13 @@ func Handler() http.Handler {
 			return
 		}
 
+		// .mjs 在部分环境 mime 库未登记；ESM import 依赖正确的 JS Content-Type。
+		if strings.HasSuffix(reqPath, ".mjs") {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		}
+
 		r2 := r.Clone(r.Context())
-		r2.URL.Path = "/" + path
+		r2.URL.Path = "/" + path.Clean("/"+reqPath)
 		files.ServeHTTP(w, r2)
 	})
 }

@@ -401,15 +401,15 @@ type ProbeApplyResult struct {
 }
 
 type ProbeRuntimeStats struct {
-	FullObserversInFlight    int64
-	FullObserverLimit        int64
-	ObserverBytesInFlight    int64
-	ObserverByteLimit        int64
-	ObservationQueueDepth    int64
-	ObservationQueueCapacity int64
-	DroppedByCapacity        uint64
-	DroppedByPersistence     uint64
-	DroppedCandidates        uint64
+	FullObserversInFlight    int64  `json:"full_observers_in_flight"`
+	FullObserverLimit        int64  `json:"full_observer_limit"`
+	ObserverBytesInFlight    int64  `json:"observer_bytes_in_flight"`
+	ObserverByteLimit        int64  `json:"observer_byte_limit"`
+	ObservationQueueDepth    int64  `json:"observation_queue_depth"`
+	ObservationQueueCapacity int64  `json:"observation_queue_capacity"`
+	DroppedByCapacity        uint64 `json:"dropped_by_capacity"`
+	DroppedByPersistence     uint64 `json:"dropped_by_persistence"`
+	DroppedCandidates        uint64 `json:"dropped_candidates"`
 }
 
 type ProbeProfileStatus string
@@ -456,20 +456,20 @@ const (
 )
 
 type ProbeCostDaily struct {
-	DayUTC                string
-	Trigger               ProbeTrigger
-	Origin                RecipeSource
-	Endpoint              EndpointKind
-	RouteID               int64
-	UpstreamID            int64
-	Requests              int64
-	Succeeded             int64
-	Failed                int64
-	Canceled              int64
-	EstimatedInputTokens  int64
-	ObservedOutputTokens  int64
-	CanceledAfterSemantic int64
-	PiggybackL2Saved      int64
+	DayUTC                string       `json:"day_utc"`
+	Trigger               ProbeTrigger `json:"trigger"`
+	Origin                RecipeSource `json:"origin"`
+	Endpoint              EndpointKind `json:"endpoint"`
+	RouteID               int64        `json:"route_id"`
+	UpstreamID            int64        `json:"upstream_id"`
+	Requests              int64        `json:"requests"`
+	Succeeded             int64        `json:"succeeded"`
+	Failed                int64        `json:"failed"`
+	Canceled              int64        `json:"canceled"`
+	EstimatedInputTokens  int64        `json:"estimated_input_tokens"`
+	ObservedOutputTokens  int64        `json:"observed_output_tokens"`
+	CanceledAfterSemantic int64        `json:"canceled_after_semantic"`
+	PiggybackL2Saved      int64        `json:"piggyback_l2_saved"`
 }
 
 type ProbeCostEvidenceV1 struct {

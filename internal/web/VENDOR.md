@@ -31,6 +31,8 @@ Windows 检出后仍然对得上 —— 默认的 CRLF 转换会改变文件字�
 
 ## 没有构建链
 
-仓库里只有这一个第三方文件，没有 npm、没有打包器。CSS 是手写的
-（`app.css`），JS 是一个 Alpine 组件（`app.js`）。这个界面就是几张表格
-加表单，一条构建链换不来什么，还会让「改一行样式」变成「先装依赖」。
+仓库里只有 Alpine 这一个第三方文件，没有 npm、没有打包器。CSS 是手写的
+（`app.css`），经典 shell 是 `app.js`，P0-15 起业务 Probe 功能在
+`static/js/*.mjs`（ESM，浏览器原生 `type=module`）。`api.mjs` 是唯一业务
+网络出口；`boot.mjs` 在 Alpine 启动前增强 `window.app`，不要求修改已提交的
+`app.js` 契约文件。

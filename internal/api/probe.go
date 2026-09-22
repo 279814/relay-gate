@@ -451,6 +451,28 @@ func (s *Server) cancelCalibration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNoContent, nil)
 }
 
+func (s *Server) listProbeCosts(w http.ResponseWriter, r *http.Request) {
+	if s.probeAdmin == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
+		return
+	}
+	filter := model.ProbeCostFilter{PageRequest: pageFromQuery(r)}
+	if v := r.URL.Query().Get("route_id"); v != "" {
+		id, _ := strconv.ParseInt(v, 10, 64)
+		filter.RouteID = id
+	}
+	if v := r.URL.Query().Get("upstream_id"); v != "" {
+		id, _ := strconv.ParseInt(v, 10, 64)
+		filter.UpstreamID = id
+	}
+	page, err := s.probeAdmin.ListCosts(r.Context(), filter)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func pageFromQuery(r *http.Request) model.PageRequest {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	return model.PageRequest{Cursor: r.URL.Query().Get("cursor"), Limit: limit}
