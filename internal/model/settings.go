@@ -72,7 +72,6 @@ type Settings struct {
 	CooldownSec   int `json:"cooldown_sec"`   // 429 冷却时长（无 retry-after 时）
 
 	GlobalL2Concurrency int  `json:"global_l2_concurrency"`
-	ProbeEnabled        bool `json:"probe_enabled"`
 	PiggybackEnabled    bool `json:"piggyback_enabled"`
 	HalfOpenEnabled     bool `json:"half_open_enabled"`
 
@@ -163,7 +162,6 @@ func DefaultSettings() Settings {
 		CooldownSec:   60,
 
 		GlobalL2Concurrency: 3,
-		ProbeEnabled:        true,
 		PiggybackEnabled:    true,
 		HalfOpenEnabled:     true,
 

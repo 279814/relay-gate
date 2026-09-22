@@ -114,7 +114,7 @@ try {
         l2_interval_alive_sec = 3; l2_interval_dead_sec = 2
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
         global_l2_concurrency = 3
-        probe_enabled = $true; piggyback_enabled = $true; half_open_enabled = $true
+        piggyback_enabled = $true; half_open_enabled = $true
         sample_enabled = $true; sample_max_body_bytes = 0
         sample_resp_head_bytes = 0; sample_resp_tail_bytes = 0
         sample_keep_count = 300; sample_keep_days = 7; sample_queue_size = 256

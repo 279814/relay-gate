@@ -518,8 +518,8 @@
                 <div class="sub">估算上界，非账单</div>
               </div>
               <div class="card">
-                <h3>探活总开关</h3>
-                <div class="v" x-text="cost.probe_enabled ? '开' : '关'"></div>
+                <h3>探活策略</h3>
+                <div class="v">按站 Active/Lazy</div>
                 <div class="sub" x-text="cost.piggyback_enabled ? 'piggyback 开（真实流量抵扣 L2）' : 'piggyback 关'"></div>
               </div>
             </div>
@@ -669,7 +669,7 @@
                   </div>
                 </div>
                 <div class="row" style="margin-top:4px">
-                  <label class="check"><input type="checkbox" x-model="settings.probe_enabled"> 启用探活</label>
+                  <div class="note" style="flex:1">周期探活由各 Upstream 的 Active/Lazy 决定；服务总闸见顶部暂停按钮。</div>
                   <label class="check"><input type="checkbox" x-model="settings.piggyback_enabled"> piggyback（真实请求成功抵扣一次 L2）</label>
                   <label class="check"><input type="checkbox" x-model="settings.half_open_enabled"> 半开（给判死的站放行少量真实请求）</label>
                 </div>

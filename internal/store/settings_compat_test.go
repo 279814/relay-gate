@@ -71,6 +71,17 @@ func TestSettingsAndRunStateRevisionCAS(t *testing.T) {
 	}
 }
 
+func TestDecodeLegacySettingsStripsProbeEnabled(t *testing.T) {
+	raw := []byte(`{"probe_enabled":false,"piggyback_enabled":true}`)
+	settings, err := DecodeLegacySettings(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.PiggybackEnabled {
+		t.Fatal("expected piggyback kept")
+	}
+}
+
 func TestDecodeLegacySettingsRejectsUnknownAndTrailingJSON(t *testing.T) {
 	for _, raw := range []string{
 		`{"real_connect_sec":30,"mystery":1}`,

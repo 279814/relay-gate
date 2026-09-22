@@ -373,10 +373,6 @@ func (s *Scheduler) tick(ctx context.Context) {
 	}
 	s.onRunning()
 
-	if !settings.ProbeEnabled {
-		return
-	}
-
 	snap, err := s.cfg.Snapshot()
 	if err != nil {
 		s.log.Error("探活调度读取配置快照失败，本轮跳过", "err", err)
