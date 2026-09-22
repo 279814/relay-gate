@@ -108,6 +108,11 @@ func runServer() error {
 		return err
 	}
 	defer st.Close()
+	if n, err := st.MigrateSampleEnvelopes(); err != nil {
+		return fmt.Errorf("样本信封迁移: %w", err)
+	} else if n > 0 {
+		log.Info("已迁移旧样本行为信封密文", "rows", n)
+	}
 
 	// 启动时读一次运行状态：暂停时重启不应自动跑起来（§4.8）。
 	// 转发路径读的是 livecfg 的缓存视图，这里只为启动日志与首个 /healthz。
