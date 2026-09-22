@@ -163,7 +163,6 @@ func (r *recordingTracker) DemotePositiveConclusions() {
 func (r *recordingTracker) CompleteL1(int64, time.Time, float64) {}
 func (r *recordingTracker) CompleteL2(int64, time.Time, float64) {}
 
-
 func (r *recordingTracker) snapshot() ([]int64, []int64, []health.Report, []int64, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
