@@ -34,6 +34,11 @@ type preparedProbe struct {
 	recipe  ResolvedRecipe
 	request *http.Request
 
+	// resolvedURLHash / requestURLHash 来自唯一出站 Resolver（§7.1），
+	// 原样进 ProbeExecution —— 不能在执行侧再算一遍，否则会有第二份哈希规则。
+	resolvedURLHash string
+	requestURLHash  string
+
 	// connectionOnly 表示这次 L1 只探连接层，任何响应都算通（§4.1）。
 	//
 	// 在这里定而不是让 L1 去看请求方法：那个判据会被一份 method=HEAD 的
@@ -50,8 +55,14 @@ type preparedProbe struct {
 // mn 与 rt 可以为 nil（L1 打的是站级 /v1/models，没有模型上下文）。那种情况下
 // 引用 {{MODEL_NAME}} 的模板会以「未装配」失败 —— 这是对的：一个 upstream 作用域
 // 的 endpoint 上没有唯一的模型名，静默填一个会让探活打的模型与任何 Route 都无关。
+//
+// 除 (*preparedProbe, error) 外还回一个 ResolvedRecipe：解析一旦成功，哪怕
+// 后续的渲染/URL/认证失败（config_error），调用方也拿得到那份 identity。
+// Executor 靠它把 recipe origin/storage/version 落进 config_error 的 execution 行 ——
+// 否则 §5.2d 的成本证据（CostEvidenceFromExecution 要求 RecipeOrigin.Valid()）
+// 建不起来，整行写库失败。解析本身失败时回零值 ResolvedRecipe（identity 未定）。
 func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
-	rt *model.Route, endpoint model.EndpointKind) (*preparedProbe, error) {
+	rt *model.Route, endpoint model.EndpointKind) (*preparedProbe, ResolvedRecipe, error) {
 
 	// 没有出站解析器就地失败，**不自己拼一个地址**：探活打的地址必须与真实
 	// 请求完全一致，各拼一套的话「探活通过」不代表真实请求能通，而那个差异
@@ -61,7 +72,7 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	// 而这里跑在 Scheduler 起的 goroutine 里 —— 那里没有 recover，
 	// 一次 nil 解引用会带崩整个网关进程。
 	if p.Targets == nil {
-		return nil, errors.New("探活未装配出站目标解析器")
+		return nil, ResolvedRecipe{}, errors.New("探活未装配出站目标解析器")
 	}
 
 	var routeID int64
@@ -72,12 +83,12 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 		UpstreamID: up.ID, RouteID: routeID, Endpoint: endpoint,
 	})
 	if err != nil {
-		return nil, err
+		return nil, ResolvedRecipe{}, err
 	}
 
 	values, err := p.templateValues(ctx, up, mn, rt, resolved)
 	if err != nil {
-		return nil, err
+		return nil, resolved, err
 	}
 	rendered, err := resolved.Compiled.Render(ctx, values)
 	if err != nil {
@@ -85,7 +96,7 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 		// 而那条错误会落进 route_health.last_error（**落库**）并显示在管理界面上。
 		// TemplateValues 自己的错误只带占位符名，不带值，所以这里可以带上 ——
 		// 但 Secret 解析失败的那条来自 store，不保证同样克制。
-		return nil, fmt.Errorf("渲染 %s 层 recipe: %w", resolved.Layer, err)
+		return nil, resolved, fmt.Errorf("渲染 %s 层 recipe: %w", resolved.Layer, err)
 	}
 
 	// 渲染出的 RawQuery 当作「入站 query」交给 Resolver：Endpoint 的固定 query
@@ -99,7 +110,7 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 		Use:              outbound.ResolveSyntheticProbe,
 	})
 	if err != nil {
-		return nil, err
+		return nil, resolved, err
 	}
 
 	method := rendered.Method
@@ -117,18 +128,24 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	}
 	request, err := newProbeRequest(ctx, method, target.RawURL, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("构造 %s 探活请求: %w", endpoint, err)
+		return nil, resolved, fmt.Errorf("构造 %s 探活请求: %w", endpoint, err)
 	}
 	request.Header = rendered.Header
 	if err := p.applyProbeHeaders(ctx, request.Header, up, target); err != nil {
-		return nil, err
+		return nil, resolved, err
 	}
 	if target.RequestHost != "" {
 		request.Host = target.RequestHost
 	}
 	request.ContentLength = int64(len(rendered.Body))
 
-	return &preparedProbe{recipe: resolved, request: request, connectionOnly: connectionOnly}, nil
+	return &preparedProbe{
+		recipe:          resolved,
+		request:         request,
+		resolvedURLHash: target.ResolvedURLHash,
+		requestURLHash:  target.RequestURLHash,
+		connectionOnly:  connectionOnly,
+	}, resolved, nil
 }
 
 // estimatedTokens 是这次探活的估算 token 上界（§5.2d）。

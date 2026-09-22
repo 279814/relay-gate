@@ -193,9 +193,15 @@ func validateProbeCostEvidence(value model.ProbeCostEvidenceV1) error {
 		}
 	}
 	if value.Kind == model.CostEventExecution {
+		// CanceledAfterSemantic 与 succeeded/failed/canceled 是**正交**维度
+		// （§计划 1021 行、§设计 1845 行的「首语义后主动取消次数」）：探活拿到
+		// 首个语义证据后主动断流是**预期成功**（Succeeded=1），同时它省下了
+		// 后续 token，于是 CanceledAfterSemantic=1 —— 两者本就同时成立。
+		// 因此它的上界是 Requests，而不是 Canceled；按 Canceled 卡会把每一次
+		// 成功的 L2 探活都判成「自相矛盾」而拒绝落库，探活从此不再更新健康。
 		if value.PiggybackL2Saved != 0 || value.Requests > 1 ||
 			value.Succeeded+value.Failed+value.Canceled != value.Requests ||
-			value.CanceledAfterSemantic > value.Canceled {
+			value.CanceledAfterSemantic > value.Requests {
 			return model.WrapValidation("execution cost evidence outcome 无效")
 		}
 	} else if value.Requests != 0 || value.Succeeded != 0 || value.Failed != 0 || value.Canceled != 0 ||

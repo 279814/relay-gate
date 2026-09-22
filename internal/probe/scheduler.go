@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -10,8 +11,10 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -72,6 +75,15 @@ type Scheduler struct {
 	// cost 累计探活开销（§5.2d）。可以为 nil —— 测试里多数用例不关心计数，
 	// 而记账失败绝不该影响探活本身。
 	cost *Cost
+
+	// executor 是 P0-09 的单发执行器。装配后 L1/L2/ProbeNow 一律走它，
+	// 不再各自构造 &Prober{Transport}（§P0-09 目标）。为 nil 时（多数单元
+	// 测试）退化到旧 Prober 发送段，以保留既有健康语义的测试覆盖。
+	executor *Executor
+
+	// sequencer 分配 observation order（§P0-06）。走 executor 时，每次发送前
+	// 先要一个号；拿不到号就不发（发出去却没有 order 的结果无法排先后）。
+	sequencer *observationseq.Sequencer
 
 	// l2Sem 是全局 L2 并发闸。L2 消耗 token 且打的是真实模型端点，
 	// 不限并发的话，一次「全部 Route 都到期」会同时向所有站发请求 ——
@@ -137,6 +149,88 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 func (s *Scheduler) WithCost(c *Cost) *Scheduler {
 	s.cost = c
 	return s
+}
+
+// WithExecutor 注入 P0-09 的单发执行器（§P0-09 目标）。
+//
+// 装配后 L1/L2/ProbeNow 都经 Executor 发送并落一行 ProbeExecution，
+// Decision 再映射成 health.Tracker 现在能消费的 Outcome（P0-10 前的临时映射）。
+func (s *Scheduler) WithExecutor(executor *Executor) *Scheduler {
+	s.executor = executor
+	return s
+}
+
+// WithSequencer 注入 observation order 分配器（§P0-06）。
+//
+// 只在走 Executor 时用：每次发送前分配一个号，写进 ExecutionRequest。
+func (s *Scheduler) WithSequencer(sequencer *observationseq.Sequencer) *Scheduler {
+	s.sequencer = sequencer
+	return s
+}
+
+// nextOrder 为一次探活分配 observation order。
+//
+// sequencer 未装配时回 0（那时 execution 行的 order 为 0 —— 只在没接 P0-06
+// 的过渡装配里出现）。拿不到号返回错误，调用方据此**不发**这次探活。
+func (s *Scheduler) nextOrder(ctx context.Context, trigger model.ProbeTrigger) (int64, error) {
+	if s.sequencer == nil {
+		return 0, nil
+	}
+	return s.sequencer.Next(ctx, trigger)
+}
+
+// execL1 经 Executor 跑一次站级 L1，并把 Decision 映射成 Outcome。
+func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings model.Settings) Outcome {
+	order, err := s.nextOrder(ctx, model.TriggerScheduled)
+	if err != nil {
+		// 拿不到号：不发。当作「被忽略」，不动健康状态。
+		return Outcome{Verdict: health.VerdictIgnore}
+	}
+	res, err := s.executor.Execute(ctx, ExecutionRequest{
+		ExecutionID:      sample.NewReqID(),
+		Trigger:          model.TriggerScheduled,
+		Upstream:         up,
+		Endpoint:         model.EndpointModels,
+		Mode:             ObserveProbe,
+		Budget:           outbound.L1Budget(settings),
+		ObservationOrder: order,
+	})
+	if err != nil {
+		s.log.Error("L1 执行失败", "upstream", up.Name, "err", err)
+		return Outcome{Verdict: health.VerdictIgnore}
+	}
+	return res.Outcome
+}
+
+// execL2 经 Executor 跑一次 Route 级 L2。
+func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.ModelName,
+	rt *model.Route, settings model.Settings) Outcome {
+
+	kind, ok := mn.Protocol.Endpoint()
+	if !ok {
+		return Outcome{Verdict: health.VerdictUnavailable,
+			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
+	}
+	order, err := s.nextOrder(ctx, model.TriggerScheduled)
+	if err != nil {
+		return Outcome{Verdict: health.VerdictIgnore}
+	}
+	res, err := s.executor.Execute(ctx, ExecutionRequest{
+		ExecutionID:      sample.NewReqID(),
+		Trigger:          model.TriggerScheduled,
+		Upstream:         up,
+		ModelName:        mn,
+		Route:            rt,
+		Endpoint:         kind,
+		Mode:             ObserveProbe,
+		Budget:           outbound.L2Budget(settings),
+		ObservationOrder: order,
+	})
+	if err != nil {
+		s.log.Error("L2 执行失败", "upstream", up.Name, "model", mn.Name, "err", err)
+		return Outcome{Verdict: health.VerdictIgnore}
+	}
+	return res.Outcome
 }
 
 // WithTargets 注入与真实转发共用的出站目标解析器（§7.1）。
@@ -294,13 +388,17 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 }
 
 func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings model.Settings) {
-	tr, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
-	if err != nil {
-		s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
-		return
+	var out Outcome
+	if s.executor != nil {
+		out = s.execL1(ctx, up, settings)
+	} else {
+		tr, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
+		if err != nil {
+			s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
+			return
+		}
+		out = s.prober(tr).L1(ctx, up, settings)
 	}
-
-	out := s.prober(tr).L1(ctx, up, settings)
 	if out.Verdict == health.VerdictIgnore {
 		return // 探活被取消（暂停/关闭），不是上游的问题
 	}
@@ -373,13 +471,17 @@ func (s *Scheduler) triggerDeadRoutes(upstreamID int64) int {
 func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	mn *model.ModelName, rt *model.Route, settings model.Settings) {
 
-	tr, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
-	if err != nil {
-		s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
-		return
+	var out Outcome
+	if s.executor != nil {
+		out = s.execL2(ctx, up, mn, rt, settings)
+	} else {
+		tr, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
+		if err != nil {
+			s.log.Error("探活取连接池失败", "upstream", up.Name, "err", err)
+			return
+		}
+		out = s.prober(tr).L2(ctx, up, mn, rt, settings)
 	}
-
-	out := s.prober(tr).L2(ctx, up, mn, rt, settings)
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
@@ -574,15 +676,18 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, errNoModelName
 	}
 
-	// L1 与 L2 各取自己的连接池：两者的 connect 预算不同，而 connect 预算是
-	// 池身份的一部分（§7.3）。共用一个池就意味着其中一个的 l*_connect_sec
-	// 是死的 —— 而「让 L1/L2 配置真正生效」正是 P0-04 的目标。
-	l1Transport, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
-	if err != nil {
-		return l1, l2, err
+	if s.executor != nil {
+		l1 = s.execL1(ctx, up, settings)
+	} else {
+		// L1 与 L2 各取自己的连接池：两者的 connect 预算不同，而 connect 预算是
+		// 池身份的一部分（§7.3）。共用一个池就意味着其中一个的 l*_connect_sec
+		// 是死的 —— 而「让 L1/L2 配置真正生效」正是 P0-04 的目标。
+		l1Transport, terr := s.tr.TransportFor(up, outbound.L1Budget(settings))
+		if terr != nil {
+			return l1, l2, terr
+		}
+		l1 = s.prober(l1Transport).L1(ctx, up, settings)
 	}
-
-	l1 = s.prober(l1Transport).L1(ctx, up, settings)
 	s.countL1(up.ID, l1.Verdict == health.VerdictOK)
 	s.gate.Report(up.ID, l1.Verdict == health.VerdictOK, l1.Err)
 
@@ -596,11 +701,15 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, nil
 	}
 
-	l2Transport, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
-	if err != nil {
-		return l1, l2, err
+	if s.executor != nil {
+		l2 = s.execL2(ctx, up, mn, rt, settings)
+	} else {
+		l2Transport, terr := s.tr.TransportFor(up, outbound.L2Budget(settings))
+		if terr != nil {
+			return l1, l2, terr
+		}
+		l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
 	}
-	l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
 	s.countL2(rt.ID, mn, l2)
 	s.track.Report(health.Report{
 		RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
