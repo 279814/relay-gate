@@ -61,6 +61,90 @@ func (s *Server) listRequestLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"logs": list, "total": total})
 }
 
+// recentErrors is the P2 home summary + modal feed (§13.2).
+// Plain-text errors only; reuses failed request_log rows.
+func (s *Server) recentErrors(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, err := queryInt64(q.Get("limit"))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: 参数 limit 不是合法整数：%q",
+			model.ErrValidation, q.Get("limit")))
+		return
+	}
+	if q.Get("limit") == "" {
+		limit = 20
+	}
+	beforeID, err := queryInt64(q.Get("before_id"))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: 参数 before_id 不是合法整数：%q",
+			model.ErrValidation, q.Get("before_id")))
+		return
+	}
+	upstreamID, err := queryInt64(q.Get("upstream_id"))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: 参数 upstream_id 不是合法整数：%q",
+			model.ErrValidation, q.Get("upstream_id")))
+		return
+	}
+	f := store.RequestLogFilter{
+		UpstreamID: upstreamID,
+		OnlyFailed: true,
+		Limit:      int(limit),
+		BeforeID:   beforeID,
+	}
+	list, err := s.st.ListRequestLogs(f)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	failedCount, err := countFailedRequestLogs(s.st)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	var summary any
+	if len(list) > 0 {
+		summary = map[string]any{
+			"id":       list[0].ID,
+			"error":    list[0].Error,
+			"ts_recv":  list[0].TSRecv,
+			"upstream": list[0].UpstreamName,
+			"endpoint": list[0].Endpoint,
+			"model_in": list[0].ModelIn,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"failed_count": failedCount,
+		"latest":       summary,
+		"logs":         list,
+	})
+}
+
+type failedLogCounter interface {
+	ListRequestLogs(store.RequestLogFilter) ([]*model.RequestLog, error)
+}
+
+func countFailedRequestLogs(st failedLogCounter) (int, error) {
+	n := 0
+	var before int64
+	for {
+		page, err := st.ListRequestLogs(store.RequestLogFilter{
+			OnlyFailed: true, Limit: 500, BeforeID: before,
+		})
+		if err != nil {
+			return 0, err
+		}
+		if len(page) == 0 {
+			return n, nil
+		}
+		n += len(page)
+		before = page[len(page)-1].ID
+		if len(page) < 500 {
+			return n, nil
+		}
+	}
+}
+
 // getRetryStats 汇总重试效果（M6）。
 //
 // 这是整个 request_log 表存在的理由：没有它，「换站重试」值不值得就只能

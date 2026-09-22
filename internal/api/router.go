@@ -79,6 +79,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	// 请求日志与重试统计（M6）。日志是「重试到底有没有用」的唯一依据 ——
 	// 没有它，这个功能的收益就只能靠感觉，而它的代价是实打实的。
 	mux.HandleFunc("GET /admin/api/request-logs", s.listRequestLogs)
+	mux.HandleFunc("GET /admin/api/recent-errors", s.recentErrors)
 	mux.HandleFunc("GET /admin/api/retry-stats", s.getRetryStats)
 	mux.HandleFunc("DELETE /admin/api/request-logs", s.clearRequestLogs)
 

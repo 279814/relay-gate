@@ -70,6 +70,53 @@
                 <div class="v" x-text="`${runtime.samples_written ?? 0} / ${runtime.samples_dropped ?? 0}`"></div>
                 <div class="sub">丢弃是静默的：队列满时宁可丢样本也不阻塞转发</div>
               </div>
+              <div class="card" style="cursor:pointer" @click="openRecentErrors && openRecentErrors()">
+                <h3>最近错误</h3>
+                <div class="v" x-text="recentErrors?.failed_count ?? 0"></div>
+                <div class="sub" x-text="recentErrors?.latest?.error
+                  ? ((recentErrors.latest.error.length > 80
+                      ? recentErrors.latest.error.slice(0, 80) + '…'
+                      : recentErrors.latest.error))
+                  : '点击查看全部'"></div>
+              </div>
+            </div>
+
+            <div class="mask" x-show="recentErrors?.open" @click.self="closeRecentErrors && closeRecentErrors()"
+                 @keydown.escape.window="closeRecentErrors && closeRecentErrors()">
+              <div class="modal wide" @click.stop>
+                <div class="bar">
+                  <h3 style="margin:0">最近错误</h3>
+                  <span class="grow"></span>
+                  <button type="button" @click="closeRecentErrors && closeRecentErrors()">关闭</button>
+                </div>
+                <p class="dim">完整脱敏文本；禁止 HTML。筛选与分页基于 request_log 失败行。</p>
+                <div class="bar">
+                  <label>Upstream ID
+                    <input type="number" x-model="recentErrors.upstream_id" @change="refreshRecentErrors && refreshRecentErrors()">
+                  </label>
+                  <button type="button" @click="refreshRecentErrors && refreshRecentErrors()">刷新</button>
+                </div>
+                <table>
+                  <thead>
+                    <tr><th>时间</th><th>上游</th><th>端点</th><th>模型</th><th>错误</th><th></th></tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="row in (recentErrors?.logs || [])" :key="row.id">
+                      <tr>
+                        <td x-text="fmtTime(row.ts_recv)"></td>
+                        <td x-text="row.upstream_name"></td>
+                        <td x-text="row.endpoint"></td>
+                        <td x-text="row.model_in"></td>
+                        <td><pre class="err-pre" x-text="row.error || ''"></pre></td>
+                        <td><button type="button" @click="copyRecentError && copyRecentError(row.error)">复制</button></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+                <div class="bar">
+                  <button type="button" @click="loadMoreRecentErrors && loadMoreRecentErrors()">加载更多</button>
+                </div>
+              </div>
             </div>
 
             <div class="bar">
