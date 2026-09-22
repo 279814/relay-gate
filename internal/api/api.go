@@ -70,9 +70,20 @@ type Server struct {
 	creds   *credential.Service
 	keyring *keyring.File
 
-	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
-	adminPW  string
-	sessions *sessionStore
+	// adminPW 由 Routes 装配时写入（环境变量明文，旧部署兼容）。
+	// adminHash 来自 data/secrets/ Argon2id（§12.5）；登录与 Bearer 两条路径共用。
+	adminPW      string
+	adminHash    string
+	adminDataDir string // 用于 reset-admin 落盘哈希；可空（仅内存口令的测试）
+	sessions     *sessionStore
+}
+
+// WithAdminHash wires an Argon2id hash from data/secrets/ for login/Bearer (§12.5).
+// Env ADMIN_PASSWORD (adminPW via Routes) remains accepted when also set.
+func (s *Server) WithAdminHash(hash, dataDir string) *Server {
+	s.adminHash = hash
+	s.adminDataDir = dataDir
+	return s
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {

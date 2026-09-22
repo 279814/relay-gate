@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"strings"
 )
@@ -149,23 +148,15 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 
 // bearerOK 校验 Bearer / X-Admin-Password 口令。
 //
-// 定长比较，避免按字符逐位比较带来的时序侧信道。
+// 优先 Argon2id（data/secrets/），否则定长比较环境变量明文（旧部署兼容）。
 //
-// 口令为空时一律拒绝。这不是多余的判断：ConstantTimeCompare("", "") 返回
+// 两者皆空时一律拒绝。这不是多余的判断：ConstantTimeCompare("", "") 返回
 // **相等**，所以 adminPW 为空时，一个不带任何凭据的请求会被判为通过 ——
 // 管理接口能读写所有上游 key（§5.2f），那等于全部公开。
-//
-// config.validate 要求 ADMIN_PASSWORD 至少 8 字符，所以生产路径上到不了
-// 这里。但鉴权是这个项目里后果最重的判断，不该依赖「调用方一定先校验过」——
-// 明天多一个绕过 config.Load 的装配路径（测试工具、嵌入式用法、新的 cmd），
-// 这个默认放行就会静默生效，且不报任何错。
 func (s *Server) bearerOK(r *http.Request) bool {
-	if s.adminPW == "" {
-		return false
-	}
 	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if got == "" {
 		got = r.Header.Get("X-Admin-Password")
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.adminPW)) == 1
+	return s.passwordOK(got)
 }

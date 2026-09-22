@@ -2,7 +2,6 @@ package api
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
 	"sync"
@@ -175,10 +174,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// adminPW 为空时无人能登录，理由同 bearerOK：
-	// ConstantTimeCompare("", "") 返回相等，不挡的话空口令会登录成功。
-	if s.adminPW == "" ||
-		subtle.ConstantTimeCompare([]byte(body.Password), []byte(s.adminPW)) != 1 {
+	// 无可用凭据（无 env 明文且无 Argon2id 哈希）时无人能登录，理由同 bearerOK。
+	if !s.passwordOK(body.Password) {
 		s.sessions.noteFailure()
 		// 连续失败到阈值后延迟响应，抑制暴力破解。放在这里而不是入口：
 		// 正常登录永远不被延迟，即使之前失败过很多次。

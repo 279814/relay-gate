@@ -52,14 +52,6 @@ type journalDoc struct {
 	UpdatedAt     string `json:"updated_at"`
 }
 
-type persistedDoc struct {
-	FormatVersion     int    `json:"format_version"`
-	AdminPasswordHash string `json:"admin_password_hash"`
-	RelayKey          string `json:"relay_key"`
-	MasterKeyID       string `json:"master_key_id"`
-	UpdatedAt         string `json:"updated_at"`
-}
-
 // Bootstrap owns the data-dir exclusive journal for first credentials (§12.3).
 type Bootstrap struct {
 	DataDir string
@@ -77,7 +69,7 @@ func (b *Bootstrap) now() time.Time {
 }
 
 func (b *Bootstrap) secretsDir() string {
-	return filepath.Join(b.DataDir, "secrets")
+	return SecretsDir(b.DataDir)
 }
 
 func (b *Bootstrap) journalPath() string {
@@ -85,7 +77,7 @@ func (b *Bootstrap) journalPath() string {
 }
 
 func (b *Bootstrap) credentialsPath() string {
-	return filepath.Join(b.secretsDir(), "bootstrap-credentials.json")
+	return CredentialsFile(b.DataDir)
 }
 
 // Phase returns the current journal phase, or empty if no journal.
@@ -186,7 +178,7 @@ func (b *Bootstrap) freshInstall() (Displayed, error) {
 	if err != nil {
 		return Displayed{}, err
 	}
-	if err := b.writeCredentials(persistedDoc{
+	if err := b.writeCredentials(Persisted{
 		FormatVersion:     1,
 		AdminPasswordHash: hash,
 		RelayKey:          relay,
@@ -233,7 +225,7 @@ func (b *Bootstrap) resumeUndelivered() (Displayed, error) {
 	if err != nil {
 		return Displayed{}, err
 	}
-	if err := b.writeCredentials(persistedDoc{
+	if err := b.writeCredentials(Persisted{
 		FormatVersion:     1,
 		AdminPasswordHash: hash,
 		RelayKey:          relay,
@@ -278,24 +270,20 @@ func (b *Bootstrap) display(d Displayed) (Displayed, error) {
 }
 
 // LoadPersisted returns the delivered credential material for long-running start.
-func (b *Bootstrap) LoadPersisted() (persistedDoc, error) {
+func (b *Bootstrap) LoadPersisted() (Persisted, error) {
 	ok, err := b.Completed()
 	if err != nil {
-		return persistedDoc{}, err
+		return Persisted{}, err
 	}
 	if !ok {
-		return persistedDoc{}, ErrBootstrapIncomplete
+		return Persisted{}, ErrBootstrapIncomplete
 	}
-	raw, err := os.ReadFile(b.credentialsPath())
+	doc, err := LoadPersistedFile(b.DataDir)
 	if err != nil {
-		return persistedDoc{}, err
-	}
-	var doc persistedDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return persistedDoc{}, err
+		return Persisted{}, err
 	}
 	if doc.AdminPasswordHash == "" || doc.RelayKey == "" {
-		return persistedDoc{}, ErrBootstrapIncomplete
+		return Persisted{}, ErrBootstrapIncomplete
 	}
 	return doc, nil
 }
@@ -318,7 +306,7 @@ func (b *Bootstrap) writeJournal(doc journalDoc) error {
 	return writeJSON0600(b.journalPath(), doc)
 }
 
-func (b *Bootstrap) writeCredentials(doc persistedDoc) error {
+func (b *Bootstrap) writeCredentials(doc Persisted) error {
 	return writeJSON0600(b.credentialsPath(), doc)
 }
 
