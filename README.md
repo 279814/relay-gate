@@ -205,6 +205,13 @@ bash scripts/probe-all.sh scripts/upstreams.tsv
 单站约消耗 100 token。探测项包括鉴权头风格、模型名原名是否可用、
 流式真活/假活、首 Token 延迟、`count_tokens` 与 `/v1/responses` 支持情况。
 
+## 版本状态（v1.0.0）
+
+实现进度与 Deferred 以 [发布说明](docs/RELEASE-NOTES-v1.0.0.md) 和 docs/05–09 为准。
+公网域名部署仍看 [docs/03](docs/03-部署与配置.md)；公网 IP HTTPS 一行部署尚未验证，因此 docs/03 保留。
+
+离线发布门禁：`bash scripts/check-p5.sh`（CI 已接入）。
+
 ## 安全
 
 - 上游 key 在数据库中 **AES-GCM 加密**存储；样本里的凭据脱敏
