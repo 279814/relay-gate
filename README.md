@@ -130,12 +130,30 @@ v1.0.0 要做成什么样见 [需求与设计](docs/01-需求与设计.md)。做
 
 **今天能部署的**是 v1.0.0 之前的网关：主动探活、优先级路由、严格透传、样本留档都在。按上面的 Docker Compose，或 [服务器部署与配置](docs/03-部署与配置.md)，跑起来的就是这一层。它还不包含 v1.0.0 里的一行 IP 部署、三密钥轮换界面、最近错误弹窗、懒探活和声明式转换。那些分别在 P1–P4，现在没有。
 
-**正在做的**是 v1.0.0 的探活重做。需求基线是 [需求与设计](docs/01-需求与设计.md)，任务拆分和做到哪一步以 [P0 实施计划](docs/04-P0-探活基础门禁实施计划.md) 文首为准。P0-01 至 P0-13 已在 main（P0-13 为 PR #53）。本分支做 P0-14 探活管理 API。选路仍主要看原来的路由健康状态。
+**正在做的**是 v1.0.0 的探活重做。需求基线是 [需求与设计](docs/01-需求与设计.md)，任务拆分和做到哪一步以 [P0 实施计划](docs/04-P0-探活基础门禁实施计划.md) 文首为准。P0-01 至 P0-16 已在 main（P0-16 为 PR #56）。本分支做 P0-17：schema3 cutover、去掉全局 `probe_enabled`、离线 `db check-backup`/`db restore`。选路仍主要看原来的路由健康状态。
 
 当前这一层仍待真实流量验证的三项（都需要接上 Claude Code 才能做）：
 `/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准、
 公网模式下长思考不被 Caddy 中途掐断（配置已通过 `caddy validate`，
 但「解析器接受」不等于「运行时按预期生效」）。
+
+### 离线备份检查与恢复（P0-17）
+
+升级前会在 `data/backups/` 写下带 manifest 的 schema 边界备份。恢复必须停服务，并显式授权：
+
+```bash
+# 只读校验（不移动文件）；确认输出的 ReaderContract / PairedBuildID
+relay-gate db check-backup --database /abs/path/data/relay.db \
+  --manifest /abs/path/data/backups/<backup>/manifest.json
+
+# 破坏性恢复：先隔离当前 db/-wal/-shm，再装回 backup
+relay-gate db restore --database /abs/path/data/relay.db \
+  --manifest /abs/path/data/backups/<backup>/manifest.json \
+  --execute --accept-data-replacement \
+  --accept-reader-contract '<exact-ReaderContract-from-check>'
+```
+
+恢复后按输出的 `PairedBuildID` 启动配对 binary，再做健康检查。schema2 cutover backup 回到 schema2 兼容 reader；更早的 schema1 backup 会丢掉此后全部 P0 配置。`docs/03` 仍是域名/nginx 公网部署指南，不被本命令替换。
 
 ## 目录结构
 
@@ -154,6 +172,7 @@ scripts/          能力探测、各阶段冒烟、部署静态检查
 go build ./...
 go test ./...
 go vet ./...
+sh scripts/check-p0.sh          # P0 离线 gate（CI 已接入）
 ```
 
 前端是单页 HTML + Alpine.js，通过 `go:embed` 打进二进制 —— 没有构建链，
