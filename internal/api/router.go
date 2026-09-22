@@ -84,6 +84,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 
 	// 探活成本（§5.2d）。没有它无法判断探活策略是否过激。
 	mux.HandleFunc("GET /admin/api/probe-cost", s.getProbeCost)
+	mux.HandleFunc("GET /admin/api/probe-costs", s.listProbeCosts)
 
 	guarded := s.requireAdmin(mux)
 

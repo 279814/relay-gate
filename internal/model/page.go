@@ -6,8 +6,8 @@ type PageRequest struct {
 }
 
 type Page[T any] struct {
-	Items      []T
-	NextCursor string
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor"`
 }
 
 type UpstreamFilter struct {

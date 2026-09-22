@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>relay-gate 管理</title>
 <link rel="stylesheet" href="/admin/app.css">
-<script defer src="/admin/alpine.min.js"></script>
 </head>
 <body>
 
@@ -49,6 +48,8 @@
       <main>
         <div class="alert err" x-show="err" x-text="err" @click="err = ''"></div>
         <div class="alert done" x-show="msg" x-text="msg" @click="msg = ''"></div>
+        <div class="alert err" x-show="probeModuleError" x-text="probeModuleError"></div>
+        <div class="alert warn" x-show="probeModuleReady === false && !probeModuleError">Probe 模块加载中…</div>
 
         <!-- ── 健康看板 ─────────────────────────────────────── -->
         <template x-if="tab === 'health'">
@@ -82,7 +83,8 @@
             <table>
               <thead>
                 <tr>
-                  <th>模型</th><th>上游</th><th>优先级</th><th>状态</th>
+                  <th>模型</th><th>上游</th><th>优先级</th>
+                  <th>Reachability</th><th>Capability</th><th>RouteHealth</th>
                   <th>可选路</th><th>TTFT</th><th>连续</th><th>最近错误</th><th></th>
                 </tr>
               </thead>
@@ -92,11 +94,16 @@
                     <td x-text="r.model_name || `#${r.model_name_id}`"></td>
                     <td>
                       <span x-text="r.upstream || `#${r.upstream_id}`"></span>
-                      <!-- L1 是站级的，挂了就连坐整站，所以单独标出来 -->
-                      <span class="tag err" x-show="r.l1 && r.l1.probed && !r.l1.ok"
-                            title="站级 L1 探活失败，该站所有 Route 都会被跳过">L1 挂</span>
+                      <span class="tag warn" x-show="lazyProbeWarning(upstreams.find(u => u.id === r.upstream_id))"
+                            x-text="'Lazy'" title="Lazy 不会周期请求"></span>
                     </td>
                     <td x-text="`${r.priority} / ${r.weight}`"></td>
+                    <td>
+                      <span class="tag" x-text="reachStateFor(r.upstream_id)"></span>
+                    </td>
+                    <td>
+                      <span class="tag" x-text="capStateFor(r.route_id, 'messages')"></span>
+                    </td>
                     <td>
                       <span class="tag dot" :class="stateClass(r.state)" x-text="r.state"></span>
                     </td>
@@ -105,7 +112,6 @@
                         <span class="tag ok">可用</span>
                       </template>
                       <template x-if="!r.selectable">
-                        <!-- reason 区分「配置错」与「站挂了」：前者要改配置，后者等恢复 -->
                         <span class="tag err" x-text="r.reason" :title="r.reason"></span>
                       </template>
                     </td>
@@ -117,15 +123,18 @@
                     <td class="wrap dim" x-text="r.health?.last_error || '—'"></td>
                     <td class="nowrap">
                       <button @click="probe(r.route_id)" :disabled="probing === r.route_id"
+                              :title="lazyProbeWarning(upstreams.find(u => u.id === r.upstream_id)) || '手动探活一次'"
                               x-text="probing === r.route_id ? '探测中…' : '测试'"></button>
                     </td>
                   </tr>
                 </template>
                 <tr x-show="!(health.routes || []).length">
-                  <td colspan="9" class="empty">还没有 Route。先在「上游」与「模型」页建好，再到「路由」页绑定。</td>
+                  <td colspan="11" class="empty">还没有 Route。先在「上游」与「模型」页建好，再到「路由」页绑定。</td>
                 </tr>
               </tbody>
             </table>
+            <p class="dim" x-show="probeResult?.execution_id"
+               x-text="'本次手动探活 execution_id=' + probeResult.execution_id"></p>
 
             <!-- 手动探活结果。同步返回，点了就该看到答案 -->
             <template x-if="probeResult">
@@ -765,7 +774,450 @@
           </div>
         </template>
 
+        <!-- ── 能力 / 可达性 ───────────────────────────────── -->
+        <template x-if="tab === 'capabilities'">
+          <div>
+            <div class="bar">
+              <strong>站可达性</strong>
+              <span class="grow"></span>
+              <button @click="loadReachability(true)" :disabled="reachability.loading">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>Upstream</th><th>状态</th><th>连续 OK/Fail</th><th>最近错误</th><th>观测序</th></tr></thead>
+              <tbody>
+                <template x-for="row in reachability.items" :key="f(row,'UpstreamID','upstream_id')">
+                  <tr>
+                    <td x-text="f(row,'UpstreamID','upstream_id')"></td>
+                    <td><span class="tag" x-text="f(row,'State','state')"></span></td>
+                    <td class="num" x-text="`${f(row,'ConsecutiveOK','consecutive_ok')||0} / ${f(row,'ConsecutiveFail','consecutive_fail')||0}`"></td>
+                    <td class="wrap dim" x-text="f(row,'LastError','last_error') || '—'"></td>
+                    <td class="num" x-text="f(row,'LastObservationOrder','last_observation_order') || '—'"></td>
+                  </tr>
+                </template>
+                <tr x-show="!reachability.items.length"><td colspan="5" class="empty">暂无可达性记录</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="reachability.next_cursor">
+              <button @click="loadReachability(false)" :disabled="reachability.loading">加载更多</button>
+            </div>
+
+            <div class="bar" style="margin-top:20px">
+              <strong>Endpoint Capability</strong>
+              <span class="dim">过期行显示派生 expired 徽标；stale 不可提交</span>
+              <span class="grow"></span>
+              <button @click="loadCapabilities(true)" :disabled="capabilities.loading">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>范围</th><th>端点</th><th>状态</th><th>到期</th><th>脱敏原因</th></tr></thead>
+              <tbody>
+                <template x-for="row in capabilities.items" :key="`${f(row,'ScopeType','scope_type')}-${f(row,'ScopeID','scope_id')}-${f(row,'Endpoint','endpoint')}`">
+                  <tr>
+                    <td x-text="`${f(row,'ScopeType','scope_type')} #${f(row,'ScopeID','scope_id')}`"></td>
+                    <td class="mono" x-text="f(row,'Endpoint','endpoint')"></td>
+                    <td>
+                      <span class="tag" :class="capabilityBadge(row).stale ? 'warn' : ''"
+                            x-text="capabilityBadge(row).text"></span>
+                    </td>
+                    <td class="num" x-text="f(row,'ExpiresAt','expires_at') || '—'"></td>
+                    <td class="wrap dim" x-text="f(row,'RedactedDetail','redacted_detail') || '—'"></td>
+                  </tr>
+                </template>
+                <tr x-show="!capabilities.items.length"><td colspan="5" class="empty">暂无能力记录</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="capabilities.next_cursor">
+              <button @click="loadCapabilities(false)" :disabled="capabilities.loading">加载更多</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- ── 配方 / Endpoint / Secret ─────────────────────── -->
+        <template x-if="tab === 'recipes'">
+          <div>
+            <div class="bar">
+              <strong>Upstream Endpoints</strong>
+              <span class="dim">migration-only legacy 只读；P0 不能确认/清除 NeedsReview</span>
+              <span class="grow"></span>
+              <button class="primary" @click="endpointForm = { upstream_id: '', endpoint: 'messages', url_mode: 'canonical', url_override: '', fixed_query_template: '', auth_profile: {} }">新增 Endpoint</button>
+              <button @click="loadEndpoints(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>ID</th><th>Upstream</th><th>端点</th><th>URL</th><th>NeedsReview</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="ep in endpoints.items" :key="f(ep,'ID','id')">
+                  <tr>
+                    <td x-text="f(ep,'ID','id')"></td>
+                    <td x-text="f(ep,'UpstreamID','upstream_id')"></td>
+                    <td class="mono" x-text="f(ep,'Endpoint','endpoint')"></td>
+                    <td class="mono wrap" x-text="f(ep,'url_override','URLOverride') || f(ep,'url_mode','URLMode') || '—'"></td>
+                    <td>
+                      <span class="tag warn" x-show="f(ep,'needs_review','NeedsReview')"
+                            x-text="'needs_review'"></span>
+                      <span class="dim" x-show="f(ep,'needs_review','NeedsReview')">P1 提供转换</span>
+                    </td>
+                    <td><button class="sm" @click="endpointForm = { id: f(ep,'id','ID'), upstream_id: f(ep,'upstream_id','UpstreamID'), endpoint: f(ep,'endpoint','Endpoint'), url_mode: f(ep,'url_mode','URLMode') || 'canonical', url_override: f(ep,'url_override','URLOverride') || '', fixed_query_template: f(ep,'fixed_query_template','FixedQueryTemplate') || '', auth_profile: f(ep,'auth_profile','AuthProfile') || {}, revision: f(ep,'revision','Revision') || 0 }">编辑</button></td>
+                  </tr>
+                </template>
+                <tr x-show="!endpoints.items.length"><td colspan="6" class="empty">暂无 Endpoint</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="endpoints.next_cursor">
+              <button @click="loadEndpoints(false)" :disabled="endpoints.loading">加载更多</button>
+            </div>
+
+            <div class="bar" style="margin-top:20px">
+              <strong>Probe Secrets</strong>
+              <span class="grow"></span>
+              <button class="primary" @click="secretForm = { name: '', value: '' }">新增 Secret</button>
+              <button @click="loadSecrets(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>名称</th><th>脱敏</th><th>指纹</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="s in secrets.items" :key="f(s,'id','ID')">
+                  <tr>
+                    <td class="mono" x-text="f(s,'name','Name')"></td>
+                    <td class="mono dim" x-text="f(s,'masked','Masked') || '—'"></td>
+                    <td class="mono dim" x-text="(f(s,'fingerprint','Fingerprint') || '').slice(0,12)"></td>
+                    <td>
+                      <button class="sm" @click="clearSecret(f(s,'id','ID'), f(s,'revision','Revision'))">清除值</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!secrets.items.length"><td colspan="4" class="empty">暂无 Secret</td></tr>
+              </tbody>
+            </table>
+
+            <div class="bar" style="margin-top:20px">
+              <strong>Probe Recipes</strong>
+              <span class="dim">preview/test/publish 属后续 API；此处创建 draft 并查看</span>
+              <span class="grow"></span>
+              <button class="primary" @click="recipeForm = { scope: 'upstream', scope_id: '', endpoint: 'messages' }">新建配方</button>
+              <button @click="loadRecipes(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>ID</th><th>范围</th><th>端点</th><th>状态</th><th>修订</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="rc in recipes.items" :key="f(rc,'ID','id')">
+                  <tr>
+                    <td x-text="f(rc,'ID','id')"></td>
+                    <td x-text="`${f(rc,'ScopeType','scope_type')} #${f(rc,'ScopeID','scope_id')}`"></td>
+                    <td class="mono" x-text="f(rc,'Endpoint','endpoint')"></td>
+                    <td><span class="tag" x-text="f(rc,'Status','status')"></span></td>
+                    <td class="num" x-text="f(rc,'Revision','revision')"></td>
+                    <td><button class="sm" @click="openRecipe(f(rc,'ID','id'))">详情</button></td>
+                  </tr>
+                </template>
+                <tr x-show="!recipes.items.length"><td colspan="6" class="empty">暂无配方</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="recipes.next_cursor">
+              <button @click="loadRecipes(false)" :disabled="recipes.loading">加载更多</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- ── 执行 / 成本 ─────────────────────────────────── -->
+        <template x-if="tab === 'executions'">
+          <div>
+            <div class="bar">
+              <strong>Probe Executions</strong>
+              <span class="grow"></span>
+              <button @click="loadExecutions(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>ID</th><th>触发</th><th>Route</th><th>端点</th><th>成功</th><th>状态码</th><th>Capability</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="ex in executions.items" :key="f(ex,'ID','id')">
+                  <tr>
+                    <td class="mono" x-text="(f(ex,'ID','id')||'').slice(0,10)"></td>
+                    <td x-text="f(ex,'Trigger','trigger')"></td>
+                    <td x-text="f(ex,'RouteID','route_id')"></td>
+                    <td class="mono" x-text="f(ex,'Endpoint','endpoint')"></td>
+                    <td><span class="tag" :class="f(ex,'Success','success') ? 'ok' : 'err'"
+                              x-text="f(ex,'Success','success') ? 'ok' : 'fail'"></span></td>
+                    <td class="num" x-text="f(ex,'StatusCode','status_code') || '—'"></td>
+                    <td x-text="f(ex,'Capability','capability') || '—'"></td>
+                    <td><button class="sm" @click="openExecution(f(ex,'ID','id'))">抽屉</button></td>
+                  </tr>
+                </template>
+                <tr x-show="!executions.items.length"><td colspan="8" class="empty">暂无执行记录</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="executions.next_cursor">
+              <button @click="loadExecutions(false)" :disabled="executions.loading">加载更多</button>
+            </div>
+
+            <div class="bar" style="margin-top:20px">
+              <strong>探活成本（按日）</strong>
+              <span class="grow"></span>
+              <button @click="loadProbeCostDaily(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>日</th><th>触发</th><th>Route</th><th>Upstream</th><th>请求</th><th>成功/失败/取消</th><th>估入/观出</th><th>PiggybackL2Saved</th></tr></thead>
+              <tbody>
+                <template x-for="c in probeCostDaily.items" :key="`${f(c,'DayUTC','day_utc')}-${f(c,'RouteID','route_id')}-${f(c,'Trigger','trigger')}`">
+                  <tr>
+                    <td x-text="f(c,'DayUTC','day_utc')"></td>
+                    <td x-text="f(c,'Trigger','trigger')"></td>
+                    <td x-text="f(c,'RouteID','route_id')"></td>
+                    <td x-text="f(c,'UpstreamID','upstream_id')"></td>
+                    <td class="num" x-text="f(c,'Requests','requests')"></td>
+                    <td class="num" x-text="`${f(c,'Succeeded','succeeded')||0}/${f(c,'Failed','failed')||0}/${f(c,'Canceled','canceled')||0}`"></td>
+                    <td class="num" x-text="`${f(c,'EstimatedInputTokens','estimated_input_tokens')||0}/${f(c,'ObservedOutputTokens','observed_output_tokens')||0}`"></td>
+                    <td class="num" x-text="f(c,'PiggybackL2Saved','piggyback_l2_saved')||0"></td>
+                  </tr>
+                </template>
+                <tr x-show="!probeCostDaily.items.length"><td colspan="8" class="empty">暂无成本行</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="probeCostDaily.next_cursor">
+              <button @click="loadProbeCostDaily(false)" :disabled="probeCostDaily.loading">加载更多</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- ── 校准 ─────────────────────────────────────────── -->
+        <template x-if="tab === 'calibrations'">
+          <div>
+            <div class="bar">
+              <strong>Calibration</strong>
+              <span class="grow"></span>
+              <input type="number" x-model.number="calibForm.route_id" placeholder="route_id" style="width:100px">
+              <select x-model="calibForm.endpoint">
+                <option value="messages">messages</option>
+                <option value="chat_completions">chat_completions</option>
+                <option value="responses">responses</option>
+                <option value="models">models</option>
+                <option value="count_tokens">count_tokens</option>
+              </select>
+              <button class="primary" @click="planCalibration()">创建计划</button>
+              <button @click="loadCalibrations(true)">刷新</button>
+            </div>
+            <table>
+              <thead><tr><th>ID</th><th>Route</th><th>端点</th><th>状态</th><th>修订</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="run in calibrations.items" :key="f(run,'ID','id')">
+                  <tr>
+                    <td class="mono" x-text="(f(run,'ID','id')||'').slice(0,10)"></td>
+                    <td x-text="f(run,'RouteID','route_id')"></td>
+                    <td class="mono" x-text="f(run,'Endpoint','endpoint')"></td>
+                    <td><span class="tag" x-text="f(run,'State','state')"></span></td>
+                    <td class="num" x-text="f(run,'Revision','revision')"></td>
+                    <td class="nowrap">
+                      <button class="sm" @click="openCalibration(f(run,'ID','id'))">详情</button>
+                      <button class="sm" @click="startCalibration(f(run,'ID','id'), f(run,'Revision','revision'))">启动</button>
+                      <button class="sm" @click="cancelCalibration(f(run,'ID','id'), f(run,'Revision','revision'))">取消</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!calibrations.items.length"><td colspan="6" class="empty">暂无校准</td></tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="calibrations.next_cursor">
+              <button @click="loadCalibrations(false)" :disabled="calibrations.loading">加载更多</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- ── 探活运行诊断 ─────────────────────────────────── -->
+        <template x-if="tab === 'probe-runtime'">
+          <div>
+            <div class="bar">
+              <strong>Probe Runtime</strong>
+              <span class="grow"></span>
+              <button @click="loadProbeRuntime()">刷新</button>
+            </div>
+            <div class="alert warn" x-show="runtimeDropWarn()" x-text="runtimeDropWarn()"></div>
+            <div class="cards" x-show="probeRuntime">
+              <div class="card">
+                <h3>Observer 租约</h3>
+                <div class="v" x-text="`${f(probeRuntime,'FullObserversInFlight','full_observers_in_flight')||0} / ${f(probeRuntime,'FullObserverLimit','full_observer_limit')||0}`"></div>
+              </div>
+              <div class="card">
+                <h3>Observer 字节</h3>
+                <div class="v" x-text="`${f(probeRuntime,'ObserverBytesInFlight','observer_bytes_in_flight')||0} / ${f(probeRuntime,'ObserverByteLimit','observer_byte_limit')||0}`"></div>
+              </div>
+              <div class="card">
+                <h3>持久化队列</h3>
+                <div class="v" x-text="`${f(probeRuntime,'ObservationQueueDepth','observation_queue_depth')||0} / ${f(probeRuntime,'ObservationQueueCapacity','observation_queue_capacity')||0}`"></div>
+              </div>
+            </div>
+            <p class="dim">分母来自 API 返回的 limit/capacity，前端不复制常量。不显示请求正文。</p>
+          </div>
+        </template>
+
       </main>
+
+      <!-- ── Endpoint 表单 ─────────────────────────────────── -->
+      <template x-if="endpointForm">
+        <div class="mask" @click.self="endpointForm = null">
+          <div class="modal">
+            <h3 x-text="endpointForm.id || endpointForm.ID ? '编辑 Endpoint' : '新增 Endpoint'"></h3>
+            <div class="row">
+              <div class="field">
+                <label>Upstream ID</label>
+                <input type="number" x-model.number="endpointForm.upstream_id">
+              </div>
+              <div class="field">
+                <label>端点</label>
+                <select x-model="endpointForm.endpoint">
+                  <option value="models">models</option>
+                  <option value="messages">messages</option>
+                  <option value="responses">responses</option>
+                  <option value="chat_completions">chat_completions</option>
+                  <option value="count_tokens">count_tokens</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>URL 模式</label>
+                <input x-model="endpointForm.url_mode" class="mono" placeholder="canonical">
+              </div>
+              <div class="field">
+                <label>URL Override</label>
+                <input x-model="endpointForm.url_override" class="mono" placeholder="可选">
+              </div>
+            </div>
+            <div class="field">
+              <label>Fixed Query Template</label>
+              <input x-model="endpointForm.fixed_query_template" class="mono">
+            </div>
+            <footer>
+              <button @click="endpointForm = null">取消</button>
+              <button class="primary" @click="saveEndpoint()" :disabled="busy">保存</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="secretForm">
+        <div class="mask" @click.self="secretForm = null">
+          <div class="modal">
+            <h3>新增 Probe Secret</h3>
+            <div class="field"><label>名称</label><input x-model="secretForm.name" class="mono"></div>
+            <div class="field"><label>值</label><input type="password" x-model="secretForm.value" class="mono"></div>
+            <div class="note">值从不回显；清除用列表上的「清除值」。</div>
+            <footer>
+              <button @click="secretForm = null">取消</button>
+              <button class="primary" @click="createSecret()" :disabled="busy">创建</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="recipeForm">
+        <div class="mask" @click.self="recipeForm = null">
+          <div class="modal">
+            <h3>新建配方</h3>
+            <div class="row">
+              <div class="field">
+                <label>范围</label>
+                <select x-model="recipeForm.scope">
+                  <option value="upstream">upstream</option>
+                  <option value="route">route</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Scope ID</label>
+                <input type="number" x-model.number="recipeForm.scope_id">
+              </div>
+              <div class="field">
+                <label>端点</label>
+                <select x-model="recipeForm.endpoint">
+                  <option value="messages">messages</option>
+                  <option value="models">models</option>
+                  <option value="responses">responses</option>
+                  <option value="chat_completions">chat_completions</option>
+                  <option value="count_tokens">count_tokens</option>
+                </select>
+              </div>
+            </div>
+            <footer>
+              <button @click="recipeForm = null">取消</button>
+              <button class="primary" @click="createRecipe()" :disabled="busy">创建</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="executionDrawer">
+        <div class="mask" @click.self="closeExecution()">
+          <div class="modal wide" x-ref="execDrawer">
+            <h3>Execution 详情</h3>
+            <table>
+              <tr><th>ID</th><td class="mono" x-text="f(executionDrawer,'ID','id')"></td></tr>
+              <tr><th>Trigger</th><td x-text="f(executionDrawer,'Trigger','trigger')"></td></tr>
+              <tr><th>Status</th><td x-text="f(executionDrawer,'StatusCode','status_code')"></td></tr>
+              <tr><th>Success</th><td x-text="f(executionDrawer,'Success','success')"></td></tr>
+              <tr><th>Capability</th><td x-text="f(executionDrawer,'Capability','capability')"></td></tr>
+              <tr><th>Disposition</th>
+                <td x-text="`reach=${f(executionDrawer,'ReachabilityDisposition','reachability_disposition')} cap=${f(executionDrawer,'CapabilityDisposition','capability_disposition')}`"></td>
+              </tr>
+              <tr><th>Connect→TLS</th>
+                <td x-text="stageMS(executionDrawer,['GotConnAtMS','got_conn_at_ms'],['TLSHandshakeDoneAtMS','tls_handshake_done_at_ms'])"></td>
+              </tr>
+              <tr><th>Header</th>
+                <td x-text="stageMS(executionDrawer,['GotConnAtMS','got_conn_at_ms'],['ResponseHeaderAtMS','response_header_at_ms'])"></td>
+              </tr>
+              <tr><th>首字节</th>
+                <td x-text="stageMS(executionDrawer,['ResponseHeaderAtMS','response_header_at_ms'],['FirstByteAtMS','first_byte_at_ms'])"></td>
+              </tr>
+              <tr><th>首事件</th>
+                <td x-text="stageMS(executionDrawer,['FirstByteAtMS','first_byte_at_ms'],['FirstEventAtMS','first_event_at_ms'])"></td>
+              </tr>
+              <tr><th>首语义</th>
+                <td x-text="stageMS(executionDrawer,['FirstEventAtMS','first_event_at_ms'],['FirstSemanticAtMS','first_semantic_at_ms'])"></td>
+              </tr>
+              <tr><th>完成</th>
+                <td x-text="stageMS(executionDrawer,['SentAtMS','sent_at_ms'],['DoneAtMS','done_at_ms'])"></td>
+              </tr>
+              <tr><th>Tokens</th>
+                <td x-text="`est_in=${f(executionDrawer,'EstimatedInputTokens','estimated_input_tokens')} obs_in=${f(executionDrawer,'ObservedInputTokens','observed_input_tokens')} obs_out=${f(executionDrawer,'ObservedOutputTokens','observed_output_tokens')}`"></td>
+              </tr>
+              <tr><th>Recipe</th>
+                <td class="mono" x-text="`id=${f(executionDrawer,'RecipeID','recipe_id')} ver=${f(executionDrawer,'RecipeVersionID','recipe_version_id')} origin=${f(executionDrawer,'RecipeOrigin','recipe_origin')}`"></td>
+              </tr>
+              <tr><th>Detail</th><td class="wrap dim" x-text="f(executionDrawer,'RedactedDetail','redacted_detail') || '—'"></td></tr>
+            </table>
+            <footer><button @click="closeExecution()">关闭</button></footer>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="recipeDetail">
+        <div class="mask" @click.self="recipeDetail = null; _unlockModal()">
+          <div class="modal">
+            <h3>Recipe #<span x-text="f(recipeDetail,'ID','id')"></span></h3>
+            <pre class="body mono" x-text="JSON.stringify(recipeDetail, null, 2)"></pre>
+            <footer><button @click="recipeDetail = null; _unlockModal()">关闭</button></footer>
+          </div>
+        </div>
+      </template>
+
+      <template x-if="calibrationDetail">
+        <div class="mask" @click.self="calibrationDetail = null; _unlockModal()">
+          <div class="modal wide">
+            <h3>Calibration <span class="mono" x-text="f(calibrationDetail,'ID','id')"></span></h3>
+            <p x-text="`state=${f(calibrationDetail,'State','state')} route=${f(calibrationDetail,'RouteID','route_id')} endpoint=${f(calibrationDetail,'Endpoint','endpoint')}`"></p>
+            <table>
+              <thead><tr><th>#</th><th>Execution</th><th>Disposition</th><th>估入 token</th></tr></thead>
+              <tbody>
+                <template x-for="(cand, idx) in (f(calibrationDetail,'Candidates','candidates') || [])" :key="idx">
+                  <tr>
+                    <td x-text="idx"></td>
+                    <td class="mono" x-text="f(cand,'ExecutionID','execution_id')"></td>
+                    <td x-text="f(cand,'Disposition','disposition')"></td>
+                    <td class="num" x-text="f(cand,'EstimatedInputTokens','estimated_input_tokens')"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <footer><button @click="calibrationDetail = null; _unlockModal()">关闭</button></footer>
+          </div>
+        </div>
+      </template>
 
       <!-- ── 上游表单 ─────────────────────────────────────── -->
       <template x-if="upForm">
@@ -820,6 +1272,26 @@
               <div class="note">
                 空值表示删掉该头。不能放鉴权头 —— key 由上面的 api_key 统一注入。
                 改这个的正确方式是从「样本」页一键导入，手写等于猜。
+              </div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>探活模式</label>
+                <select x-model="upForm.probe_mode">
+                  <option value="active">Active（周期探活）</option>
+                  <option value="lazy">Lazy（不周期请求）</option>
+                </select>
+                <div class="note" x-show="upForm.probe_mode === 'lazy'">
+                  Lazy 不会产生任何周期合成请求；点健康页「测试」仍会产生一次真实模型调用。
+                </div>
+              </div>
+              <div class="field">
+                <label>Host Override</label>
+                <input x-model="upForm.host_override" class="mono" placeholder="可选，覆盖 Host">
+              </div>
+              <div class="field">
+                <label>TLS Server Name</label>
+                <input x-model="upForm.tls_server_name" class="mono" placeholder="可选 SNI">
               </div>
             </div>
             <div class="row">
@@ -1034,5 +1506,7 @@
 
 <style>[x-cloak] { display: none !important; }</style>
 <script src="/admin/app.js"></script>
+<script type="module" src="/admin/js/boot.mjs"></script>
+<script defer src="/admin/alpine.min.js"></script>
 </body>
 </html>
