@@ -79,6 +79,10 @@ type liveAttempt struct {
 	header http.Header
 	url    string
 	instr  health.AttemptInstrumentation
+	// Published transform selected at dispatch (immutable for this Attempt).
+	compiled   *transform.Compiled
+	verID      int64
+	endpointID int64
 }
 
 // retryPlan 是重试循环的不变量：预算、次数上限、已试过哪些 Route。
@@ -164,7 +168,15 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				res: la.at.Result(), attempts: attempt, reqID: reqID,
 			}
 			if la.at.CanCommit() {
-				oc.res = la.at.Commit(w)
+				oc.res = h.commitLive(w, la)
+				// fail_closed response transform before any client byte.
+				if oc.res != nil && oc.res.Err != nil && !oc.res.HeadersSent &&
+					la.compiled != nil {
+					writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
+					finishObserver(la, health.AttemptFinish{})
+					la.cand.Release()
+					return nil, false
+				}
 			} else {
 				la.at.Discard()
 			}
@@ -318,8 +330,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	}
 
 	// Published binding only; unbound → passthrough (§15.1).
+	var compiled *transform.Compiled
+	var verID int64
 	if h.transforms != nil && target.EndpointID != 0 {
-		compiled, verID, terr := h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
+		var terr error
+		compiled, verID, terr = h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
 		if terr != nil {
 			h.log.Error("加载 transform 失败", "err", terr, "route", cand.Route.ID)
 			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "转换配置错误")
@@ -422,7 +437,8 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		cand: cand, at: at, tee: tee, secTee: secTee,
 		keys: h.credentialsOf(r, cand),
 		body: outBody, header: outHeader, url: target.RawURL,
-		instr: instr,
+		instr:    instr,
+		compiled: compiled, verID: verID, endpointID: target.EndpointID,
 	}, true
 }
 
