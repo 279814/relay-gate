@@ -1,13 +1,20 @@
+package livecfg
+
 // Package livecfg 提供数据库业务配置的带缓存只读视图。
 //
 // 与 internal/config 的分工：那边是启动时读一次的环境变量（进程级不可变，
 // 缺失即拒绝启动）；这边是运行时可热改的业务配置（上游、路由、超时、总闸）。
-package livecfg
+//
+// P0-10 起：LoadConfigBundle 一次事务读完全部行；Source 构建同代 routing+Probe
+// 快照后以单个原子指针发布。真实流量在 Refresh 失败时仍可读旧 routing；
+// ProbeSnapshot 在 Invalidate 后未成功 Refresh 前返回 config_snapshot_unavailable。
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -15,132 +22,164 @@ import (
 	"github.com/279814/relay-gate/internal/store"
 )
 
-// DefaultTTL 是缓存有效期。
+// DefaultTTL 是真实流量 routing 缓存有效期。
 //
-// 为什么要缓存：SQLite 被限制为单连接（store.Open 里 MaxOpenConns(1)），
-// 而一次转发要读 5 张表。样本落库（最大 256KB 的 BLOB）与探活的状态回写
-// 共用这条连接，不缓存就会队头阻塞 —— 一次样本写入拖慢所有在途请求的选路。
-//
-// 为什么不做写后失效通知：2 秒的陈旧度对「在管理界面改配置 → 生效」是无感的，
-// 换来的是不必把缓存实例穿到 api 层、再在每个写操作后手工调一次失效 ——
-// 那种挂钩漏一处就会变成「改了不生效」的疑难问题。
+// Probe 路径不走 TTL：管理员写入后必须 Invalidate+Refresh；失败时 Probe
+// 拒绝发送，真实转发仍可用最后一份 routing。
 const DefaultTTL = 2 * time.Second
 
-// Source 是 proxy.ConfigSource 的生产实现。
+// Source 是 proxy.ConfigSource 的生产实现，也是 ConfigPublisher。
 type Source struct {
 	st  *store.Store
 	ttl time.Duration
 	log *slog.Logger
-	now func() time.Time // 测试注入时钟，生产为 time.Now
+	now func() time.Time
 
 	mu  sync.RWMutex
-	cur *bundle
+	cur *PublishedConfig
+	// probeReady 为 false 时 ProbeSnapshot 返回 unavailable（Invalidate 之后、
+	// Refresh 成功之前）。routing 仍可读 cur。
+	probeReady bool
 	// lastAttempt 记的是**尝试**加载的时刻，不是成功时刻。
-	// 失败也要计时，否则数据库读不出来时每个请求都会重试并刷日志。
 	lastAttempt time.Time
-}
-
-// bundle 是一次加载得到的完整配置。整体替换、绝不原地改 ——
-// 因此持有旧 bundle 的并发读者始终看到一份自洽的配置，不需要加锁。
-type bundle struct {
-	snap     *router.Snapshot
-	settings model.Settings
-	state    store.RunState
+	generation  atomic.Uint64
 }
 
 func New(st *store.Store, log *slog.Logger) *Source {
-	return &Source{st: st, ttl: DefaultTTL, log: log, now: time.Now}
+	return &Source{st: st, ttl: DefaultTTL, log: log, now: time.Now, probeReady: true}
 }
 
 func (s *Source) Snapshot() (*router.Snapshot, error) {
-	b, err := s.get()
+	pub, err := s.get(false)
 	if err != nil {
 		return nil, err
 	}
-	return b.snap, nil
+	return pub.Routing, nil
 }
 
 func (s *Source) Settings() (model.Settings, error) {
-	b, err := s.get()
+	pub, err := s.get(false)
 	if err != nil {
 		return model.Settings{}, err
 	}
-	return b.settings, nil
+	return pub.Settings, nil
 }
 
 func (s *Source) RunState() (store.RunState, error) {
-	b, err := s.get()
+	pub, err := s.get(false)
 	if err != nil {
 		return "", err
 	}
-	return b.state, nil
+	return pub.RunState, nil
 }
 
-func (s *Source) get() (*bundle, error) {
+// Bundle 返回当前已发布的同代配置。
+func (s *Source) Bundle() (*PublishedConfig, error) {
+	return s.get(false)
+}
+
+// ProbeSnapshot 返回探活快照。Invalidate 后未 Refresh 成功时返回 unavailable。
+func (s *Source) ProbeSnapshot() (*ProbeSnapshot, error) {
 	s.mu.RLock()
-	cur, last := s.cur, s.lastAttempt
+	ready, cur := s.probeReady, s.cur
 	s.mu.RUnlock()
+	if !ready || cur == nil || cur.Probe == nil {
+		return nil, ErrProbeSnapshotUnavailable
+	}
+	// TTL 过期时尝试刷新；失败仍返回旧 Probe（与「Invalidate 后失败」不同——
+	// 后者明确禁止发送）。
+	pub, err := s.get(true)
+	if err != nil {
+		return nil, err
+	}
+	if pub.Probe == nil {
+		return nil, ErrProbeSnapshotUnavailable
+	}
+	return pub.Probe, nil
+}
+
+// Invalidate 标记 Probe 快照不可用，要求随后 Refresh。
+func (s *Source) Invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.probeReady = false
+	s.lastAttempt = time.Time{} // 强制下一次 get 重新加载
+}
+
+// Refresh 同步从 Store 加载并原子发布新配置。成功后 Probe 恢复可用。
+func (s *Source) Refresh() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAttempt = s.now()
+	pub, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	s.cur = pub
+	s.probeReady = true
+	return nil
+}
+
+func (s *Source) get(requireProbe bool) (*PublishedConfig, error) {
+	s.mu.RLock()
+	cur, last, ready := s.cur, s.lastAttempt, s.probeReady
+	s.mu.RUnlock()
+	if requireProbe && (!ready || cur == nil || cur.Probe == nil) {
+		return nil, ErrProbeSnapshotUnavailable
+	}
 	if cur != nil && s.now().Sub(last) < s.ttl {
 		return cur, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 双检：等锁期间可能已被别的请求刷新过了。
 	if s.cur != nil && s.now().Sub(s.lastAttempt) < s.ttl {
+		if requireProbe && (!s.probeReady || s.cur.Probe == nil) {
+			return nil, ErrProbeSnapshotUnavailable
+		}
 		return s.cur, nil
 	}
 	s.lastAttempt = s.now()
 
-	nb, err := s.load()
+	pub, err := s.loadLocked()
 	if err != nil {
-		// 有旧配置就继续用它服务，别让所有请求变成 500。
-		// 配置没变的情况下，数据库暂时读不出来（文件锁、WAL checkpoint）
-		// 不该导致网关中断 —— 可用性正是这个项目存在的理由。
 		if s.cur != nil {
 			s.log.Error("刷新配置失败，继续使用上一次的配置", "err", err)
+			if requireProbe && (!s.probeReady || s.cur.Probe == nil) {
+				return nil, ErrProbeSnapshotUnavailable
+			}
 			return s.cur, nil
 		}
 		return nil, err
 	}
-	s.cur = nb
-	return nb, nil
+	s.cur = pub
+	// 自动 TTL 刷新成功也恢复 probeReady（仅当之前未显式 Invalidate，
+	// 或 Invalidate 后最终读到了新 bundle）。
+	s.probeReady = true
+	return pub, nil
 }
 
-func (s *Source) load() (*bundle, error) {
-	mns, err := s.st.ListModelNames()
+func (s *Source) loadLocked() (*PublishedConfig, error) {
+	bundle, err := s.st.LoadConfigBundle(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("读取 model_name: %w", err)
+		return nil, fmt.Errorf("LoadConfigBundle: %w", err)
 	}
-	ups, err := s.st.ListUpstreams()
+	generation := s.generation.Add(1)
+	pub, err := buildPublishedConfig(bundle, generation, s.now())
 	if err != nil {
-		return nil, fmt.Errorf("读取 upstream: %w", err)
+		return nil, err
 	}
-	rts, err := s.st.ListRoutes(0)
-	if err != nil {
-		return nil, fmt.Errorf("读取 route: %w", err)
-	}
-	settings, err := s.st.GetSettings()
-	if err != nil {
-		return nil, fmt.Errorf("读取 settings: %w", err)
-	}
-	state, err := s.st.GetRunState()
-	if err != nil {
-		return nil, fmt.Errorf("读取运行状态: %w", err)
-	}
+	return pub, nil
+}
 
-	// SaveSettings 已经校验过，所以这里失败只可能是有人手改了库或降级了版本。
-	// 但代价太大不能放过：RealFirstTokenSec = 0 会让 time.AfterFunc(0) 立刻开火，
-	// 每个请求都以「首 Token 超时」失败，而且看不出原因。
-	if err := settings.Validate(); err != nil {
-		s.log.Error("库里的 settings 不合法，本次改用默认值。请在管理界面重新保存设置",
-			"err", err)
-		settings = model.DefaultSettings()
+// Endpoint 实现 outbound.EndpointConfigSource：优先读同代 Probe 快照。
+func (s *Source) Endpoint(ctx context.Context, upstreamID int64, endpoint model.EndpointKind) (*model.UpstreamEndpoint, error) {
+	pub, err := s.Bundle()
+	if err != nil {
+		return nil, err
 	}
-
-	return &bundle{
-		snap:     router.BuildSnapshot(mns, ups, rts),
-		settings: settings,
-		state:    state,
-	}, nil
+	if pub == nil || pub.Probe == nil {
+		return nil, ErrProbeSnapshotUnavailable
+	}
+	return pub.Probe.Endpoint(ctx, upstreamID, endpoint)
 }

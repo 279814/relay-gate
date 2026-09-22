@@ -29,7 +29,23 @@ func (s *Store) GetSettings() (model.Settings, error) {
 		return model.Settings{}, err
 	}
 
-	return DecodeLegacySettings([]byte(raw))
+	return usableSettings(DecodeLegacySettings([]byte(raw)))
+}
+
+// usableSettings 把解码结果收成转发和探活可以共用的一份。
+//
+// SaveSettings 会拒绝过短的超时，所以正常写入到不了这里。手改库或版本降级
+// 可以写出 Validate 不接受的值。原样放行会把长思考按 1 秒砍断；只在某一条
+// 读路径换成默认值、另一条仍用原值，则探活期望和提交时的指纹不同，结论全部
+// config_stale。JSON 本身不合法仍然返回错误，不能把损坏的行假装成默认设置。
+func usableSettings(settings model.Settings, err error) (model.Settings, error) {
+	if err != nil {
+		return model.Settings{}, err
+	}
+	if err := settings.Validate(); err != nil {
+		return model.DefaultSettings(), nil
+	}
+	return settings, nil
 }
 
 // DecodeLegacySettings is the only decoder allowed to accept the three
@@ -146,7 +162,7 @@ func (s *Store) GetSettingsWithRevision() (model.Settings, int64, error) {
 	if err != nil {
 		return model.Settings{}, 0, err
 	}
-	settings, err := DecodeLegacySettings([]byte(raw))
+	settings, err := usableSettings(DecodeLegacySettings([]byte(raw)))
 	return settings, revision, err
 }
 
