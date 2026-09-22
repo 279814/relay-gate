@@ -645,7 +645,21 @@ func (d *incrementalDecoder) finishJSON() ([]ProtocolEvent, error) {
 	if len(bytes.TrimSpace(remaining)) > 0 {
 		return nil, makeDecoderError(ErrTrailingJSON, WireJSON, int64(len(body)-len(remaining)), "", int64(len(remaining)), 0)
 	}
-	return d.decodePayload("", raw)
+	events, err := d.decodePayload("", raw)
+	if err != nil {
+		return nil, err
+	}
+	// 一份完整的非流式正文自己就是「协议正常结束」：整个响应已经到手，
+	// 没有也不需要一个单独的结束事件。不补的话 Real 模式下每个非流式 200
+	// 都缺少 normalEndSeen，于是被判成 partial_failure（§6.8 要求 partial
+	// 累计 Route 失败）—— 而一个 stream_expected=false 的站每次请求都走这条路。
+	//
+	// 已经是结束事件时不重复补：一份 `{"type":"message_stop"}` 正文上面那段
+	// 已经把它标成 EventProtocolEnd，再追加一个只会让「结束了几次」变得含混。
+	if len(events) > 0 && events[len(events)-1].Kind == EventProtocolEnd {
+		return events, nil
+	}
+	return append(events, ProtocolEvent{Kind: EventProtocolEnd, EventName: "body_complete"}), nil
 }
 
 func (d *incrementalDecoder) decodePayload(eventName string, payload []byte) ([]ProtocolEvent, error) {
@@ -765,7 +779,29 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 	} else if event.OutputTokens > 0 {
 		event.Kind = EventUsage
 	}
+	// 结束标记的判定必须排在最后。response.completed 同时是终结事件**和**
+	// usage 的载体，先判 usage 的话它会被归成 EventUsage，于是「协议正常结束」
+	// 这个事实丢失 —— 而 §6.8 要求真实流量必须见到它才算成功。
+	if terminal, ok := protocolTerminalEvents[d.spec.Protocol]; ok && name == terminal {
+		event.Kind = EventProtocolEnd
+		event.Semantic = false
+	}
 	return []ProtocolEvent{event}, nil
+}
+
+// protocolTerminalEvents 是各协议自己的正常结束事件名。
+//
+// 只认 `[DONE]` 是不够的，而这正是原先的缺陷：Anthropic 从不发 [DONE]，
+// 它以 message_stop 结束；Responses 以 response.completed 结束。两者原先都
+// 只是普通 metadata，于是 Classifier 的 normalEndSeen 永远不置位，Real 模式
+// 下每一次**完全正常**的响应都被判成 partial_failure —— 而 §6.8 要求 partial
+// 累计 Route 失败，于是全部 Anthropic 站会在真实流量接入的那一刻一起掉血。
+//
+// Chat 不在表里：它的结束标记是 SSE 的 `[DONE]` 哨兵，在事件名阶段就被
+// 拦下了（见上面的 [DONE]/done 分支），不走 JSON 对象这条路。
+var protocolTerminalEvents = map[model.Protocol]string{
+	model.ProtoAnthropic:       "message_stop",
+	model.ProtoOpenAIResponses: "response.completed",
 }
 
 func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json.RawMessage) {
@@ -944,14 +980,50 @@ func remoteErrorEvent(eventName string, raw json.RawMessage) ProtocolEvent {
 		event.RedactedType = "error"
 		return event
 	}
-	event.RedactedType = stringField(body, "type")
-	event.ErrorCode = scalarString(body["code"])
+	event.RedactedType = structuredIdentifier(stringField(body, "type"))
+	event.ErrorCode = structuredIdentifier(scalarString(body["code"]))
 	status, ok := integerField(body, "status")
 	if ok {
 		event.ErrorStatus = int(status)
 	}
-	event.ErrorField = stringField(body, "param")
+	event.ErrorField = structuredIdentifier(stringField(body, "param"))
 	return event
+}
+
+// maxStructuredIdentifier 是 type/code/param 允许的长度。
+//
+// 这三个字段在所有已知协议里都是短枚举（最长的 `unsupported_beta_header`
+// 是 23 字节）。给 64 是宽松的上界，同时挡住「把整段说明塞进 type」。
+const maxStructuredIdentifier = 64
+
+// structuredIdentifier 只放行真正的结构化标识符，其余一律丢掉。
+//
+// 为什么必须在这里挡：§2.4 与 §4.6 要求脱敏详情只由结构化枚举拼装，而这三个
+// 字段的内容**完全由上游控制** —— 原先是逐字抄进 ProtocolEvent 的。实测过的
+// 形态是把说明文字写进 error.type（`"your key sk-ant-... is out of quota"`），
+// 于是那段文字连带其中的凭据一路进了 probe_execution.redacted_detail，也就是
+// 进日志、API 响应和 UI。而 message 字段从一开始就被刻意排除在外，正是为了
+// 不让散文进来 —— type 上开着这个口子等于那道防线不成立。
+//
+// 判据是字符白名单而不是「不含某些东西」：要挡的是任意散文，黑名单永远漏下
+// 一种拼法。丢掉而不是截断：截断后的半句散文既泄漏又无法分类，而空值会让
+// errorDetail 回落到 "remote_error"，那至少是个诚实的结论。
+func structuredIdentifier(value string) string {
+	if value == "" || len(value) > maxStructuredIdentifier {
+		return ""
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '_' || character == '-' || character == '.':
+		default:
+			return ""
+		}
+	}
+	return value
 }
 
 func stringField(object map[string]json.RawMessage, name string) string {

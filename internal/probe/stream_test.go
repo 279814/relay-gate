@@ -145,12 +145,31 @@ func TestJSONRejectsTrailingNonWhitespace(t *testing.T) {
 	}
 }
 
+// payloadEvents 剥掉非流式正文末尾的「正文读完」事件。
+//
+// 普通 JSON 的完整正文自己就是协议结束（见 finishJSON），所以每份 JSON 都会
+// 多一个 EventProtocolEnd。断言正文语义的那些用例关心的是它**前面**那些事件，
+// 而顺手把 len 改成 2 会让「多出来的这一个到底是什么」不再被检查 ——
+// 于是任何一个多余事件都能混进来。这里顺带把那个契约钉住。
+func payloadEvents(t *testing.T, events []ProtocolEvent) []ProtocolEvent {
+	t.Helper()
+	if len(events) == 0 {
+		t.Fatal("no events at all")
+	}
+	last := events[len(events)-1]
+	if last.Kind != EventProtocolEnd {
+		t.Fatalf("last event = %#v, want the body-complete protocol end", last)
+	}
+	return events[:len(events)-1]
+}
+
 func TestCountTokensUsesInputTokensAndModelsRecognizesEmptyList(t *testing.T) {
 	events, err := decodeChunks(t, eventSpec(model.EndpointCountTokens, model.ProtoAnthropic), WireJSON,
 		`{"input_tokens":8}`)
 	if err != nil {
 		t.Fatalf("count_tokens decode: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || !events[0].Semantic || events[0].InputTokens != 8 || events[0].OutputTokens != 0 {
 		t.Fatalf("count_tokens events = %#v", events)
 	}
@@ -159,6 +178,7 @@ func TestCountTokensUsesInputTokensAndModelsRecognizesEmptyList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("models decode: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || !events[0].ModelListRecognized || !events[0].Semantic || events[0].ModelCount != 0 {
 		t.Fatalf("models events = %#v", events)
 	}
@@ -170,6 +190,7 @@ func TestNonEmptyModelOutputIsSemanticButErrorEnvelopeIsNot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chat decode: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || !events[0].Semantic || events[0].SemanticKind != "text" {
 		t.Fatalf("chat events = %#v", events)
 	}
@@ -179,6 +200,7 @@ func TestNonEmptyModelOutputIsSemanticButErrorEnvelopeIsNot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error envelope decode: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || events[0].Kind != EventRemoteError || events[0].Semantic || events[0].RedactedType != "server_error" {
 		t.Fatalf("error envelope events = %#v", events)
 	}
@@ -336,37 +358,46 @@ func TestEmptyDeltasAndZeroUsageAreNotSemantic(t *testing.T) {
 	}
 }
 
-// 正数 output usage 必须带出 EventUsage 与准确的 token 数。
+// 正数 output usage 必须带出准确的 token 数，且不算语义证据。
 //
 // 刻意不断言 Semantic：manifest 里 responses_output_text_delta 的
 // response.completed 带 usage 却标记为非 semantic，也就是「有没有内容证据」
 // 与「产生了多少 token」是两件事。把 usage 也算成内容证据的话，一个
 // 只回 usage 就收尾的站会和真正吐出内容的站不可区分 —— 而那正是 §8.8
 // 列为「不能单独判活」的一条。判活规则属于 P0-08 的 Classifier。
-func TestPositiveOutputUsageIsReportedAsUsageEvent(t *testing.T) {
+//
+// Kind 按 case 声明而不是一律 EventUsage：response.completed 同时是
+// Responses 协议的**结束标记**，它的 Kind 必须是 EventProtocolEnd
+// （否则 Real 模式看不到协议正常结束，见 protocolTerminalEvents）。
+// token 不会因此丢失 —— Classifier 与 Kind 无关地累加。
+func TestPositiveOutputUsageIsReportedWithAccurateTokens(t *testing.T) {
 	tests := []struct {
-		name   string
-		spec   DecoderSpec
-		wire   string
-		tokens int64
+		name     string
+		spec     DecoderSpec
+		wire     string
+		tokens   int64
+		wantKind EventKind
 	}{
 		{
-			name:   "anthropic",
-			spec:   eventSpec(model.EndpointMessages, model.ProtoAnthropic),
-			wire:   "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
-			tokens: 1,
+			name:     "anthropic",
+			spec:     eventSpec(model.EndpointMessages, model.ProtoAnthropic),
+			wire:     "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+			tokens:   1,
+			wantKind: EventUsage,
 		},
 		{
-			name:   "responses",
-			spec:   eventSpec(model.EndpointResponses, model.ProtoOpenAIResponses),
-			wire:   "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":2}}}\n\n",
-			tokens: 2,
+			name:     "responses",
+			spec:     eventSpec(model.EndpointResponses, model.ProtoOpenAIResponses),
+			wire:     "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":2}}}\n\n",
+			tokens:   2,
+			wantKind: EventProtocolEnd,
 		},
 		{
-			name:   "chat",
-			spec:   eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat),
-			wire:   "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
-			tokens: 3,
+			name:     "chat",
+			spec:     eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat),
+			wire:     "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
+			tokens:   3,
+			wantKind: EventUsage,
 		},
 	}
 	for _, tc := range tests {
@@ -378,8 +409,11 @@ func TestPositiveOutputUsageIsReportedAsUsageEvent(t *testing.T) {
 			if len(events) != 1 {
 				t.Fatalf("events = %#v, want exactly one", events)
 			}
-			if events[0].Kind != EventUsage || events[0].OutputTokens != tc.tokens {
-				t.Fatalf("event = %#v, want EventUsage with %d output tokens", events[0], tc.tokens)
+			if events[0].Kind != tc.wantKind || events[0].OutputTokens != tc.tokens {
+				t.Fatalf("event = %#v, want %s with %d output tokens", events[0], tc.wantKind, tc.tokens)
+			}
+			if events[0].Semantic {
+				t.Fatalf("usage must not be semantic evidence: %#v", events[0])
 			}
 		})
 	}
@@ -497,6 +531,7 @@ func TestJSONModelsDirectArrayAndArbitraryObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode array: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || !events[0].ModelListRecognized || events[0].ModelCount != 0 {
 		t.Fatalf("direct array events = %#v", events)
 	}
@@ -509,6 +544,25 @@ func TestJSONModelsDirectArrayAndArbitraryObject(t *testing.T) {
 		if event.ModelListRecognized || event.Kind == EventModelList {
 			t.Fatalf("arbitrary object recognized as model list: %#v", events)
 		}
+	}
+}
+
+// 本身就是结束事件的 JSON 正文不能拿到第二个结束事件。
+//
+// finishJSON 给非流式正文补一个 body_complete，而 `{"type":"message_stop"}`
+// 已经被识别成 EventProtocolEnd —— 无条件追加会让「这个响应结束了几次」变得
+// 含混，而下一个按结束事件计数的读者（P0-13 的真实流量观察器）会看到 2。
+func TestJSONTerminalBodyDoesNotGetASecondProtocolEnd(t *testing.T) {
+	events, err := decodeChunks(t, eventSpec(model.EndpointMessages, model.ProtoAnthropic), WireJSON,
+		`{"type":"message_stop"}`)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %#v, want exactly one protocol end", events)
+	}
+	if events[0].Kind != EventProtocolEnd || events[0].EventName != "message_stop" {
+		t.Fatalf("event = %#v, want the message_stop protocol end", events[0])
 	}
 }
 
@@ -746,6 +800,7 @@ func TestWireAutoAcceptsLargeSingleValueJSONFedByteByByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || events[0].InputTokens != 8 {
 		t.Fatalf("events = %#v, want one count_tokens event with 8 input tokens", events)
 	}
@@ -777,6 +832,7 @@ func TestWireAutoAcceptsPrettyPrintedJSONFedByteByByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
+	events = payloadEvents(t, events)
 	if len(events) != 1 || !events[0].ModelListRecognized || events[0].ModelCount != 41 {
 		t.Fatalf("events = %#v, want one model list of 41", events)
 	}

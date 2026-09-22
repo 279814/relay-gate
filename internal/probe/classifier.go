@@ -155,7 +155,6 @@ func (classifier *ResponseClassifier) Observe(event ProtocolEvent) (Decision, bo
 			classifier.semanticSeen = true
 		}
 	case EventUsage:
-		classifier.addTokens(event)
 		// count_tokens 的正整数 input 是它唯一的成功证据，Decoder 已在那条
 		// 路径上设了 Semantic。模型端点的 usage 不设，所以不会误判活。
 		if event.Semantic {
@@ -178,6 +177,14 @@ func (classifier *ResponseClassifier) Observe(event ProtocolEvent) (Decision, bo
 		// §8.8 明确列为不能判活：message_start、response.created、ping、
 		// 空 delta。它们只证明「连上了」，而那已经由 status 表达。
 	}
+
+	// token 与 Kind 无关地累加。原先只在 EventUsage 分支累加，而 Kind 是
+	// **互斥**的：Decoder 见到 Semantic 就把事件归为 EventSemantic，于是同一个
+	// 事件上的 token 被丢掉。丢的恰好是两类最要紧的：count_tokens 的
+	// input_tokens（它是唯一带 input 的探活端点，且那个数字就长在它的语义
+	// 事件上），以及非流式正文里与 content 同在一个 JSON 对象的 usage。
+	// 后果是 §5.2d 的成本核算长期少算 —— 一个会骗人的计数器比没有更糟。
+	classifier.addTokens(event)
 
 	if classifier.readyToFinish() {
 		decision := classifier.conclude(nil, nil)
