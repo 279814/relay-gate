@@ -152,19 +152,19 @@ type Compiled struct {
 // Registry holds in-process sets, bindings, and execution records.
 // Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
-	mu         sync.RWMutex
-	sets       map[int64]*Set
-	bindings   map[string]*Binding // key route:endpoint
-	execs      []ExecutionRecord
-	nextSet    atomic.Int64
-	nextVer    atomic.Int64
-	execSeq    atomic.Uint64
-	execCap    int
-	persist    PersistSink
-	requestMs  int
-	sseMs      int
-	budgetLog  []BudgetAudit
-	budgetCap  int
+	mu        sync.RWMutex
+	sets      map[int64]*Set
+	bindings  map[string]*Binding // key route:endpoint
+	execs     []ExecutionRecord
+	nextSet   atomic.Int64
+	nextVer   atomic.Int64
+	execSeq   atomic.Uint64
+	execCap   int
+	persist   PersistSink
+	requestMs int
+	sseMs     int
+	budgetLog []BudgetAudit
+	budgetCap int
 }
 
 // BudgetLimits is the mutable execution time budget (§15.3).
