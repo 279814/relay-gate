@@ -31,7 +31,8 @@
 - 内容安全默认只告警、不自动改响应或禁用 Route。
 - 不提交 `.env`、Keyring、`upstreams.tsv`、`docs/02`、样本正文。
 
-## 已知 Deferred（不要当成已上线）
+## 最终审查（本 PR 合入后）
 
-见 docs/05–09 各自 Deferred 节。其中对运维影响最大的是：公网 IP HTTPS 未验证，
-因此 README 仍指向 docs/03，而不是「一行公网 IP」替换叙事。
+- 修复：请求转换 `fail_closed` 失败时清掉半截头/ body 变更，避免调用方误用脏 Attempt。
+- 补测：Transform publish/rollback API；fail_closed 部分变更回滚。
+- 文档：追踪矩阵 P0/P1 若干行与文首进度改为与 main 事实一致。
