@@ -71,13 +71,13 @@ func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer:
 			if err := c.applyOneRequest(i, rule, &out); err != nil {
 				out.Err = err
-				if policy == FailOpen {
-					out.Header = cloneHeader(in.Header)
-					out.Body = append([]byte(nil), in.Body...)
-					out.Changed = false
-					restoreProtected(out.Header, savedAuth)
-					return out
-				}
+				// Both policies must not hand callers a half-mutated request:
+				// fail_closed discards the Attempt; fail_open falls back to original.
+				out.Header = cloneHeader(in.Header)
+				out.Body = append([]byte(nil), in.Body...)
+				out.Changed = false
+				out.HitRules = nil
+				restoreProtected(out.Header, savedAuth)
 				return out
 			}
 		default:
@@ -161,11 +161,10 @@ func (c *Compiled) ApplyResponse(in ResponseInput) ResponseResult {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer, KindSetStatus:
 			if err := c.applyOneResponse(i, rule, &out); err != nil {
 				out.Err = err
-				if policy == FailOpen {
-					out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
-					out.Changed = false
-					return out
-				}
+				out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
+				out.Changed = false
+				out.HitRules = nil
+				restoreProtected(out.Header, saved)
 				return out
 			}
 		}

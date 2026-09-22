@@ -170,6 +170,39 @@ func TestResponse_FailOpenRestores(t *testing.T) {
 	}
 }
 
+func TestRequest_FailClosedResetsPartialMutation(t *testing.T) {
+	c, err := Compile(Version{
+		ReqFailPolicy: FailClosed,
+		Rules: []Rule{
+			{Kind: KindSetHeader, Name: "X-Trace", Value: "1"},
+			{Kind: KindSetJSONPointer, Name: "/missing", Value: "x"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := RequestInput{
+		Header: http.Header{"Authorization": []string{"Bearer k"}, "X-Keep": []string{"y"}},
+		Body:   []byte(`{"ok":true}`),
+	}
+	out := c.ApplyRequest(in)
+	if out.Err == nil {
+		t.Fatal("expected error")
+	}
+	if out.Header.Get("X-Trace") != "" {
+		t.Fatal("fail_closed left partial header mutation")
+	}
+	if out.Header.Get("X-Keep") != "y" || out.Header.Get("Authorization") != "Bearer k" {
+		t.Fatalf("original headers lost: %v", out.Header)
+	}
+	if !bytes.Equal(out.Body, in.Body) {
+		t.Fatal("body mutated on fail_closed")
+	}
+	if len(out.HitRules) != 0 {
+		t.Fatalf("hit_rules should clear on failure: %v", out.HitRules)
+	}
+}
+
 func TestSetJSONPointer_TopLevelOffset(t *testing.T) {
 	c, err := Compile(Version{
 		Rules: []Rule{{Kind: KindSetJSONPointer, Name: "/model", Value: "mapped"}},
