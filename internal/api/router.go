@@ -41,6 +41,33 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/health", s.getHealth)
 	mux.HandleFunc("POST /admin/api/routes/{id}/probe", s.probeRoute)
 
+	mux.HandleFunc("GET /admin/api/upstream-endpoints", s.listUpstreamEndpoints)
+	mux.HandleFunc("POST /admin/api/upstream-endpoints", s.createUpstreamEndpoint)
+	mux.HandleFunc("GET /admin/api/upstream-endpoints/{id}", s.getUpstreamEndpoint)
+	mux.HandleFunc("PUT /admin/api/upstream-endpoints/{id}", s.updateUpstreamEndpoint)
+	mux.HandleFunc("DELETE /admin/api/upstream-endpoints/{id}", s.deleteUpstreamEndpoint)
+
+	mux.HandleFunc("GET /admin/api/probe-secrets", s.listProbeSecrets)
+	mux.HandleFunc("POST /admin/api/probe-secrets", s.createProbeSecret)
+	mux.HandleFunc("PUT /admin/api/probe-secrets/{id}", s.updateProbeSecret)
+	mux.HandleFunc("DELETE /admin/api/probe-secrets/{id}", s.deleteProbeSecret)
+
+	mux.HandleFunc("GET /admin/api/probe-recipes", s.listProbeRecipes)
+	mux.HandleFunc("POST /admin/api/probe-recipes", s.createProbeRecipe)
+	mux.HandleFunc("GET /admin/api/probe-recipes/{id}", s.getProbeRecipe)
+
+	mux.HandleFunc("GET /admin/api/probe-executions", s.listProbeExecutions)
+	mux.HandleFunc("GET /admin/api/probe-executions/{id}", s.getProbeExecution)
+	mux.HandleFunc("GET /admin/api/capabilities", s.listCapabilities)
+	mux.HandleFunc("GET /admin/api/reachability", s.listReachability)
+	mux.HandleFunc("GET /admin/api/probe-runtime", s.getProbeRuntime)
+
+	mux.HandleFunc("GET /admin/api/calibrations", s.listCalibrations)
+	mux.HandleFunc("POST /admin/api/calibrations", s.createCalibration)
+	mux.HandleFunc("GET /admin/api/calibrations/{id}", s.getCalibration)
+	mux.HandleFunc("POST /admin/api/calibrations/{id}/start", s.startCalibration)
+	mux.HandleFunc("POST /admin/api/calibrations/{id}/cancel", s.cancelCalibration)
+
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
 	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)

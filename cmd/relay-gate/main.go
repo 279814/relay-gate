@@ -200,6 +200,7 @@ func run() error {
 	janitor := probe.NewRetentionJanitor(st, log)
 
 	calibrator := probe.NewCalibrationService(st, executor, probe.WallClock(), log, cfgSrc.Settings, capRegistry)
+	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, sched)
 	var bg sync.WaitGroup
 	bg.Add(6)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
@@ -228,6 +229,7 @@ func run() error {
 		WithCost(cost).
 		WithInvalidator(sched).
 		WithRunState(runCtrl).
+		WithProbeAdmin(probeAdmin).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 

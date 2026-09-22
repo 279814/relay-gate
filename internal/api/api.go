@@ -52,6 +52,9 @@ type Server struct {
 	// runState 是 P0-12 服务总闸。未注入时 state GET/SET fail closed 503。
 	runState RunStateAdmin
 
+	// probeAdmin 是 P0-14 探活管理服务。未注入时新探活端点 503。
+	probeAdmin ProbeAdmin
+
 	// adminPW 由 Routes 装配时写入，会话与 Bearer 两条路径共用。
 	adminPW  string
 	sessions *sessionStore
