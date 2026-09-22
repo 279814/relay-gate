@@ -1,11 +1,27 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
+
+// RunStateAdmin 是 /admin/api/state 的唯一写入口（§P0-12）。
+type RunStateAdmin interface {
+	Get(ctx context.Context) (runstate.Snapshot, error)
+	Current() runstate.Snapshot
+	Set(ctx context.Context, state model.RunState, expectedRevision int64) (runstate.Snapshot, error)
+}
+
+// WithRunState 注入进程级 RunState Controller。
+func (s *Server) WithRunState(ctrl RunStateAdmin) *Server {
+	s.runState = ctrl
+	return s
+}
 
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	st, err := s.st.GetSettings()
@@ -13,7 +29,6 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	// 把硬下限一并告知前端，让输入框能自己限制，而不是等提交后才报错。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"settings": st,
 		"limits": map[string]int{
@@ -29,7 +44,6 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	// 以现值为基底做部分更新：只想改一个超时不必提交整份配置。
 	if err := decodeJSON(r, &cur); err != nil {
 		s.writeErr(w, err)
 		return
@@ -43,29 +57,70 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cur)
 }
 
-// getState / setState 是服务总闸（§4.8）。
-// 管理端点在 paused 下仍必须可用，否则暂停后无法通过 UI 恢复。
+// getState / setState 是服务总闸（§4.8 / §P0-12）。
 func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
-	st, err := s.st.GetRunState()
+	if s.runState == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"run state controller unavailable"})
+		return
+	}
+	snap, err := s.runState.Get(r.Context())
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"state": string(st)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":    string(snap.State),
+		"revision": snap.Revision,
+	})
 }
 
 func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
+	if s.runState == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"run state controller unavailable"})
+		return
+	}
 	var body struct {
-		State string `json:"state"`
+		State            string `json:"state"`
+		ExpectedRevision *int64 `json:"expected_revision"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.SetRunState(store.RunState(body.State)); err != nil {
+	state := model.RunState(body.State)
+	if !state.Valid() {
+		s.writeErr(w, model.WrapValidation("state 必须是 running 或 paused"))
+		return
+	}
+	expected := int64(0)
+	if body.ExpectedRevision != nil {
+		expected = *body.ExpectedRevision
+	} else {
+		expected = s.runState.Current().Revision
+	}
+	snap, err := s.runState.Set(r.Context(), state, expected)
+	if err != nil {
+		var pending *runstate.TransitionPendingError
+		if errors.As(err, &pending) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"code":         pending.Code,
+				"persisted":    true,
+				"state":        string(pending.Persisted.State),
+				"new_revision": pending.Persisted.Revision,
+				"error":        pending.Error(),
+			})
+			return
+		}
+		if runstate.RevisionConflict(err) || errors.Is(err, store.ErrRevisionConflict) {
+			writeJSON(w, http.StatusConflict, errBody{"revision conflict"})
+			return
+		}
 		s.writeErr(w, err)
 		return
 	}
-	s.log.Info("切换服务状态", "state", body.State)
-	writeJSON(w, http.StatusOK, map[string]string{"state": body.State})
+	s.log.Info("切换服务状态", "state", snap.State, "revision", snap.Revision)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":    string(snap.State),
+		"revision": snap.Revision,
+	})
 }

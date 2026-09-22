@@ -139,6 +139,25 @@ func (registry *CapabilityRegistry) InvalidateScope(scope model.RecipeScope, sco
 	}
 }
 
+// DemotePositive 丢弃未过期的 supported 正结论，保留负状态。
+func (registry *CapabilityRegistry) DemotePositive() {
+	if registry == nil {
+		return
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	now := registry.now()
+	for key, row := range registry.rows {
+		if row.State != model.CapabilitySupported {
+			continue
+		}
+		if row.ExpiresAt > 0 && !now.Before(time.UnixMilli(row.ExpiresAt)) {
+			continue // 已过期，读侧已是 unknown
+		}
+		delete(registry.rows, key)
+	}
+}
+
 // InvalidateAll 清空。
 func (registry *CapabilityRegistry) InvalidateAll() {
 	registry.mu.Lock()

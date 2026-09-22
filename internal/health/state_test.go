@@ -323,33 +323,58 @@ func TestClaim_DeadUsesShortFixedIntervals(t *testing.T) {
 	}
 }
 
-// 久治不愈的站只放宽 L2（省 token），L1 保持 20 秒不变。
-// L1 是零成本的，而且它转通会立即触发 L2（§4.4b），所以放宽 L2 不影响发现速度。
+// dead 超过 60 分钟后 L2 放宽到 300s；L1 仍保持短周期（§8.10）。
 func TestClaim_LongDeadWidensL2ButNotL1(t *testing.T) {
 	tr, fs, now := newTestTracker(t)
 	fs.s.FailThreshold = 1
 	fs.s.L1IntervalDeadSec = 20
 	fs.s.L2IntervalDeadSec = 30
 
-	for i := 0; i <= longDeadFails; i++ {
-		report(tr, 1, VerdictUnavailable, SourceL2)
-	}
+	report(tr, 1, VerdictUnavailable, SourceL2) // → dead，lastErrAt = *now
 
+	// 推进到「已死 > 60 分钟」
+	*now = now.Add(61 * time.Minute)
 	tr.ClaimL1(1)
 	tr.ClaimL2(1)
 
 	*now = now.Add(21 * time.Second)
 	if !tr.ClaimL1(1) {
-		t.Error("久死站的 L1 仍应保持 20 秒 —— 它零成本，且转通会立即触发 L2")
+		t.Error("久死站的 L1 仍应保持 20 秒")
 	}
 
-	*now = now.Add(30 * time.Second) // 累计 51s，超过原本的 30s L2 间隔
+	*now = now.Add(30 * time.Second) // 累计 51s << 300s
 	if tr.ClaimL2(1) {
-		t.Error("久死站的 L2 应已放宽到 2 分钟")
+		t.Error("久死站的 L2 应已放宽到 300 秒")
 	}
-	*now = now.Add(90 * time.Second) // 累计 141s > 120s
+	*now = now.Add(250 * time.Second) // 累计 > 300s
 	if !tr.ClaimL2(1) {
-		t.Error("超过 2 分钟后应到期")
+		t.Error("超过 300 秒后应到期")
+	}
+}
+
+func TestDeadModelIntervals(t *testing.T) {
+	tr, fs, now := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	fs.s.L1IntervalDeadSec = 20
+
+	report(tr, 1, VerdictUnavailable, SourceL2)
+	tr.ClaimL2(1)
+
+	// ≤10 分钟 → 30s
+	*now = now.Add(31 * time.Second)
+	if !tr.ClaimL2(1) {
+		t.Error("短死 L2 应为 30s")
+	}
+
+	*now = now.Add(11 * time.Minute) // 已死约 11 分钟 → 120s 档
+	tr.ClaimL2(1)
+	*now = now.Add(31 * time.Second)
+	if tr.ClaimL2(1) {
+		t.Error("中死 L2 应为 120s，31s 不应到期")
+	}
+	*now = now.Add(90 * time.Second)
+	if !tr.ClaimL2(1) {
+		t.Error("中死 120s 后应到期")
 	}
 }
 

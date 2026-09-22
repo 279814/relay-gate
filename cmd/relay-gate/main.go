@@ -18,10 +18,12 @@ import (
 	"github.com/279814/relay-gate/internal/config"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/web"
@@ -145,20 +147,37 @@ func run() error {
 		return errors.Is(err, store.ErrNotFound)
 	})
 
-	// P0-10：ResultRecorder 经 CommitProbeObservation 推进 Reachability/Capability；
-	// 内存 Registry 只在 ApplyCurrent 后 CAS 更新。不得再注入 ExecutionOnlyRecorder。
-	// AlwaysOpenAdmission 仍是 P0-12 前的占坑器。
+	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
+	runCtrl, err := runstate.NewController(st)
+	if err != nil {
+		return fmt.Errorf("打开 runstate controller: %w", err)
+	}
+	defer runCtrl.Close()
+	coordinator := probe.NewSyntheticCoordinator(model.RunState(runState))
+
 	resultRecorder := probe.NewResultRecorder(st, obsReducer, reachTracker, capRegistry)
 	executor := probe.NewExecutor(targets, st, recipes,
 		probe.ManagerTransports{Manager: transports},
-		resultRecorder, probe.AlwaysOpenAdmission(),
+		resultRecorder, coordinator,
 		probe.WallClock(), log)
 
 	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
 		WithCost(cost).
 		WithTargets(targets, st).
 		WithRecipes(recipes).
-		WithExecutor(executor)
+		WithExecutor(executor).
+		WithRunState(runCtrl).
+		WithCapabilityRegistry(capRegistry)
+	if err := coordinator.BindResumeTarget(sched); err != nil {
+		return fmt.Errorf("绑定 scheduler resume: %w", err)
+	}
+	if err := runCtrl.BindSyntheticController(coordinator); err != nil {
+		return fmt.Errorf("绑定 synthetic controller: %w", err)
+	}
+	if err := runCtrl.EnsureStartupPrepare(); err != nil {
+		return fmt.Errorf("启动 PrepareResume: %w", err)
+	}
+	fwd.WithRunState(runCtrl)
 	persister := health.NewPersister(tracker, st, log)
 
 	// 探活与落库跟着这个 ctx 收尾。放在 srv.Shutdown 之后取消：
@@ -202,6 +221,7 @@ func run() error {
 		WithHealth(tracker, gate, sched).
 		WithCost(cost).
 		WithInvalidator(sched).
+		WithRunState(runCtrl).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 
@@ -218,9 +238,9 @@ func run() error {
 	// 而部署之后第一个要回答的往往就是它（尤其「我到底推上去了没有」）。
 	// 版本号不是秘密 —— 仓库是自己的，且它换不来任何攻击面。
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		state, err := cfgSrc.RunState()
-		if err != nil {
-			state = runState // 库暂时读不出来时报启动时的状态，别让健康检查失败
+		state := runCtrl.Current().State
+		if !state.Valid() {
+			state = model.RunState(runState)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)

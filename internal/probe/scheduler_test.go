@@ -154,6 +154,15 @@ func (r *recordingTracker) ResetAll() {
 	r.resets++
 }
 
+func (r *recordingTracker) DemotePositiveConclusions() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resets++
+}
+
+func (r *recordingTracker) CompleteL1(int64, time.Time, float64) {}
+func (r *recordingTracker) CompleteL2(int64, time.Time, float64) {}
+
 func (r *recordingTracker) snapshot() ([]int64, []int64, []health.Report, []int64, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -713,8 +722,9 @@ func TestScheduler_ProbeNow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l1.Verdict != health.VerdictOK {
-		t.Errorf("L1 应通过，得到 %s（%v）", l1.Verdict, l1.Err)
+	// P0-12：ProbeNow 是一次 manual L2；l1 为零值兼容旧签名。
+	if l1.Verdict != 0 {
+		t.Errorf("兼容 adapter 的 L1 应为零值，得到 %s", l1.Verdict)
 	}
 	if l2.Verdict != health.VerdictOK {
 		t.Errorf("L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
@@ -726,14 +736,9 @@ func TestScheduler_ProbeNow(t *testing.T) {
 	}
 }
 
-// 装配 Executor 后，ProbeNow 走单发执行器（§P0-09 目标）：L1/L2 都经它发送
-// 并各落一行 ProbeExecution，Decision 再映射成 Outcome 供状态机消费。
+// 装配 Executor 后，ProbeNow 恰好一次 manual Execute。
 func TestScheduler_ProbeNowUsesExecutor(t *testing.T) {
 	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models" {
-			w.WriteHeader(200)
-			return
-		}
 		drainBody(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -746,28 +751,21 @@ func TestScheduler_ProbeNowUsesExecutor(t *testing.T) {
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
 	hs.sched.WithExecutor(executor)
 
-	// 装配 Executor 后，旧 Prober 发送段不该再被碰到（§P0-09 第 5 条）。
-	// Prober 回落路径唯一的连接池来源是 s.tr.TransportFor —— 换成一个一被
-	// 调用就记账的探针，就能证明「Executor 在场时绝不走 Prober」：探针计数
-	// 非零即说明回落发生了。
 	spy := &spyTransportSource{}
 	hs.sched.tr = spy
 
 	snap, _ := hs.cfg.Snapshot()
 	rt := snap.RoutesByModelName[1][0]
 
-	l1, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if l1.Verdict != health.VerdictOK {
-		t.Errorf("经 Executor 的 L1 应通过，得到 %s（%v）", l1.Verdict, l1.Err)
 	}
 	if l2.Verdict != health.VerdictOK {
 		t.Errorf("经 Executor 的 L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
 	}
-	if recorder.calls != 2 {
-		t.Errorf("L1 与 L2 应各落一行 execution，实际落库 %d 次", recorder.calls)
+	if recorder.calls != 1 {
+		t.Errorf("恰好一次 manual execution，实际落库 %d 次", recorder.calls)
 	}
 	if got := spy.count(); got != 0 {
 		t.Errorf("Executor 在场时绝不该走 Prober 回落，但 TransportFor 被调用了 %d 次", got)
@@ -807,47 +805,41 @@ type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
-// L1 失败时不必再探 L2，但失败仍要落到状态机。
-func TestScheduler_ProbeNowSkipsL2WhenL1Fails(t *testing.T) {
-	var l2Hits int
+// Lazy 站的手动 ProbeNow 仍可发一次，且不改变 ProbeMode。
+func TestScheduler_ProbeNowLazyManualOnce(t *testing.T) {
+	var hits int
 	var mu sync.Mutex
 	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models" {
-			w.WriteHeader(503)
-			return
-		}
 		mu.Lock()
-		l2Hits++
+		hits++
 		mu.Unlock()
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
+		_, _ = w.Write([]byte(aliveSSE))
 	})
+	for _, up := range hs.cfg.snap.Upstreams {
+		up.ProbeMode = model.ProbeModeLazy
+	}
 
 	snap, _ := hs.cfg.Snapshot()
 	rt := snap.RoutesByModelName[1][0]
+	modeBefore := snap.Upstreams[rt.UpstreamID].ProbeMode
 
-	l1, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l1.Verdict == health.VerdictOK {
-		t.Error("L1 应失败")
+	if l2.Verdict != health.VerdictOK {
+		t.Errorf("Lazy 手动测试应成功，得到 %s", l2.Verdict)
 	}
-	if l2.Verdict != health.VerdictOK || l2.Status != 0 {
-		// L2 未执行时 Outcome 是零值，而零值的 Verdict 恰好是 VerdictOK。
-		// 这里靠 Status == 0 区分「没跑」与「跑了且通过」。
-		if l2.Status != 0 {
-			t.Errorf("L1 失败时不该探 L2，但 L2 有结果：%+v", l2)
-		}
+	if snap.Upstreams[rt.UpstreamID].ProbeMode != modeBefore {
+		t.Error("手动测试不得改变 ProbeMode")
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if l2Hits != 0 {
-		t.Errorf("L1 失败时不该发 L2 请求，实际发了 %d 次", l2Hits)
-	}
-
-	_, _, reports, _, _ := hs.track.snapshot()
-	if len(reports) == 0 {
-		t.Error("L1 失败也要落到状态机，否则手动测试看到「站挂了」而状态没变")
+	if hits != 1 {
+		t.Errorf("恰好一次请求，实际 %d", hits)
 	}
 }
 

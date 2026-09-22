@@ -7,22 +7,26 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
-// intervalFor 按状态返回 L1/L2 间隔（§4.6）。
+const (
+	// shortDeadWindow：dead 不超过 10 分钟 → L2 30s（§8.10）。
+	shortDeadWindow = 10 * time.Minute
+	// midDeadWindow：dead 10–60 分钟 → L2 120s。
+	midDeadWindow = 60 * time.Minute
+	// longDeadL2Short / Mid / Long 是三档 dead L2 间隔。
+	longDeadL2Short = 30 * time.Second
+	longDeadL2Mid   = 120 * time.Second
+	longDeadL2Long  = 300 * time.Second
+)
+
+// intervalFor 按状态返回 L1/L2 间隔（§4.6 / §8.10）。
 //
-// dead 用固定短周期而不是指数退避：这个项目的核心诉求就是「死了要尽快
-// 发现恢复」，退避到 10 分钟等于把恢复发现延迟拉到 10 分钟。
-//
-// 唯一的温和保护：连续失败超过 longDeadFails 次（约 30 分钟没恢复）后
-// **只**放宽 L2，L1 保持 20 秒不变。这不影响发现速度 —— 站真恢复时
-// L1 会先转通，而 L1 转通会立即触发 L2（§4.4b），不用等 L2 的周期。
-func intervalFor(rs *routeState, s model.Settings) (l1, l2 time.Duration) {
+// dead 用固定短周期而不是指数退避：核心诉求是「死了要尽快发现恢复」。
+// 唯一放宽：长期死亡只拉长 L2；L1 / 连接恢复检查保持 20 秒。
+func intervalFor(rs *routeState, s model.Settings, now time.Time) (l1, l2 time.Duration) {
 	switch rs.state {
 	case model.StateDead:
 		l1 = time.Duration(s.L1IntervalDeadSec) * time.Second
-		l2 = time.Duration(s.L2IntervalDeadSec) * time.Second
-		if rs.consecutiveFail > longDeadFails {
-			l2 = longDeadL2Interval
-		}
+		l2 = deadL2Interval(rs, s, now)
 	case model.StateAlive:
 		l1 = time.Duration(s.L1IntervalAliveSec) * time.Second
 		l2 = time.Duration(s.L2IntervalAliveSec) * time.Second
@@ -32,13 +36,25 @@ func intervalFor(rs *routeState, s model.Settings) (l1, l2 time.Duration) {
 	return l1, l2
 }
 
-const (
-	// longDeadFails 是「久治不愈」的门槛。按 dead 状态 20s 一次 L1 算，
-	// 60 次约等于 20 分钟持续失败。
-	longDeadFails = 60
-	// longDeadL2Interval 是久死站的 L2 间隔。只放宽 L2（省 token），L1 不变。
-	longDeadL2Interval = 2 * time.Minute
-)
+func deadL2Interval(rs *routeState, s model.Settings, now time.Time) time.Duration {
+	// 优先按「已死多久」分档（§8.10）；没有 lastErrAt 时退回设置值。
+	if !rs.lastErrAt.IsZero() {
+		age := now.Sub(rs.lastErrAt)
+		switch {
+		case age <= shortDeadWindow:
+			return longDeadL2Short
+		case age <= midDeadWindow:
+			return longDeadL2Mid
+		default:
+			return longDeadL2Long
+		}
+	}
+	base := time.Duration(s.L2IntervalDeadSec) * time.Second
+	if base <= 0 {
+		return longDeadL2Short
+	}
+	return base
+}
 
 // ClaimL1 原子地「判断 L1 是否到期并预占下一次」。到期返回 true。
 //
@@ -59,7 +75,7 @@ func (t *Tracker) ClaimL1(routeID int64) bool {
 	if !rs.nextL1At.IsZero() && now.Before(rs.nextL1At) {
 		return false
 	}
-	l1, _ := intervalFor(rs, s)
+	l1, _ := intervalFor(rs, s, now)
 	rs.nextL1At = now.Add(l1)
 	return true
 }
@@ -82,10 +98,11 @@ func (t *Tracker) ClaimL2(routeID int64) bool {
 	if !rs.nextL2At.IsZero() && now.Before(rs.nextL2At) {
 		return false
 	}
-	_, l2 := intervalFor(rs, s)
+	_, l2 := intervalFor(rs, s, now)
 
-	// piggyback 只对**非 dead** 生效。dead 站的「上次真实成功」可能是
-	// 半小时前的事，拿它跳过探活就等于永远不再探 —— 恰好废掉快速恢复。
+	// Tracker 侧 piggyback 仅按时间窗粗判；P0-12 Scheduler 以
+	// LastRealOKToken == current SemanticRevision 为权威跳过条件。
+	// 这里保留时间窗以避免无 Scheduler 装配时的旧路径空转。
 	if s.PiggybackEnabled && rs.state != model.StateDead && !rs.lastRealOKAt.IsZero() {
 		if now.Sub(rs.lastRealOKAt) < l2 {
 			rs.nextL2At = rs.lastRealOKAt.Add(l2)
@@ -118,11 +135,10 @@ func (t *Tracker) TriggerL1(routeID int64) {
 	t.get(routeID).nextL1At = time.Time{}
 }
 
-// ResetAll 把所有 Route 置回 unknown 并清空探活预占（§4.8 恢复时用）。
+// ResetAll 把所有 Route 置回 unknown 并清空探活预占。
 //
-// 置 unknown 而不是保留暂停前的状态：暂停期间站点可能恢复也可能挂掉，
-// 那些状态已经过期了。unknown 是乐观的（视为可用），所以恢复瞬间
-// 就能承接流量，不会出现「刚点开就 503」。
+// P0-12 PrepareResume 改用 DemotePositiveConclusions：只降正结论，保留
+// dead/recovering/cooldown 等负状态。ResetAll 仍保留给测试与旧调用方。
 func (t *Tracker) ResetAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -133,9 +149,63 @@ func (t *Tracker) ResetAll() {
 		rs.cooldownUntil = time.Time{}
 		rs.nextL1At = time.Time{}
 		rs.nextL2At = time.Time{}
-		// 不清 lastRealOKAt：它是历史事实，且 unknown 状态下
-		// intervalFor 返回 0，piggyback 也就不起作用。
 	}
+}
+
+// DemotePositiveConclusions 把 alive 正结论降为 effective unknown（§P0-12 resume）。
+//
+// dead / recovering / cooldown 负状态保留；只清探活预占以便渐进复核。
+func (t *Tracker) DemotePositiveConclusions() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, rs := range t.state {
+		if rs.state == model.StateAlive {
+			rs.state = model.StateUnknown
+			rs.consecutiveOK = 0
+		}
+		rs.nextL1At = time.Time{}
+		rs.nextL2At = time.Time{}
+	}
+}
+
+// CompleteL1 在探活完成后从完成时刻计算下次到期（§8.10）。
+func (t *Tracker) CompleteL1(routeID int64, completedAt time.Time, jitter float64) {
+	s := t.currentSettings()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rs := t.get(routeID)
+	l1, _ := intervalFor(rs, s, completedAt)
+	if completedAt.IsZero() {
+		completedAt = t.now()
+	}
+	rs.nextL1At = completedAt.Add(applyJitter(l1, jitter))
+}
+
+// CompleteL2 同 CompleteL1。
+func (t *Tracker) CompleteL2(routeID int64, completedAt time.Time, jitter float64) {
+	s := t.currentSettings()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rs := t.get(routeID)
+	_, l2 := intervalFor(rs, s, completedAt)
+	if completedAt.IsZero() {
+		completedAt = t.now()
+	}
+	rs.nextL2At = completedAt.Add(applyJitter(l2, jitter))
+}
+
+// applyJitter 把间隔乘以 [0.9, 1.1] 内的因子；factor<=0 时不加 jitter。
+func applyJitter(base time.Duration, factor float64) time.Duration {
+	if base <= 0 || factor <= 0 {
+		return base
+	}
+	if factor < 0.9 {
+		factor = 0.9
+	}
+	if factor > 1.1 {
+		factor = 1.1
+	}
+	return time.Duration(float64(base) * factor)
 }
 
 // Forget 丢弃某个 Route 的状态，用于 Route 被删除后。

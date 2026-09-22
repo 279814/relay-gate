@@ -120,6 +120,9 @@ type Scheduler struct {
 
 	// wg 等所有在途探活收尾，让 Close 有确定的语义。
 	wg sync.WaitGroup
+
+	// p012 挂 P0-12 扩展（runstate / pending / jitter）。
+	p012 *schedulerP012
 }
 
 // Tracker 是 Scheduler 需要的健康状态读写面，由 *health.Tracker 实现。
@@ -361,11 +364,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		s.log.Error("探活调度读取设置失败，本轮跳过", "err", err)
 		return
 	}
-	state, err := s.cfg.RunState()
-	if err != nil {
-		s.log.Error("探活调度读取运行状态失败，本轮跳过", "err", err)
-		return
-	}
+	state := s.currentRunState()
 
 	// §4.8：暂停时探活全停。目的是「不用时不浪费探活额度」。
 	if state == store.StatePaused {
@@ -409,6 +408,9 @@ func (s *Scheduler) tick(ctx context.Context) {
 			if up == nil || !up.Enabled {
 				continue
 			}
+			if up.ProbeMode == model.ProbeModeLazy {
+				continue
+			}
 			s.maybeProbe(ctx, up, mn, rt, settings)
 		}
 	}
@@ -429,6 +431,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 		go func() {
 			defer s.wg.Done()
 			defer s.endL1(up.ID)
+			defer s.completeL1(rt.ID)
 			s.runL1(ctx, up, settings)
 		}()
 	}
@@ -453,6 +456,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	go func() {
 		defer s.wg.Done()
 		defer s.endL2(up.ID, rt.ID)
+		defer s.completeL2(rt.ID)
 		s.runL2(ctx, up, mn, rt, settings)
 	}()
 }
@@ -620,6 +624,27 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 		"verdict", out.Verdict.String(), "ttft_ms", out.TTFT.Milliseconds())
 }
 
+// completeL1 从完成时刻重算下次 L1（含 jitter）。
+func (s *Scheduler) completeL1(routeID int64) {
+	completer, ok := s.track.(interface {
+		CompleteL1(routeID int64, completedAt time.Time, jitter float64)
+	})
+	if !ok {
+		return
+	}
+	completer.CompleteL1(routeID, time.Now(), s.jitterFactor())
+}
+
+func (s *Scheduler) completeL2(routeID int64) {
+	completer, ok := s.track.(interface {
+		CompleteL2(routeID int64, completedAt time.Time, jitter float64)
+	})
+	if !ok {
+		return
+	}
+	completer.CompleteL2(routeID, time.Now(), s.jitterFactor())
+}
+
 // ── 并发闸 ───────────────────────────────────────────────
 
 // beginL1 保证「同一轮 tick 内同一个站只调度一次 L1」，且「同一时刻
@@ -650,8 +675,9 @@ func (s *Scheduler) beginL1(upstreamID int64) bool {
 
 func (s *Scheduler) endL1(upstreamID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.inflightL1, upstreamID)
+	s.mu.Unlock()
+	s.noteL1Finished(upstreamID)
 }
 
 // beginL2 同时满足三个约束：全局并发上限、同 Upstream 串行、同 Route 不重入。
@@ -659,24 +685,33 @@ func (s *Scheduler) beginL2(upstreamID, routeID int64) bool {
 	s.mu.Lock()
 	if s.busyUp[upstreamID] || s.inflightL2[routeID] {
 		s.mu.Unlock()
+		p := s.ensureP012()
+		p.mu.Lock()
+		p.pendingL2[routeID] = true
+		p.mu.Unlock()
 		return false
 	}
 	sem := s.sem()
 	s.mu.Unlock()
 
-	// 非阻塞获取全局额度：满了就让这个 Route 等下一个 tick，
-	// 而不是把 tick 的 goroutine 堵在这里。
 	select {
 	case sem <- struct{}{}:
 	default:
+		p := s.ensureP012()
+		p.mu.Lock()
+		p.pendingL2[routeID] = true
+		p.mu.Unlock()
 		return false
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 双检：等额度期间可能已被同站的另一个 Route 抢先。
 	if s.busyUp[upstreamID] || s.inflightL2[routeID] {
 		<-sem
+		p := s.ensureP012()
+		p.mu.Lock()
+		p.pendingL2[routeID] = true
+		p.mu.Unlock()
 		return false
 	}
 	s.busyUp[upstreamID] = true
@@ -693,6 +728,7 @@ func (s *Scheduler) endL2(upstreamID, routeID int64) {
 	if sem != nil {
 		<-sem
 	}
+	s.noteL2Finished(routeID)
 }
 
 // sem 懒建全局 L2 闸。调用方必须已持有锁。
@@ -743,9 +779,8 @@ func (s *Scheduler) onRunning() {
 	s.lastRunning = store.StateRunning
 	s.mu.Unlock()
 
-	s.track.ResetAll()
-	s.gate.Reset()
-	s.log.Info("服务已恢复，全部 Route 置 unknown 并立即重新探活")
+	s.PrepareResume()
+	s.ResumeGradually()
 }
 
 // gcRemoved 丢弃已被删除的 Route/Upstream 的状态。
@@ -771,11 +806,9 @@ func (s *Scheduler) gcRemoved(snap *router.Snapshot) {
 
 // ── 即时探活（§4.5）──────────────────────────────────────
 
-// ProbeNow 立即探一个 Route，同步返回结果。供 UI 的「测试」按钮用。
+// ProbeNow 是 P0-12 兼容 adapter：恰好一次 manual 模型端点 Execute。
 //
-// 同步是刻意的：用户点了按钮就是要看结果，异步的话还得再设计一个
-// 「查询上次手动探活结果」的接口。它不走并发闸 —— 手动触发是单次的，
-// 而且用户正在等。
+// Lazy 站也允许一次手动测试且不改 ProbeMode。返回的 l1 为零值（兼容旧签名）。
 func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	rt *model.Route) (l1, l2 Outcome, err error) {
 
@@ -792,39 +825,27 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, errNoModelName
 	}
 
-	var l1Reachable bool
 	if s.executor != nil {
-		res := s.execL1(ctx, up, settings)
-		l1 = res.Outcome
-		l1Reachable = res.Decision.Reachable || res.Decision.StatusCode > 0
-		if res.Decision.ErrorClass == model.ErrorUnreachable {
-			l1Reachable = false
+		kind, ok := mn.Protocol.Endpoint()
+		if !ok {
+			return l1, l2, fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)
 		}
-	} else {
-		// L1 与 L2 各取自己的连接池：两者的 connect 预算不同，而 connect 预算是
-		// 池身份的一部分（§7.3）。共用一个池就意味着其中一个的 l*_connect_sec
-		// 是死的 —— 而「让 L1/L2 配置真正生效」正是 P0-04 的目标。
-		l1Transport, terr := s.tr.TransportFor(up, outbound.L1Budget(settings))
-		if terr != nil {
-			return l1, l2, terr
+		order, oerr := s.nextOrder(ctx, model.TriggerManual)
+		if oerr != nil {
+			return l1, Outcome{Verdict: health.VerdictIgnore}, nil
 		}
-		l1 = s.prober(l1Transport).L1(ctx, up, settings)
-		l1Reachable = l1.Verdict == health.VerdictOK
-	}
-	s.countL1(up.ID, l1Reachable)
-	s.gate.Report(up.ID, l1Reachable, l1.Err)
-
-	// 只有真正不可达才跳过 L2；401/404/429/503 仍可达（§8.9）。
-	if !l1Reachable {
-		s.track.Report(health.Report{
-			RouteID: rt.ID, Verdict: l1.Verdict, Source: health.SourceL1,
-			Err: l1.Err, RetryAfter: l1.RetryAfter,
-		})
-		return l1, l2, nil
-	}
-
-	if s.executor != nil {
-		l2 = s.execL2(ctx, up, mn, rt, settings).Outcome
+		req := ExecutionRequest{
+			ExecutionID: sample.NewReqID(), Trigger: model.TriggerManual,
+			Upstream: up, ModelName: mn, Route: rt, Endpoint: kind,
+			Mode: ObserveProbe, Budget: outbound.L2Budget(settings), ObservationOrder: order,
+		}
+		s.attachExpectations(ctx, &req, up, mn, rt, kind)
+		res, xerr := s.executor.Execute(ctx, req)
+		if xerr != nil {
+			s.log.Error("手动探活执行失败", "err", xerr)
+			return l1, Outcome{Verdict: health.VerdictIgnore}, nil
+		}
+		l2 = res.Outcome
 	} else {
 		l2Transport, terr := s.tr.TransportFor(up, outbound.L2Budget(settings))
 		if terr != nil {
@@ -832,11 +853,13 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		}
 		l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
 	}
-	s.countL2(rt.ID, mn, l2)
-	s.track.Report(health.Report{
-		RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
-		Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
-	})
+	if l2.Verdict != health.VerdictIgnore {
+		s.countL2(rt.ID, mn, l2)
+		s.track.Report(health.Report{
+			RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
+			Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
+		})
+	}
 	return l1, l2, nil
 }
 
@@ -883,47 +906,12 @@ func findModelName(snap *router.Snapshot, id int64) *model.ModelName {
 	return nil
 }
 
-// ── 配置变更触发即时探活（§4.5 表格第 3 行）─────────────────
-
-// InvalidateRoute 让某个 Route 在下一个 tick 立刻重探。
-//
-// 只清预占，不在这里直接发探活请求。理由与 TriggerL2 相同（health/schedule.go）：
-// 直接探的话，一次批量配置导入会同时发起几十个请求，而 tick 里已经有
-// 完整的并发闸与「同站串行」约束。走 tick 最多等 1 秒。
-//
-// 顺带清 L1：改了 key 或 base_url 时，L1 的结论同样过期了 —— 而站级 L1
-// 失败会让 L2 被整个跳过（§4.1），不清 L1 的话，一个刚被改对的站
-// 仍会因为旧的 L1 失败结论而探不到 L2。
-func (s *Scheduler) InvalidateRoute(routeID int64) {
-	s.track.TriggerL1(routeID)
-	s.track.TriggerL2(routeID)
-}
-
-// InvalidateUpstream 让某个 Upstream 下所有 Route 立刻重探。
-//
-// 同时清掉站级 L1 结论：改 key 后旧的「这个站 401」必须作废，
-// 否则 L2 会被 gate.OK 挡住，用户改对了 key 也看不到恢复。
-func (s *Scheduler) InvalidateUpstream(upstreamID int64) {
-	s.gate.Forget(upstreamID)
-
-	snap, err := s.cfg.Snapshot()
-	if err != nil {
-		return
-	}
-	for _, rts := range snap.RoutesByModelName {
-		for _, rt := range rts {
-			if rt.UpstreamID == upstreamID {
-				s.InvalidateRoute(rt.ID)
-			}
-		}
-	}
-}
+// ── 配置变更触发即时探活（§4.5）─────────────────
+// InvalidateRoute / InvalidateUpstream 见 scheduler_control.go。
 
 // InvalidateModelName 让某个 ModelName 下所有 Route 重探 L2。
 //
-// 只清 L2：这个层级能改的是 probe_prompt / probe_max_tokens / protocol，
-// 全都只影响 L2 的请求内容。L1 打的是站的 /v1/models，与模型无关 ——
-// 清它等于白发一次请求。
+// 只清 L2：这个层级能改的是 probe_prompt / protocol，与站级 /models 无关。
 func (s *Scheduler) InvalidateModelName(modelNameID int64) {
 	snap, err := s.cfg.Snapshot()
 	if err != nil {
