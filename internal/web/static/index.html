@@ -767,6 +767,126 @@
           </div>
         </template>
 
+        <!-- ── 声明式转换（P4）─────────────────────────────── -->
+        <template x-if="tab === 'transforms'">
+          <div>
+            <div class="bar">
+              <strong>声明式转换</strong>
+              <span class="dim">无脚本 · 版本化 · 未绑定透传</span>
+              <span class="grow"></span>
+              <button @click="loadTransforms()">刷新</button>
+            </div>
+            <div class="row" style="margin-bottom:12px">
+              <div class="field" style="max-width:240px">
+                <label>新建转换集</label>
+                <input x-model="transforms.newName" placeholder="名称">
+              </div>
+              <button class="primary" @click="createTransformSet()">创建</button>
+            </div>
+            <div class="row" style="align-items:flex-start;gap:16px">
+              <div style="min-width:220px;max-width:280px">
+                <table>
+                  <thead><tr><th>ID</th><th>名称</th></tr></thead>
+                  <tbody>
+                    <template x-for="s in (transforms.sets || [])" :key="s.id">
+                      <tr @click="selectTransformSet(s)" :class="{'row-active': transforms.selectedId === s.id}" style="cursor:pointer">
+                        <td class="mono" x-text="s.id"></td>
+                        <td x-text="s.name"></td>
+                      </tr>
+                    </template>
+                    <tr x-show="!(transforms.sets || []).length"><td colspan="2" class="empty">暂无</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div style="flex:1" x-show="transforms.selected">
+                <div class="field">
+                  <label>草稿规则（JSON 数组）</label>
+                  <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
+                </div>
+                <div class="row">
+                  <div class="field">
+                    <label>请求失败策略</label>
+                    <select x-model="transforms.reqFailPolicy">
+                      <option value="fail_closed">fail_closed</option>
+                      <option value="fail_open">fail_open</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label>响应失败策略</label>
+                    <select x-model="transforms.resFailPolicy">
+                      <option value="fail_open">fail_open</option>
+                      <option value="fail_closed">fail_closed</option>
+                    </select>
+                  </div>
+                  <div class="field" style="flex:1">
+                    <label>备注</label>
+                    <input x-model="transforms.note">
+                  </div>
+                </div>
+                <div class="bar" style="margin:8px 0">
+                  <button class="primary" @click="saveTransformDraft()">保存草稿</button>
+                </div>
+                <div class="row">
+                  <div class="field" style="max-width:120px">
+                    <label>Route ID</label>
+                    <input x-model="transforms.routeId">
+                  </div>
+                  <div class="field" style="max-width:120px">
+                    <label>Endpoint ID</label>
+                    <input x-model="transforms.endpointId">
+                  </div>
+                  <button @click="publishTransform()">Publish</button>
+                  <button @click="shadowTransform()">Shadow</button>
+                </div>
+                <div class="field" style="margin-top:12px">
+                  <label>Preview phase / body</label>
+                  <div class="row">
+                    <select x-model="transforms.previewPhase">
+                      <option value="request">request</option>
+                      <option value="response">response</option>
+                    </select>
+                    <input style="flex:1" x-model="transforms.previewBody" placeholder='{"model":"x"}'>
+                    <button @click="previewTransform()">Preview</button>
+                  </div>
+                  <pre class="mono wrap" style="margin-top:8px;white-space:pre-wrap" x-text="transforms.previewResult"></pre>
+                </div>
+              </div>
+            </div>
+            <h3 style="font-size:13px;margin:18px 0 8px">Bindings</h3>
+            <table>
+              <thead><tr><th>Route</th><th>Endpoint</th><th>Set</th><th>Published</th><th>Shadow</th></tr></thead>
+              <tbody>
+                <template x-for="(b, idx) in (transforms.bindings || [])" :key="idx">
+                  <tr>
+                    <td class="mono" x-text="b.route_id"></td>
+                    <td class="mono" x-text="b.endpoint_id"></td>
+                    <td class="mono" x-text="b.set_id"></td>
+                    <td class="mono" x-text="b.published_id || '—'"></td>
+                    <td class="mono" x-text="b.shadow_id || '—'"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(transforms.bindings || []).length"><td colspan="5" class="empty">暂无绑定</td></tr>
+              </tbody>
+            </table>
+            <h3 style="font-size:13px;margin:18px 0 8px">Executions（脱敏）</h3>
+            <table>
+              <thead><tr><th>时间</th><th>Phase</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
+              <tbody>
+                <template x-for="(ex, idx) in (transforms.executions || [])" :key="idx">
+                  <tr>
+                    <td class="mono" x-text="ex.at"></td>
+                    <td x-text="ex.phase"></td>
+                    <td x-text="ex.ok ? 'yes' : 'no'"></td>
+                    <td class="wrap" x-text="(ex.hit_rules || []).join(', ')"></td>
+                    <td class="wrap" x-text="ex.error || ''"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(transforms.executions || []).length"><td colspan="5" class="empty">暂无执行记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
         <template x-if="tab === 'settings'">
           <div>
             <div class="bar">

@@ -114,6 +114,7 @@ func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 		"static/js/migration.mjs":   true,
 		"static/js/credentials.mjs": true,
 		"static/js/security.mjs":    true,
+		"static/js/transforms.mjs":  true,
 	}
 	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

@@ -11,6 +11,7 @@ import { createRecentErrorsFeature } from './errors.mjs';
 import { createMigrationFeature } from './migration.mjs';
 import { createCredentialsFeature, mergeCredentialsTab } from './credentials.mjs';
 import { createSecurityFeature, mergeSecurityTab } from './security.mjs';
+import { createTransformsFeature, mergeTransformsTab } from './transforms.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -42,6 +43,8 @@ if (typeof base !== 'function') {
       mergeCredentialsTab(shell);
       createSecurityFeature(shell, api);
       mergeSecurityTab(shell);
+      createTransformsFeature(shell, api);
+      mergeTransformsTab(shell);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -112,6 +115,8 @@ if (typeof base !== 'function') {
       } else if (tab === 'security') {
         this.loadSecurityFindings();
         this.loadSMTP();
+      } else if (tab === 'transforms') {
+        this.loadTransforms();
       } else if (tab === 'health') {
         this.refreshHealthSide();
       }
