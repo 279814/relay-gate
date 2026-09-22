@@ -263,6 +263,30 @@ func TestAPI_RetryStatsOnEmptyDB(t *testing.T) {
 	}
 }
 
+func TestAPI_RecentErrors(t *testing.T) {
+	s, h := newTestServer(t)
+	seedLogs(t, s)
+	rec := do(t, h, "GET", "/admin/api/recent-errors?limit=10", "", true)
+	if rec.Code != 200 {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		FailedCount int                 `json:"failed_count"`
+		Logs        []*model.RequestLog `json:"logs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.FailedCount < 1 {
+		t.Fatalf("failed_count = %d", out.FailedCount)
+	}
+	for _, l := range out.Logs {
+		if l.Succeeded() {
+			t.Fatalf("recent-errors returned success row %#v", l)
+		}
+	}
+}
+
 func TestAPI_ClearRequestLogs(t *testing.T) {
 	s, h := newTestServer(t)
 	seedLogs(t, s)

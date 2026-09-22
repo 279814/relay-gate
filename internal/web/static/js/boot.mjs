@@ -7,6 +7,7 @@
 
 import { createApiClient } from './api.mjs';
 import { createProbeFeature, mergeProbeTabs } from './probes.mjs';
+import { createRecentErrorsFeature } from './errors.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -32,6 +33,7 @@ if (typeof base !== 'function') {
     try {
       createProbeFeature(shell, api);
       mergeProbeTabs(shell);
+      createRecentErrorsFeature(shell, api);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -66,6 +68,7 @@ if (typeof base !== 'function') {
           this.running = st.state === 'running';
         } catch { /* */ }
         if (this.probeModuleReady) await this.refreshHealthSide();
+        if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };
     }
 
@@ -74,6 +77,7 @@ if (typeof base !== 'function') {
       shell.loadHealth = async function loadHealth() {
         await origLoadHealth();
         if (this.probeModuleReady) await this.refreshHealthSide();
+        if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };
     }
 
