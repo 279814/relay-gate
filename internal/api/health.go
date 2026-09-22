@@ -170,16 +170,34 @@ func countSelectable(rows []healthRow) int {
 
 // probeRoute 手动探活一个 Route（§4.5：UI 手动点「测试」，结果直接展示）。
 //
-// 同步返回结果。异步的话还得再设计一个「查询上次手动探活结果」的接口，
-// 而用户点了按钮就是要立刻看到答案。
+// P0-14：优先走 ManualProbeRunner（恰好一次 manual execution）；
+// 未装配时回落旧 ProbeNow compatibility adapter。
 func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
-	if s.prober == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errBody{"探活未启用"})
-		return
-	}
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), manualProbeTimeout)
+	defer cancel()
+
+	if s.probeAdmin != nil {
+		exec, err := s.probeAdmin.RunManual(ctx, id)
+		if err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"execution_id": exec.ID,
+			"execution":    exec,
+			"ok":           exec.Success,
+		})
+		return
+	}
+
+	if s.prober == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"探活未启用"})
 		return
 	}
 	rt, err := s.st.GetRoute(id)
@@ -204,12 +222,6 @@ func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := router.BuildSnapshot(mns, ups, routes)
-
-	// 给手动探活一个独立的时限。不用 r.Context()：浏览器可能在
-	// L2 还没跑完时就超时断开，而我们仍然想把这次探活的结果写进状态机 ——
-	// 那是用户点这个按钮的主要目的。
-	ctx, cancel := context.WithTimeout(context.Background(), manualProbeTimeout)
-	defer cancel()
 
 	l1, l2, err := s.prober.ProbeNow(ctx, snap, rt)
 	if err != nil {
