@@ -6,7 +6,8 @@ import (
 
 // ConfigInvalidator 在配置变更后立即触发相关 Route 的探活（§4.5 表格第 3 行）。
 //
-// 由 probe.Scheduler 实现。
+// 由 probe.Scheduler 实现；P1 起亦可由 SemanticInvalidator 包装，同时清
+// RouteHealth / RecoveryGate / Capability / 学习引用（§9.2）。
 type ConfigInvalidator interface {
 	// InvalidateRoute 触发单个 Route 的 L1 + L2。
 	InvalidateRoute(routeID int64)
@@ -16,6 +17,53 @@ type ConfigInvalidator interface {
 	// InvalidateModelName 触发某个 ModelName 下所有 Route 的 L2。
 	// 改 probe_prompt / probe_max_tokens 只影响 L2 的内容，L1 与它无关。
 	InvalidateModelName(modelNameID int64)
+}
+
+// SemanticConfigInvalidator clears §9.2 runtime state then delegates schedule invalidation.
+type SemanticConfigInvalidator struct {
+	Semantic interface {
+		InvalidateRoute(routeID int64)
+		InvalidateUpstream(upstreamID int64, routeIDs []int64)
+	}
+	Inner          ConfigInvalidator
+	RoutesOfUpstream func(upstreamID int64) []int64
+}
+
+func (s *SemanticConfigInvalidator) InvalidateRoute(routeID int64) {
+	if s == nil {
+		return
+	}
+	if s.Semantic != nil {
+		s.Semantic.InvalidateRoute(routeID)
+	}
+	if s.Inner != nil {
+		s.Inner.InvalidateRoute(routeID)
+	}
+}
+
+func (s *SemanticConfigInvalidator) InvalidateUpstream(upstreamID int64) {
+	if s == nil {
+		return
+	}
+	var routeIDs []int64
+	if s.RoutesOfUpstream != nil {
+		routeIDs = s.RoutesOfUpstream(upstreamID)
+	}
+	if s.Semantic != nil {
+		s.Semantic.InvalidateUpstream(upstreamID, routeIDs)
+	}
+	if s.Inner != nil {
+		s.Inner.InvalidateUpstream(upstreamID)
+	}
+}
+
+func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
+	if s == nil {
+		return
+	}
+	if s.Inner != nil {
+		s.Inner.InvalidateModelName(modelNameID)
+	}
 }
 
 // WithInvalidator 接上配置变更钩子（§4.5）。

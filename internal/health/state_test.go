@@ -190,9 +190,8 @@ func TestReport_IgnoreDoesNotTouchState(t *testing.T) {
 
 // ── §4.4 恢复判定 ────────────────────────────────────────
 
-// 死站首次探通就转 unknown（可用），不必等第二次。
-// 让恢复的站空等一个探活周期，正是这个项目要解决的痛点。
-func TestReport_DeadRouteRecoversToUnknownOnFirstSuccess(t *testing.T) {
+// 死站首次合成探通进入 recovering（§9.1），须再达 OKThreshold 才 alive。
+func TestReport_DeadRouteRecoversToRecoveringOnFirstSuccess(t *testing.T) {
 	tr, fs, _ := newTestTracker(t)
 	fs.s.FailThreshold = 1
 	fs.s.OKThreshold = 2
@@ -203,8 +202,8 @@ func TestReport_DeadRouteRecoversToUnknownOnFirstSuccess(t *testing.T) {
 	}
 
 	report(tr, 1, VerdictOK, SourceL2)
-	if got := tr.State(1); got != model.StateUnknown {
-		t.Errorf("死站首次探通应转 unknown（立即可用），得到 %s", got)
+	if got := tr.State(1); got != model.StateRecovering {
+		t.Errorf("死站首次合成探通应转 recovering，得到 %s", got)
 	}
 
 	report(tr, 1, VerdictOK, SourceL2)
@@ -227,18 +226,17 @@ func TestReport_RealSuccessPromotesUnknownToAlive(t *testing.T) {
 	}
 }
 
-// 但**死站**的真实请求成功只能升到 unknown，不能直接 alive。
-// 半开放行（§4.4c）会让真实流量打到死站上，一次成功就宣布痊愈太乐观了。
-func TestReport_RealSuccessOnDeadOnlyReachesUnknown(t *testing.T) {
+// §9.1：持 RecoveryGate 的真实成功让 dead 立即 alive。
+func TestReport_RealSuccessOnDeadGoesAlive(t *testing.T) {
 	tr, fs, _ := newTestTracker(t)
 	fs.s.FailThreshold = 1
-	fs.s.OKThreshold = 2
+	fs.s.OKThreshold = 5
 
 	report(tr, 1, VerdictUnavailable, SourceL2)
 	report(tr, 1, VerdictOK, SourceReal)
 
-	if got := tr.State(1); got != model.StateUnknown {
-		t.Errorf("半开成功应转 unknown 而非直接 alive，得到 %s", got)
+	if got := tr.State(1); got != model.StateAlive {
+		t.Errorf("半开真实成功应立即 alive，得到 %s", got)
 	}
 }
 

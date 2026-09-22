@@ -8,6 +8,7 @@
 import { createApiClient } from './api.mjs';
 import { createProbeFeature, mergeProbeTabs } from './probes.mjs';
 import { createRecentErrorsFeature } from './errors.mjs';
+import { createMigrationFeature } from './migration.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -34,6 +35,7 @@ if (typeof base !== 'function') {
       createProbeFeature(shell, api);
       mergeProbeTabs(shell);
       createRecentErrorsFeature(shell, api);
+      createMigrationFeature(shell, api);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;

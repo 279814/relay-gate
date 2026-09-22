@@ -209,23 +209,62 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 
 // selectFor 选一个候选。allowHalfOpen 仅第一次尝试为 true。
 //
+// recovering 态的 Route 须额外占 RecoveryGate（§9.4 / Lazy §8.11）：拿不到则
+// 跳过该 Route 继续选，不排队。
+//
 // 刻意不写错误响应：重试路径上选不到站**不是**错误 —— 那时手上还捏着
 // 上一次尝试的响应，正确动作是把它交给客户端，而不是回一个 503。
 func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 	exclude map[int64]bool, allowHalfOpen bool) (*router.Candidate, bool, error) {
 
-	cand, err := router.SelectExcluding(pre.snapshot, h.health, pre.inModel, proto, exclude)
-	if err == nil {
-		return cand, false, nil
+	if exclude == nil {
+		exclude = map[int64]bool{}
 	}
-	if !allowHalfOpen {
+	for {
+		cand, err := router.SelectExcluding(pre.snapshot, h.health, pre.inModel, proto, exclude)
+		if err == nil {
+			wrapped, ok := h.wrapRecoveryIfNeeded(cand)
+			if ok {
+				return wrapped, false, nil
+			}
+			exclude[cand.Route.ID] = true
+			cand.Release()
+			continue
+		}
+		if !allowHalfOpen {
+			return nil, false, err
+		}
+		if c := h.halfOpen(pre.snapshot, pre.inModel, proto, pre.settings, err); c != nil {
+			return c, true, nil
+		}
 		return nil, false, err
 	}
-	if c := h.halfOpen(pre.snapshot, pre.inModel, proto, pre.settings, err); c != nil {
-		return c, true, nil
-	}
-	return nil, false, err
 }
+
+// wrapRecoveryIfNeeded takes RecoveryGate when the Route is recovering.
+// ok=false means the gate is busy; caller must Release cand and try another Route.
+func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidate, bool) {
+	if cand == nil || cand.Route == nil {
+		return cand, true
+	}
+	if h.health == nil || h.health.State(cand.Route.ID) != model.StateRecovering {
+		return cand, true
+	}
+	if h.recovery == nil {
+		return cand, true
+	}
+	relGate, ok := h.recovery.TryAcquire(cand.Route.ID)
+	if !ok {
+		return nil, false
+	}
+	rt, up, mn := cand.Route, cand.Upstream, cand.ModelName
+	prevRelease := cand.Release
+	return router.NewCandidate(rt, up, mn, func() {
+		prevRelease()
+		relGate()
+	}), true
+}
+
 
 // dispatch 重建全部出站产物并发出请求。
 //
@@ -283,7 +322,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
-	fwd := &Forwarder{Transport: tr, Timeouts: TimeoutsFrom(realBudget),
+	to := TimeoutsFrom(realBudget)
+	if settings.RetryPolicy.Normalize() == model.RetryPolicyAggressive {
+		to = to.WithAggressivePeek(time.Duration(settings.RealFirstByteSec) * time.Second)
+	}
+	fwd := &Forwarder{Transport: tr, Timeouts: to,
 		RequestHost: target.RequestHost}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会

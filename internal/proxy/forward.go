@@ -28,8 +28,12 @@ import (
 type Timeouts struct {
 	Connect    time.Duration
 	FirstToken time.Duration
-	Idle       time.Duration // 流内两个 chunk 之间的静默上限
-	Total      time.Duration
+	// PeekWait is the pre-commit first-body-byte window (§11.5).
+	// Safe/Balanced use a short bound (2s); Aggressive uses real_first_byte_sec.
+	// Zero means fall back to FirstToken.
+	PeekWait time.Duration
+	Idle     time.Duration // 流内两个 chunk 之间的静默上限
+	Total    time.Duration
 }
 
 // TimeoutsFrom 把 outbound.Budget 投影成转发路径用的四段。
@@ -49,9 +53,25 @@ func TimeoutsFrom(budget outbound.Budget) Timeouts {
 	return Timeouts{
 		Connect:    budget.Connect,
 		FirstToken: firstToken,
+		PeekWait:   2 * time.Second, // §11.5 Safe/Balanced default bound
 		Idle:       budget.IdleTimeout(),
 		Total:      budget.Total,
 	}
+}
+
+// WithAggressivePeek expands the pre-commit first-byte wait to real_first_byte_sec (§11.5).
+func (to Timeouts) WithAggressivePeek(realFirstByte time.Duration) Timeouts {
+	if realFirstByte > 0 {
+		to.PeekWait = realFirstByte
+	}
+	return to
+}
+
+func (to Timeouts) peekWaitOrFirstToken() time.Duration {
+	if to.PeekWait > 0 {
+		return to.PeekWait
+	}
+	return to.FirstToken
 }
 
 // RealTimeouts 是真实请求的四段超时。
@@ -316,7 +336,8 @@ func (at *Attempt) Peek() []byte {
 	// 首 Token 时限与断流唤醒，与 streamBody 用同一套手段：关响应体来
 	// 解开阻塞的 Read（拿不到底层 net.Conn，设不了 ReadDeadline）。
 	var timedOut atomic.Bool
-	timer := time.AfterFunc(f.Timeouts.FirstToken, func() {
+	peekWait := f.Timeouts.peekWaitOrFirstToken()
+	timer := time.AfterFunc(peekWait, func() {
 		timedOut.Store(true)
 		_ = at.resp.Body.Close()
 	})
@@ -363,7 +384,7 @@ func (at *Attempt) Peek() []byte {
 	res.DoneAt = time.Now()
 	switch {
 	case timedOut.Load():
-		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.FirstToken)
+		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.peekWaitOrFirstToken())
 	case at.clientCtx.Err() != nil:
 		res.Err = fmt.Errorf("%w: %v", ErrCanceled, err)
 	case at.ctx.Err() != nil:

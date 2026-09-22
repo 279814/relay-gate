@@ -75,6 +75,20 @@ type Handler struct {
 
 	// recovery 是 P1 RecoveryGate：dead/recovering 半开 single-flight。
 	recovery *health.RecoveryGate
+
+	// countCaps provides per-Route count_tokens Capability (§10.3). Optional.
+	countCaps CountTokensCapability
+}
+
+// CountTokensCapability is the narrow Capability lookup used by count_tokens multi-route (§10.3).
+type CountTokensCapability interface {
+	Effective(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind, expectedToken string) model.CapabilityState
+}
+
+// WithCountTokensCapability injects Capability lookup for multi-route count_tokens.
+func (h *Handler) WithCountTokensCapability(c CountTokensCapability) *Handler {
+	h.countCaps = c
+	return h
 }
 
 // NewHandler 组装透传处理器。

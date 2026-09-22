@@ -229,18 +229,29 @@ func (t *Tracker) applyOK(rs *routeState, rep Report, s model.Settings, now time
 	}
 
 	switch {
-	case rs.state == model.StateDead:
-		// 死站首次探通 → unknown（乐观，立即可承接真实流量）。
-		// 不直接跳 alive 是因为一次成功可能是偶然；但也绝不留在 dead ——
-		// 那会让恢复的站空等第二次探活（§4.4）。
-		rs.state = model.StateUnknown
-
-	case rs.state == model.StateUnknown && rep.Source == SourceReal:
-		// unknown 期间真实请求成功 → 直接 alive。真实请求比探活的
-		// `1+1=?` 有力得多：它带着完整上下文和工具定义都通过了。
+	case rs.state == model.StateDead && rep.Source == SourceReal:
+		// §9.1：持 RecoveryGate 的真实成功让 dead 立即 alive。
 		rs.state = model.StateAlive
 
-	case rs.consecutiveOK >= s.OKThreshold:
+	case rs.state == model.StateDead:
+		// 合成成功：dead → recovering，须再达 OKThreshold 才 alive（§9.1）。
+		rs.state = model.StateRecovering
+
+	case rs.state == model.StateRecovering && rep.Source == SourceReal:
+		// 真实成功权重大于合成：recovering 立即 alive。
+		rs.state = model.StateAlive
+
+	case rs.state == model.StateRecovering && rs.consecutiveOK >= s.OKThreshold:
+		rs.state = model.StateAlive
+
+	case rs.state == model.StateUnknown && rep.Source == SourceReal:
+		// 普通 unknown（从未有负结论）真实成功 → 直接 alive。
+		rs.state = model.StateAlive
+
+	case rs.state == model.StateUnknown && rs.consecutiveOK >= s.OKThreshold:
+		rs.state = model.StateAlive
+
+	case rs.consecutiveOK >= s.OKThreshold && rs.state != model.StateRecovering:
 		rs.state = model.StateAlive
 	}
 }

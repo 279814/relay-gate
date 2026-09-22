@@ -82,9 +82,12 @@ type HealthState string
 
 const (
 	// StateUnknown 视为**可用**（乐观）。重启后全部置此值，否则重启即全站不可用（§2.4）。
+	// 仅用于「从未出现有效负结论」的普通未验证态；由 dead 恢复而来的必须用 recovering（§9.1）。
 	StateUnknown HealthState = "unknown"
 	StateAlive   HealthState = "alive"
 	StateDead    HealthState = "dead"
+	// StateRecovering 是由 dead 经合成成功进入的恢复确认态；真实流量须经 RecoveryGate（§9.1/§9.4）。
+	StateRecovering HealthState = "recovering"
 )
 
 // Defaults 按 M0 实测结论填充零值字段。

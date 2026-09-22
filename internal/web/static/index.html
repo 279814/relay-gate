@@ -738,7 +738,7 @@
                   </div>
                 </div>
 
-                <h3 style="font-size:13px;margin:18px 0 8px">请求内重试（§3.5）</h3>
+                <h3 style="font-size:13px;margin:18px 0 8px">请求内重试（§3.5 / §11）</h3>
                 <div class="row">
                   <div class="field">
                     <label>最大尝试次数</label>
@@ -746,6 +746,18 @@
                            x-model.number="settings.retry_max_attempts">
                     <div class="note"
                          x-text="`含第一次，填 1 = 不重试。上限 ${limits.max_retry_attempts || 5} —— 这是一次客户端请求最多向上游发几次完整请求，每次都可能真的消耗 token`"></div>
+                  </div>
+                  <div class="field">
+                    <label>重试策略</label>
+                    <select x-model="settings.retry_policy">
+                      <option value="safe">safe（仅未写入证据）</option>
+                      <option value="balanced">balanced（默认）</option>
+                      <option value="aggressive">aggressive</option>
+                    </select>
+                    <div class="note warn" x-show="settings.retry_policy === 'aggressive'">
+                      Aggressive 会把提交前首字节等待扩大到 real_first_byte_sec，
+                      从而延迟响应头发出，且可能对上游重复执行请求。
+                    </div>
                   </div>
                 </div>
 
@@ -883,7 +895,7 @@
           <div>
             <div class="bar">
               <strong>Upstream Endpoints</strong>
-              <span class="dim">migration-only legacy 只读；P0 不能确认/清除 NeedsReview</span>
+              <span class="dim">legacy NeedsReview：确认后转为 canonical（须显式 URL）</span>
               <span class="grow"></span>
               <button class="primary" @click="endpointForm = { upstream_id: '', endpoint: 'messages', url_mode: 'canonical', url_override: '', fixed_query_template: '', auth_profile: {} }">新增 Endpoint</button>
               <button @click="loadEndpoints(true)">刷新</button>
@@ -900,7 +912,8 @@
                     <td>
                       <span class="tag warn" x-show="f(ep,'needs_review','NeedsReview')"
                             x-text="'needs_review'"></span>
-                      <span class="dim" x-show="f(ep,'needs_review','NeedsReview')">P1 提供转换</span>
+                      <button class="sm" x-show="f(ep,'needs_review','NeedsReview')"
+                              @click="confirmEndpointReview(ep)">确认审核</button>
                     </td>
                     <td><button class="sm" @click="endpointForm = { id: f(ep,'id','ID'), upstream_id: f(ep,'upstream_id','UpstreamID'), endpoint: f(ep,'endpoint','Endpoint'), url_mode: f(ep,'url_mode','URLMode') || 'canonical', url_override: f(ep,'url_override','URLOverride') || '', fixed_query_template: f(ep,'fixed_query_template','FixedQueryTemplate') || '', auth_profile: f(ep,'auth_profile','AuthProfile') || {}, revision: f(ep,'revision','Revision') || 0 }">编辑</button></td>
                   </tr>

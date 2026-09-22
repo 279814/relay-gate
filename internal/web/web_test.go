@@ -88,6 +88,7 @@ func TestHandler_DoesNotRequireAuth(t *testing.T) {
 		{"/admin/", http.StatusOK},
 		{"/admin/app.js", http.StatusOK},
 		{"/admin/js/boot.mjs", http.StatusOK},
+		{"/admin/js/migration.mjs", http.StatusOK},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
@@ -109,7 +110,8 @@ func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 		"static/js/probes.mjs": true,
 		"static/js/modal.mjs":  true,
 		"static/js/boot.mjs":   true,
-		"static/js/errors.mjs": true,
+		"static/js/errors.mjs":     true,
+		"static/js/migration.mjs":  true,
 	}
 	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
