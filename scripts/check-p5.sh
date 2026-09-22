@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # P5 release validation gate（离线）：schema 6 终态、Keyring、备份拒绝门、
-# 安全扫描不改字节、Transform 未绑定透传、RecoveryGate single-flight。
+# 安全扫描不改字节、Transform 未绑定透传、RecoveryGate single-flight、
+# IP 证书续期可观测（fake RenewWatch；不冒充真实公网签发）。
 # 不覆盖公网证书签发或多日 soak——那些不得在本脚本里冒充通过。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
