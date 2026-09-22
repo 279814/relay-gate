@@ -1,5 +1,7 @@
 package transform
 
+import "fmt"
+
 // PersistSink stores the full transform snapshot (SQLite).
 type PersistSink interface {
 	SaveTransformSnapshot(sets []Set, bindings []Binding) error
@@ -57,9 +59,9 @@ func (r *Registry) LoadFromPersist() error {
 	return nil
 }
 
-func (r *Registry) flushLocked() {
+func (r *Registry) flushLocked() error {
 	if r.persist == nil {
-		return
+		return nil
 	}
 	sets := make([]Set, 0, len(r.sets))
 	for _, s := range r.sets {
@@ -69,5 +71,8 @@ func (r *Registry) flushLocked() {
 	for _, b := range r.bindings {
 		bindings = append(bindings, *cloneBinding(b))
 	}
-	_ = r.persist.SaveTransformSnapshot(sets, bindings)
+	if err := r.persist.SaveTransformSnapshot(sets, bindings); err != nil {
+		return fmt.Errorf("persist transform snapshot: %w", err)
+	}
+	return nil
 }
