@@ -119,6 +119,42 @@ func TestTransformAPI_PublishRollback(t *testing.T) {
 	}
 }
 
+func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
+	reg := transform.NewRegistry(20)
+	s := New(nil, nil).WithTransformRegistry(reg)
+	h := s.Routes("pw")
+
+	raise := httptest.NewRequest(http.MethodPut, "/admin/api/transforms/budgets",
+		bytes.NewReader([]byte(`{"request_ms":80,"sse_event_ms":10,"confirm_raise":false}`)))
+	raise.Header.Set("Authorization", "Bearer pw")
+	raise.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, raise)
+	if w.Code == http.StatusOK {
+		t.Fatalf("raise without confirm should fail: %s", w.Body.String())
+	}
+
+	ok := httptest.NewRequest(http.MethodPut, "/admin/api/transforms/budgets",
+		bytes.NewReader([]byte(`{"request_ms":80,"sse_event_ms":10,"confirm_raise":true}`)))
+	ok.Header.Set("Authorization", "Bearer pw")
+	ok.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, ok)
+	if w.Code != http.StatusOK {
+		t.Fatalf("raise confirm=%d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Budgets transform.BudgetLimits  `json:"budgets"`
+		Audit   []transform.BudgetAudit `json:"audit"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Budgets.RequestMs != 80 || len(body.Audit) == 0 || body.Audit[0].Action != "raise_budget" {
+		t.Fatalf("body=%+v", body)
+	}
+}
+
 func itoa64(v int64) string {
 	return jsonNumber(v)
 }

@@ -104,6 +104,8 @@ func (s *Server) Routes(adminPW string) http.Handler {
 
 	mux.HandleFunc("GET /admin/api/transforms", s.listTransformSets)
 	mux.HandleFunc("POST /admin/api/transforms", s.createTransformSet)
+	mux.HandleFunc("GET /admin/api/transforms/budgets", s.getTransformBudgets)
+	mux.HandleFunc("PUT /admin/api/transforms/budgets", s.putTransformBudgets)
 	mux.HandleFunc("GET /admin/api/transforms/{id}", s.getTransformSet)
 	mux.HandleFunc("PUT /admin/api/transforms/{id}/draft", s.putTransformDraft)
 	mux.HandleFunc("POST /admin/api/transforms/{id}/preview", s.postTransformPreview)

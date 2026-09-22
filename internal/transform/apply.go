@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RequestInput is the outbound request after Endpoint URL/auth/model mapping.
@@ -75,8 +76,22 @@ func (c *Compiled) ApplyRequestSecrets(in RequestInput, secrets SecretMap) Reque
 		Taint:      &sec.taint,
 	}
 	savedAuth := snapshotProtected(out.Header)
+	budget := c.reqBudget
+	if budget == 0 {
+		budget = time.Duration(DefaultRequestBudgetMs) * time.Millisecond
+	}
+	deadline := time.Now().Add(budget)
 
 	for i, rule := range c.Version.Rules {
+		if err := checkBudget(deadline); err != nil {
+			out.Err = err
+			out.Header = cloneHeader(in.Header)
+			out.Body = append([]byte(nil), in.Body...)
+			out.Changed = false
+			out.HitRules = nil
+			restoreProtected(out.Header, savedAuth)
+			return out
+		}
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate:
@@ -210,7 +225,20 @@ func (c *Compiled) ApplyResponseSecrets(in ResponseInput, secrets SecretMap) Res
 		return out
 	}
 	saved := snapshotProtected(out.Header)
+	budget := c.reqBudget
+	if budget == 0 {
+		budget = time.Duration(DefaultRequestBudgetMs) * time.Millisecond
+	}
+	deadline := time.Now().Add(budget)
 	for i, rule := range c.Version.Rules {
+		if err := checkBudget(deadline); err != nil {
+			out.Err = err
+			out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
+			out.Changed = false
+			out.HitRules = nil
+			restoreProtected(out.Header, saved)
+			return out
+		}
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate, KindSetStatus:
@@ -317,7 +345,15 @@ func (c *Compiled) ApplySSEEvent(ev SSEEvent) (SSEEvent, []string, bool, error) 
 	out := ev
 	var hits []string
 	synthetic := false
+	budget := c.sseBudget
+	if budget == 0 {
+		budget = time.Duration(DefaultSSEBudgetMs) * time.Millisecond
+	}
+	deadline := time.Now().Add(budget)
 	for i, rule := range c.Version.Rules {
+		if err := checkBudget(deadline); err != nil {
+			return ev, hits, false, err
+		}
 		switch rule.Kind {
 		case KindSSEMatch:
 			if rule.Match != "" && ev.Event != rule.Match && rule.Match != "*" {

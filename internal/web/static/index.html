@@ -783,6 +783,18 @@
               </div>
               <button class="primary" @click="createTransformSet()">创建</button>
             </div>
+            <div class="row" style="margin-bottom:12px;gap:12px;align-items:flex-end">
+              <div class="field" style="max-width:140px">
+                <label>请求/响应预算 ms</label>
+                <input type="number" min="1" max="5000" x-model.number="transforms.budgetRequestMs">
+              </div>
+              <div class="field" style="max-width:140px">
+                <label>SSE 事件预算 ms</label>
+                <input type="number" min="1" max="5000" x-model.number="transforms.budgetSSEMs">
+              </div>
+              <button @click="saveTransformBudgets()">保存预算</button>
+              <span class="dim">提高需二次确认并审计</span>
+            </div>
             <div class="row" style="align-items:flex-start;gap:16px">
               <div style="min-width:220px;max-width:280px">
                 <table>
@@ -882,6 +894,21 @@
                   </tr>
                 </template>
                 <tr x-show="!(transforms.executions || []).length"><td colspan="5" class="empty">暂无执行记录</td></tr>
+              </tbody>
+            </table>
+            <h3 style="font-size:13px;margin:18px 0 8px">预算审计</h3>
+            <table>
+              <thead><tr><th>时间</th><th>动作</th><th>详情</th><th>确认提高</th></tr></thead>
+              <tbody>
+                <template x-for="(a, idx) in (transforms.budgetAudit || [])" :key="idx">
+                  <tr>
+                    <td class="mono" x-text="a.at"></td>
+                    <td x-text="a.action"></td>
+                    <td class="wrap" x-text="a.detail"></td>
+                    <td x-text="a.confirmed_raise ? 'yes' : 'no'"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(transforms.budgetAudit || []).length"><td colspan="4" class="empty">暂无</td></tr>
               </tbody>
             </table>
           </div>

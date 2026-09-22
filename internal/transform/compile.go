@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -33,7 +34,12 @@ func Compile(v Version) (*Compiled, error) {
 		return nil, fmt.Errorf("invalid res_fail_policy %q", v.ResFailPolicy)
 	}
 
-	out := &Compiled{Version: v, regex: make(map[int]*regexp.Regexp)}
+	out := &Compiled{
+		Version:   v,
+		regex:     make(map[int]*regexp.Regexp),
+		reqBudget: time.Duration(DefaultRequestBudgetMs) * time.Millisecond,
+		sseBudget: time.Duration(DefaultSSEBudgetMs) * time.Millisecond,
+	}
 	for i, rule := range v.Rules {
 		if err := validateRule(i, rule); err != nil {
 			return nil, err
