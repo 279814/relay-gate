@@ -87,6 +87,10 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/probe-cost", s.getProbeCost)
 	mux.HandleFunc("GET /admin/api/probe-costs", s.listProbeCosts)
 
+	mux.HandleFunc("GET /admin/api/security/findings", s.listSecurityFindings)
+	mux.HandleFunc("POST /admin/api/security/scan", s.postSecurityScan)
+	mux.HandleFunc("POST /admin/api/security/canary", s.postSecurityCanary)
+
 	guarded := s.requireAdmin(mux)
 
 	// 会话端点挂在鉴权**之外**。

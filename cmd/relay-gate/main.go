@@ -26,6 +26,7 @@ import (
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/web"
 )
@@ -252,6 +253,7 @@ func runServer() error {
 		WithInvalidator(sched).
 		WithRunState(runCtrl).
 		WithProbeAdmin(probeAdmin).
+		WithSecurityCenter(security.NewCenter(500)).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 
