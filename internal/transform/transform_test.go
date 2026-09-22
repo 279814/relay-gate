@@ -3,6 +3,7 @@ package transform
 import (
 	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -220,5 +221,29 @@ func TestSetJSONPointer_TopLevelOffset(t *testing.T) {
 	}
 	if !bytes.Contains(out.Body, []byte(`"keep":1`)) {
 		t.Fatalf("remarshaled unexpectedly: %s", out.Body)
+	}
+}
+
+func TestResponse_ReplaceBytesHonorsAddedBudget(t *testing.T) {
+	// From is one byte; To is large enough that many matches exceed MaxAddedBytes.
+	to := strings.Repeat("Z", 64*1024)
+	from := "a"
+	body := []byte(strings.Repeat(from, 64)) // 64 matches → ~4 MiB expansion > 1 MiB budget
+	c, err := Compile(Version{
+		ResFailPolicy: FailClosed,
+		Rules:         []Rule{{Kind: KindReplaceBytes, From: from, To: to}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := c.ApplyResponse(ResponseInput{Status: 200, Body: body})
+	if out.Err == nil {
+		t.Fatal("expected replace_bytes added-byte budget error")
+	}
+	if !strings.Contains(out.Err.Error(), "would add") {
+		t.Fatalf("err=%v", out.Err)
+	}
+	if !bytes.Equal(out.Body, body) {
+		t.Fatal("fail_closed must restore original body")
 	}
 }

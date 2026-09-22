@@ -289,7 +289,13 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *
 		if !bytes.Contains(out.Body, []byte(rule.From)) {
 			return nil
 		}
-		out.Body = bytes.ReplaceAll(out.Body, []byte(rule.From), []byte(rule.To))
+		n := bytes.Count(out.Body, []byte(rule.From))
+		repl := []byte(rule.To)
+		added := n * (len(repl) - len(rule.From))
+		if added > MaxAddedBytes {
+			return fmt.Errorf("replace_bytes would add %d bytes", added)
+		}
+		out.Body = bytes.ReplaceAll(out.Body, []byte(rule.From), repl)
 		out.HitRules = append(out.HitRules, name)
 	case KindSetJSONPointer:
 		val, err := sec.resolveRuleValue(rule)
@@ -299,6 +305,9 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *
 		next, err := setJSONPointerOffset(out.Body, rule.Name, val)
 		if err != nil {
 			return err
+		}
+		if int64(len(next))-int64(len(out.Body)) > MaxAddedBytes {
+			return fmt.Errorf("json pointer rewrite exceeds added-byte budget")
 		}
 		out.Body = next
 		out.HitRules = append(out.HitRules, name)
