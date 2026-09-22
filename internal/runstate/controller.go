@@ -40,17 +40,17 @@ const (
 // State/Revision 是持久化用户意图（仅 running|paused）。Maintenance 是内部
 // 叠加态（§4.4），不写库、不覆盖 paused。
 type Snapshot struct {
-	State             model.RunState `json:"state"`
-	Revision          int64          `json:"revision"`
-	Maintenance       bool           `json:"maintenance"`
-	MaintenanceReason string         `json:"maintenance_reason,omitempty"`
+	State             model.RunState  `json:"state"`
+	Revision          int64           `json:"revision"`
+	Maintenance       bool            `json:"maintenance"`
+	MaintenanceReason string          `json:"maintenance_reason,omitempty"`
 	Warmup            *WarmupProgress `json:"warmup,omitempty"`
 }
 
 // WarmupProgress 是 resume 后的暖机视图（§13.5）。
 type WarmupProgress struct {
 	Active   bool `json:"active"`
-	Pending  int  `json:"pending"`  // 仍为 unknown、待复核
+	Pending  int  `json:"pending"` // 仍为 unknown、待复核
 	Alive    int  `json:"alive"`
 	Negative int  `json:"negative"` // dead/recovering/cooldown 等负状态
 	Total    int  `json:"total"`

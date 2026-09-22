@@ -342,4 +342,3 @@ func TestController_WarmupAfterResume(t *testing.T) {
 		t.Fatalf("pending=0 后暖机应结束: %+v", cleared.Warmup)
 	}
 }
-

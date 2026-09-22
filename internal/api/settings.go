@@ -72,9 +72,9 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{
-		"state":      string(snap.State),
-		"effective":  snap.Effective(),
-		"revision":   snap.Revision,
+		"state":       string(snap.State),
+		"effective":   snap.Effective(),
+		"revision":    snap.Revision,
 		"maintenance": snap.Maintenance,
 	}
 	if snap.MaintenanceReason != "" {
