@@ -17,6 +17,7 @@ import (
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/transform"
 )
 
 // MaxRequestBody 是入站 body 上限。
@@ -63,6 +64,9 @@ type Handler struct {
 
 	// security 被动扫描旁路。可为 nil。
 	security *security.Observer
+
+	// transforms provides published declarative transforms (§15). Optional.
+	transforms *transform.Registry
 
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
@@ -121,6 +125,12 @@ func NewHandler(cfg ConfigSource, healthView router.HealthView,
 // WithSecurityObserver injects the P3 passive scan observer (optional).
 func (h *Handler) WithSecurityObserver(o *security.Observer) *Handler {
 	h.security = o
+	return h
+}
+
+// WithTransforms injects the P4 declarative transform registry (optional).
+func (h *Handler) WithTransforms(reg *transform.Registry) *Handler {
+	h.transforms = reg
 	return h
 }
 

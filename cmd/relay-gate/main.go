@@ -169,6 +169,11 @@ func runServer() error {
 	secObs := security.NewObserver(secCenter, 64, log)
 	defer secObs.Close()
 
+	xform := transform.NewRegistry(500).WithPersist(st)
+	if err := xform.LoadFromPersist(); err != nil {
+		return fmt.Errorf("加载 transform 快照: %w", err)
+	}
+
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
 		WithTargets(targets, st).
 		WithTransports(transports).
@@ -176,7 +181,8 @@ func runServer() error {
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
-		WithSecurityObserver(secObs)
+		WithSecurityObserver(secObs).
+		WithTransforms(xform)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer transports.CloseIdleConnections()
 
@@ -300,7 +306,7 @@ func runServer() error {
 		WithProbeAdmin(probeAdmin).
 		WithSecurityCenter(secCenter).
 		WithAlertMailer(mailer).
-		WithTransformRegistry(transform.NewRegistry(500)).
+		WithTransformRegistry(xform).
 		WithCredentials(credSvc, kr).
 		Routes(cfg.AdminPW))
 	fwd.Routes(mux)

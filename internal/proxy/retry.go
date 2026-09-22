@@ -12,6 +12,7 @@ import (
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/transform"
 )
 
 // 请求内重试（§3.5）。
@@ -314,6 +315,43 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, false
+	}
+
+	// Published binding only; unbound → passthrough (§15.1).
+	if h.transforms != nil && target.EndpointID != 0 {
+		compiled, verID, terr := h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
+		if terr != nil {
+			h.log.Error("加载 transform 失败", "err", terr, "route", cand.Route.ID)
+			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "转换配置错误")
+			return nil, false
+		}
+		if compiled != nil {
+			beforeBody := outBody
+			tr := compiled.ApplyRequest(transform.RequestInput{Header: outHeader, Body: outBody})
+			if tr.Err != nil && tr.PolicyUsed == transform.FailClosed {
+				h.transforms.RecordExecution(transform.ExecutionRecord{
+					RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: verID,
+					Mode: "published", Phase: "request", OK: false, Error: tr.Err.Error(),
+					FailPolicyUsed: tr.PolicyUsed, InputHash: transform.HashBytes(beforeBody),
+				})
+				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")
+				return nil, false
+			}
+			outHeader, outBody = tr.Header, tr.Body
+			if tr.Changed || tr.Err != nil {
+				errText := ""
+				if tr.Err != nil {
+					errText = tr.Err.Error()
+				}
+				h.transforms.RecordExecution(transform.ExecutionRecord{
+					RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: verID,
+					Mode: "published", Phase: "request", OK: tr.Err == nil,
+					HitRules: tr.HitRules, FailPolicyUsed: tr.PolicyUsed,
+					InputHash: transform.HashBytes(beforeBody), OutputHash: transform.HashBytes(outBody),
+					Error: errText,
+				})
+			}
+		}
 	}
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)

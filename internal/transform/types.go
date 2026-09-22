@@ -138,8 +138,8 @@ type Compiled struct {
 	regex   map[int]*regexp.Regexp // rule index → compiled RE2
 }
 
-// Registry holds in-process sets, bindings, and execution records (P4 core;
-// SQLite persistence deferred).
+// Registry holds in-process sets, bindings, and execution records.
+// Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
 	mu       sync.RWMutex
 	sets     map[int64]*Set
@@ -149,6 +149,7 @@ type Registry struct {
 	nextVer  atomic.Int64
 	execSeq  atomic.Uint64
 	execCap  int
+	persist  PersistSink
 }
 
 // NewRegistry constructs an empty transform registry.
