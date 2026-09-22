@@ -32,9 +32,13 @@ const (
 	KindRenameHeader   = "rename_header"
 	KindReplaceBytes   = "replace_bytes"
 	KindSetJSONPointer = "set_json_pointer"
-	KindSetStatus      = "set_status"
-	KindSSEMatch       = "sse_match"
-	KindSSEAppendEnd   = "sse_append_end" // synthetic completion
+	// JSON Patch subset (§15.4): add / remove / copy. No move/test/script ops.
+	KindJSONPatchAdd    = "json_patch_add"
+	KindJSONPatchRemove = "json_patch_remove"
+	KindJSONPatchCopy   = "json_patch_copy"
+	KindSetStatus       = "set_status"
+	KindSSEMatch        = "sse_match"
+	KindSSEAppendEnd    = "sse_append_end" // synthetic completion
 )
 
 // FailPolicy for apply failures.
