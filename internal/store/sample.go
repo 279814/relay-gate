@@ -15,6 +15,7 @@ import (
 //
 // 调用方（sample.Recorder）已在后台单 goroutine 里，所以这里不必再考虑并发；
 // 但**必须假设 body 已脱敏** —— 本函数不做脱敏，那是 sample 包的职责。
+// Body BLOBs are stored as v1 envelopes when a Cipher is configured.
 func (s *Store) InsertSample(smp *model.Sample) error {
 	inH, err := marshalJSONHeaders(smp.InHeaders)
 	if err != nil {
@@ -25,6 +26,19 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 		return err
 	}
 	respH, err := marshalJSONHeaders(smp.RespHeaders)
+	if err != nil {
+		return err
+	}
+
+	inBody, err := s.encryptSampleBody(smp.InBody)
+	if err != nil {
+		return err
+	}
+	outBody, err := s.encryptSampleBody(smp.OutBody)
+	if err != nil {
+		return err
+	}
+	respBody, err := s.encryptSampleBody(smp.RespBody)
 	if err != nil {
 		return err
 	}
@@ -41,9 +55,9 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 		smp.ReqID,
 		smp.TSRecv, smp.TSSent, smp.TSFirstByte, smp.TSDone,
 		smp.Endpoint, smp.ModelIn, smp.ModelOut, smp.ModelNameID, smp.RouteID, smp.UpstreamID,
-		smp.InMethod, smp.InPath, smp.InQuery, inH, smp.InBody,
-		smp.OutURL, outH, smp.OutBody,
-		smp.RespStatus, respH, smp.RespBody,
+		smp.InMethod, smp.InPath, smp.InQuery, inH, inBody,
+		smp.OutURL, outH, outBody,
+		smp.RespStatus, respH, respBody,
 		string(smp.Outcome), smp.Error, int(smp.Truncated), smp.Pinned)
 	if err != nil {
 		return fmt.Errorf("写入样本: %w", err)
@@ -59,16 +73,17 @@ const sampleCols = `id, req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
 	resp_status, resp_headers, resp_body,
 	outcome, error, truncated, pinned`
 
-func scanSample(sc interface{ Scan(...any) error }) (*model.Sample, error) {
+func scanSample(sc interface{ Scan(...any) error }, cipher *Cipher) (*model.Sample, error) {
 	var s model.Sample
 	var inH, outH, respH string
+	var inBody, outBody, respBody []byte
 	var outcome string
 	var trunc int
 	if err := sc.Scan(&s.ID, &s.ReqID, &s.TSRecv, &s.TSSent, &s.TSFirstByte, &s.TSDone,
 		&s.Endpoint, &s.ModelIn, &s.ModelOut, &s.ModelNameID, &s.RouteID, &s.UpstreamID,
-		&s.InMethod, &s.InPath, &s.InQuery, &inH, &s.InBody,
-		&s.OutURL, &outH, &s.OutBody,
-		&s.RespStatus, &respH, &s.RespBody,
+		&s.InMethod, &s.InPath, &s.InQuery, &inH, &inBody,
+		&s.OutURL, &outH, &outBody,
+		&s.RespStatus, &respH, &respBody,
 		&outcome, &s.Error, &trunc, &s.Pinned); err != nil {
 		return nil, err
 	}
@@ -84,6 +99,15 @@ func scanSample(sc interface{ Scan(...any) error }) (*model.Sample, error) {
 	}
 	if s.RespHeaders, err = unmarshalJSONHeaders(respH); err != nil {
 		return nil, fmt.Errorf("样本 %d 的 resp_headers: %w", s.ID, err)
+	}
+	if s.InBody, err = decryptSampleBody(cipher, inBody); err != nil {
+		return nil, fmt.Errorf("样本 %d 的 in_body: %w", s.ID, err)
+	}
+	if s.OutBody, err = decryptSampleBody(cipher, outBody); err != nil {
+		return nil, fmt.Errorf("样本 %d 的 out_body: %w", s.ID, err)
+	}
+	if s.RespBody, err = decryptSampleBody(cipher, respBody); err != nil {
+		return nil, fmt.Errorf("样本 %d 的 resp_body: %w", s.ID, err)
 	}
 	return &s, nil
 }
@@ -176,7 +200,7 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 
 func (s *Store) GetSample(id int64) (*model.Sample, error) {
 	row := s.db.QueryRow(`SELECT `+sampleCols+` FROM sample WHERE id = ?`, id)
-	smp, err := scanSample(row)
+	smp, err := scanSample(row, s.cipher)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -268,4 +292,81 @@ func unmarshalJSONHeaders(raw string) (http.Header, error) {
 		return nil, err
 	}
 	return h, nil
+}
+
+func (s *Store) encryptSampleBody(plain []byte) ([]byte, error) {
+	if s.cipher == nil {
+		return plain, nil
+	}
+	return s.cipher.EncryptSampleBlob(plain)
+}
+
+func decryptSampleBody(cipher *Cipher, raw []byte) ([]byte, error) {
+	if cipher == nil {
+		return append([]byte(nil), raw...), nil
+	}
+	return cipher.DecryptSampleBlob(raw)
+}
+
+// MigrateSampleEnvelopes rewrites legacy plaintext sample body BLOBs into v1
+// envelopes in place. Rows are never deleted; already-enveloped fields are left
+// alone. Returns the number of rows that had at least one field rewritten.
+func (s *Store) MigrateSampleEnvelopes() (int64, error) {
+	if s.cipher == nil {
+		return 0, fmt.Errorf("sample envelope migration requires Cipher")
+	}
+	rows, err := s.db.Query(`SELECT id, in_body, out_body, resp_body FROM sample`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type row struct {
+		id                     int64
+		in, out, resp          []byte
+		needIn, needOut, needR bool
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.in, &r.out, &r.resp); err != nil {
+			return 0, err
+		}
+		r.needIn = len(r.in) > 0 && !IsSampleEnvelope(r.in)
+		r.needOut = len(r.out) > 0 && !IsSampleEnvelope(r.out)
+		r.needR = len(r.resp) > 0 && !IsSampleEnvelope(r.resp)
+		if r.needIn || r.needOut || r.needR {
+			todo = append(todo, r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var migrated int64
+	for _, r := range todo {
+		in, out, resp := r.in, r.out, r.resp
+		var err error
+		if r.needIn {
+			if in, err = s.cipher.EncryptSampleBlob(r.in); err != nil {
+				return migrated, fmt.Errorf("encrypt sample %d in_body: %w", r.id, err)
+			}
+		}
+		if r.needOut {
+			if out, err = s.cipher.EncryptSampleBlob(r.out); err != nil {
+				return migrated, fmt.Errorf("encrypt sample %d out_body: %w", r.id, err)
+			}
+		}
+		if r.needR {
+			if resp, err = s.cipher.EncryptSampleBlob(r.resp); err != nil {
+				return migrated, fmt.Errorf("encrypt sample %d resp_body: %w", r.id, err)
+			}
+		}
+		if _, err := s.db.Exec(`UPDATE sample SET in_body=?, out_body=?, resp_body=? WHERE id=?`,
+			in, out, resp, r.id); err != nil {
+			return migrated, fmt.Errorf("update sample %d: %w", r.id, err)
+		}
+		migrated++
+	}
+	return migrated, nil
 }
