@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,13 +41,28 @@ import (
 var version = "dev"
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "启动失败：%v\n", err)
-		os.Exit(1)
+	code := runMain(os.Args, os.Stdin, os.Stdout, os.Stderr)
+	if code != 0 {
+		os.Exit(code)
 	}
 }
 
-func run() error {
+// runMain 是可测入口：在打开 Store / 监听端口之前识别 probe 子命令。
+func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 1 {
+		switch args[1] {
+		case "probe-one", "probe-matrix":
+			return runProbeCLI(args[1:], stdin, stdout, stderr, probeCLIDeps{})
+		}
+	}
+	if err := runServer(); err != nil {
+		fmt.Fprintf(stderr, "启动失败：%v\n", err)
+		return exitFail
+	}
+	return exitOK
+}
+
+func runServer() error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg, err := config.Load()

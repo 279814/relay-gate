@@ -1,23 +1,26 @@
-# M0 上游能力探测输入模板
+# P0 上游能力探测输入模板（由 relay-gate probe-one / probe-matrix 消费）
 #
 # 复制为 upstreams.tsv 后填写（该文件名已在 .gitignore 中，不会进版本库）：
 #     cp scripts/upstreams.example.tsv scripts/upstreams.tsv
 #
-# 字段用 Tab 分隔（不是空格）。# 开头为注释，空行忽略。
+# 字段用 Tab 分隔（不是空格）。# 开头为注释，空行忽略。CRLF 可接受。
 #
-# 1 名称        中转站标识。**一个物理站一行**，不要按模型拆行
-# 2 base_url    根地址，不要带 /v1。例：https://api.example.com
-# 3 api_key     该站的 key
-# 4 claude模型  该站能用的 claude 模型名，**多个用英文逗号分隔**；没有就填 -
-# 5 gpt模型     该站能用的 gpt 模型名，**多个用英文逗号分隔**；没有就填 -
-# 6 已知状态    你的判断：好用 / 挂了 / 不稳 / 不确定。用于交叉验证脚本结论
+# 在线执行（会产生真实费用，内容发往第三方站点）：
+#   relay-gate probe-matrix --online --accept-probe-cost \
+#     --input scripts/upstreams.tsv \
+#     --output .local/p0/reports/out.json \
+#     --report .local/p0/reports/out.md
+#   # 若重放 control fixture，另加：
+#   #   --control-manifest .local/p0/controls/manifest.json --accept-control-replay
 #
-# 模型名必须是你在该站实际能用的原名（含 -thinking、[1M] 等后缀），脚本只测你写的这些。
+# 或：bash scripts/probe-all.sh scripts/upstreams.tsv
 #
-# 关于 "-"：填 - 表示该站没有这类模型，脚本跳过相关检查、结论记 n/a 且不计入统计。
-#   纯 claude 站  → 第 5 列填 -
-#   纯 gpt 站     → 第 4 列填 -（脚本自动改在 chat/completions 上探鉴权与流式）
-#   两列都填 -    → 报错退出，至少要给一个
+# 1 名称        中转站 alias（唯一）。**一个物理站一行**
+# 2 base_url    根地址，不要带 /v1
+# 3 api_key     该站的 key（只经 TSV/stdin 进入进程，勿当 CLI 参数传递）
+# 4 claude模型  逗号分隔；没有填 -
+# 5 gpt模型     逗号分隔；没有填 -
+# 6 已知状态    好用 / 挂了 / 不稳 / 不确定（交叉验证用）
 #
 # 名称	base_url	api_key	claude模型名	gpt模型名	已知状态
 站A	https://api.a.com	sk-xxx	claude-opus-5,claude-fable-5	gpt-5.6-sol	好用
