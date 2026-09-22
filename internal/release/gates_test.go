@@ -11,13 +11,33 @@ import (
 	"net/http"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/279814/relay-gate/internal/acmeip"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
+
+// releaseRenewBot is a minimal fake for §23 renew observability (no public cert).
+type releaseRenewBot struct{}
+
+func (releaseRenewBot) RenewIP(ip string) (string, string, time.Time, error) {
+	return "CERT:" + ip, "KEY:" + ip, time.Now().UTC().Add(160 * time.Hour), nil
+}
+
+func (releaseRenewBot) Validate(certPEM, keyPEM, expectIP string) error {
+	if !bytes.Contains([]byte(certPEM), []byte(expectIP)) {
+		return errors.New("SAN missing IP")
+	}
+	return nil
+}
+
+type releaseReloader struct{}
+
+func (releaseReloader) Reload() error { return nil }
 
 func TestEmptyDBOpensAsSchema6(t *testing.T) {
 	dir := t.TempDir()
@@ -177,4 +197,21 @@ func TestRecoveryGateSingleFlight(t *testing.T) {
 		t.Fatal("after release should succeed")
 	}
 	release3()
+}
+
+func TestIPCertRenewObservability(t *testing.T) {
+	w := acmeip.NewRenewWatch(releaseRenewBot{}, releaseReloader{}, "203.0.113.80", acmeip.DefaultLowValidity)
+	if err := w.TryRenew(); err != nil {
+		t.Fatal(err)
+	}
+	snap := w.Snapshot()
+	if snap["renew_successes"] != 1 {
+		t.Fatalf("renew_successes=%v", snap["renew_successes"])
+	}
+	if snap["alert_low_validity"] != false {
+		t.Fatalf("160h remaining must not alert: %+v", snap)
+	}
+	if snap["not_after"] == "" {
+		t.Fatal("not_after must be observable")
+	}
 }
