@@ -153,8 +153,8 @@ func TestOpenUsesVersionedRunnerAndKeepsLifecycleLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Version != 4 {
-		t.Fatalf("Open state = %+v, want schema 4", state)
+	if state.Version != 5 {
+		t.Fatalf("Open state = %+v, want schema 5", state)
 	}
 	if _, err := Open(path, cipher); !errors.Is(err, ErrInstanceLocked) {
 		t.Fatalf("second Open error = %v, want ErrInstanceLocked", err)
@@ -171,7 +171,7 @@ func TestOpenUsesVersionedRunnerAndKeepsLifecycleLock(t *testing.T) {
 	}
 }
 
-func TestKnownLegacyVariantsReachSchemaFour(t *testing.T) {
+func TestKnownLegacyVariantsReachSchemaFive(t *testing.T) {
 	for _, variant := range []legacySchemaVariant{
 		legacySchemaM2,
 		legacySchemaM6PreColumn,
@@ -198,15 +198,15 @@ func TestKnownLegacyVariantsReachSchemaFour(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if state.Version != 4 {
+			if state.Version != 5 {
 				t.Fatalf("state = %+v", state)
 			}
 			manifests, err := filepath.Glob(filepath.Join(filepath.Dir(path), "backups", "schema-*-to-*", "manifest.json"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(manifests) != 4 {
-				t.Fatalf("backup manifests = %d, want one per boundary (0→1,1→2,2→3,3→4)", len(manifests))
+			if len(manifests) != 5 {
+				t.Fatalf("backup manifests = %d, want one per boundary (0→1,1→2,2→3,3→4,4→5)", len(manifests))
 			}
 		})
 	}

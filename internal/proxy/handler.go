@@ -15,6 +15,7 @@ import (
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -59,6 +60,9 @@ type Handler struct {
 
 	// logs 接收逐次尝试的请求日志。可为 nil（不记日志）。
 	logs LogSink
+
+	// security 被动扫描旁路。可为 nil。
+	security *security.Observer
 
 	// relayKeys 是入站合法凭据集合。
 	relayKeys map[string]bool
@@ -112,6 +116,12 @@ func NewHandler(cfg ConfigSource, healthView router.HealthView,
 		transports: outbound.NewManager(),
 		recovery:   health.NewRecoveryGate(),
 	}
+}
+
+// WithSecurityObserver injects the P3 passive scan observer (optional).
+func (h *Handler) WithSecurityObserver(o *security.Observer) *Handler {
+	h.security = o
+	return h
 }
 
 // WithRecoveryGate 注入共享 RecoveryGate（可选；默认 NewHandler 已自建）。
@@ -393,6 +403,22 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	if oc.respTee != nil {
 		h.recordSample(r, proto, oc, recvAt, pre.inModel, pre.body, pre.settings)
+	}
+	if h.security != nil && oc.secTee != nil {
+		upName := ""
+		if oc.cand != nil && oc.cand.Upstream != nil {
+			upName = oc.cand.Upstream.Name
+		}
+		var routeID int64
+		if oc.cand != nil && oc.cand.Route != nil {
+			routeID = oc.cand.Route.ID
+		}
+		h.security.Enqueue(security.ObserveJob{
+			Body:     oc.secTee.Bytes(),
+			Upstream: upName,
+			RouteID:  routeID,
+			ReqID:    oc.reqID,
+		})
 	}
 }
 

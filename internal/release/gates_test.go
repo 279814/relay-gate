@@ -19,7 +19,7 @@ import (
 	"github.com/279814/relay-gate/internal/transform"
 )
 
-func TestEmptyDBOpensAsSchema4(t *testing.T) {
+func TestEmptyDBOpensAsSchema5(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "relay.db")
 	cipher, err := store.NewCipher("test-passphrase-at-least-16-chars")
@@ -35,8 +35,12 @@ func TestEmptyDBOpensAsSchema4(t *testing.T) {
 	if err := st.DB().QueryRow(`SELECT version FROM schema_version WHERE singleton = 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("schema_version=%d want 4", version)
+	if version != 5 {
+		t.Fatalf("schema_version=%d want 5", version)
+	}
+	var n int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='security_finding'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("security_finding missing: n=%d err=%v", n, err)
 	}
 }
 

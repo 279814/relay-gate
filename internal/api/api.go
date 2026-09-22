@@ -60,7 +60,8 @@ type Server struct {
 	probeAdmin ProbeAdmin
 
 	// security 是 P3 Security Center。未注入时 list 返回空。
-	security *security.Center
+	security SecurityCenter
+	mailer   *security.AlertMailer
 
 	// transforms 是 P4 声明式转换注册表。未注入时 list 返回空。
 	transforms *transform.Registry

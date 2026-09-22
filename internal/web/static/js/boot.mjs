@@ -10,6 +10,7 @@ import { createProbeFeature, mergeProbeTabs } from './probes.mjs';
 import { createRecentErrorsFeature } from './errors.mjs';
 import { createMigrationFeature } from './migration.mjs';
 import { createCredentialsFeature, mergeCredentialsTab } from './credentials.mjs';
+import { createSecurityFeature, mergeSecurityTab } from './security.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -39,6 +40,8 @@ if (typeof base !== 'function') {
       createMigrationFeature(shell, api);
       createCredentialsFeature(shell, api);
       mergeCredentialsTab(shell);
+      createSecurityFeature(shell, api);
+      mergeSecurityTab(shell);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -106,6 +109,9 @@ if (typeof base !== 'function') {
         this.loadProbeRuntime();
       } else if (tab === 'credentials') {
         this.loadCredentials();
+      } else if (tab === 'security') {
+        this.loadSecurityFindings();
+        this.loadSMTP();
       } else if (tab === 'health') {
         this.refreshHealthSide();
       }

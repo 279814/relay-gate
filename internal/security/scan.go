@@ -23,16 +23,20 @@ const (
 
 // Finding is one passive observation.
 type Finding struct {
-	ID       string   `json:"id"`
-	AtMS     int64    `json:"at_ms"`
-	Severity Severity `json:"severity"`
-	Category string   `json:"category"`
-	Summary  string   `json:"summary"`
-	Detail   string   `json:"detail"`
-	Upstream string   `json:"upstream,omitempty"`
-	RouteID  int64    `json:"route_id,omitempty"`
-	ReqID    string   `json:"req_id,omitempty"`
-	Source   string   `json:"source"` // passive | canary | smtp_test
+	ID                string   `json:"id"`
+	AtMS              int64    `json:"at_ms"`
+	Severity          Severity `json:"severity"`
+	Category          string   `json:"category"`
+	Summary           string   `json:"summary"`
+	Detail            string   `json:"detail"`
+	Upstream          string   `json:"upstream,omitempty"`
+	RouteID           int64    `json:"route_id,omitempty"`
+	ReqID             string   `json:"req_id,omitempty"`
+	Source            string   `json:"source"` // passive | canary | smtp_test
+	ScannerVersion    string   `json:"scanner_version,omitempty"`
+	RuleVersion       string   `json:"rule_version,omitempty"`
+	BytesScanned      int64    `json:"bytes_scanned,omitempty"`
+	IncompleteReason  string   `json:"incomplete_reason,omitempty"`
 }
 
 // Center is the in-process Security Center store (bounded ring).

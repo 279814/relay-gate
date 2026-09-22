@@ -162,13 +162,21 @@ func runServer() error {
 	// 真实请求的结果回写健康状态（§3.5）。这是**最快**的故障发现路径 ——
 	// 探活有周期，真实请求没有延迟，站挂掉那一刻就有请求撞上去。
 	sharedRecovery := health.NewRecoveryGate()
+	mailer := security.NewAlertMailer()
+	secCenter := security.NewPersistentCenter(500, func(f security.Finding) error {
+		return st.InsertSecurityFinding(f)
+	}, mailer)
+	secObs := security.NewObserver(secCenter, 64, log)
+	defer secObs.Close()
+
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
 		WithTargets(targets, st).
 		WithTransports(transports).
 		WithHealthReporter(probe.NewReporter(tracker)).
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
-		WithRecoveryGate(sharedRecovery)
+		WithRecoveryGate(sharedRecovery).
+		WithSecurityObserver(secObs)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer transports.CloseIdleConnections()
 
@@ -290,7 +298,8 @@ func runServer() error {
 		WithInvalidator(inv).
 		WithRunState(runCtrl).
 		WithProbeAdmin(probeAdmin).
-		WithSecurityCenter(security.NewCenter(500)).
+		WithSecurityCenter(secCenter).
+		WithAlertMailer(mailer).
 		WithTransformRegistry(transform.NewRegistry(500)).
 		WithCredentials(credSvc, kr).
 		Routes(cfg.AdminPW))
