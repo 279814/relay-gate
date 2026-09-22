@@ -624,8 +624,8 @@ func TestScheduler_RunningTicksDoNotRepeatedlyReset(t *testing.T) {
 	}
 }
 
-// 探活总开关关掉时不发请求，但总闸状态仍要跟踪。
-func TestScheduler_ProbeDisabledSendsNothing(t *testing.T) {
+// Active/Lazy：Lazy 站不发周期 synthetic；总闸仍跟踪。
+func TestScheduler_LazyProbeModeSendsNothing(t *testing.T) {
 	var hits int
 	var mu sync.Mutex
 	hs := newSchedHarness(t, 2, func(w http.ResponseWriter, r *http.Request) {
@@ -634,7 +634,9 @@ func TestScheduler_ProbeDisabledSendsNothing(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(200)
 	})
-	hs.cfg.settings.ProbeEnabled = false
+	for _, up := range hs.cfg.snap.Upstreams {
+		up.ProbeMode = model.ProbeModeLazy
+	}
 
 	hs.sched.tick(context.Background())
 	hs.sched.wg.Wait()
@@ -642,7 +644,7 @@ func TestScheduler_ProbeDisabledSendsNothing(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if hits != 0 {
-		t.Errorf("probe_enabled=false 时不该探活，实际发了 %d 次", hits)
+		t.Errorf("Lazy ProbeMode 不该周期探活，实际发了 %d 次", hits)
 	}
 }
 

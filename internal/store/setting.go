@@ -48,8 +48,8 @@ func usableSettings(settings model.Settings, err error) (model.Settings, error) 
 	return settings, nil
 }
 
-// DecodeLegacySettings is the only decoder allowed to accept the three
-// pre-P0 timeout keys. API DTOs use their own strict current-schema decoder.
+// DecodeLegacySettings is the only decoder allowed to accept pre-P0 keys
+// (timeout aliases and probe_enabled). API DTOs use their own strict decoder.
 func DecodeLegacySettings(raw []byte) (model.Settings, error) {
 	var present map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &present); err != nil {
@@ -59,9 +59,24 @@ func DecodeLegacySettings(raw []byte) (model.Settings, error) {
 		return model.Settings{}, model.WrapValidation("settings 必须是 JSON object")
 	}
 
+	// Strip keys that exist only for migration; model.Settings no longer carries them.
+	filtered := make(map[string]json.RawMessage, len(present))
+	for k, v := range present {
+		switch k {
+		case "probe_enabled":
+			continue
+		default:
+			filtered[k] = v
+		}
+	}
+	stripped, err := json.Marshal(filtered)
+	if err != nil {
+		return model.Settings{}, err
+	}
+
 	type settingsAlias model.Settings
 	decoded := settingsAlias(model.DefaultSettings())
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(bytes.NewReader(stripped))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
 		return model.Settings{}, model.WrapValidation("settings 字段无效: %v", err)

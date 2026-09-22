@@ -131,7 +131,7 @@ try {
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
         global_l2_concurrency = 3
-        probe_enabled = $false; piggyback_enabled = $false; half_open_enabled = $false
+        piggyback_enabled = $false; half_open_enabled = $false
         retry_max_attempts = 3
         sample_enabled = $true; sample_max_body_bytes = 0
         sample_resp_head_bytes = 0; sample_resp_tail_bytes = 0
@@ -352,7 +352,7 @@ try {
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
         global_l2_concurrency = 3
-        probe_enabled = $false; piggyback_enabled = $false; half_open_enabled = $false
+        piggyback_enabled = $false; half_open_enabled = $false
         retry_max_attempts = 3
         sample_enabled = $true; sample_max_body_bytes = 0
         sample_resp_head_bytes = 0; sample_resp_tail_bytes = 0

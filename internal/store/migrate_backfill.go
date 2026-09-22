@@ -111,10 +111,32 @@ func legacyProbeMode(ctx context.Context, db schemaTwoExecutor) (model.ProbeMode
 	if err != nil {
 		return "", fmt.Errorf("迁移 legacy settings: %w", err)
 	}
-	if settings.ProbeEnabled {
+	_ = settings
+	enabled, err := legacyProbeEnabled(raw)
+	if err != nil {
+		return "", err
+	}
+	if enabled {
 		return model.ProbeModeActive, nil
 	}
 	return model.ProbeModeLazy, nil
+}
+
+// legacyProbeEnabled reads the removed Settings.ProbeEnabled key for v1→v2 backfill only.
+func legacyProbeEnabled(raw []byte) (bool, error) {
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &present); err != nil {
+		return true, err
+	}
+	v, ok := present["probe_enabled"]
+	if !ok {
+		return true, nil
+	}
+	var enabled bool
+	if err := json.Unmarshal(v, &enabled); err != nil {
+		return true, err
+	}
+	return enabled, nil
 }
 
 func loadLegacyUpstreamConfigs(ctx context.Context, db schemaTwoExecutor, cipher *Cipher) (map[int64]*legacyUpstreamConfig, error) {

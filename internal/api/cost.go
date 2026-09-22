@@ -41,7 +41,6 @@ func (s *Server) getProbeCost(w http.ResponseWriter, r *http.Request) {
 			"l2_alive_sec": settings.L2IntervalAliveSec,
 			"l2_dead_sec":  settings.L2IntervalDeadSec,
 		},
-		"probe_enabled":     settings.ProbeEnabled,
 		"piggyback_enabled": settings.PiggybackEnabled,
 	})
 }
