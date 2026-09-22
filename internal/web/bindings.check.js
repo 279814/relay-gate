@@ -22,9 +22,11 @@ async function main() {
   const { createCredentialsFeature, mergeCredentialsTab } = await import(pathToFileURL(path.join(dir, 'js', 'credentials.mjs')).href);
   const { createSecurityFeature, mergeSecurityTab } = await import(pathToFileURL(path.join(dir, 'js', 'security.mjs')).href);
   const { createTransformsFeature, mergeTransformsTab } = await import(pathToFileURL(path.join(dir, 'js', 'transforms.mjs')).href);
+  const { createRuntimeStateFeature } = await import(pathToFileURL(path.join(dir, 'js', 'runtime.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
+  createRuntimeStateFeature(inst);
   createProbeFeature(inst, api);
   mergeProbeTabs(inst);
   createRecentErrorsFeature(inst, api);
