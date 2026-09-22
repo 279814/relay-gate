@@ -627,6 +627,71 @@
         </template>
 
         <!-- ── 设置 ─────────────────────────────────────────── -->
+        <!-- ── 凭据（P2）──────────────────────────────────── -->
+        <template x-if="tab === 'credentials'">
+          <div>
+            <div class="bar">
+              <strong>凭据与 Master Key</strong>
+              <span class="dim">查看/轮换需再次输入管理员密码；Cache-Control: no-store</span>
+              <span class="grow"></span>
+              <button @click="loadCredentials()">刷新</button>
+            </div>
+            <div class="row" style="margin-bottom:12px">
+              <div class="field" style="max-width:280px">
+                <label>管理员密码（操作前填写）</label>
+                <input type="password" x-model="credentials.password" autocomplete="current-password">
+              </div>
+            </div>
+            <div class="cards">
+              <div class="card">
+                <h3>Relay Key</h3>
+                <div class="sub" x-text="'active fp: ' + (credentials.status?.relay_active_fingerprint || '—')"></div>
+                <div class="sub" x-text="'grace fp: ' + (credentials.status?.relay_grace_fingerprint || '—')
+                  + ' · left ' + (credentials.status?.relay_grace_seconds_left ?? 0) + 's'"></div>
+                <div class="bar" style="margin-top:8px">
+                  <button class="primary" @click="rotateRelayKey()">轮换</button>
+                  <button @click="revokeRelayGrace()">立即撤销旧 Key</button>
+                </div>
+                <div class="mono wrap" x-show="credentials.relay_key" x-text="credentials.relay_key"></div>
+              </div>
+              <div class="card">
+                <h3>Master Key</h3>
+                <div class="sub" x-text="'key_id: ' + (credentials.status?.keyring?.key_id || '—')"></div>
+                <div class="sub" x-text="'phase: ' + (credentials.status?.keyring?.phase || 'idle')"></div>
+                <div class="bar" style="margin-top:8px">
+                  <button @click="revealMasterKey()">短时查看</button>
+                </div>
+                <div class="mono wrap" x-show="credentials.master_key" x-text="credentials.master_key"></div>
+                <div class="field" style="margin-top:10px">
+                  <label>新 Master Key（≥16）</label>
+                  <input type="password" x-model="credentials.new_master" autocomplete="new-password">
+                </div>
+                <button class="primary" @click="rotateMasterKey()">轮换 Master Key</button>
+              </div>
+              <div class="card">
+                <h3>管理员密码</h3>
+                <div class="sub">不可查看，可重新生成；重置后其他会话立即失效</div>
+                <button @click="resetAdminPassword()">重置并显示一次</button>
+                <div class="mono wrap" x-show="credentials.admin_password" x-text="credentials.admin_password"></div>
+              </div>
+            </div>
+            <h3 style="font-size:13px;margin:18px 0 8px">审计</h3>
+            <table>
+              <thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead>
+              <tbody>
+                <template x-for="(ev, idx) in (credentials.status?.audit || [])" :key="idx">
+                  <tr>
+                    <td class="mono" x-text="ev.at"></td>
+                    <td x-text="ev.action"></td>
+                    <td class="wrap" x-text="ev.detail"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(credentials.status?.audit || []).length"><td colspan="3" class="empty">暂无审计</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
         <template x-if="tab === 'settings'">
           <div>
             <div class="bar">
