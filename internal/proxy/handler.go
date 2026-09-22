@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -68,6 +69,9 @@ type Handler struct {
 
 	// runState 是 P0-12 热路径总闸；非 nil 时优先于 cfg.RunState（避 livecfg TTL）。
 	runState runstate.Reader
+
+	// observers 是 P0-13 真实流量旁路工厂；可为 nil（不观察）。
+	observers health.AttemptObserverFactory
 }
 
 // NewHandler 组装透传处理器。
@@ -139,6 +143,12 @@ func (h *Handler) WithTargets(targets outbound.TargetProvider, keys outbound.Sec
 // WithRunState 注入热路径总闸（优先于 livecfg 的 2s TTL）。
 func (h *Handler) WithRunState(r runstate.Reader) *Handler {
 	h.runState = r
+	return h
+}
+
+// WithObservers 注入 P0-13 真实流量旁路工厂。
+func (h *Handler) WithObservers(f health.AttemptObserverFactory) *Handler {
+	h.observers = f
 	return h
 }
 

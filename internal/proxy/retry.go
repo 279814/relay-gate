@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -73,6 +74,7 @@ type liveAttempt struct {
 	body   []byte
 	header http.Header
 	url    string
+	instr  health.AttemptInstrumentation
 }
 
 // retryPlan 是重试循环的不变量：预算、次数上限、已试过哪些 Route。
@@ -162,6 +164,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			} else {
 				la.at.Discard()
 			}
+			finishObserver(la, health.AttemptFinish{ClientCommitted: oc.res != nil && oc.res.BytesWritten > 0})
 			la.cand.Release()
 
 			// 最后一行日志要在 Commit **之后**记：BytesWritten 与 DoneAt
@@ -192,6 +195,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		// 「500 + body 里写着 rate limit」会被判成故障而累计判死，
 		// 本该只是冷却 60 秒。
 		la.at.Discard()
+		finishObserver(la, health.AttemptFinish{})
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
@@ -290,16 +294,40 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		fwd.RespTee = tee
 	}
 
-	// 传 r.Context() 而不是带预算的 ctx：预算已经夹进 Timeouts.Total 了，
-	// 而 Send 要靠这个 ctx 分辨「客户端走了」与「我们自己的时限到了」。
-	// 把带预算的 ctx 传进去，一个吃掉整份预算的慢站会被记成「客户端取消」
-	// （非上游故障），于是永远攒不够失败次数、永远不判死。
-	at := fwd.Send(r.Context(), r.Method, target.RawURL, outHeader, outBody)
+	instr := health.NoopInstrumentation()
+	if h.observers != nil {
+		instr = h.observers.PrepareAttempt(r.Context(), health.AttemptTarget{
+			Attempt:    0,
+			Protocol:   proto,
+			Endpoint:   kind,
+			UpstreamID: cand.Upstream.ID,
+			RouteID:    cand.Route.ID,
+			Config: health.AttemptConfigFacts{
+				EndpointRevision: target.EndpointRevision,
+				ResolvedURLHash:  target.ResolvedURLHash,
+			},
+		}, health.AttemptRequestView{
+			Header:   outHeader,
+			RawQuery: "",
+			Body:     outBody,
+		})
+	}
+
+	sendCtx := r.Context()
+	if instr.Trace != nil {
+		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
+		instr.Trace.MarkSent(time.Now())
+	}
+	at := fwd.Send(sendCtx, r.Method, target.RawURL, outHeader, outBody)
+	if instr.Observer != nil && at.Result() != nil && at.Result().Status > 0 {
+		instr.Observer.TryHeaders(at.Result().Status, at.Result().RespHeaders, time.Now())
+	}
 
 	return &liveAttempt{
 		cand: cand, at: at, tee: tee,
 		keys: h.credentialsOf(r, cand),
 		body: outBody, header: outHeader, url: target.RawURL,
+		instr: instr,
 	}, true
 }
 
@@ -316,7 +344,7 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 	if attempt >= plan.maxAttempts {
 		return nil
 	}
-	if !retryable(la.at) {
+	if !h.retryableAttempt(r, la) {
 		return nil
 	}
 	// 客户端已经走了就别再花上游额度了 —— 没人在等这个响应。
@@ -331,6 +359,28 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 		return nil
 	}
 	return cand
+}
+
+// retryableAttempt 在旧 classifyPayload 之上叠加 P0-13 RetryDecider。
+// Decider 仅额外放行 TryNextRoute；Keep/失败一律回落旧判定，避免收紧重试。
+func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt) bool {
+	if la == nil || la.at == nil {
+		return false
+	}
+	base := retryable(la.at)
+	if la.instr.Retry == nil {
+		return base
+	}
+	res := la.at.Result()
+	if res == nil {
+		return base
+	}
+	prefix := la.at.Peek()
+	advice := la.instr.Retry.DecidePeek(r.Context(), res.Status, res.RespHeaders, prefix, true)
+	if advice.Disposition == health.RetryTryNextRoute {
+		return true
+	}
+	return base
 }
 
 // retryable 判断一次**尚未提交**的尝试是否值得换站重来（§3.5）。
@@ -382,6 +432,14 @@ func retryable(at *Attempt) bool {
 		return IsUpstreamFault(err)
 	}
 	return verdict == payloadError
+}
+
+func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
+	if la == nil || la.instr.Observer == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	la.instr.Observer.Finish(fin)
 }
 
 // attemptLog 把一次尝试整理成一行日志。
