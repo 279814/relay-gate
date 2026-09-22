@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probetemplate"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -45,6 +47,7 @@ type CalibrationStore interface {
 	GetModelName(id int64) (*model.ModelName, error)
 	Endpoint(ctx context.Context, upstreamID int64, kind model.EndpointKind) (*model.UpstreamEndpoint, error)
 	ListCalibrationRunsPage(ctx context.Context, filter model.CalibrationFilter) (model.Page[*model.CalibrationRun], error)
+	ResolveProbeSecret(ctx context.Context, name string) (probetemplate.ResolvedSecret, error)
 }
 
 // CalibrationPlanOptions 区分手动与 Active 首次自动校准。
@@ -458,20 +461,40 @@ func (s *CalibrationService) sendCandidate(ctx context.Context, run *model.Calib
 	}
 	budget := outbound.L2Budget(settings)
 
+	timeout := version.TimeoutProfile
+	if timeout == "" {
+		timeout = model.TimeoutL2Standard
+	}
+	selector := model.EvidencePolicySelector{
+		Kind: model.EvidenceL2, Endpoint: run.Endpoint, TimeoutProfile: timeout,
+	}
+	settingsFingerprint := ""
+	if policy, policyErr := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector); policyErr == nil {
+		settingsFingerprint = revisioncodec.ProbeSettingsFingerprint(policy)
+	}
+	secretHash, err := s.secretRevisionsHash(ctx, refs)
+	if err != nil {
+		return err
+	}
+
 	req := ExecutionRequest{
-		ExecutionID:      executionID,
-		Trigger:          model.TriggerCalibration,
-		Upstream:         upstream,
-		ModelName:        modelName,
-		Route:            route,
-		Endpoint:         run.Endpoint,
-		Mode:             ObserveProbe,
-		Budget:           budget,
-		ObservationOrder: s.clock.Now().UnixMilli(),
-		CalibrationRunID: run.ID,
-		CandidateOrdinal: candidate.Ordinal,
-		ExplicitRecipe:   &explicit,
-		AuthOverride:     &authProfile,
+		ExecutionID:               executionID,
+		Trigger:                   model.TriggerCalibration,
+		Upstream:                  upstream,
+		ModelName:                 modelName,
+		Route:                     route,
+		Endpoint:                  run.Endpoint,
+		Mode:                      ObserveProbe,
+		Budget:                    budget,
+		ObservationOrder:          s.clock.Now().UnixMilli(),
+		CalibrationRunID:          run.ID,
+		CandidateOrdinal:          candidate.Ordinal,
+		ExplicitRecipe:            &explicit,
+		AuthOverride:              &authProfile,
+		DiagnosticEndpoint:        endpointRow,
+		CalibrationPolicySelector: selector,
+		ProbeSettingsFingerprint:  settingsFingerprint,
+		ProbeSecretRevisionsHash:  secretHash,
 	}
 	if req.ObservationOrder <= 0 {
 		req.ObservationOrder = 1
@@ -488,6 +511,31 @@ func (s *CalibrationService) sendCandidate(ctx context.Context, run *model.Calib
 		return err
 	}
 	return s.finishFromExecution(ctx, fresh, fresh.Candidates[fresh.Current], &result.Execution)
+}
+
+func (s *CalibrationService) secretRevisionsHash(ctx context.Context, refs []model.RequiredSecretRef) (string, error) {
+	if len(refs) == 0 {
+		return revisioncodec.SecretRevisionSetHash(nil), nil
+	}
+	revisions := make([]model.SecretRevision, 0, len(refs))
+	for _, ref := range refs {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			continue
+		}
+		secret, err := s.store.ResolveProbeSecret(ctx, name)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				revisions = append(revisions, model.SecretRevision{Name: name})
+				continue
+			}
+			return "", err
+		}
+		revisions = append(revisions, model.SecretRevision{
+			ID: secret.ID, Name: name, Revision: secret.Revision, Resolved: true,
+		})
+	}
+	return revisioncodec.SecretRevisionSetHash(revisions), nil
 }
 
 func (s *CalibrationService) finishFromExecution(ctx context.Context, run *model.CalibrationRun,
@@ -529,13 +577,19 @@ func (s *CalibrationService) finishFromExecution(ctx context.Context, run *model
 		if err != nil {
 			return err
 		}
+		// Expected* 必须是测试当时冻在 execution 上的口径，不能用 commit 前的
+		// 最新读数——否则 Secret/Auth 在 RoundTrip 后被改掉时 CAS 仍会成功。
+		expectedEndpointRev := execution.EndpointRevision
+		if expectedEndpointRev < 1 {
+			expectedEndpointRev = endpointRow.Revision
+		}
 		_, err = s.store.CommitCalibrationSuccess(ctx, model.CalibrationCommit{
 			RunID:                    run.ID,
 			ExpectedRunRevision:      run.Revision,
 			CandidateOrdinal:         candidate.Ordinal,
 			ExecutionID:              execution.ID,
 			Endpoint:                 *endpointRow,
-			ExpectedEndpointRevision: endpointRow.Revision,
+			ExpectedEndpointRevision: expectedEndpointRev,
 			RecipeID:                 recipe.ID,
 			ExpectedRecipeRevision:   recipe.Revision,
 			SelectedVersionID:        candidate.MaterializedRecipe.DBVersionID,

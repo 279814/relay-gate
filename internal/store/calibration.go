@@ -18,6 +18,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probetemplate"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 // materializedCandidatePayload 把物化身份与预分配 ExecutionID 一起持久化。
@@ -699,6 +700,9 @@ func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.C
 	if currentEndpoint.Revision != commit.ExpectedEndpointRevision {
 		return nil, ErrRevisionConflict
 	}
+	if err = requireCalibrationEvidenceCurrent(ctx, tx, execution, currentEndpoint, run); err != nil {
+		return nil, err
+	}
 
 	recipe, err := scanProbeRecipe(tx.QueryRowContext(ctx, `SELECT `+recipeCols+
 		` FROM probe_recipe WHERE id=?`, commit.RecipeID))
@@ -884,6 +888,117 @@ func writeAuthExhaustedConfigErrorTx(ctx context.Context, tx *sql.Tx, run *model
 		RedactedDetail:             "auth_calibration_exhausted",
 	}
 	return saveCapability(ctx, tx, cap)
+}
+
+// requireCalibrationEvidenceCurrent 校验 candidate 测试后 Secret/Endpoint/Auth/
+// Route/Model/Settings 未变（§P0-11 第 14 条）。force 不能绕过。
+func requireCalibrationEvidenceCurrent(ctx context.Context, tx *sql.Tx, execution *model.ProbeExecution,
+	currentEndpoint *model.UpstreamEndpoint, run *model.CalibrationRun) error {
+
+	var networkRev, credentialRev int64
+	if err := tx.QueryRowContext(ctx, `SELECT network_revision,credential_revision FROM upstream WHERE id=?`,
+		execution.UpstreamID).Scan(&networkRev, &credentialRev); err != nil {
+		return err
+	}
+	if execution.UpstreamNetworkRevision != networkRev || execution.UpstreamCredentialRevision != credentialRev {
+		return ErrRevisionConflict
+	}
+
+	if execution.EndpointID > 0 {
+		if currentEndpoint.ID != execution.EndpointID ||
+			currentEndpoint.Revision != execution.EndpointRevision ||
+			currentEndpoint.AuthProfile.Revision != execution.AuthProfileRevision {
+			return ErrRevisionConflict
+		}
+	} else if currentEndpoint.Revision != execution.EndpointRevision && execution.EndpointRevision > 0 {
+		return ErrRevisionConflict
+	}
+
+	if execution.RouteID > 0 {
+		var routeCap, modelCap int64
+		if err := tx.QueryRowContext(ctx, `SELECT r.capability_revision,m.capability_revision
+			FROM route r JOIN model_name m ON m.id=r.model_name_id WHERE r.id=?`,
+			execution.RouteID).Scan(&routeCap, &modelCap); err != nil {
+			return err
+		}
+		if execution.RouteCapabilityRevision != routeCap || execution.ModelCapabilityRevision != modelCap {
+			return ErrRevisionConflict
+		}
+	}
+
+	if execution.ProbeSettingsFingerprint != "" {
+		settings, err := loadSettingsTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		timeout := model.TimeoutL2Standard
+		if execution.CapabilityPolicySelector.TimeoutProfile != "" {
+			timeout = execution.CapabilityPolicySelector.TimeoutProfile
+		}
+		selector := model.EvidencePolicySelector{
+			Kind: model.EvidenceL2, Endpoint: run.Endpoint, TimeoutProfile: timeout,
+		}
+		if execution.CapabilityPolicySelector.Kind != "" {
+			selector = execution.CapabilityPolicySelector
+		}
+		policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+		if err != nil {
+			return err
+		}
+		if revisioncodec.ProbeSettingsFingerprint(policy) != execution.ProbeSettingsFingerprint {
+			return ErrRevisionConflict
+		}
+	}
+
+	secretNames, err := recipeVersionSecretNamesTx(ctx, tx, execution.RecipeVersionID)
+	if err != nil {
+		return err
+	}
+	if execution.ProbeSecretRevisionsHash != "" || len(secretNames) > 0 {
+		revisions := make([]model.SecretRevision, 0, len(secretNames))
+		for _, name := range secretNames {
+			var id, revision int64
+			err := tx.QueryRowContext(ctx, `SELECT id,revision FROM probe_secret WHERE name=?`, name).
+				Scan(&id, &revision)
+			if errors.Is(err, sql.ErrNoRows) {
+				revisions = append(revisions, model.SecretRevision{Name: name})
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			revisions = append(revisions, model.SecretRevision{
+				ID: id, Name: name, Revision: revision, Resolved: true,
+			})
+		}
+		currentHash := revisioncodec.SecretRevisionSetHash(revisions)
+		if currentHash != execution.ProbeSecretRevisionsHash {
+			return ErrRevisionConflict
+		}
+	}
+	return nil
+}
+
+func recipeVersionSecretNamesTx(ctx context.Context, tx *sql.Tx, versionID int64) ([]string, error) {
+	if versionID < 1 {
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM recipe_version_required_secret
+		WHERE recipe_version_id=? AND bound_secret_id_snapshot IS NOT NULL AND bound_secret_id_snapshot>0
+		ORDER BY name`, versionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 func ensureCalibrationRecipeTx(ctx context.Context, tx *sql.Tx, routeID int64,

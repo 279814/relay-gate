@@ -109,6 +109,15 @@ type ExecutionRequest struct {
 	// 声称另一个 version 已通过。二者都非 nil 时 prepare 走显式路径。
 	ExplicitRecipe *ResolvedRecipe
 	AuthOverride   *model.EndpointAuthProfile
+
+	// DiagnosticEndpoint / ProbeSettingsFingerprint / ProbeSecretRevisionsHash
+	// 只用于校准：把 test 当时的 Endpoint/Auth/Settings/Secret 口径冻进 execution，
+	// 供 CommitCalibrationSuccess 在 commit 时与 DB-current 比对（§P0-11 第 14 条）。
+	// 不作为 CapabilityExpectation，避免校准中间态经 ResultRecorder 提前写能力。
+	DiagnosticEndpoint        *model.UpstreamEndpoint
+	CalibrationPolicySelector model.EvidencePolicySelector
+	ProbeSettingsFingerprint  string
+	ProbeSecretRevisionsHash  string
 }
 
 // ExecutionResult 是一次执行的产出。
@@ -767,7 +776,36 @@ func (e *Executor) buildExecution(req ExecutionRequest, recipe ResolvedRecipe, d
 	// disposition 恒为 not_applicable），所以这段现在是空跑；留着是为了 P0-10
 	// 接入期望后，落库的证据与期望在同一口径上对齐，而不必改这里。
 	applyExpectationColumns(&exec, req.ReachabilityExpectation, req.CapabilityExpectation)
+	stampCalibrationDiagnostics(&exec, req)
 	return exec
+}
+
+// stampCalibrationDiagnostics 把校准候选测试时的配置口径冻进 execution。
+//
+// 不经 CapabilityExpectation：校准成功前 Auth 尚未 commit，ResultRecorder 若按
+// 完整语义期望落能力会把中间态写进 Registry。commit 侧只比对这里冻住的字段。
+func stampCalibrationDiagnostics(exec *model.ProbeExecution, req ExecutionRequest) {
+	if req.CalibrationRunID == "" {
+		return
+	}
+	if req.DiagnosticEndpoint != nil {
+		exec.EndpointID = req.DiagnosticEndpoint.ID
+		exec.EndpointRevision = req.DiagnosticEndpoint.Revision
+		exec.AuthProfileRevision = req.DiagnosticEndpoint.AuthProfile.Revision
+	}
+	if req.Route != nil {
+		exec.RouteCapabilityRevision = req.Route.CapabilityRevision
+	}
+	if req.ModelName != nil {
+		exec.ModelCapabilityRevision = req.ModelName.CapabilityRevision
+	}
+	if req.ProbeSettingsFingerprint != "" {
+		exec.ProbeSettingsFingerprint = req.ProbeSettingsFingerprint
+		exec.CapabilityPolicySelector = req.CalibrationPolicySelector
+	}
+	if req.ProbeSecretRevisionsHash != "" {
+		exec.ProbeSecretRevisionsHash = req.ProbeSecretRevisionsHash
+	}
 }
 
 // applyRecipeIdentity 把解析出的 recipe 身份/来源/版本展平进 execution。
