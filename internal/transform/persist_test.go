@@ -1,6 +1,7 @@
 package transform_test
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -52,5 +53,24 @@ func TestPersistRoundTrip(t *testing.T) {
 	c2, _, err := reg2.PublishedCompiled(9, 99)
 	if err != nil || c2 != nil {
 		t.Fatalf("unbound endpoint should skip: c=%v err=%v", c2, err)
+	}
+}
+
+type failPersist struct{}
+
+func (failPersist) SaveTransformSnapshot([]transform.Set, []transform.Binding) error {
+	return errors.New("persist boom")
+}
+func (failPersist) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, error) {
+	return nil, nil, nil
+}
+
+func TestCreateSetSurfacesPersistError(t *testing.T) {
+	reg := transform.NewRegistry(4).WithPersist(failPersist{})
+	if _, err := reg.CreateSet("x"); err == nil {
+		t.Fatal("expected persist error")
+	}
+	if len(reg.ListSets()) != 0 {
+		t.Fatal("failed CreateSet must not leave set in memory")
 	}
 }

@@ -31,7 +31,10 @@ func (r *Registry) CreateSet(name string) (*Set, error) {
 		},
 	}
 	r.sets[id] = s
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		delete(r.sets, id)
+		return nil, err
+	}
 	return cloneSet(s), nil
 }
 
@@ -88,7 +91,9 @@ func (r *Registry) UpdateDraft(setID int64, rules []Rule, reqPolicy, resPolicy, 
 		s.Draft.ResFailPolicy = resPolicy
 	}
 	s.Draft.Note = note
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		return nil, err
+	}
 	return cloneSet(s), nil
 }
 
@@ -153,7 +158,9 @@ func (r *Registry) PublishSnapshot(setID, routeID, endpointID int64) (*Binding, 
 	b.SetID = setID
 	b.PublishedID = snap.ID
 	b.Revision++
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		return nil, nil, err
+	}
 	return cloneBinding(b), &snap, nil
 }
 
@@ -186,7 +193,9 @@ func (r *Registry) ShadowSnapshot(setID, routeID, endpointID int64) (*Binding, *
 	b.SetID = setID
 	b.ShadowID = snap.ID
 	b.Revision++
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		return nil, nil, err
+	}
 	return cloneBinding(b), &snap, nil
 }
 
@@ -215,7 +224,9 @@ func (r *Registry) Rollback(routeID, endpointID, versionID int64) (*Binding, err
 	}
 	b.PublishedID = versionID
 	b.Revision++
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		return nil, err
+	}
 	return cloneBinding(b), nil
 }
 
@@ -230,7 +241,9 @@ func (r *Registry) ClearPublished(routeID, endpointID int64) (*Binding, error) {
 	}
 	b.PublishedID = 0
 	b.Revision++
-	r.flushLocked()
+	if err := r.flushLocked(); err != nil {
+		return nil, err
+	}
 	return cloneBinding(b), nil
 }
 
