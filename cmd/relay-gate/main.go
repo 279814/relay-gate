@@ -315,7 +315,7 @@ func runServer() error {
 			return ids
 		},
 	}
-	mux.Handle("/admin/api/", api.New(st, log).
+	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).
 		WithCost(cost).
@@ -325,8 +325,11 @@ func runServer() error {
 		WithSecurityCenter(secCenter).
 		WithAlertMailer(mailer).
 		WithTransformRegistry(xform).
-		WithCredentials(credSvc, kr).
-		Routes(cfg.AdminPW))
+		WithCredentials(credSvc, kr)
+	if hash, err := credential.LoadAdminHash(dataDir); err == nil {
+		adminAPI = adminAPI.WithAdminHash(hash, dataDir)
+	}
+	mux.Handle("/admin/api/", adminAPI.Routes(cfg.AdminPW))
 	fwd.Routes(mux)
 
 	// 管理界面（§6）。挂在 /admin/ 下，与 /admin/api/ 并存 ——

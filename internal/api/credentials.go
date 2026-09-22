@@ -142,6 +142,19 @@ func (s *Server) postResetAdminPassword(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	hash, err := credential.HashAdminPassword(newPW)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if s.adminDataDir != "" {
+		if err := credential.ReplaceAdminHash(s.adminDataDir, hash); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+	}
+	s.adminHash = hash
+	// 同进程 Bearer / 登录仍认新明文；不保留旧明文。不落盘可恢复明文。
 	s.adminPW = newPW
 	s.sessions.revokeAll()
 	tok, err := s.sessions.issue()
@@ -273,7 +286,13 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) passwordOK(got string) bool {
-	if s.adminPW == "" || got == "" {
+	if got == "" {
+		return false
+	}
+	if s.adminHash != "" && credential.VerifyAdminPassword(got, s.adminHash) {
+		return true
+	}
+	if s.adminPW == "" {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.adminPW)) == 1
