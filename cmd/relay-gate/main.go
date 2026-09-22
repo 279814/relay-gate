@@ -47,12 +47,18 @@ func main() {
 	}
 }
 
-// runMain 是可测入口：在打开 Store / 监听端口之前识别 probe 子命令。
+// runMain 是可测入口：在打开 Store / 监听端口之前识别离线子命令。
 func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 1 {
 		switch args[1] {
 		case "probe-one", "probe-matrix":
 			return runProbeCLI(args[1:], stdin, stdout, stderr, probeCLIDeps{})
+		case "db":
+			if len(args) < 3 {
+				fmt.Fprintf(stderr, "用法: relay-gate db <check-backup|restore> ...\n")
+				return exitUsage
+			}
+			return runDBCLI(args[2:], stdout, stderr)
 		}
 	}
 	if err := runServer(); err != nil {

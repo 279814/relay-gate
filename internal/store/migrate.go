@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const developmentSchemaVersion = 2
+const developmentSchemaVersion = 3
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
@@ -52,6 +52,9 @@ const (
 	schemaV2FreshFingerprint           = "ca6217482a0464d771535862bc99f2624f985732fdc4b7f951b00810b655bcbf"
 	schemaV2M2UpgradeFingerprint       = "82fbd450859331bc56bebeb2b5019e2d3bf26d53a722c4f042e2d8d5b0898295"
 	schemaV2M6UpgradeFingerprint       = "0be11e42d9f087afba819457b94458d03aa595e9a504d49ee9dce6ac1b1c4710"
+	schemaV3FreshFingerprint           = "463fd48fd95efcccd7d8bb4ef2a3ede76768dbbbb8ae1b386c186f4002ea73e7"
+	schemaV3M2UpgradeFingerprint       = "209a946cc1b189eeb025434ea276c566738dd561ba0ca0f8f7fa5578b63178f5"
+	schemaV3M6UpgradeFingerprint       = "cef417c838c9a0c6430839f61f90308df793f5b540c963915b36c8345b9d2d1d"
 )
 
 type schemaQuerier interface {
@@ -113,6 +116,11 @@ func schemaVersionFingerprintKnown(version int, fingerprint string) bool {
 		return fingerprint == schemaV2FreshFingerprint ||
 			fingerprint == schemaV2M2UpgradeFingerprint ||
 			fingerprint == schemaV2M6UpgradeFingerprint
+	case 3:
+		switch fingerprint {
+		case schemaV3FreshFingerprint, schemaV3M2UpgradeFingerprint, schemaV3M6UpgradeFingerprint:
+			return true
+		}
 	}
 	return false
 }

@@ -51,6 +51,11 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 		}
 	}()
 
+	// Resume crash-interrupted restore before treating a missing/partial DB as empty.
+	if err := resumeIncompleteRestoreIfAny(context.Background(), databasePath, c); err != nil {
+		return nil, err
+	}
+
 	// _txlock=immediate：写事务一开始就取写锁，避免 SQLite 在事务中途升级锁时
 	// 报 SQLITE_BUSY（读事务升级为写事务是死锁的经典来源）。
 	db, err := sql.Open("sqlite", dsn+connPragmas)
@@ -108,13 +113,17 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaTwo(ctx, db)
+			return initializeEmptySchemaThree(ctx, db)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
 			}
 		case state.Version == 1:
 			if _, err := migrateSchemaOneToTwo(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
+		case state.Version == 2:
+			if _, err := migrateSchemaTwoToThree(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
 			}
 		case state.Version == developmentSchemaVersion:
