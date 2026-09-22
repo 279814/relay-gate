@@ -1,0 +1,186 @@
+package credential
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/279814/relay-gate/internal/keyring"
+)
+
+func TestHashAdminPasswordRoundTrip(t *testing.T) {
+	hash, err := HashAdminPassword("test-admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(hash, "$argon2id$") {
+		t.Fatalf("want PHC argon2id, got %q", hash)
+	}
+	if !VerifyAdminPassword("test-admin-password", hash) {
+		t.Fatal("verify should succeed")
+	}
+	if VerifyAdminPassword("wrong-password!!", hash) {
+		t.Fatal("verify should fail for wrong password")
+	}
+}
+
+func TestBootstrapFreshDisplayOnce(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	b := &Bootstrap{DataDir: dir, Out: &out}
+	d, err := b.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.AdminPassword == "" || d.RelayKey == "" || d.MasterKey == "" {
+		t.Fatalf("empty credentials: %+v", d)
+	}
+	if !strings.HasPrefix(d.RelayKey, "rk-") {
+		t.Fatalf("relay key prefix: %q", d.RelayKey)
+	}
+	if !strings.Contains(out.String(), "ADMIN_PASSWORD="+d.AdminPassword) {
+		t.Fatalf("stdout missing admin: %s", out.String())
+	}
+	phase, err := b.Phase()
+	if err != nil || phase != PhaseDisplayed {
+		t.Fatalf("phase=%q err=%v", phase, err)
+	}
+	persisted, err := b.LoadPersisted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyAdminPassword(d.AdminPassword, persisted.AdminPasswordHash) {
+		t.Fatal("persisted hash must match displayed admin password")
+	}
+	if persisted.RelayKey != d.RelayKey {
+		t.Fatal("persisted relay mismatch")
+	}
+	_, err = b.Run()
+	if !errors.Is(err, ErrBootstrapComplete) {
+		t.Fatalf("second run err=%v", err)
+	}
+}
+
+func TestBootstrapCrashAfterPersistedRegeneratesAdminRelayKeepsMaster(t *testing.T) {
+	dir := t.TempDir()
+	crash := &Bootstrap{DataDir: dir, Out: ioDiscard{}, CrashAfter: CrashAfterCredentialsPersisted}
+	_, err := crash.Run()
+	if !errors.Is(err, errInjectedCrash) {
+		t.Fatalf("want injected crash, got %v", err)
+	}
+	phase, err := crash.Phase()
+	if err != nil || phase != PhaseCredentialsPersisted {
+		t.Fatalf("phase=%q err=%v", phase, err)
+	}
+	kr := keyring.Open(dir)
+	keyID1, master1, err := kr.LoadActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw1, err := os.ReadFile(crash.credentialsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	resume := &Bootstrap{DataDir: dir, Out: &out}
+	d, err := resume.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID2, master2, err := kr.LoadActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyID1 != keyID2 || master1 != master2 || d.MasterKey != master1 {
+		t.Fatalf("master must be kept: %q/%q vs %q/%q displayed=%q",
+			keyID1, master1, keyID2, master2, d.MasterKey)
+	}
+	raw2, err := os.ReadFile(resume.credentialsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(raw1, raw2) {
+		t.Fatal("undelivered admin/relay must be regenerated (credentials file unchanged)")
+	}
+	if !VerifyAdminPassword(d.AdminPassword, mustLoadHash(t, resume)) {
+		t.Fatal("new admin must match new hash")
+	}
+	if resumePhase, _ := resume.Phase(); resumePhase != PhaseDisplayed {
+		t.Fatalf("phase=%q", resumePhase)
+	}
+}
+
+func TestBootstrapCrashAfterPreparedCanComplete(t *testing.T) {
+	dir := t.TempDir()
+	crash := &Bootstrap{DataDir: dir, Out: ioDiscard{}, CrashAfter: CrashAfterPrepared}
+	_, err := crash.Run()
+	if !errors.Is(err, errInjectedCrash) {
+		t.Fatalf("want injected crash, got %v", err)
+	}
+	phase, _ := crash.Phase()
+	if phase != PhasePrepared {
+		t.Fatalf("phase=%q", phase)
+	}
+	var out bytes.Buffer
+	b := &Bootstrap{DataDir: dir, Out: &out}
+	d, err := b.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.MasterKey == "" {
+		t.Fatal("expected master")
+	}
+	if p, _ := b.Phase(); p != PhaseDisplayed {
+		t.Fatalf("phase=%q", p)
+	}
+}
+
+func TestBootstrapLockFileExclusive(t *testing.T) {
+	dir := t.TempDir()
+	b1 := &Bootstrap{DataDir: dir}
+	unlock, err := b1.acquireLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	b2 := &Bootstrap{DataDir: dir}
+	_, err = b2.acquireLock()
+	if err == nil {
+		t.Fatal("second lock should fail")
+	}
+}
+
+func mustLoadHash(t *testing.T, b *Bootstrap) string {
+	t.Helper()
+	doc, err := b.LoadPersisted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc.AdminPasswordHash
+}
+
+type ioDiscard struct{}
+
+func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestBootstrapSecretsDirPermissions(t *testing.T) {
+	dir := t.TempDir()
+	b := &Bootstrap{DataDir: dir, Out: ioDiscard{}}
+	if _, err := b.Run(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "secrets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		// On Windows permission bits are approximate; only soft-check unix.
+		if filepath.Separator == '/' {
+			t.Fatalf("secrets dir should be 0700, got %v", info.Mode())
+		}
+	}
+}

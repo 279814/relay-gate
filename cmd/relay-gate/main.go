@@ -63,6 +63,8 @@ func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				return exitUsage
 			}
 			return runDBCLI(args[2:], stdout, stderr)
+		case "credentials":
+			return runCredentialsCLI(args[2:], stdout, stderr)
 		}
 	}
 	if err := runServer(); err != nil {
