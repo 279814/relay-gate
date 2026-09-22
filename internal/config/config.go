@@ -54,7 +54,9 @@ func (c *Config) validate() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("缺少必需的环境变量：\n  - %s\n\n"+
-			"生成随机值：openssl rand -hex 32", strings.Join(missing, "\n  - "))
+			"新安装请先运行一次性：relay-gate credentials bootstrap --data-dir <data>\n"+
+			"或设置环境变量（兼容旧部署）。生成随机值：openssl rand -hex 32",
+			strings.Join(missing, "\n  - "))
 	}
 	return nil
 }

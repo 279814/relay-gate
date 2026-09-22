@@ -14,7 +14,7 @@
 |---|---|---|
 | P0 | docs/04 | 探活基础门禁至 P0-17 schema3 cutover / 离线 restore（PR #57） |
 | P1 | docs/05 | RecoveryGate、RetryPolicy、duplicate_risk DB 列、重复 model、语义失效、count_tokens 多 Route、Lazy 恢复（PR #58 / #64） |
-| P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；Runtime Controller **maintenance 叠加态 + 暖机进度**；**未**签发真实公网证书 |
+| P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；Runtime Controller **maintenance 叠加态 + 暖机进度**；首次凭据 **bootstrap journal**（`credentials bootstrap`，崩溃恢复 + Argon2id 落盘）；**未**签发真实公网证书 |
 | P3 | docs/07 | 被动扫描旁路、SMTP 假服务器、Active 手动 canary、finding 持久化、Security Center 模块（PR #60 / #66） |
 | P4 | docs/08 | 声明式编译器/API（PR #61）；schema 6 持久化 + proxy 请求/响应/SSE（PR #67 / #68 / #71）；UI（PR #73）；JSON Patch；body_template；Secret 污点；执行预算二次确认审计 |
 | P5 | docs/09 | 离线发布门禁 `check-p5` + 本说明；旧 sample 信封迁移（PR #69 / #72） |
@@ -37,6 +37,7 @@
 - 多日生产 soak / 长流压测（本仓库与 CI 时长不允许伪称完成）
 - 确认后的旧 sample 明文 dual-read 清理（信封迁移已交付；去掉明文回退需运维确认）
 - README 替换 docs/03 后的删除清单（Caddyfile、deploy-nginx.sh；**真实公网证书验证前不得删**）
+- 旧环境变量 migration journal（§12.8）、CLI `reset-admin`（§12.5）、登录/Bearer 全面改读 Argon2id（bootstrap 已落盘哈希）
 
 ## 最终审查记录
 
