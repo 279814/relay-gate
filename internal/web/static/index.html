@@ -692,6 +692,81 @@
           </div>
         </template>
 
+        <!-- ── 安全中心（P3）──────────────────────────────── -->
+        <template x-if="tab === 'security'">
+          <div>
+            <div class="bar">
+              <strong>Security Center</strong>
+              <span class="dim">被动扫描 · 手动 canary · SMTP（纯文本）</span>
+              <span class="grow"></span>
+              <button @click="loadSecurityFindings()">刷新 findings</button>
+            </div>
+            <div class="row" style="margin-bottom:12px">
+              <div class="field" style="max-width:160px">
+                <label>严重级别</label>
+                <select x-model="security.severity" @change="loadSecurityFindings()">
+                  <option value="">全部</option>
+                  <option value="critical">critical</option>
+                  <option value="high">high</option>
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="info">info</option>
+                </select>
+              </div>
+              <div class="field" style="flex:1">
+                <label>诊断扫描文本</label>
+                <input x-model="security.scanText" placeholder="粘贴响应片段（仅本地规则）">
+              </div>
+              <button class="primary" @click="runSecurityScan()">扫描</button>
+            </div>
+            <div class="row" style="margin-bottom:12px">
+              <div class="field" style="max-width:200px">
+                <label>手动 Canary Route ID（需 Active）</label>
+                <input x-model="security.canaryRouteId" placeholder="route id">
+              </div>
+              <button @click="runSecurityCanary()">运行 Canary</button>
+            </div>
+            <table>
+              <thead><tr><th>时间</th><th>级别</th><th>类别</th><th>摘要</th><th>来源</th></tr></thead>
+              <tbody>
+                <template x-for="f in (security.findings || [])" :key="f.id">
+                  <tr>
+                    <td class="mono" x-text="f.at_ms"></td>
+                    <td x-text="f.severity"></td>
+                    <td x-text="f.category"></td>
+                    <td class="wrap" x-text="f.summary"></td>
+                    <td x-text="f.source"></td>
+                  </tr>
+                </template>
+                <tr x-show="!(security.findings || []).length"><td colspan="5" class="empty">暂无 finding</td></tr>
+              </tbody>
+            </table>
+            <h3 style="font-size:13px;margin:18px 0 8px">SMTP 告警</h3>
+            <div class="cards" x-show="security.smtp">
+              <div class="card">
+                <label><input type="checkbox" x-model="security.smtp.enabled"> 启用</label>
+                <div class="field"><label>Host</label><input x-model="security.smtp.host"></div>
+                <div class="field"><label>Port</label><input type="number" x-model.number="security.smtp.port"></div>
+                <div class="field"><label>From</label><input x-model="security.smtp.from"></div>
+                <div class="field"><label>Recipients（逗号分隔）</label><input x-model="security.smtp.recipients"></div>
+                <div class="field"><label>Username</label><input x-model="security.smtp.username"></div>
+                <div class="field"><label>Password（留空保持）</label><input type="password" x-model="security.smtpPassword"></div>
+                <div class="field"><label>最低级别</label>
+                  <select x-model="security.smtp.min_severity">
+                    <option value="critical">critical</option>
+                    <option value="high">high</option>
+                    <option value="medium">medium</option>
+                  </select>
+                </div>
+                <div class="bar" style="margin-top:8px">
+                  <button class="primary" @click="saveSMTP()">保存</button>
+                  <button @click="testSMTP()">发送测试</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+
         <template x-if="tab === 'settings'">
           <div>
             <div class="bar">

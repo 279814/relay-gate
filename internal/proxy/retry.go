@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -54,6 +55,7 @@ type forwardOutcome struct {
 	outHeader http.Header
 	outURL    string
 	respTee   *sample.HeadTail
+	secTee    *sample.HeadTail // passive security scan copy (§14.2); independent of sample switch
 	res       *Result
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
@@ -70,6 +72,7 @@ type liveAttempt struct {
 	cand   *router.Candidate
 	at     *Attempt
 	tee    *sample.HeadTail
+	secTee *sample.HeadTail
 	keys   []string
 	body   []byte
 	header http.Header
@@ -156,7 +159,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
-				outURL: la.url, respTee: la.tee, keys: la.keys,
+				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
 				res: la.at.Result(), attempts: attempt, reqID: reqID,
 			}
 			if la.at.CanCommit() {
@@ -333,7 +336,19 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	var tee *sample.HeadTail
 	if h.samples != nil && settings.SampleEnabled {
 		tee = sample.NewHeadTail(settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
+	}
+	// 被动扫描副本与样本开关无关（§14.3：样本关闭时仍可扫描）。
+	var secTee *sample.HeadTail
+	if h.security != nil {
+		secTee = sample.NewHeadTail(256<<10, 256<<10)
+	}
+	switch {
+	case tee != nil && secTee != nil:
+		fwd.RespTee = io.MultiWriter(tee, secTee)
+	case tee != nil:
 		fwd.RespTee = tee
+	case secTee != nil:
+		fwd.RespTee = secTee
 	}
 
 	instr := health.NoopInstrumentation()
@@ -366,7 +381,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	}
 
 	return &liveAttempt{
-		cand: cand, at: at, tee: tee,
+		cand: cand, at: at, tee: tee, secTee: secTee,
 		keys: h.credentialsOf(r, cand),
 		body: outBody, header: outHeader, url: target.RawURL,
 		instr: instr,
