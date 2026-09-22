@@ -83,7 +83,8 @@ type Settings struct {
 	// 只用一个旋钮而不是「开关 + 次数」：两个字段表达同一件事时，
 	// enabled=true 且 attempts=1 这种自相矛盾的组合就必须有人去解释，
 	// 而它没有任何有用的语义。
-	RetryMaxAttempts int `json:"retry_max_attempts"`
+	RetryMaxAttempts int         `json:"retry_max_attempts"`
+	RetryPolicy      RetryPolicy `json:"retry_policy"`
 
 	// ── 样本记录（§3.6.3）────────────────────────────────
 	//
@@ -166,6 +167,7 @@ func DefaultSettings() Settings {
 		HalfOpenEnabled:     true,
 
 		RetryMaxAttempts: 3, // 初次 + 最多 2 次重试（§3.5）
+		RetryPolicy:      RetryPolicyBalanced,
 
 		SampleEnabled:       true,
 		SampleMaxBodyBytes:  0, // 0 = 不截断，完整保留入站与出站请求体
@@ -257,6 +259,11 @@ func (s *Settings) Validate() error {
 			"填大不会报错，只会让每个失败请求悄悄放大成同样多次上游调用",
 			MaxRetryAttempts, s.RetryMaxAttempts)
 	}
+	policy := s.RetryPolicy.Normalize()
+	if !policy.Valid() {
+		return invalid("retry_policy 必须是 safe、balanced 或 aggressive，收到 %q", s.RetryPolicy)
+	}
+	s.RetryPolicy = policy
 	// 三个体积上限：0 = 不限（完整留档），负数无意义。
 	//
 	// 不设**上限**是刻意的：这几个值的作用就是封顶，给封顶再封一层顶

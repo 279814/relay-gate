@@ -379,6 +379,14 @@ func FuzzReplaceModelRoundTrip(f *testing.F) {
 	})
 }
 
+// 顶层重复 model 键必须 400，且零上游调用（§6.2）。
+func TestExtractModel_DuplicateTopLevelRejected(t *testing.T) {
+	_, err := ExtractModel([]byte(`{"model":"a","stream":true,"model":"b"}`))
+	if !errors.Is(err, ErrDuplicateModel) {
+		t.Fatalf("err = %v, want ErrDuplicateModel", err)
+	}
+}
+
 // HTML 转义必须关闭：json.Marshal 默认把 < > & 写成 < > &，
 // 虽然 JSON 合法且语义相同，但字节不同。对以字节保真为目的的网关不合适。
 func TestEncodeJSONStringNoHTMLEscape(t *testing.T) {

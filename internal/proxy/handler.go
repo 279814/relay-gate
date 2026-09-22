@@ -72,12 +72,15 @@ type Handler struct {
 
 	// observers 是 P0-13 真实流量旁路工厂；可为 nil（不观察）。
 	observers health.AttemptObserverFactory
+
+	// recovery 是 P1 RecoveryGate：dead/recovering 半开 single-flight。
+	recovery *health.RecoveryGate
 }
 
 // NewHandler 组装透传处理器。
 //
 // samples 可为 nil，表示不记录样本。
-func NewHandler(cfg ConfigSource, health router.HealthView,
+func NewHandler(cfg ConfigSource, healthView router.HealthView,
 	samples SampleSink, relayKeys []string, log *slog.Logger) *Handler {
 
 	keys := make(map[string]bool, len(relayKeys))
@@ -87,13 +90,22 @@ func NewHandler(cfg ConfigSource, health router.HealthView,
 		}
 	}
 	return &Handler{
-		cfg: cfg, health: health, samples: samples, log: log,
+		cfg: cfg, health: healthView, samples: samples, log: log,
 		relayKeys: keys,
 		// 默认自建一个：多数测试与冒烟脚本不关心连接池分组，而一个
 		// nil Manager 会让每条转发路径都要判空。main 会用 WithTransports
 		// 换成与探活共享的那一个。
 		transports: outbound.NewManager(),
+		recovery:   health.NewRecoveryGate(),
 	}
+}
+
+// WithRecoveryGate 注入共享 RecoveryGate（可选；默认 NewHandler 已自建）。
+func (h *Handler) WithRecoveryGate(g *health.RecoveryGate) *Handler {
+	if g != nil {
+		h.recovery = g
+	}
+	return h
 }
 
 // WithTransports 换成与探活共享的连接池管理器。
@@ -289,6 +301,11 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	// 4. 取出 model 值用于选路。只读不改。
 	inModel, err := ExtractModel(body)
 	if err != nil {
+		if errors.Is(err, ErrDuplicateModel) {
+			writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
+				"请求体顶层 model 键重复")
+			return nil, false
+		}
 		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
 			fmt.Sprintf("无法确定请求的 model: %v", err))
 		return nil, false
@@ -386,21 +403,29 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 		return nil
 	}
 
-	// DeadRoutesFor 已按优先级升序排好，取第一个能占到额度的。
-	// 它返回 *model.Route 而不是 Candidate，所以并发额度要自己占 ——
-	// 不占的话半开会绕过 max_concurrency，而一个刚恢复的站最不该被打爆。
+	// DeadRoutesFor 已按优先级升序排好，取第一个能同时占到
+	// RecoveryGate（§9.4 single-flight）与普通并发额度的。
 	for _, rt := range router.DeadRoutesFor(snap, h.health, mn) {
 		up := snap.Upstreams[rt.UpstreamID]
 		if up == nil {
 			continue
 		}
+		relGate, ok := h.recovery.TryAcquire(rt.ID)
+		if !ok {
+			continue
+		}
 		release, ok := h.health.TryAcquire(rt.ID, rt.MaxConcurrency)
 		if !ok {
+			relGate()
 			continue
 		}
 		h.log.Info("全部 Route 均 dead，半开放行一次试探",
 			"model", inModel, "upstream", up.Name, "route", rt.ID)
-		return router.NewCandidate(rt, up, mn, release)
+		combined := func() {
+			release()
+			relGate()
+		}
+		return router.NewCandidate(rt, up, mn, combined)
 	}
 	return nil
 }
