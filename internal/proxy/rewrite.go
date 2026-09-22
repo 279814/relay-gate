@@ -16,6 +16,10 @@ import (
 // 是原样转发还是回 400。
 var ErrNoModelField = errors.New("body 中没有顶层 model 字段")
 
+// ErrDuplicateModel 表示 body 顶层出现多个 model 键（§6.2 / §6.3）。
+// 完整 body 模板不得制造重复 model；网关拒绝并零上游调用。
+var ErrDuplicateModel = errors.New("body 顶层 model 键重复")
+
 // ExtractModel 只读出 body 顶层的 model 值，不做任何修改。
 // 选路阶段用它来匹配 ModelName。
 //
@@ -135,6 +139,26 @@ func locateTopLevelModel(body []byte) (start, end int, err error) {
 		start = end - len(raw)
 		if start < afterKey || start > len(body) || end > len(body) {
 			return 0, 0, fmt.Errorf("定位 model 值失败：区间 [%d,%d) 不合法", start, end)
+		}
+		// Continue scanning for a second top-level "model" (§6.2). Trailing
+		// invalid JSON after the first model must not fail ExtractModel —
+		// body validity is the upstream's job (§3.3); we only reject duplicates.
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return start, end, nil
+			}
+			k, ok := keyTok.(string)
+			if !ok {
+				return start, end, nil
+			}
+			if k == "model" {
+				return 0, 0, ErrDuplicateModel
+			}
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return start, end, nil
+			}
 		}
 		return start, end, nil
 	}

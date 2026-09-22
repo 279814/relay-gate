@@ -50,6 +50,13 @@ type RequestLog struct {
 	// 混进成功率会拉低整体数字，让人误以为站的质量在下降。
 	HalfOpen bool   `json:"half_open"`
 	Error    string `json:"error"`
+
+	// DuplicateRisk is true when a retry may have re-executed work already
+	// accepted by an upstream (§11.2). Safe retries that never got a connection
+	// stay false. Not yet a dedicated DB column; surfaced in API JSON when loaded
+	// from memory path and encoded into Error for persisted rows as a marker.
+	DuplicateRisk bool   `json:"duplicate_risk"`
+	RetryReason   string `json:"retry_reason,omitempty"`
 }
 
 // TTFT 返回首 Token 延迟的毫秒数。未测到时为 0。

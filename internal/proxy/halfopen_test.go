@@ -122,3 +122,33 @@ func TestHandler_HalfOpenRespectsMaxConcurrency(t *testing.T) {
 	blocked <- struct{}{} // 放行第一个
 	<-done
 }
+
+// RecoveryGate：max_concurrency=0（不限普通并发）时半开仍 single-flight（§9.4）。
+func TestHandler_HalfOpenRecoveryGateEvenWhenMaxConcurrencyUnlimited(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(200)
+	})
+	hs.cfg.settings.HalfOpenEnabled = true
+	hs.cfg.snap.RoutesByModelName[1][0].MaxConcurrency = 0
+	hs.health.dead[100] = true
+
+	done := make(chan int, 2)
+	go func() {
+		done <- hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`)).Code
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first half-open never reached upstream")
+	}
+	rec2 := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+	if rec2.Code != 503 {
+		t.Errorf("second half-open must be blocked by RecoveryGate, got %d", rec2.Code)
+	}
+	close(release)
+	<-done
+}

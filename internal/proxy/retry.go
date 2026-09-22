@@ -344,7 +344,7 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 	if attempt >= plan.maxAttempts {
 		return nil
 	}
-	if !h.retryableAttempt(r, la) {
+	if !h.retryableAttempt(r, la, pre.settings.RetryPolicy) {
 		return nil
 	}
 	// 客户端已经走了就别再花上游额度了 —— 没人在等这个响应。
@@ -361,26 +361,59 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 	return cand
 }
 
-// retryableAttempt 在旧 classifyPayload 之上叠加 P0-13 RetryDecider。
-// Decider 仅额外放行 TryNextRoute；Keep/失败一律回落旧判定，避免收紧重试。
-func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt) bool {
+// retryableAttempt 在旧 classifyPayload 之上叠加 P0-13 RetryDecider 与 P1 RetryPolicy。
+func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy model.RetryPolicy) bool {
 	if la == nil || la.at == nil {
 		return false
 	}
 	base := retryable(la.at)
+	if !base {
+		return false
+	}
+	policy = policy.Normalize()
+	if policy == model.RetryPolicySafe && !safeRetryEvidence(la) {
+		return false
+	}
 	if la.instr.Retry == nil {
-		return base
+		return true
 	}
 	res := la.at.Result()
 	if res == nil {
-		return base
+		return true
 	}
 	prefix := la.at.Peek()
 	advice := la.instr.Retry.DecidePeek(r.Context(), res.Status, res.RespHeaders, prefix, true)
 	if advice.Disposition == health.RetryTryNextRoute {
 		return true
 	}
+	// KeepAttempt from decider does not widen beyond base; Safe already filtered.
+	if policy == model.RetryPolicyAggressive {
+		return base
+	}
 	return base
+}
+
+// safeRetryEvidence is true only when nothing proves the request reached the upstream (§11.2 Safe).
+func safeRetryEvidence(la *liveAttempt) bool {
+	if la == nil || la.at == nil {
+		return false
+	}
+	res := la.at.Result()
+	if res != nil && res.Status > 0 {
+		// Any HTTP status means headers arrived — request was accepted upstream.
+		return false
+	}
+	if la.instr.Trace != nil {
+		snap := la.instr.Trace.Snapshot()
+		if !snap.ResponseHeaderAt.IsZero() {
+			return false
+		}
+		// Got a connection but no response: body may already have been written.
+		if !snap.GotConnAt.IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 // retryable 判断一次**尚未提交**的尝试是否值得换站重来（§3.5）。
@@ -486,6 +519,14 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 		Outcome:  classifyOutcome(res),
 		Retried:  retried,
 		HalfOpen: halfOpen,
+	}
+	if retried {
+		l.DuplicateRisk = !safeRetryEvidence(la)
+		if l.DuplicateRisk {
+			l.RetryReason = "policy_retry_after_possible_upstream_accept"
+		} else {
+			l.RetryReason = "safe_connect_failure"
+		}
 	}
 	if res.Err != nil {
 		// 与样本、健康回写同一条脱敏规则。日志会显示在管理界面上，
