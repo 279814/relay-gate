@@ -91,6 +91,7 @@ type ResolvedTarget struct {
 	// RequestURLHash 是这一次实际 URL 的不可逆证据，只进单条 execution/log。
 	RequestURLHash   string
 	EndpointRevision int64
+	EndpointID       int64
 }
 
 // RequestURLHasher 对最终 URL 求带密钥的摘要。由 store.Cipher 实现。
@@ -291,6 +292,7 @@ func (resolver *Resolver) finish(target *url.URL, requestHost, configIdentity st
 		ResolvedURLHash:  hex.EncodeToString(digest[:]),
 		RequestURLHash:   resolver.hasher.SumRequestURL([]byte(raw)),
 		EndpointRevision: endpoint.Revision,
+		EndpointID:       endpoint.ID,
 	}, nil
 }
 
