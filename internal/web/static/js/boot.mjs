@@ -22,6 +22,34 @@ if (typeof base !== 'function') {
     shell.probeModuleReady = false;
     shell.probeModuleError = '';
     shell.stateRevision = 0;
+    shell.displayState = 'running';
+    shell.maintenanceReason = '';
+    shell.warmup = null;
+
+    shell.applyStatePayload = function applyStatePayload(st) {
+      if (!st) return;
+      this.stateRevision = st.revision || 0;
+      this.running = st.state === 'running';
+      this.displayState = st.effective || st.state || (this.running ? 'running' : 'paused');
+      this.maintenanceReason = st.maintenance_reason || '';
+      this.warmup = st.warmup || null;
+    };
+
+    shell.stateLabel = function stateLabel() {
+      if (this.displayState === 'maintenance') return '维护中';
+      return this.running ? '运行中' : '已暂停';
+    };
+
+    shell.stateTagClass = function stateTagClass() {
+      if (this.displayState === 'maintenance') return 'warn';
+      return this.running ? 'ok' : 'warn';
+    };
+
+    shell.warmupNote = function warmupNote() {
+      const w = this.warmup;
+      if (!w || !w.active || this.displayState !== 'running') return '';
+      return '暖机中：' + (w.pending || 0) + '/' + (w.total || 0) + ' Route 待复核（负状态已保留）';
+    };
 
     const api = createApiClient({
       onUnauthorized: () => {
@@ -61,8 +89,7 @@ if (typeof base !== 'function') {
       if (this.authed && this.probeModuleReady) {
         try {
           const st = await api.get('/state');
-          this.stateRevision = st.revision || 0;
-          this.running = st.state === 'running';
+          this.applyStatePayload(st);
         } catch {
           /* state 可选 */
         }
@@ -75,8 +102,7 @@ if (typeof base !== 'function') {
         await origLoadAll();
         try {
           const st = await api.get('/state');
-          this.stateRevision = st.revision || 0;
-          this.running = st.state === 'running';
+          this.applyStatePayload(st);
         } catch { /* */ }
         if (this.probeModuleReady) await this.refreshHealthSide();
         if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
@@ -122,11 +148,15 @@ if (typeof base !== 'function') {
       }
     };
 
-    // 总闸带 revision；409 刷新 revision。
+    // 总闸带 revision；409 刷新 revision。maintenance 禁止切换。
     shell.toggleState = async function toggleState() {
+      if (this.displayState === 'maintenance') {
+        this.err = '维护中不可切换启停（Master Key 轮换等）';
+        return;
+      }
       const next = this.running ? 'paused' : 'running';
-      const pauseMsg = '已暂停：synthetic 已取消，真实在途请求不终止；新请求 503';
-      const resumeMsg = '已恢复：将渐进复核 Route，不瞬间全量重探';
+      const pauseMsg = '已暂停：新请求与合成探活停止；真实在途请求不终止';
+      const resumeMsg = '已恢复：将渐进复核 Route，暖机完成前不暗示全部已验证';
       try {
         this.busy = true;
         this.err = '';
@@ -134,21 +164,20 @@ if (typeof base !== 'function') {
           state: next,
           expected_revision: this.stateRevision || 0,
         });
-        this.running = next === 'running';
-        this.stateRevision = data.revision || this.stateRevision;
+        this.applyStatePayload(data);
         this.msg = next === 'paused' ? pauseMsg : resumeMsg;
         this.loadHealth();
       } catch (e) {
         if (e.status === 409) {
           try {
             const st = await api.get('/state');
-            this.stateRevision = st.revision || 0;
-            this.running = st.state === 'running';
+            this.applyStatePayload(st);
           } catch { /* */ }
           this.err = '状态 revision 冲突，已刷新当前 revision，请重试';
         } else if (e.status === 503 && e.data && e.data.code === 'pause_drain_pending') {
           this.stateRevision = e.data.new_revision || this.stateRevision;
           this.running = false;
+          this.displayState = 'paused';
           this.msg = '暂停已持久化，正在排空 synthetic…';
         } else {
           this.err = e.message;

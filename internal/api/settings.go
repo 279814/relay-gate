@@ -10,11 +10,14 @@ import (
 	"github.com/279814/relay-gate/internal/store"
 )
 
-// RunStateAdmin 是 /admin/api/state 的唯一写入口（§P0-12）。
+// RunStateAdmin 是 /admin/api/state 的唯一写入口（§P0-12 / §13.5）。
 type RunStateAdmin interface {
 	Get(ctx context.Context) (runstate.Snapshot, error)
 	Current() runstate.Snapshot
 	Set(ctx context.Context, state model.RunState, expectedRevision int64) (runstate.Snapshot, error)
+	EnterMaintenance(reason string) error
+	ExitMaintenance() error
+	InMaintenance() bool
 }
 
 // WithRunState 注入进程级 RunState Controller。
@@ -68,10 +71,19 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"state":    string(snap.State),
-		"revision": snap.Revision,
-	})
+	out := map[string]any{
+		"state":      string(snap.State),
+		"effective":  snap.Effective(),
+		"revision":   snap.Revision,
+		"maintenance": snap.Maintenance,
+	}
+	if snap.MaintenanceReason != "" {
+		out["maintenance_reason"] = snap.MaintenanceReason
+	}
+	if snap.Warmup != nil {
+		out["warmup"] = snap.Warmup
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
@@ -118,9 +130,16 @@ func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	s.log.Info("切换服务状态", "state", snap.State, "revision", snap.Revision)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"state":    string(snap.State),
-		"revision": snap.Revision,
-	})
+	s.log.Info("切换服务状态", "state", snap.State, "revision", snap.Revision,
+		"effective", snap.Effective())
+	out := map[string]any{
+		"state":       string(snap.State),
+		"effective":   snap.Effective(),
+		"revision":    snap.Revision,
+		"maintenance": snap.Maintenance,
+	}
+	if snap.Warmup != nil {
+		out["warmup"] = snap.Warmup
+	}
+	writeJSON(w, http.StatusOK, out)
 }

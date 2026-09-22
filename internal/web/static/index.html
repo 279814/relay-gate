@@ -31,10 +31,11 @@
     <div>
       <header>
         <h1>relay-gate</h1>
-        <span class="tag dot" :class="running ? 'ok' : 'warn'"
-              x-text="running ? '运行中' : '已暂停'"></span>
+        <span class="tag dot" :class="stateTagClass()"
+              x-text="stateLabel()"></span>
         <span class="grow"></span>
-        <button @click="toggleState()" :disabled="busy"
+        <span class="note" x-show="warmupNote()" x-text="warmupNote()"></span>
+        <button @click="toggleState()" :disabled="busy || displayState === 'maintenance'"
                 x-text="running ? '暂停服务' : '启动服务'"></button>
         <button @click="logout()">登出</button>
       </header>
@@ -634,6 +635,7 @@
               <strong>凭据与 Master Key</strong>
               <span class="dim">查看/轮换需再次输入管理员密码；Cache-Control: no-store</span>
               <span class="grow"></span>
+              <span class="tag warn" x-show="displayState === 'maintenance'" x-text="'维护中：' + (maintenanceReason || 'credential')"></span>
               <button @click="loadCredentials()">刷新</button>
             </div>
             <div class="row" style="margin-bottom:12px">
@@ -649,8 +651,8 @@
                 <div class="sub" x-text="'grace fp: ' + (credentials.status?.relay_grace_fingerprint || '—')
                   + ' · left ' + (credentials.status?.relay_grace_seconds_left ?? 0) + 's'"></div>
                 <div class="bar" style="margin-top:8px">
-                  <button class="primary" @click="rotateRelayKey()">轮换</button>
-                  <button @click="revokeRelayGrace()">立即撤销旧 Key</button>
+                  <button class="primary" @click="rotateRelayKey()" :disabled="displayState === 'maintenance'">轮换</button>
+                  <button @click="revokeRelayGrace()" :disabled="displayState === 'maintenance'">立即撤销旧 Key</button>
                 </div>
                 <div class="mono wrap" x-show="credentials.relay_key" x-text="credentials.relay_key"></div>
               </div>
@@ -666,7 +668,7 @@
                   <label>新 Master Key（≥16）</label>
                   <input type="password" x-model="credentials.new_master" autocomplete="new-password">
                 </div>
-                <button class="primary" @click="rotateMasterKey()">轮换 Master Key</button>
+                <button class="primary" @click="rotateMasterKey()" :disabled="displayState === 'maintenance'">轮换 Master Key</button>
               </div>
               <div class="card">
                 <h3>管理员密码</h3>

@@ -235,6 +235,17 @@ func runServer() error {
 	if err := runCtrl.BindSyntheticController(coordinator); err != nil {
 		return fmt.Errorf("绑定 synthetic controller: %w", err)
 	}
+	runCtrl.BindWarmupSource(tracker)
+	if krStatus, err := kr.Status(); err == nil {
+		switch krStatus.Phase {
+		case keyring.PhasePrepared, keyring.PhaseDBCommitted, keyring.PhaseKeyActivated:
+			if err := runCtrl.EnterMaintenance("master_key_rotation_incomplete"); err != nil {
+				return fmt.Errorf("未完成 Master Key 轮换，进入 maintenance: %w", err)
+			}
+			log.Warn("Keyring 轮换未完成，保持 maintenance 直至恢复",
+				"phase", krStatus.Phase, "rotation_id", krStatus.RotationID)
+		}
+	}
 	if err := runCtrl.EnsureStartupPrepare(); err != nil {
 		return fmt.Errorf("启动 PrepareResume: %w", err)
 	}

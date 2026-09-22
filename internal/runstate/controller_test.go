@@ -264,3 +264,82 @@ func TestController_BindOnceAndFailClosed(t *testing.T) {
 		t.Fatal("nil 绑定应失败")
 	}
 }
+
+func TestController_MaintenanceOverlayDoesNotOverwritePaused(t *testing.T) {
+	st := newMemStore(model.RunStateRunning, 1)
+	c, err := NewController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	synth := &fakeSynth{}
+	_ = c.BindSyntheticController(synth)
+
+	if err := c.EnterMaintenance("master_key_rotation"); err != nil {
+		t.Fatal(err)
+	}
+	snap := c.Current()
+	if snap.State != model.RunStateRunning {
+		t.Fatalf("maintenance 不得改持久化 state，got %s", snap.State)
+	}
+	if !snap.Maintenance || snap.Effective() != "maintenance" || snap.Admitting() {
+		t.Fatalf("effective/admission 错误: %+v", snap)
+	}
+	if synth.cancels != 1 {
+		t.Fatalf("maintenance 应取消 synthetic，cancels=%d", synth.cancels)
+	}
+	if err := c.EnterMaintenance("again"); !errors.Is(err, ErrMaintenanceActive) {
+		t.Fatalf("重复进入应 ErrMaintenanceActive，got %v", err)
+	}
+
+	// 维护期间仍可改持久化意图（不覆盖叠加态）。
+	paused, err := c.Set(context.Background(), model.RunStatePaused, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.State != model.RunStatePaused || !paused.Maintenance {
+		t.Fatalf("paused 意图应保留且仍 maintenance: %+v", paused)
+	}
+
+	if err := c.ExitMaintenance(); err != nil {
+		t.Fatal(err)
+	}
+	after := c.Current()
+	if after.Maintenance || after.Effective() != "paused" || after.Admitting() {
+		t.Fatalf("退出后应显示 paused: %+v", after)
+	}
+}
+
+type countWarmup struct {
+	u, a, n, total int
+}
+
+func (w countWarmup) RouteHealthCounts() (unknown, alive, negative, total int) {
+	return w.u, w.a, w.n, w.total
+}
+
+func TestController_WarmupAfterResume(t *testing.T) {
+	st := newMemStore(model.RunStatePaused, 2)
+	c, err := NewController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.BindSyntheticController(&fakeSynth{})
+	c.BindWarmupSource(countWarmup{u: 3, a: 1, n: 2, total: 6})
+
+	snap, err := c.Set(context.Background(), model.RunStateRunning, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Warmup == nil || !snap.Warmup.Active || snap.Warmup.Pending != 3 {
+		t.Fatalf("resume 后应有暖机进度: %+v", snap.Warmup)
+	}
+
+	c.BindWarmupSource(countWarmup{u: 0, a: 4, n: 2, total: 6})
+	cleared := c.Current()
+	if cleared.Warmup != nil && cleared.Warmup.Active {
+		t.Fatalf("pending=0 后暖机应结束: %+v", cleared.Warmup)
+	}
+}
+

@@ -38,6 +38,10 @@ export function createCredentialsFeature(shell, api) {
   };
 
   shell.rotateRelayKey = async function rotateRelayKey() {
+    if (this.displayState === 'maintenance') {
+      this.err = '维护中禁止凭据轮换';
+      return;
+    }
     try {
       const data = await api.post('/credentials/rotate-relay', {
         password: this.credentials.password,
@@ -77,6 +81,10 @@ export function createCredentialsFeature(shell, api) {
   };
 
   shell.rotateMasterKey = async function rotateMasterKey() {
+    if (this.displayState === 'maintenance') {
+      this.err = '维护中禁止重复触发 Master Key 轮换';
+      return;
+    }
     try {
       const data = await api.post('/credentials/rotate-master', {
         password: this.credentials.password,
@@ -86,8 +94,16 @@ export function createCredentialsFeature(shell, api) {
       this.credentials.new_master = '';
       this.credentials.master_key = '';
       await this.loadCredentials();
+      try {
+        const st = await api.get('/state');
+        if (typeof this.applyStatePayload === 'function') this.applyStatePayload(st);
+      } catch { /* */ }
     } catch (e) {
       this.err = e && e.message ? e.message : String(e);
+      try {
+        const st = await api.get('/state');
+        if (typeof this.applyStatePayload === 'function') this.applyStatePayload(st);
+      } catch { /* */ }
     }
   };
 }
