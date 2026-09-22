@@ -20,6 +20,7 @@ type HealthView interface {
 // GateView 暴露站级 L1 结论。由 health.UpstreamGate 实现。
 type GateView interface {
 	Status(upstreamID int64) health.UpstreamStatus
+	StatusAt(upstreamID, networkRevision int64) health.UpstreamStatus
 }
 
 // Prober 执行手动探活。由 probe.Scheduler 实现。
@@ -112,7 +113,11 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 			row.Upstream = up.Name
 		}
 		if s.gate != nil {
-			row.L1 = s.gate.Status(rt.UpstreamID)
+			if up != nil {
+				row.L1 = s.gate.StatusAt(rt.UpstreamID, up.NetworkRevision)
+			} else {
+				row.L1 = s.gate.Status(rt.UpstreamID)
+			}
 		}
 		row.Selectable, row.Reason = selectability(rt, up, st)
 		rows = append(rows, row)

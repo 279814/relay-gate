@@ -9,10 +9,10 @@ import (
 
 // Reporter 把真实请求的结果翻译成健康判定，是 proxy.HealthReporter 的实现。
 //
-// 与探活共用同一套分类器（ClassifyHTTP / ClassifyTransportErr）是刻意的：
-// 两边各写一套的话，「429 是限流不是故障」「客户端断开不算上游的账」
-// 这类规则迟早会在其中一边漏掉，而漏掉的表现是好站被判死 —— 静默、
-// 不报错、只能靠翻状态才发现。
+// P0-10：Capability/Reachability 的权威写回走 ResultRecorder + CommitProbeObservation；
+// 本 Reporter 仍是临时 adapter，只把真实流量结果喂给旧 RouteHealth Tracker
+// （完整真实观察与 RecoveryGate 属 P0-13 / P1）。与探活共用分类器，避免
+// 「429 / 客户端断开」规则在两边分叉。
 type Reporter struct {
 	track Tracker
 }

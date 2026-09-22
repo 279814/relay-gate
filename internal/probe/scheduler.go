@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
@@ -40,6 +41,14 @@ type ConfigSource interface {
 	Snapshot() (*router.Snapshot, error)
 	Settings() (model.Settings, error)
 	RunState() (store.RunState, error)
+}
+
+// ProbeSnapshotSource 是 P0-10 起 Scheduler 构造 expectation 的来源。
+//
+// livecfg.Source 实现它；单元测试的 fakeCfg 可不实现 —— 那时走 Executor
+// 但不传期望，disposition 保持 not_applicable（与 P0-09 行为一致）。
+type ProbeSnapshotSource interface {
+	ProbeSnapshot() (*livecfg.ProbeSnapshot, error)
 }
 
 // TransportSource 按用途提供出站连接池。
@@ -179,14 +188,13 @@ func (s *Scheduler) nextOrder(ctx context.Context, trigger model.ProbeTrigger) (
 	return s.sequencer.Next(ctx, trigger)
 }
 
-// execL1 经 Executor 跑一次站级 L1，并把 Decision 映射成 Outcome。
-func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings model.Settings) Outcome {
+// execL1 经 Executor 跑一次站级 L1。
+func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings model.Settings) ExecutionResult {
 	order, err := s.nextOrder(ctx, model.TriggerScheduled)
 	if err != nil {
-		// 拿不到号：不发。当作「被忽略」，不动健康状态。
-		return Outcome{Verdict: health.VerdictIgnore}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
 	}
-	res, err := s.executor.Execute(ctx, ExecutionRequest{
+	req := ExecutionRequest{
 		ExecutionID:      sample.NewReqID(),
 		Trigger:          model.TriggerScheduled,
 		Upstream:         up,
@@ -194,28 +202,30 @@ func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings mod
 		Mode:             ObserveProbe,
 		Budget:           outbound.L1Budget(settings),
 		ObservationOrder: order,
-	})
+	}
+	s.attachExpectations(ctx, &req, up, nil, nil, model.EndpointModels)
+	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		s.log.Error("L1 执行失败", "upstream", up.Name, "err", err)
-		return Outcome{Verdict: health.VerdictIgnore}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
 	}
-	return res.Outcome
+	return res
 }
 
 // execL2 经 Executor 跑一次 Route 级 L2。
 func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.ModelName,
-	rt *model.Route, settings model.Settings) Outcome {
+	rt *model.Route, settings model.Settings) ExecutionResult {
 
 	kind, ok := mn.Protocol.Endpoint()
 	if !ok {
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictUnavailable,
+			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}}
 	}
 	order, err := s.nextOrder(ctx, model.TriggerScheduled)
 	if err != nil {
-		return Outcome{Verdict: health.VerdictIgnore}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
 	}
-	res, err := s.executor.Execute(ctx, ExecutionRequest{
+	req := ExecutionRequest{
 		ExecutionID:      sample.NewReqID(),
 		Trigger:          model.TriggerScheduled,
 		Upstream:         up,
@@ -225,12 +235,70 @@ func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.Mo
 		Mode:             ObserveProbe,
 		Budget:           outbound.L2Budget(settings),
 		ObservationOrder: order,
-	})
+	}
+	s.attachExpectations(ctx, &req, up, mn, rt, kind)
+	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		s.log.Error("L2 执行失败", "upstream", up.Name, "model", mn.Name, "err", err)
-		return Outcome{Verdict: health.VerdictIgnore}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
 	}
-	return res.Outcome
+	return res
+}
+
+// attachExpectations 从 ProbeSnapshot + RecipeResolver 填充双期望。
+//
+// 快照不可用时不传期望（不发送公网之前 Scheduler 上层应已跳过；这里兜底
+// 让 execution 仍能落库且 disposition=not_applicable）。
+func (s *Scheduler) attachExpectations(ctx context.Context, req *ExecutionRequest,
+	up *model.Upstream, mn *model.ModelName, rt *model.Route, endpoint model.EndpointKind) {
+
+	src, ok := s.cfg.(ProbeSnapshotSource)
+	if !ok || src == nil {
+		return
+	}
+	snap, err := src.ProbeSnapshot()
+	if err != nil || snap == nil {
+		if err != nil && !errors.Is(err, livecfg.ErrProbeSnapshotUnavailable) {
+			s.log.Error("读取 ProbeSnapshot 失败，本次不带 expectation", "err", err)
+		}
+		return
+	}
+	var routeID int64
+	if rt != nil {
+		routeID = rt.ID
+	}
+	recipe, err := s.resolveRecipeForExpectation(ctx, up.ID, routeID, endpoint)
+	if err != nil {
+		s.log.Error("解析 recipe 以构造 expectation 失败", "upstream", up.Name, "err", err)
+		return
+	}
+	if endpoint == model.EndpointModels {
+		reach, reachPol, cap, capPol, err := buildL1Expectations(snap, up.ID, recipe)
+		if err != nil {
+			s.log.Error("构造 L1 expectation 失败", "upstream", up.Name, "err", err)
+			return
+		}
+		req.ReachabilityExpectation, req.ReachabilityPolicy = reach, reachPol
+		req.CapabilityExpectation, req.CapabilityPolicy = cap, capPol
+		return
+	}
+	reach, reachPol, cap, capPol, err := buildL2Expectations(snap, up, rt, endpoint, recipe)
+	if err != nil {
+		s.log.Error("构造 L2 expectation 失败", "upstream", up.Name, "err", err)
+		return
+	}
+	req.ReachabilityExpectation, req.ReachabilityPolicy = reach, reachPol
+	req.CapabilityExpectation, req.CapabilityPolicy = cap, capPol
+	_ = mn
+}
+
+func (s *Scheduler) resolveRecipeForExpectation(ctx context.Context, upstreamID, routeID int64,
+	endpoint model.EndpointKind) (ResolvedRecipe, error) {
+
+	if s.recipes == nil {
+		return ResolvedRecipe{}, fmt.Errorf("recipe resolver 未装配")
+	}
+	return s.recipes.Resolve(ctx, RecipeQuery{UpstreamID: upstreamID, RouteID: routeID, Endpoint: endpoint})
 }
 
 // WithTargets 注入与真实转发共用的出站目标解析器（§7.1）。
@@ -365,8 +433,10 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 		}()
 	}
 
-	// 站级 L1 失败时跳过 L2（§4.1）：站都连不上，探模型纯属浪费 token。
-	if !s.gate.OK(up.ID) {
+	// 站级不可达时跳过 L2：站都连不上，探模型纯属浪费 token。
+	// 必须用快照里的 network revision。用内存行自己的 revision 去比，
+	// 等于永远相等，代理或地址改过之后旧的 unreachable 会一直挡住 L2。
+	if !s.gate.OKAt(up.ID, up.NetworkRevision) {
 		return
 	}
 	if !s.track.ClaimL2(rt.ID) {
@@ -389,8 +459,29 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 
 func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings model.Settings) {
 	var out Outcome
+	var reachable bool
 	if s.executor != nil {
-		out = s.execL1(ctx, up, settings)
+		// Probe 快照不可用时不发送（§4.9）。
+		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
+			if _, err := src.ProbeSnapshot(); errors.Is(err, livecfg.ErrProbeSnapshotUnavailable) {
+				s.log.Warn("ProbeSnapshot 不可用，跳过 L1", "upstream", up.Name)
+				return
+			}
+		}
+		res := s.execL1(ctx, up, settings)
+		out = res.Outcome
+		if out.Verdict == health.VerdictIgnore || res.Decision.ErrorClass == model.ErrorIgnored {
+			return
+		}
+		var apply bool
+		reachable, apply = l1StationEffect(res.Decision)
+		if !apply {
+			// 本地 config_error 没有网络证据。记成站挂了会连坐所有 Route，
+			// 而配方写错和站不可达是两件事。
+			s.log.Warn("L1 没有站级可达性结论，不更新 RouteHealth",
+				"upstream", up.Name, "class", res.Decision.ErrorClass)
+			return
+		}
 	} else {
 		tr, err := s.tr.TransportFor(up, outbound.L1Budget(settings))
 		if err != nil {
@@ -398,29 +489,48 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 			return
 		}
 		out = s.prober(tr).L1(ctx, up, settings)
-	}
-	if out.Verdict == health.VerdictIgnore {
-		return // 探活被取消（暂停/关闭），不是上游的问题
+		if out.Verdict == health.VerdictIgnore {
+			return
+		}
+		reachable = out.Verdict == health.VerdictOK
 	}
 
-	ok := out.Verdict == health.VerdictOK
-	s.countL1(up.ID, ok)
-	recovered := s.gate.Report(up.ID, ok, out.Err)
+	s.countL1(up.ID, reachable)
+	recovered := s.gate.Report(up.ID, reachable, out.Err)
 
-	if !ok {
-		// L1 失败 → 整站 dead：该 Upstream 下所有 Route 一并标记（§4.1）。
-		// 这是分两级的主要收益 —— 一次零 token 的探测就否决了整站。
+	if !reachable {
+		// 只有真正拿不到响应头才连坐 RouteHealth（§8.9）。
 		s.propagateL1Failure(up, out)
 		return
 	}
 
 	if recovered {
-		// §4.4b：L1 从失败转成功，立即对该站所有 dead Route 触发 L2，
-		// 不等 L2 周期。站级恢复的发现延迟因此收敛到 L1 周期（20s）。
 		n := s.triggerDeadRoutes(up.ID)
 		s.log.Info("上游 L1 恢复，已触发该站 dead Route 的 L2",
 			"upstream", up.Name, "routes", n)
 	}
+}
+
+// l1StationEffect 决定这次 L1 能不能当成「站不可达」。
+//
+// 拿到响应头（任何状态码，含 401/404/429/503）都算可达，不得连坐 RouteHealth。
+// 只有 ErrorUnreachable，或状态码为 0 且不是本地 config_error，才更新站级失败。
+// config_error 返回 apply=false：调用方不得改 Gate，也不得传播到 Route。
+func l1StationEffect(decision Decision) (reachable, apply bool) {
+	switch decision.ErrorClass {
+	case model.ErrorIgnored:
+		return false, false
+	case model.ErrorConfig:
+		if decision.StatusCode <= 0 {
+			return false, false
+		}
+	case model.ErrorUnreachable:
+		return false, true
+	}
+	if decision.StatusCode > 0 || decision.Reachable {
+		return true, true
+	}
+	return false, true
 }
 
 // propagateL1Failure 把站级失败落到该 Upstream 下的每个 Route。
@@ -473,7 +583,13 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 
 	var out Outcome
 	if s.executor != nil {
-		out = s.execL2(ctx, up, mn, rt, settings)
+		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
+			if _, err := src.ProbeSnapshot(); errors.Is(err, livecfg.ErrProbeSnapshotUnavailable) {
+				s.log.Warn("ProbeSnapshot 不可用，跳过 L2", "upstream", up.Name, "route", rt.ID)
+				return
+			}
+		}
+		out = s.execL2(ctx, up, mn, rt, settings).Outcome
 	} else {
 		tr, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
 		if err != nil {
@@ -676,8 +792,14 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, errNoModelName
 	}
 
+	var l1Reachable bool
 	if s.executor != nil {
-		l1 = s.execL1(ctx, up, settings)
+		res := s.execL1(ctx, up, settings)
+		l1 = res.Outcome
+		l1Reachable = res.Decision.Reachable || res.Decision.StatusCode > 0
+		if res.Decision.ErrorClass == model.ErrorUnreachable {
+			l1Reachable = false
+		}
 	} else {
 		// L1 与 L2 各取自己的连接池：两者的 connect 预算不同，而 connect 预算是
 		// 池身份的一部分（§7.3）。共用一个池就意味着其中一个的 l*_connect_sec
@@ -687,13 +809,13 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 			return l1, l2, terr
 		}
 		l1 = s.prober(l1Transport).L1(ctx, up, settings)
+		l1Reachable = l1.Verdict == health.VerdictOK
 	}
-	s.countL1(up.ID, l1.Verdict == health.VerdictOK)
-	s.gate.Report(up.ID, l1.Verdict == health.VerdictOK, l1.Err)
+	s.countL1(up.ID, l1Reachable)
+	s.gate.Report(up.ID, l1Reachable, l1.Err)
 
-	// L1 失败就不必再探 L2 —— 站都连不上，探模型只是白等一次超时。
-	// 但仍要把失败落到状态机，否则手动测试看到「站挂了」而状态没变。
-	if l1.Verdict != health.VerdictOK {
+	// 只有真正不可达才跳过 L2；401/404/429/503 仍可达（§8.9）。
+	if !l1Reachable {
 		s.track.Report(health.Report{
 			RouteID: rt.ID, Verdict: l1.Verdict, Source: health.SourceL1,
 			Err: l1.Err, RetryAfter: l1.RetryAfter,
@@ -702,7 +824,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	}
 
 	if s.executor != nil {
-		l2 = s.execL2(ctx, up, mn, rt, settings)
+		l2 = s.execL2(ctx, up, mn, rt, settings).Outcome
 	} else {
 		l2Transport, terr := s.tr.TransportFor(up, outbound.L2Budget(settings))
 		if terr != nil {

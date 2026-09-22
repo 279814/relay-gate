@@ -77,7 +77,10 @@ func run() error {
 
 	cfgSrc := livecfg.New(st, log)
 	tracker := health.NewTracker(cfgSrc)
-	gate := health.NewUpstreamGate()
+	reachTracker := health.NewReachabilityTracker(cfgSrc)
+	gate := health.NewUpstreamGate().WithTracker(reachTracker)
+	capRegistry := probe.NewCapabilityRegistry(cfgSrc)
+	obsReducer := health.NewObservationReducer(nil)
 
 	// 样本记录（§3.6）。开关与保留策略都在 Settings 里、都可热改
 	// （前者每请求现读，后者每次清理现读）。只有队列大小是启动时定格的 ——
@@ -105,7 +108,9 @@ func run() error {
 	// 在 main 里显式装配三样东西：Cipher 提供 keyed digest（URL 证据不能用
 	// 裸 SHA，见 §4.3），Store 提供 Endpoint 配置与 legacy URL 解密。
 	// P0-10 的原子 ConfigBundle 上线后只换 EndpointConfigSource，规则不动。
-	targets := outbound.NewProvider(st, st, outbound.NewResolver(cipher))
+	// 出站目标解析：P0-10 起 Endpoint 来自同代 ConfigBundle/Probe 快照；
+	// Store 仍提供 legacy URL 解密与 Secret。
+	targets := outbound.NewProvider(cfgSrc, st, outbound.NewResolver(cipher))
 
 	// 连接池按网络身份分组（§7.3）。真实请求、L1、L2、count_tokens 各传自己
 	// 的 connect 预算，值不同必须不同池 —— 那正是「l1_connect_sec 真正生效」
@@ -140,15 +145,13 @@ func run() error {
 		return errors.Is(err, store.ErrNotFound)
 	})
 
-	// P0-09 的单发执行器：L1/L2/ProbeNow 都经它发送并落一行 ProbeExecution。
-	//
-	// ExecutionOnlyRecorder 只写 execution 行、不推进任何状态（状态机是 P0-10）。
-	// AlwaysOpenAdmission 是这一版的占坑器（P0-12 换成进程级 Coordinator）。
-	// WallClock 是生产时钟，测试用 ManualClock 拨快。连接池经 ManagerTransports
-	// 复用与转发同一个 Manager（§7.3）。
+	// P0-10：ResultRecorder 经 CommitProbeObservation 推进 Reachability/Capability；
+	// 内存 Registry 只在 ApplyCurrent 后 CAS 更新。不得再注入 ExecutionOnlyRecorder。
+	// AlwaysOpenAdmission 仍是 P0-12 前的占坑器。
+	resultRecorder := probe.NewResultRecorder(st, obsReducer, reachTracker, capRegistry)
 	executor := probe.NewExecutor(targets, st, recipes,
 		probe.ManagerTransports{Manager: transports},
-		probe.NewExecutionOnlyRecorder(st), probe.AlwaysOpenAdmission(),
+		resultRecorder, probe.AlwaysOpenAdmission(),
 		probe.WallClock(), log)
 
 	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).

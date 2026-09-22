@@ -867,3 +867,33 @@ func TestScheduler_ProbeNowRejectsBrokenConfig(t *testing.T) {
 		t.Error("ModelName 不存在应报错")
 	}
 }
+
+func TestL1StationEffectDoesNotSpreadConfigErrors(t *testing.T) {
+	reachable, apply := l1StationEffect(Decision{
+		ErrorClass: model.ErrorConfig, StatusCode: 0,
+	})
+	if apply || reachable {
+		t.Fatalf("config_error without a response was treated as a station verdict: reachable=%v apply=%v", reachable, apply)
+	}
+
+	reachable, apply = l1StationEffect(Decision{
+		ErrorClass: model.ErrorAuthRejected, StatusCode: 401,
+	})
+	if !apply || !reachable {
+		t.Fatalf("401 must stay reachable and must not be dropped: reachable=%v apply=%v", reachable, apply)
+	}
+
+	reachable, apply = l1StationEffect(Decision{
+		ErrorClass: model.ErrorUnreachable, StatusCode: 0,
+	})
+	if !apply || reachable {
+		t.Fatalf("no response headers must mark the station unreachable: reachable=%v apply=%v", reachable, apply)
+	}
+
+	reachable, apply = l1StationEffect(Decision{
+		ErrorClass: model.ErrorTransient, StatusCode: 503,
+	})
+	if !apply || !reachable {
+		t.Fatalf("503 has response headers and must not kill every route: reachable=%v apply=%v", reachable, apply)
+	}
+}

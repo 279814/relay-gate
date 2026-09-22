@@ -3,18 +3,22 @@ package health
 import (
 	"sync"
 	"time"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
-// UpstreamGate 记录 L1 的站级结论（§4.1）。
+// UpstreamGate 记录 L1 的站级结论（§4.1），P0-10 起是 ReachabilityTracker 的兼容 facade。
 //
-// 单独放一个类型而不是塞进 Tracker：L1 的粒度是 Upstream，Tracker 的粒度是
+// 单独放一个类型而不是塞进 Tracker：L1 的粒度是 Upstream，Route Tracker 的粒度是
 // Route，两者的 key 空间不同。混在一个 map 里就要靠命名约定区分「这个 ID
 // 是站还是路由」—— 那种约定迟早会被记错，而记错的表现是把某个 Route 的
 // 状态当成站的状态来传播，一次误判连坐整站。
 //
-// 它仍在 health 包内，与 Tracker 共享包内可见性：调度器要同时读两者，
-// 分到两个包就得把内部状态导出成公开 API。
+// 生产路径由 ResultRecorder.ApplyCommitted 写入 ReachabilityTracker；Report
+// 仍更新 legacy 视图，以便未接 Commit 的单元测试（旧 Prober 路径）保持原语义。
 type UpstreamGate struct {
+	tracker *ReachabilityTracker
+
 	mu  sync.Mutex
 	ups map[int64]*upstreamState
 	now func() time.Time
@@ -32,6 +36,15 @@ type upstreamState struct {
 func NewUpstreamGate() *UpstreamGate {
 	return &UpstreamGate{ups: map[int64]*upstreamState{}, now: time.Now}
 }
+
+// WithTracker 把 Gate 接到 ReachabilityTracker。生产装配必须调用。
+func (g *UpstreamGate) WithTracker(tracker *ReachabilityTracker) *UpstreamGate {
+	g.tracker = tracker
+	return g
+}
+
+// Tracker 返回底层 ReachabilityTracker（可能为 nil）。
+func (g *UpstreamGate) Tracker() *ReachabilityTracker { return g.tracker }
 
 // Report 记录一次 L1 结论，返回该站是否**从失败转为成功**。
 //
@@ -65,13 +78,33 @@ func (g *UpstreamGate) Report(upstreamID int64, ok bool, err error) (recovered b
 }
 
 // OK 返回该站最近一次 L1 的结论。没探过的站返回 true（乐观）。
+//
+// 没有当前 network revision 时，不能拿内存行里记下的 revision 自己比自己：
+// 那样网络配置变了也永远判「仍是当前结论」。调度热路径用 OKAt。
+// 这里在接了 Tracker 且没有外部 revision 时，只在行内 revision 与
+// settings 指纹仍自洽时采信；调用方拿得到快照 revision 时必须走 OKAt。
 func (g *UpstreamGate) OK(upstreamID int64) bool {
+	if g.tracker != nil {
+		row := g.tracker.Snapshot(upstreamID)
+		if row == nil {
+			return true
+		}
+		return g.tracker.OK(upstreamID, row.ObservedNetworkRevision)
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if st := g.ups[upstreamID]; st != nil {
 		return st.ok
 	}
 	return true
+}
+
+// OKAt 用调用方提供的当前 networkRevision 做读侧失效。
+func (g *UpstreamGate) OKAt(upstreamID, networkRevision int64) bool {
+	if g.tracker != nil {
+		return g.tracker.OK(upstreamID, networkRevision)
+	}
+	return g.OK(upstreamID)
 }
 
 // UpstreamStatus 是站级 L1 状态的对外快照。
@@ -84,6 +117,11 @@ type UpstreamStatus struct {
 }
 
 func (g *UpstreamGate) Status(upstreamID int64) UpstreamStatus {
+	if g.tracker != nil {
+		if row := g.tracker.Snapshot(upstreamID); row != nil {
+			return statusFromRow(upstreamID, row, g.tracker.Effective(upstreamID, row.ObservedNetworkRevision))
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st := g.ups[upstreamID]
@@ -99,8 +137,37 @@ func (g *UpstreamGate) Status(upstreamID int64) UpstreamStatus {
 	}
 }
 
+// StatusAt 用调用方的当前 network revision 做读侧失效。
+//
+// revision 对不上时按「还没探过」返回：界面上的旧 unreachable 不能在
+// 地址或代理已经改过之后继续显示成现在的结论。
+func (g *UpstreamGate) StatusAt(upstreamID, networkRevision int64) UpstreamStatus {
+	if g.tracker != nil {
+		if row := g.tracker.Snapshot(upstreamID); row != nil {
+			if row.ObservedNetworkRevision != networkRevision {
+				return UpstreamStatus{UpstreamID: upstreamID, OK: true}
+			}
+			return statusFromRow(upstreamID, row, g.tracker.Effective(upstreamID, networkRevision))
+		}
+	}
+	return g.Status(upstreamID)
+}
+
+func statusFromRow(upstreamID int64, row *model.UpstreamReachability, state model.ReachabilityState) UpstreamStatus {
+	return UpstreamStatus{
+		UpstreamID: upstreamID,
+		OK:         state != model.ReachabilityUnreachable,
+		Probed:     state != model.ReachabilityUnknown,
+		LastError:  row.LastError,
+		LastAt:     maxInt64(row.LastOKAt, row.LastErrorAt),
+	}
+}
+
 // RetainOnly 只保留 keep 里的 Upstream，其余丢弃（配置删站后清理）。
 func (g *UpstreamGate) RetainOnly(keep map[int64]bool) {
+	if g.tracker != nil {
+		g.tracker.RetainOnly(keep)
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for id := range g.ups {
@@ -120,6 +187,9 @@ func (g *UpstreamGate) RetainOnly(keep map[int64]bool) {
 // 与 RetainOnly 的区别：那个按「配置里还剩谁」批量清理，是垃圾回收；
 // 这个是针对单个站的定点作废。
 func (g *UpstreamGate) Forget(upstreamID int64) {
+	if g.tracker != nil {
+		g.tracker.Invalidate(upstreamID)
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.ups, upstreamID)
@@ -127,7 +197,17 @@ func (g *UpstreamGate) Forget(upstreamID int64) {
 
 // Reset 清空全部站级状态（§4.8 从暂停恢复时用）。
 func (g *UpstreamGate) Reset() {
+	if g.tracker != nil {
+		g.tracker.InvalidateAll()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.ups = map[int64]*upstreamState{}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
