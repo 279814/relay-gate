@@ -104,9 +104,28 @@ func (registry *CapabilityRegistry) Snapshot(scope model.RecipeScope, scopeID in
 
 // Invalidate 丢弃一行（配置变更后立即 effective unknown）。
 func (registry *CapabilityRegistry) Invalidate(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) {
+	if registry == nil {
+		return
+	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	delete(registry.rows, capabilityKey{scopeType: scope, scopeID: scopeID, endpoint: endpoint})
+}
+
+// InvalidateAfterCalibration 在校准成功或鉴权穷尽写 config_error 后丢弃内存行。
+//
+// DB 侧的失效/写入由 Store.CommitCalibrationSuccess / AdvanceCalibrationAfterExecution
+// 负责；Registry 只清热路径，避免读到已过期的 supported。
+func (registry *CapabilityRegistry) InvalidateAfterCalibration(routeID, upstreamID int64, endpoint model.EndpointKind) {
+	if registry == nil {
+		return
+	}
+	if routeID > 0 {
+		registry.Invalidate(model.RecipeScopeRoute, routeID, endpoint)
+	}
+	if upstreamID > 0 {
+		registry.Invalidate(model.RecipeScopeUpstream, upstreamID, endpoint)
+	}
 }
 
 // InvalidateScope 丢弃某 scope 下全部 endpoint。

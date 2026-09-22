@@ -176,11 +176,13 @@ func run() error {
 	defer seq.Close()
 	sched.WithSequencer(seq)
 
+	calibrator := probe.NewCalibrationService(st, executor, probe.WallClock(), log, cfgSrc.Settings, capRegistry)
 	var bg sync.WaitGroup
-	bg.Add(3)
+	bg.Add(4)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
 	go func() { defer bg.Done(); persister.Run(bgCtx) }()
 	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
+	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
 	defer func() {
 		stopBG()
 		bg.Wait()

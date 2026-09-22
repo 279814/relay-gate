@@ -85,6 +85,32 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	if err != nil {
 		return nil, ResolvedRecipe{}, err
 	}
+	return p.finishPrepare(ctx, up, mn, rt, endpoint, resolved, nil)
+}
+
+// prepareExplicit 使用校准物化的 Recipe 与候选 AuthProfile（§P0-11）。
+func (p *Prober) prepareExplicit(ctx context.Context, req ExecutionRequest) (*preparedProbe, ResolvedRecipe, error) {
+	if p.Targets == nil {
+		return nil, ResolvedRecipe{}, errors.New("探活未装配出站目标解析器")
+	}
+	if req.ExplicitRecipe == nil || req.Upstream == nil {
+		return nil, ResolvedRecipe{}, errors.New("explicit prepare 缺少 recipe/upstream")
+	}
+	if req.ExplicitRecipe.Identity.Storage != model.RecipeStorageDB || req.ExplicitRecipe.Identity.DBVersionID < 1 {
+		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 StorageDB+DBVersionID")
+	}
+	facts := req.ExplicitRecipe.Facts
+	if facts.Use == "" {
+		facts.Use = model.BindingExplicitTest
+		req.ExplicitRecipe.Facts = facts
+	}
+	return p.finishPrepare(ctx, req.Upstream, req.ModelName, req.Route, req.Endpoint,
+		*req.ExplicitRecipe, req.AuthOverride)
+}
+
+func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
+	rt *model.Route, endpoint model.EndpointKind, resolved ResolvedRecipe,
+	authOverride *model.EndpointAuthProfile) (*preparedProbe, ResolvedRecipe, error) {
 
 	values, err := p.templateValues(ctx, up, mn, rt, resolved)
 	if err != nil {
@@ -92,16 +118,9 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	}
 	rendered, err := resolved.Compiled.Render(ctx, values)
 	if err != nil {
-		// 不复述下层文本：probetemplate.Render 用 %w 包了 ValueResolver 的错误，
-		// 而那条错误会落进 route_health.last_error（**落库**）并显示在管理界面上。
-		// TemplateValues 自己的错误只带占位符名，不带值，所以这里可以带上 ——
-		// 但 Secret 解析失败的那条来自 store，不保证同样克制。
 		return nil, resolved, fmt.Errorf("渲染 %s 层 recipe: %w", resolved.Layer, err)
 	}
 
-	// 渲染出的 RawQuery 当作「入站 query」交给 Resolver：Endpoint 的固定 query
-	// （认证参数那类）与 Recipe 的固定 query（?beta=true）是两个来源，拼接顺序
-	// 由 Resolver 独占（§7.1）。在这里自己拼一次就是第二份 URL 规则。
 	target, err := p.Targets.ResolveTarget(ctx, outbound.TargetInput{
 		Upstream:         up.ProbeConfig(),
 		Endpoint:         endpoint,
@@ -112,11 +131,11 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	if err != nil {
 		return nil, resolved, err
 	}
+	if authOverride != nil {
+		target.AuthProfile = *authOverride
+	}
 
 	method := rendered.Method
-	// 空 l1_path 的语义是「只探连接层」，也就是 HEAD base_url。这一项 URL 层
-	// 表达不了（EndpointURLOverride 只能给出地址），而 Recipe 里写死 HEAD
-	// 也不行 —— 同一份内置模板要服务两种 l1_path 配置。
 	connectionOnly := endpoint == model.EndpointModels && strings.TrimSpace(up.L1Path) == ""
 	if connectionOnly {
 		method = http.MethodHead

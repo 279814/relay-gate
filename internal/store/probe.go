@@ -1,5 +1,7 @@
 package store
 
+// Probe Secret / Recipe 版本仓储。CalibrationRun 状态机见 calibration.go（§P0-11）。
+
 import (
 	"context"
 	"database/sql"
