@@ -17,11 +17,13 @@ eval(js);
 async function main() {
   const { createApiClient } = await import(pathToFileURL(path.join(dir, 'js', 'api.mjs')).href);
   const { createProbeFeature, mergeProbeTabs } = await import(pathToFileURL(path.join(dir, 'js', 'probes.mjs')).href);
+  const { createRecentErrorsFeature } = await import(pathToFileURL(path.join(dir, 'js', 'errors.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
   createProbeFeature(inst, api);
   mergeProbeTabs(inst);
+  createRecentErrorsFeature(inst, api);
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([
