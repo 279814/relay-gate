@@ -195,13 +195,19 @@ func run() error {
 	defer seq.Close()
 	sched.WithSequencer(seq)
 
+	traffic := probe.NewTrafficObserverManager(cfgSrc, seq, resultRecorder, log).WithScheduler(sched)
+	fwd.WithObservers(traffic)
+	janitor := probe.NewRetentionJanitor(st, log)
+
 	calibrator := probe.NewCalibrationService(st, executor, probe.WallClock(), log, cfgSrc.Settings, capRegistry)
 	var bg sync.WaitGroup
-	bg.Add(4)
+	bg.Add(6)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
 	go func() { defer bg.Done(); persister.Run(bgCtx) }()
 	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
 	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
+	go func() { defer bg.Done(); traffic.Run(bgCtx) }()
+	go func() { defer bg.Done(); janitor.Run(bgCtx) }()
 	defer func() {
 		stopBG()
 		bg.Wait()
