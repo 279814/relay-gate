@@ -112,6 +112,16 @@ func validateRule(i int, rule Rule) error {
 		if strings.TrimSpace(rule.To) == "" || !strings.HasPrefix(strings.TrimSpace(rule.To), "/") {
 			return fmt.Errorf("rule %d: json_patch_copy requires to pointer starting with /", i)
 		}
+	case KindBodyTemplate:
+		if rule.Value == "" {
+			return fmt.Errorf("rule %d: body_template requires value", i)
+		}
+		if len(rule.Value) > MaxBodyBuffer {
+			return fmt.Errorf("rule %d: body_template exceeds %d byte buffer", i, MaxBodyBuffer)
+		}
+		if err := validateBodyTemplateShape([]byte(rule.Value)); err != nil {
+			return fmt.Errorf("rule %d: %w", i, err)
+		}
 	case KindSetStatus:
 		if rule.Value == "" {
 			return fmt.Errorf("rule %d: status value required", i)
