@@ -50,6 +50,9 @@ jobs:
       - name: P0 offline gate
         run: bash scripts/check-p0.sh
 
+      - name: P5 release gate
+        run: bash scripts/check-p5.sh
+
       # 前端的两个静态检查。ubuntu-latest 自带 node，不需要 setup-node ——
       # 原先「CI 里没有 node」的判断已经不成立了。
       #
