@@ -314,6 +314,17 @@ func runServer() error {
 			}
 			return ids
 		},
+		RoutesOfModelName: func(modelNameID int64) []int64 {
+			routes, err := st.ListRoutes(modelNameID)
+			if err != nil {
+				return nil
+			}
+			ids := make([]int64, 0, len(routes))
+			for _, rt := range routes {
+				ids = append(ids, rt.ID)
+			}
+			return ids
+		},
 	}
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).

@@ -54,3 +54,36 @@ func TestSemanticInvalidatorClearsTrackerGateCapsSchedule(t *testing.T) {
 		t.Fatalf("sched=%v", sched.routes)
 	}
 }
+
+// ModelName Protocol/Name/probe 变更必须立刻丢掉旧 RouteHealth（§9.2），
+// 且不得经 ScheduleClearer 去 TriggerL1（那是站级 /models）。
+func TestSemanticInvalidatorInvalidateModelNameClearsHealthWithoutSchedule(t *testing.T) {
+	tr, fs, _ := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	tr.Report(Report{RouteID: 11, Verdict: VerdictUnavailable, Source: SourceL2})
+	tr.Report(Report{RouteID: 12, Verdict: VerdictUnavailable, Source: SourceL2})
+	if tr.State(11) != model.StateDead || tr.State(12) != model.StateDead {
+		t.Fatalf("setup dead: %s %s", tr.State(11), tr.State(12))
+	}
+	gate := NewRecoveryGate()
+	if _, ok := gate.TryAcquire(11); !ok {
+		t.Fatal("acquire 11")
+	}
+	caps := &memCaps{}
+	sched := &memSched{}
+	inv := NewSemanticInvalidator(tr, gate, caps, sched, nil)
+	inv.InvalidateModelName(99, []int64{11, 12})
+
+	if tr.State(11) != model.StateUnknown || tr.State(12) != model.StateUnknown {
+		t.Fatalf("want both forgotten→unknown, got %s %s", tr.State(11), tr.State(12))
+	}
+	if gate.InFlight(11) {
+		t.Fatal("recovery gate for route 11 must be forgotten")
+	}
+	if len(caps.cleared) != 2 {
+		t.Fatalf("caps cleared=%v", caps.cleared)
+	}
+	if len(sched.routes) != 0 {
+		t.Fatalf("ModelName invalidate must not call ScheduleClearer (would TriggerL1): %v", sched.routes)
+	}
+}

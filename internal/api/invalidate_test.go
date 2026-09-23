@@ -249,6 +249,56 @@ func TestInvalidate_ModelNamePromptChangeTriggersProbe(t *testing.T) {
 	}
 }
 
+// SemanticConfigInvalidator must clear §9.2 RouteHealth for child Routes when a
+// ModelName changes — TriggerL2 alone leaves old dead/alive until the next probe.
+func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T) {
+	sem := &recordingSemantic{}
+	inner := &recordingInvalidator{}
+	wrap := &SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfModelName: func(modelNameID int64) []int64 {
+			if modelNameID != 5 {
+				t.Fatalf("unexpected modelNameID %d", modelNameID)
+			}
+			return []int64{101, 102}
+		},
+	}
+	wrap.InvalidateModelName(5)
+	if len(sem.modelNames) != 1 || sem.modelNames[0] != 5 {
+		t.Fatalf("semantic InvalidateModelName calls=%v", sem.modelNames)
+	}
+	if len(sem.modelNameRoutes) != 1 || len(sem.modelNameRoutes[0]) != 2 ||
+		sem.modelNameRoutes[0][0] != 101 || sem.modelNameRoutes[0][1] != 102 {
+		t.Fatalf("semantic routeIDs=%v", sem.modelNameRoutes)
+	}
+	_, _, mns := inner.counts()
+	if mns != 1 {
+		t.Fatalf("inner InvalidateModelName count=%d", mns)
+	}
+}
+
+type recordingSemantic struct {
+	routes          []int64
+	upstreams       []int64
+	modelNames      []int64
+	modelNameRoutes [][]int64
+}
+
+func (r *recordingSemantic) InvalidateRoute(routeID int64) {
+	r.routes = append(r.routes, routeID)
+}
+
+func (r *recordingSemantic) InvalidateUpstream(upstreamID int64, _ []int64) {
+	r.upstreams = append(r.upstreams, upstreamID)
+}
+
+func (r *recordingSemantic) InvalidateModelName(modelNameID int64, routeIDs []int64) {
+	r.modelNames = append(r.modelNames, modelNameID)
+	cp := append([]int64(nil), routeIDs...)
+	r.modelNameRoutes = append(r.modelNameRoutes, cp)
+}
+
 func TestInvalidate_RoutePriorityChangeDoesNotTriggerProbe(t *testing.T) {
 	// priority / weight 只影响选路偏好，探活结果一模一样。
 	h, inv := newInvalidatorServer(t)

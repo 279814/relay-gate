@@ -83,3 +83,32 @@ func (s *SemanticInvalidator) InvalidateUpstream(upstreamID int64, routeIDs []in
 		s.learner.ForgetUpstream(upstreamID)
 	}
 }
+
+// InvalidateModelName clears §9.2 Route runtime state for every Route under a
+// ModelName whose Protocol / probe payload / matching name changed.
+//
+// Unlike InvalidateRoute, this must not invoke ScheduleClearer: ModelName edits
+// only change L2 probe content (§4.5), and Scheduler.InvalidateRoute would also
+// TriggerL1. Tracker.Forget already drops schedule reservations by deleting the
+// route row; the caller then TriggerL2 via ConfigInvalidator.InvalidateModelName.
+func (s *SemanticInvalidator) InvalidateModelName(_ int64, routeIDs []int64) {
+	if s == nil {
+		return
+	}
+	for _, routeID := range routeIDs {
+		if routeID <= 0 {
+			continue
+		}
+		s.mu.Lock()
+		if s.tracker != nil {
+			s.tracker.Forget(routeID)
+		}
+		if s.recovery != nil {
+			s.recovery.Forget(routeID)
+		}
+		if s.caps != nil {
+			s.caps.InvalidateScope(model.RecipeScopeRoute, routeID)
+		}
+		s.mu.Unlock()
+	}
+}
