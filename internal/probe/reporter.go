@@ -22,14 +22,16 @@ func NewReporter(track Tracker) *Reporter { return &Reporter{track: track} }
 // ReportResult 上报一次真实转发的结果（§3.5）。
 //
 // 非阻塞：全程只做内存里的状态更新，没有 I/O。
-func (r *Reporter) ReportResult(routeID int64, res *proxy.ResultView) {
+// generation 来自选路占位；与当前 RouteHealth 世代不一致则丢弃。
+func (r *Reporter) ReportResult(routeID int64, generation uint64, res *proxy.ResultView) {
 	out := classifyReal(res)
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
 
 	r.track.Report(health.Report{
-		RouteID: routeID, Verdict: out.Verdict, Source: health.SourceReal,
+		RouteID: routeID, Generation: generation,
+		Verdict: out.Verdict, Source: health.SourceReal,
 		Err: out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
 	})
 

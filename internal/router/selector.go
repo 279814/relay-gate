@@ -26,6 +26,10 @@ type Candidate struct {
 	Upstream  *model.Upstream
 	ModelName *model.ModelName
 
+	// HealthGeneration 是选路占位时的 RouteHealth 世代，供真实流量
+	// Report 绑定；Forget 后同 id 新行世代不同，迟到结论必须丢弃。
+	HealthGeneration uint64
+
 	// release 是选中时占下的并发额度的释放函数，见 Release。
 	release func()
 }
@@ -52,9 +56,10 @@ func (c *Candidate) Release() {
 // 让额度必须从 TryAcquire 来、且只能通过这个入口装进 Candidate，
 // 「占了就一定会还」这条不变量才守得住。
 func NewCandidate(rt *model.Route, up *model.Upstream,
-	mn *model.ModelName, release func()) *Candidate {
+	mn *model.ModelName, release func(), healthGeneration uint64) *Candidate {
 
-	return &Candidate{Route: rt, Upstream: up, ModelName: mn, release: release}
+	return &Candidate{Route: rt, Upstream: up, ModelName: mn,
+		release: release, HealthGeneration: healthGeneration}
 }
 
 // HealthView 提供选路所需的健康状态。由 health 包实现，
@@ -71,8 +76,10 @@ type HealthView interface {
 	// 判定与占位必须在同一个临界区内完成。
 	//
 	// ok 为 true 时 release 非 nil，且必须在请求结束时调用一次。
+	// generation 是占位时的 RouteHealth 世代，真实流量回写须带上它，
+	// 以免 Forget 后同 id 新 Route 被迟到结论污染。
 	// 实现须保证 release 可重复调用（多调无副作用）。
-	TryAcquire(routeID int64, limit int) (release func(), ok bool)
+	TryAcquire(routeID int64, limit int) (release func(), generation uint64, ok bool)
 }
 
 // Snapshot 是选路依赖的配置快照。调用方从 store 读一次，避免每请求查库。
@@ -201,12 +208,12 @@ func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 			}
 			// 占位与判定在 TryAcquire 内部一次完成，中间没有让并发请求
 			// 挤进来的窗口。
-			release, ok := hv.TryAcquire(chosen.ID, chosen.MaxConcurrency)
+			release, gen, ok := hv.TryAcquire(chosen.ID, chosen.MaxConcurrency)
 			if !ok {
 				continue
 			}
 			return &Candidate{Route: chosen, Upstream: up,
-				ModelName: mn, release: release}, nil
+				ModelName: mn, release: release, HealthGeneration: gen}, nil
 		}
 	}
 

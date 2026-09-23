@@ -56,7 +56,7 @@ func deadL2Interval(rs *routeState, s model.Settings, now time.Time) time.Durati
 	return base
 }
 
-// ClaimL1 原子地「判断 L1 是否到期并预占下一次」。到期返回 true。
+// ClaimL1 原子地「判断 L1 是否到期并预占下一次」。到期返回 true 与当前世代。
 //
 // 必须是一个操作，不能拆成 DueL1() + MarkL1()。拆开的话两步之间有窗口：
 // 调度器每个 tick 都会遍历所有 Route，若上一轮的探活还没跑完（公益站
@@ -65,7 +65,9 @@ func deadL2Interval(rs *routeState, s model.Settings, now time.Time) time.Durati
 //
 // 预占的方式是立刻把 nextAt 推到「现在 + 间隔」。探活跑完后由
 // Report 触发的状态变化会重算间隔，不需要再回填。
-func (t *Tracker) ClaimL1(routeID int64) bool {
+//
+// generation 须带进后续对该 Route 的 Report，避免 Forget 后迟到结论污染同 id 新行。
+func (t *Tracker) ClaimL1(routeID int64) (generation uint64, ok bool) {
 	s := t.currentSettings()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -73,11 +75,11 @@ func (t *Tracker) ClaimL1(routeID int64) bool {
 	rs := t.get(routeID)
 	now := t.now()
 	if !rs.nextL1At.IsZero() && now.Before(rs.nextL1At) {
-		return false
+		return 0, false
 	}
 	l1, _ := intervalFor(rs, s, now)
 	rs.nextL1At = now.Add(l1)
-	return true
+	return rs.generation, true
 }
 
 // ClaimL2 同 ClaimL1，另外实现 piggyback（§4.6）。
@@ -88,7 +90,7 @@ func (t *Tracker) ClaimL1(routeID int64) bool {
 //
 // 跳过时同样要推进 nextL2At，否则下个 tick 会立刻再判一次 —— 那样
 // piggyback 就从「省一次探活」变成了「每个 tick 都白跑一遍判定逻辑」。
-func (t *Tracker) ClaimL2(routeID int64) bool {
+func (t *Tracker) ClaimL2(routeID int64) (generation uint64, ok bool) {
 	s := t.currentSettings()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -96,7 +98,7 @@ func (t *Tracker) ClaimL2(routeID int64) bool {
 	rs := t.get(routeID)
 	now := t.now()
 	if !rs.nextL2At.IsZero() && now.Before(rs.nextL2At) {
-		return false
+		return 0, false
 	}
 	_, l2 := intervalFor(rs, s, now)
 
@@ -106,12 +108,12 @@ func (t *Tracker) ClaimL2(routeID int64) bool {
 	if s.PiggybackEnabled && rs.state != model.StateDead && !rs.lastRealOKAt.IsZero() {
 		if now.Sub(rs.lastRealOKAt) < l2 {
 			rs.nextL2At = rs.lastRealOKAt.Add(l2)
-			return false
+			return 0, false
 		}
 	}
 
 	rs.nextL2At = now.Add(l2)
-	return true
+	return rs.generation, true
 }
 
 // TriggerL2 清掉 L2 的预占，让下一个 tick 立刻探它（§4.4b / §4.5）。

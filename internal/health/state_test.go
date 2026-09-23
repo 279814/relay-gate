@@ -260,10 +260,10 @@ func TestReport_ChangedIsFalseWhenStateStable(t *testing.T) {
 func TestClaim_UnknownProbesImmediately(t *testing.T) {
 	tr, _, _ := newTestTracker(t)
 
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("unknown 的 L1 应立即到期")
 	}
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("unknown 的 L2 应立即到期")
 	}
 	// unknown 的间隔是 0，所以下一个 tick 仍然到期 —— 这是有意的，
@@ -280,18 +280,18 @@ func TestClaim_IsAtomicAndPreventsDoubleProbe(t *testing.T) {
 
 	report(tr, 1, VerdictOK, SourceL1) // → alive，间隔 60s
 
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Fatal("首次应到期")
 	}
 	// 探活还在跑（没有 Report），下一个 tick 不能再抢到
 	for i := 0; i < 10; i++ {
-		if tr.ClaimL1(1) {
+		if _, ok := tr.ClaimL1(1); ok {
 			t.Fatal("预占后不该被再次抢到 —— 会导致同一个 Route 被并发探两次")
 		}
 	}
 
 	*now = now.Add(61 * time.Second)
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("间隔已过，应重新到期")
 	}
 }
@@ -304,19 +304,19 @@ func TestClaim_DeadUsesShortFixedIntervals(t *testing.T) {
 	fs.s.L2IntervalDeadSec = 30
 
 	report(tr, 1, VerdictUnavailable, SourceL2)
-	tr.ClaimL1(1)
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL1(1)
+	_, _ = tr.ClaimL2(1)
 
 	*now = now.Add(21 * time.Second)
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("dead 的 L1 应 20 秒一轮")
 	}
-	if tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); ok {
 		t.Error("dead 的 L2 是 30 秒，21 秒时还不该到期")
 	}
 
 	*now = now.Add(10 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("31 秒后 dead 的 L2 应到期")
 	}
 }
@@ -332,20 +332,20 @@ func TestClaim_LongDeadWidensL2ButNotL1(t *testing.T) {
 
 	// 推进到「已死 > 60 分钟」
 	*now = now.Add(61 * time.Minute)
-	tr.ClaimL1(1)
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL1(1)
+	_, _ = tr.ClaimL2(1)
 
 	*now = now.Add(21 * time.Second)
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("久死站的 L1 仍应保持 20 秒")
 	}
 
 	*now = now.Add(30 * time.Second) // 累计 51s << 300s
-	if tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); ok {
 		t.Error("久死站的 L2 应已放宽到 300 秒")
 	}
 	*now = now.Add(250 * time.Second) // 累计 > 300s
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("超过 300 秒后应到期")
 	}
 }
@@ -356,22 +356,22 @@ func TestDeadModelIntervals(t *testing.T) {
 	fs.s.L1IntervalDeadSec = 20
 
 	report(tr, 1, VerdictUnavailable, SourceL2)
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL2(1)
 
 	// ≤10 分钟 → 30s
 	*now = now.Add(31 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("短死 L2 应为 30s")
 	}
 
 	*now = now.Add(11 * time.Minute) // 已死约 11 分钟 → 120s 档
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL2(1)
 	*now = now.Add(31 * time.Second)
-	if tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); ok {
 		t.Error("中死 L2 应为 120s，31s 不应到期")
 	}
 	*now = now.Add(90 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("中死 120s 后应到期")
 	}
 }
@@ -384,18 +384,18 @@ func TestClaim_PiggybackSkipsL2AfterRealSuccess(t *testing.T) {
 	fs.s.L2IntervalAliveSec = 300
 
 	report(tr, 1, VerdictOK, SourceReal) // → alive，且刷新 lastRealOKAt
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL2(1)
 
 	*now = now.Add(301 * time.Second)
 	report(tr, 1, VerdictOK, SourceReal) // 又一次真实成功
 
 	*now = now.Add(10 * time.Second)
-	if tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); ok {
 		t.Error("距上次真实成功仅 10 秒，应被 piggyback 跳过")
 	}
 
 	*now = now.Add(300 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("超过 L2 间隔且无新的真实成功，应正常探活")
 	}
 }
@@ -415,9 +415,9 @@ func TestClaim_PiggybackDoesNotApplyToDeadRoutes(t *testing.T) {
 		t.Fatal("前置条件：应为 dead")
 	}
 
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL2(1)
 	*now = now.Add(31 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("dead 站不该被 piggyback 跳过 —— 那会让它永远不再被探活")
 	}
 }
@@ -430,10 +430,10 @@ func TestClaim_PiggybackCanBeDisabled(t *testing.T) {
 	fs.s.L2IntervalAliveSec = 300
 
 	report(tr, 1, VerdictOK, SourceReal)
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL2(1)
 
 	*now = now.Add(301 * time.Second)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("piggyback 关闭时应按周期正常探活")
 	}
 }
@@ -444,18 +444,18 @@ func TestTrigger_ClearsClaimForImmediateProbe(t *testing.T) {
 	fs.s.OKThreshold = 1
 
 	report(tr, 1, VerdictOK, SourceL2)
-	tr.ClaimL1(1)
-	tr.ClaimL2(1)
-	if tr.ClaimL2(1) {
+	_, _ = tr.ClaimL1(1)
+	_, _ = tr.ClaimL2(1)
+	if _, ok := tr.ClaimL2(1); ok {
 		t.Fatal("前置条件：应已被预占")
 	}
 
 	tr.TriggerL2(1)
-	if !tr.ClaimL2(1) {
+	if _, ok := tr.ClaimL2(1); !ok {
 		t.Error("TriggerL2 后应立即可探")
 	}
 	tr.TriggerL1(1)
-	if !tr.ClaimL1(1) {
+	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("TriggerL1 后应立即可探")
 	}
 }
@@ -470,8 +470,8 @@ func TestResetAll_ClearsStateAndClaims(t *testing.T) {
 
 	report(tr, 1, VerdictUnavailable, SourceL2)
 	tr.Report(Report{RouteID: 2, Verdict: VerdictRateLimited, Source: SourceL2})
-	tr.ClaimL1(1)
-	tr.ClaimL2(1)
+	_, _ = tr.ClaimL1(1)
+	_, _ = tr.ClaimL2(1)
 
 	tr.ResetAll()
 
@@ -481,7 +481,10 @@ func TestResetAll_ClearsStateAndClaims(t *testing.T) {
 	if tr.CoolingDown(2) {
 		t.Error("恢复后应清除冷却")
 	}
-	if !tr.ClaimL1(1) || !tr.ClaimL2(1) {
+	if _, ok1 := tr.ClaimL1(1); !ok1 {
+		t.Fatal("claim L1")
+	}
+	if _, ok2 := tr.ClaimL2(1); !ok2 {
 		t.Error("恢复后应立即可探活（§4.8：全量 L1，再对需要的跑 L2）")
 	}
 	if n := tr.Status(1).ConsecutiveFail; n != 0 {

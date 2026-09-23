@@ -10,7 +10,7 @@ import (
 // acquire 是测试里的便捷包装：不关心上限，只要占位成功。
 func acquire(t *testing.T, tr *Tracker, routeID int64) func() {
 	t.Helper()
-	release, ok := tr.TryAcquire(routeID, 0)
+	release, _, ok := tr.TryAcquire(routeID, 0)
 	if !ok {
 		t.Fatalf("不限并发时 TryAcquire(%d) 不该失败", routeID)
 	}
@@ -105,7 +105,7 @@ func TestTracker_ConcurrentBeginDone(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perRoute; j++ {
-				done, ok := tr.TryAcquire(routeID, 0)
+				done, _, ok := tr.TryAcquire(routeID, 0)
 				if !ok {
 					continue // 不限并发时不该发生，交给下面的配平断言暴露
 				}
@@ -129,23 +129,23 @@ func TestTracker_ConcurrentBeginDone(t *testing.T) {
 func TestTracker_TryAcquireEnforcesLimit(t *testing.T) {
 	tr := NewTracker(nil)
 
-	r1, ok := tr.TryAcquire(100, 2)
+	r1, _, ok := tr.TryAcquire(100, 2)
 	if !ok {
 		t.Fatal("第 1 个应放行")
 	}
-	if _, ok = tr.TryAcquire(100, 2); !ok {
+	if _, _, ok = tr.TryAcquire(100, 2); !ok {
 		t.Fatal("第 2 个应放行")
 	}
-	if _, ok = tr.TryAcquire(100, 2); ok {
+	if _, _, ok = tr.TryAcquire(100, 2); ok {
 		t.Fatal("第 3 个超过 limit=2，应被拒绝")
 	}
 	// 上限是 per-Route 的，别的 Route 不受影响
-	if _, ok = tr.TryAcquire(200, 2); !ok {
+	if _, _, ok = tr.TryAcquire(200, 2); !ok {
 		t.Error("另一个 Route 的额度不该被占用")
 	}
 
 	r1()
-	if _, ok = tr.TryAcquire(100, 2); !ok {
+	if _, _, ok = tr.TryAcquire(100, 2); !ok {
 		t.Error("释放一个后应腾出一格")
 	}
 }
@@ -157,7 +157,7 @@ func TestTracker_ZeroLimitMeansUnlimited(t *testing.T) {
 	for _, limit := range []int{0, -1} {
 		tr = NewTracker(nil)
 		for i := 0; i < 100; i++ {
-			if _, ok := tr.TryAcquire(100, limit); !ok {
+			if _, _, ok := tr.TryAcquire(100, limit); !ok {
 				t.Fatalf("limit=%d 应视为不限，第 %d 个被拒", limit, i)
 			}
 		}
@@ -186,7 +186,7 @@ func TestTracker_TryAcquireNoOversubscribeUnderRace(t *testing.T) {
 			defer wg.Done()
 			start.Wait()
 
-			release, ok := tr.TryAcquire(100, limit)
+			release, _, ok := tr.TryAcquire(100, limit)
 			if !ok {
 				return
 			}
@@ -220,7 +220,7 @@ func TestTracker_ReleaseAfterForgetDoesNotPoisonReusedID(t *testing.T) {
 	tr := NewTracker(nil)
 	const id int64 = 42
 
-	oldRel, ok := tr.TryAcquire(id, 1)
+	oldRel, _, ok := tr.TryAcquire(id, 1)
 	if !ok {
 		t.Fatal("acquire before forget")
 	}
@@ -244,7 +244,7 @@ func TestTracker_ReleaseAfterForgetDoesNotPoisonReusedID(t *testing.T) {
 
 	// 同 id 新 Route 占位后，旧 release（已 once）与第二次「假想」路径都已耗尽；
 	// 再 acquire 一个新的并确认旧闭包不会让计数穿零或超发。
-	newRel, ok := tr.TryAcquire(id, 1)
+	newRel, _, ok := tr.TryAcquire(id, 1)
 	if !ok {
 		t.Fatal("reused id must acquire a fresh slot")
 	}
@@ -255,7 +255,7 @@ func TestTracker_ReleaseAfterForgetDoesNotPoisonReusedID(t *testing.T) {
 	if tr.InFlight(id) != 1 {
 		t.Fatalf("stale release poisoned reused id: inflight=%d", tr.InFlight(id))
 	}
-	if _, ok := tr.TryAcquire(id, 1); ok {
+	if _, _, ok := tr.TryAcquire(id, 1); ok {
 		t.Fatal("reused id with limit=1 must stay single-flight while new holder is live")
 	}
 	if tr.State(id) == model.StateDead {
@@ -272,13 +272,13 @@ func TestTracker_StaleReleaseAfterReuseDoesNotUndercount(t *testing.T) {
 	tr := NewTracker(nil)
 	const id int64 = 7
 
-	oldRel, ok := tr.TryAcquire(id, 1)
+	oldRel, _, ok := tr.TryAcquire(id, 1)
 	if !ok {
 		t.Fatal("old acquire")
 	}
 	tr.Forget(id)
 
-	newRel, ok := tr.TryAcquire(id, 1)
+	newRel, _, ok := tr.TryAcquire(id, 1)
 	if !ok {
 		t.Fatal("new acquire on reused id")
 	}
@@ -286,10 +286,57 @@ func TestTracker_StaleReleaseAfterReuseDoesNotUndercount(t *testing.T) {
 	if got := tr.InFlight(id); got != 1 {
 		t.Fatalf("stale release undercounted reused id: inflight=%d want 1", got)
 	}
-	if _, ok := tr.TryAcquire(id, 1); ok {
+	if _, _, ok := tr.TryAcquire(id, 1); ok {
 		t.Fatal("limit=1 oversubscribed after stale release")
 	}
 	newRel()
+}
+
+// Forget 后迟到的探活结论不得按 id 写回：否则同 id 新 Route 会被旧
+// Fatal/Unavailable 直接判死。Claim 时绑定的 generation 必须对得上。
+func TestTracker_ReportAfterForgetDoesNotPoisonReusedID(t *testing.T) {
+	fs := &fakeSettings{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := NewTracker(fs)
+	const id int64 = 99
+
+	gen, ok := tr.ClaimL2(id)
+	if !ok || gen == 0 {
+		t.Fatalf("claim before forget: ok=%v gen=%d", ok, gen)
+	}
+	tr.Forget(id)
+
+	// 同 id 新逻辑 Route：占位后应是干净的 unknown。
+	newGen, ok := tr.ClaimL2(id)
+	if !ok || newGen == 0 {
+		t.Fatalf("claim after reuse: ok=%v gen=%d", ok, newGen)
+	}
+	if newGen == gen {
+		t.Fatal("reused id must receive a new generation")
+	}
+	if tr.State(id) != model.StateUnknown {
+		t.Fatalf("fresh route state=%s want unknown", tr.State(id))
+	}
+
+	// 旧世代迟到失败：必须忽略，且不得把新行判死。
+	if tr.Report(Report{
+		RouteID: id, Generation: gen, Verdict: VerdictFatal, Source: SourceL2,
+	}) {
+		t.Fatal("stale generation report must not change state")
+	}
+	if tr.State(id) != model.StateUnknown {
+		t.Fatalf("stale fatal poisoned reused id: state=%s want unknown", tr.State(id))
+	}
+
+	// 新世代仍可正常判死，证明门禁没有把 Report 整条废掉。
+	if !tr.Report(Report{
+		RouteID: id, Generation: newGen, Verdict: VerdictFatal, Source: SourceL2,
+	}) {
+		t.Fatal("current generation fatal should apply")
+	}
+	if tr.State(id) != model.StateDead {
+		t.Fatalf("current generation state=%s want dead", tr.State(id))
+	}
 }
 
 // Snapshot 是副本，改它不能影响内部状态。

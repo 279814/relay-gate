@@ -146,9 +146,10 @@ func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, mn *model.Mo
 	}
 	up := snap.Upstreams[best.rt.UpstreamID]
 	var release func()
+	var gen uint64
 	if h.health != nil {
 		var ok bool
-		release, ok = h.health.TryAcquire(best.rt.ID, best.rt.MaxConcurrency)
+		release, gen, ok = h.health.TryAcquire(best.rt.ID, best.rt.MaxConcurrency)
 		if !ok {
 			exclude[best.rt.ID] = true
 			return h.selectCountTokensCandidate(snap, mn, exclude, prefer)
@@ -156,7 +157,7 @@ func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, mn *model.Mo
 	} else {
 		release = func() {}
 	}
-	return router.NewCandidate(best.rt, up, mn, release), nil
+	return router.NewCandidate(best.rt, up, mn, release, gen), nil
 }
 
 // proxyCountTokens 把 count_tokens 转发给上游。

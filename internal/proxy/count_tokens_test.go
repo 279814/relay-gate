@@ -26,7 +26,7 @@ type recordingReporter struct {
 	probed   int
 }
 
-func (r *recordingReporter) ReportResult(int64, *ResultView) {
+func (r *recordingReporter) ReportResult(int64, uint64, *ResultView) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.reported++
@@ -431,7 +431,7 @@ type capturingReporter struct {
 	seen *ResultView
 }
 
-func (c *capturingReporter) ReportResult(_ int64, res *ResultView) {
+func (c *capturingReporter) ReportResult(_ int64, _ uint64, res *ResultView) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.seen = res

@@ -37,11 +37,11 @@ func (f *fakeHealth) State(id int64) model.HealthState {
 }
 func (f *fakeHealth) CoolingDown(id int64) bool { return f.cooling[id] }
 
-func (f *fakeHealth) TryAcquire(id int64, limit int) (func(), bool) {
+func (f *fakeHealth) TryAcquire(id int64, limit int) (func(), uint64, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if limit > 0 && f.inflight[id] >= limit {
-		return nil, false
+		return nil, 0, false
 	}
 	f.inflight[id]++
 	// once 是接口契约的一部分（release 须可重复调用），替身也照做 ——
@@ -53,7 +53,7 @@ func (f *fakeHealth) TryAcquire(id int64, limit int) (func(), bool) {
 			defer f.mu.Unlock()
 			f.inflight[id]--
 		})
-	}, true
+	}, 1, true
 }
 
 func (f *fakeHealth) inFlight(id int64) int {
