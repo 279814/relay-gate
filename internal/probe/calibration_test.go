@@ -78,6 +78,62 @@ func (s storeEndpointSource) Endpoint(ctx context.Context, upstreamID int64, kin
 	return s.store.Endpoint(ctx, upstreamID, kind)
 }
 
+func TestCalibration_SuccessInvalidatesRouteHealth(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	var calls atomic.Int64
+	svc, _ := newCalibrationHarness(t, st, up, func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		n := calls.Load()
+		if n < 3 {
+			return respFrom(401, "application/json", `{"error":{"type":"authentication_error"}}`), nil
+		}
+		return respFrom(200, "text/event-stream", anthropicSemanticBody()), nil
+	})
+	inv := &recordingRouteInvalidator{}
+	svc.WithInvalidator(inv)
+
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := svc.Start(context.Background(), run.ID, run.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		_ = svc.stepOnce(context.Background())
+		got, _ := st.GetCalibrationRun(context.Background(), started.ID)
+		if got.State == model.CalibrationSucceeded || got.State == model.CalibrationFailed ||
+			got.State == model.CalibrationInterrupted {
+			break
+		}
+	}
+	final, err := st.GetCalibrationRun(context.Background(), started.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.State != model.CalibrationSucceeded {
+		t.Fatalf("state=%s", final.State)
+	}
+	if len(inv.routes) == 0 || inv.routes[len(inv.routes)-1] != rt.ID {
+		t.Fatalf("§9.2: calibration success must InvalidateRoute(%d), got %v", rt.ID, inv.routes)
+	}
+}
+
+type recordingRouteInvalidator struct {
+	routes    []int64
+	upstreams []int64
+}
+
+func (r *recordingRouteInvalidator) InvalidateRoute(id int64) {
+	r.routes = append(r.routes, id)
+}
+
+func (r *recordingRouteInvalidator) InvalidateUpstream(id int64) {
+	r.upstreams = append(r.upstreams, id)
+}
+
 func TestCalibration_PlanPersistsAtMostThreeCandidates(t *testing.T) {
 	st := calibrationTestStore(t)
 	_, _, rt := seedCalibrationRoute(t, st)
