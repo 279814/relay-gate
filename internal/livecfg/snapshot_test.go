@@ -39,8 +39,9 @@ func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reach.ObservationToken == "" || reach.Revision.NetworkRevision != up.NetworkRevision {
-		t.Fatalf("reachability expectation=%+v", reach)
+	if reach.ObservationToken == "" || reach.Revision.NetworkRevision != up.NetworkRevision ||
+		reach.Revision.CreatedAt != up.CreatedAt {
+		t.Fatalf("reachability expectation=%+v upstream created_at=%d", reach, up.CreatedAt)
 	}
 
 	s.Invalidate()

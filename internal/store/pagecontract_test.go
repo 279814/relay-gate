@@ -379,6 +379,7 @@ func TestListProbeExecutionsPageContract(t *testing.T) {
 	}
 	revision := model.ReachabilityRevision{
 		NetworkRevision:     upstream.NetworkRevision,
+		CreatedAt:           upstream.CreatedAt,
 		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
 	}
 	expectation := &model.ReachabilityExpectation{

@@ -262,6 +262,7 @@ func (encoder *canonicalEncoder) optionalReachabilityExpectation(value *model.Re
 	encoder.int64(value.UpstreamID)
 	encoder.selector(value.PolicySelector)
 	encoder.int64(value.Revision.NetworkRevision)
+	encoder.int64(value.Revision.CreatedAt)
 	encoder.string(value.Revision.SettingsFingerprint)
 	encoder.string(value.ObservationToken)
 }

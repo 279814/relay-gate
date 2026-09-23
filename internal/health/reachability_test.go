@@ -115,3 +115,50 @@ func TestUpstreamGateOKAtDoesNotTrustTheRowsOwnRevision(t *testing.T) {
 		t.Fatalf("stale row was still presented as the current L1 status: %+v", status)
 	}
 }
+
+// Forget 后迟到的 L1 Report 不得按 id 写回：否则同 id 新站会被旧
+// unreachable/reachable 污染（与 Tracker.Report-after-Forget 同类）。
+func TestUpstreamGate_ReportAfterForgetDoesNotPoisonReusedID(t *testing.T) {
+	gate := NewUpstreamGate()
+	const id int64 = 7
+	gen := gate.EnsureGeneration(id)
+	_ = gate.Report(id, gen, false, errString("dial"))
+	if gate.OK(id) {
+		t.Fatal("setup: gate should be down")
+	}
+
+	gate.Forget(id)
+	if !gate.OK(id) {
+		t.Fatal("Forget must return optimistic OK")
+	}
+
+	// Late probe from the deleted incarnation.
+	if gate.Report(id, gen, false, errString("dial")) {
+		t.Fatal("stale report must not claim recovery")
+	}
+	if !gate.OK(id) {
+		t.Fatal("stale generation report must not mark reused id down")
+	}
+
+	newGen := gate.EnsureGeneration(id)
+	if newGen == gen {
+		t.Fatal("reused id must receive a new generation")
+	}
+	if gate.Report(id, newGen, false, errString("dial")) {
+		t.Fatal("fresh failure is not recovery")
+	}
+	if gate.OK(id) {
+		t.Fatal("current generation failure should apply")
+	}
+	// Stale success must not clear the new down state.
+	if gate.Report(id, gen, true, nil) {
+		t.Fatal("stale success must not recover reused id")
+	}
+	if gate.OK(id) {
+		t.Fatal("stale success poisoned reused id")
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }

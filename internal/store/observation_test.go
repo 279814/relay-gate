@@ -51,6 +51,7 @@ func TestCommitProbeObservationIsAtomicIdempotentAndPanicSafe(t *testing.T) {
 	}
 	revision := model.ReachabilityRevision{
 		NetworkRevision:     upstream.NetworkRevision,
+		CreatedAt:           upstream.CreatedAt,
 		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
 	}
 	expectation := &model.ReachabilityExpectation{
@@ -130,6 +131,7 @@ func TestCommitProbeObservationAppliesReachabilityWhenCapabilityIsConfigStale(t 
 	}
 	reachRevision := model.ReachabilityRevision{
 		NetworkRevision:     upstream.NetworkRevision,
+		CreatedAt:           upstream.CreatedAt,
 		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(reachPolicy),
 	}
 	reachExpectation := &model.ReachabilityExpectation{
@@ -263,6 +265,7 @@ func TestCommitProbeObservationSeparatesConfigStaleFromSuperseded(t *testing.T) 
 	}
 	revision := model.ReachabilityRevision{
 		NetworkRevision:     upstream.NetworkRevision,
+		CreatedAt:           upstream.CreatedAt,
 		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
 	}
 	expectation := &model.ReachabilityExpectation{UpstreamID: upstream.ID, PolicySelector: selector, Revision: revision}

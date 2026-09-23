@@ -86,6 +86,7 @@ func (s *ProbeSnapshot) ReachabilityExpectation(upstreamID int64, selector model
 	}
 	revision := model.ReachabilityRevision{
 		NetworkRevision:     up.NetworkRevision,
+		CreatedAt:           up.CreatedAt,
 		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
 	}
 	return model.ReachabilityExpectation{

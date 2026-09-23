@@ -216,7 +216,8 @@ func (store *Store) reduceReachabilityTx(ctx context.Context, tx *sql.Tx, execut
 
 func currentReachabilityRevisionForUpstream(ctx context.Context, tx *sql.Tx, upstreamID int64, selector model.EvidencePolicySelector) (model.ReachabilityRevision, error) {
 	var revision model.ReachabilityRevision
-	if err := tx.QueryRowContext(ctx, `SELECT network_revision FROM upstream WHERE id=?`, upstreamID).Scan(&revision.NetworkRevision); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT network_revision, created_at FROM upstream WHERE id=?`, upstreamID).
+		Scan(&revision.NetworkRevision, &revision.CreatedAt); errors.Is(err, sql.ErrNoRows) {
 		return revision, ErrNotFound
 	} else if err != nil {
 		return revision, err
