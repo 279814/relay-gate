@@ -8,9 +8,9 @@ import (
 
 // HasSemanticEvidence 报告一段响应前缀/事件是否含 §8.8 判活证据。
 //
-// 与探活 Decoder 对齐：非空 text/thinking/tool/refusal delta，或非流式
-// 非空模型输出。正数 usage、message_start、空 delta、HTML 都不算。
-// 拿不准（半截 JSON）返回 false —— piggyback 假阳性比漏掉一次更糟。
+// §8.8 判活：非空 text/thinking/tool/refusal delta、正数 output usage、
+// 或非流式非空模型输出。message_start、空 delta、output_tokens:0、HTML
+// 都不算。拿不准（半截 JSON）返回 false —— piggyback 假阳性比漏掉一次更糟。
 func HasSemanticEvidence(prefix []byte, contentType string) bool {
 	prefix = bytes.TrimSpace(prefix)
 	if len(prefix) == 0 {
@@ -77,7 +77,7 @@ func jsonBytesHaveSemanticEvidence(b []byte) bool {
 
 func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 	// 与 classifyJSONObject 同向：顶层结构化 error 不得因伴生 text/content/
-	// choices 被当成语义成功（§6.8 / §8.8 / §8.12）。
+	// choices/usage 被当成语义成功（§6.8 / §8.8 / §8.12）。
 	if v, ok := top["error"]; ok && !isJSONNull(v) {
 		return false
 	}
@@ -102,7 +102,14 @@ func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 
 	// OpenAI Chat streaming / non-streaming.
 	if _, ok := top["choices"]; ok {
-		return chatChoicesSemantic(top["choices"])
+		if chatChoicesSemantic(top["choices"]) {
+			return true
+		}
+		// choices 可为空壳，但仍可能带正数 usage（探活 Decoder 同路径）。
+		if positiveOutputUsage(top) {
+			return true
+		}
+		return false
 	}
 
 	// Anthropic non-stream message body.
@@ -119,7 +126,55 @@ func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 		}
 	}
 
+	// §8.8：正数 output usage 单独即判活（usage 路径与探活 Decoder 一致）。
+	if positiveOutputUsage(top) {
+		return true
+	}
+
 	return false
+}
+
+// positiveOutputUsage 读探活 Decoder 已识别的 usage 路径：顶层 usage、
+// 以及 Responses response.completed 嵌套的 response.usage。正数
+// completion_tokens / output_tokens 才算；0 与缺失不算。
+func positiveOutputUsage(top map[string]json.RawMessage) bool {
+	if usageHasPositiveOutput(top["usage"]) {
+		return true
+	}
+	if raw, ok := top["response"]; ok {
+		var body map[string]json.RawMessage
+		if json.Unmarshal(raw, &body) == nil && usageHasPositiveOutput(body["usage"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func usageHasPositiveOutput(raw json.RawMessage) bool {
+	var usage map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &usage) != nil {
+		return false
+	}
+	if n := jsonTokenCount(usage, "completion_tokens"); n > 0 {
+		return true
+	}
+	return jsonTokenCount(usage, "output_tokens") > 0
+}
+
+func jsonTokenCount(object map[string]json.RawMessage, name string) int64 {
+	raw, ok := object[name]
+	if !ok {
+		return 0
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil {
+		return 0
+	}
+	value, err := number.Int64()
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
 }
 
 func anthropicDeltaSemantic(raw json.RawMessage) bool {
