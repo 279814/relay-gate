@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -486,6 +487,69 @@ func TestHandler_NoRelayKeysConfiguredRejectsAll(t *testing.T) {
 	if rec := hs.serve(r); rec.Code != 401 {
 		t.Errorf("未配置 relay key 时应一律拒绝，得到 %d", rec.Code)
 	}
+}
+
+// TestHandler_RelayRotateGraceRevokeOnModelRoute pins §12.6 on POST /v1/messages:
+// new key works immediately; old key only during grace; revoke/expiry → 401 and
+// zero upstream calls. Static NewHandler keys alone cannot satisfy this.
+func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
+	hs := newHarness(t, nil)
+	now := time.Now()
+	creds := credential.New().WithNow(func() time.Time { return now })
+	creds.SetActiveRelayKey(hs.relayPW)
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).
+		WithRelayKeyValidator(creds).
+		WithTargets(testTargets(hs.cfg), nil)
+	t.Cleanup(hs.h.CloseIdleConnections)
+
+	mustOK := func(key string) {
+		t.Helper()
+		hs.gotReq = &capturedRequest{}
+		r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
+		r.Header.Set("X-Api-Key", key)
+		if rec := hs.serve(r); rec.Code != 200 {
+			t.Fatalf("key %q: want 200, got %d body=%s", key, rec.Code, rec.Body.String())
+		}
+		if hs.gotReq.method == "" {
+			t.Fatal("accepted key must reach upstream")
+		}
+	}
+	mustRejectNoUpstream := func(key string) {
+		t.Helper()
+		hs.gotReq = &capturedRequest{}
+		r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
+		r.Header.Set("X-Api-Key", key)
+		if rec := hs.serve(r); rec.Code != 401 {
+			t.Fatalf("key %q: want 401, got %d", key, rec.Code)
+		}
+		if hs.gotReq.method != "" {
+			t.Fatal("rejected key must not reach upstream")
+		}
+	}
+
+	mustOK(hs.relayPW)
+
+	newKey, grace, err := creds.RotateRelayKey()
+	if err != nil || newKey == "" || grace != 600 {
+		t.Fatalf("rotate: new=%q grace=%d err=%v", newKey, grace, err)
+	}
+	mustOK(newKey)
+	mustOK(hs.relayPW) // grace window
+
+	creds.RevokeGrace()
+	mustRejectNoUpstream(hs.relayPW)
+	mustOK(newKey)
+
+	// Second rotate + clock past grace (not only explicit revoke).
+	newer, _, err := creds.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustOK(newer)
+	mustOK(newKey)
+	now = now.Add(10*time.Minute + time.Second)
+	mustRejectNoUpstream(newKey)
+	mustOK(newer)
 }
 
 // ── 总闸与选路错误 ────────────────────────────────────────

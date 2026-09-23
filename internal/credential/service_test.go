@@ -25,6 +25,46 @@ func TestRelayRotateGraceAndRevoke(t *testing.T) {
 	}
 }
 
+func TestRelayGraceExpiry(t *testing.T) {
+	s := New()
+	now := time.Now()
+	s.WithNow(func() time.Time { return now })
+	s.SetActiveRelayKey("rk_old")
+	newKey, _, err := s.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.ValidRelayKey("rk_old") {
+		t.Fatal("old should work during grace")
+	}
+	now = now.Add(10*time.Minute + time.Second)
+	if s.ValidRelayKey("rk_old") {
+		t.Fatal("old should be rejected after grace expiry")
+	}
+	if !s.ValidRelayKey(newKey) {
+		t.Fatal("new should remain after grace expiry")
+	}
+}
+
+func TestRelayAlsoKeysSurviveRotate(t *testing.T) {
+	s := New()
+	s.SetActiveRelayKeys([]string{"rk_a", "rk_b"})
+	newKey, _, err := s.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.ValidRelayKey(newKey) || !s.ValidRelayKey("rk_a") || !s.ValidRelayKey("rk_b") {
+		t.Fatalf("new+old-grace+also should work; activeKeys=%v", s.ActiveRelayKeys())
+	}
+	s.RevokeGrace()
+	if s.ValidRelayKey("rk_a") {
+		t.Fatal("rotated-away primary must not survive revoke")
+	}
+	if !s.ValidRelayKey("rk_b") || !s.ValidRelayKey(newKey) {
+		t.Fatal("also-key and new active must remain")
+	}
+}
+
 func TestMasterRevealWindow(t *testing.T) {
 	s := New()
 	now := time.Now()
