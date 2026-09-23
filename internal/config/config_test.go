@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,88 @@ func TestLoad_MissingBothFailsWithoutLeakingSecrets(t *testing.T) {
 	// No accidental dump of a fabricated secret path content.
 	if strings.Contains(msg, "active") && strings.Contains(msg, "key_id") {
 		t.Fatalf("error must not dump keyring JSON: %q", msg)
+	}
+}
+
+func TestLoad_IncompleteBootstrapJournalRefusesStart(t *testing.T) {
+	clearCredEnv(t)
+	dir := t.TempDir()
+	master := "file-master-key-at-least-16"
+	relay := "rk-undelivered-relay"
+	hash, err := credential.HashAdminPassword("undelivered-admin-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSecretsArtifacts(t, dir, master, relay, hash)
+	// Simulate crash after credentials_persisted, before displayed (§12.3).
+	secrets := filepath.Join(dir, "secrets")
+	journal := []byte(`{"format_version":1,"phase":"credentials_persisted","master_key_id":"kid-test","updated_at":"2026-01-01T00:00:00Z"}` + "\n")
+	if err := os.WriteFile(filepath.Join(secrets, "credentials-bootstrap.journal"), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_DB", filepath.Join(dir, "relay-gate.db"))
+
+	_, err = Load()
+	if err == nil {
+		t.Fatal("expected refuse start on incomplete bootstrap journal")
+	}
+	if !errors.Is(err, credential.ErrBootstrapIncomplete) {
+		t.Fatalf("want ErrBootstrapIncomplete, got %v", err)
+	}
+	if strings.Contains(err.Error(), master) || strings.Contains(err.Error(), relay) {
+		t.Fatalf("must not echo secrets: %v", err)
+	}
+}
+
+func TestLoad_DisplayedBootstrapJournalAllowsFileSecrets(t *testing.T) {
+	clearCredEnv(t)
+	dir := t.TempDir()
+	master := "file-master-key-at-least-16"
+	relay := "rk-delivered-relay"
+	hash, err := credential.HashAdminPassword("delivered-admin-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSecretsArtifacts(t, dir, master, relay, hash)
+	secrets := filepath.Join(dir, "secrets")
+	journal := []byte(`{"format_version":1,"phase":"displayed","master_key_id":"kid-test","updated_at":"2026-01-01T00:00:00Z"}` + "\n")
+	if err := os.WriteFile(filepath.Join(secrets, "credentials-bootstrap.journal"), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_DB", filepath.Join(dir, "relay-gate.db"))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EncKey != master || len(cfg.RelayKeys) != 1 || cfg.RelayKeys[0] != relay {
+		t.Fatalf("enc=%q relay=%v", cfg.EncKey, cfg.RelayKeys)
+	}
+}
+
+func TestLoad_IncompleteMigrationJournalRefusesStart(t *testing.T) {
+	clearCredEnv(t)
+	dir := t.TempDir()
+	master := "file-master-key-at-least-16"
+	relay := "rk-imported-not-done"
+	hash, err := credential.HashAdminPassword("imported-admin-pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSecretsArtifacts(t, dir, master, relay, hash)
+	secrets := filepath.Join(dir, "secrets")
+	journal := []byte(`{"format_version":1,"phase":"imported","master_key_id":"kid-test","updated_at":"2026-01-01T00:00:00Z"}` + "\n")
+	if err := os.WriteFile(filepath.Join(secrets, "credentials-migration.journal"), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_DB", filepath.Join(dir, "relay-gate.db"))
+
+	_, err = Load()
+	if err == nil {
+		t.Fatal("expected refuse start on incomplete migration journal")
+	}
+	if !errors.Is(err, credential.ErrMigrationIncomplete) {
+		t.Fatalf("want ErrMigrationIncomplete, got %v", err)
 	}
 }
 
