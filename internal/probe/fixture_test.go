@@ -1049,7 +1049,7 @@ func TestClaudeCaptureScriptFailsClosedAndProtectsOutput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode private capture body: %v", err)
 		}
-		if !strings.HasPrefix(capture.RequestLine, "POST /v1/messages ") ||
+		if !isControlMessagesRequestLine(capture.RequestLine) ||
 			!capture.AuthenticationVerified ||
 			!bytes.Contains(body, []byte("1+1=? control:")) {
 			t.Fatal("private capture envelope did not preserve the verified control request")
@@ -1141,7 +1141,7 @@ func main() {
 	}
 	prompt := arguments[len(arguments)-1]
 	body := []byte(fmt.Sprintf(` + "`" + `{"model":"fixture","max_tokens":1,"stream":true,"messages":[{"role":"user","content":%q}]}` + "`" + `, prompt))
-	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(os.Getenv("ANTHROPIC_BASE_URL"), "/")+"/v1/messages", bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(os.Getenv("ANTHROPIC_BASE_URL"), "/")+"/v1/messages?beta=true", bytes.NewReader(body))
 	if err != nil {
 		panic(err)
 	}
@@ -1177,6 +1177,84 @@ func main() {
 		t.Fatalf("build fake Claude CLI: %v (%s)", err, output)
 	}
 	return executable
+}
+
+// isControlMessagesRequestLine mirrors scripts/capture-claude-request.ps1
+// Test-ControlMessagesRequestLine: exact allowlist only.
+func isControlMessagesRequestLine(requestLine string) bool {
+	switch requestLine {
+	case "POST /v1/messages HTTP/1.0",
+		"POST /v1/messages HTTP/1.1",
+		"POST /v1/messages?beta=true HTTP/1.0",
+		"POST /v1/messages?beta=true HTTP/1.1":
+		return true
+	default:
+		return false
+	}
+}
+
+func TestControlMessagesRequestLineShapes(t *testing.T) {
+	accepted := []string{
+		"POST /v1/messages HTTP/1.0",
+		"POST /v1/messages HTTP/1.1",
+		"POST /v1/messages?beta=true HTTP/1.0",
+		"POST /v1/messages?beta=true HTTP/1.1",
+	}
+	rejected := []string{
+		"",
+		"GET /v1/messages HTTP/1.1",
+		"POST /v1/messages HTTP/2.0",
+		"POST /v1/messages?beta=false HTTP/1.1",
+		"POST /v1/messages?beta=true&extra=1 HTTP/1.1",
+		"POST /v1/messages/count_tokens HTTP/1.1",
+		"POST /v1/chat/completions HTTP/1.1",
+		"POST /v1/messages%3Fbeta=true HTTP/1.1",
+		"POST http://127.0.0.1/v1/messages?beta=true HTTP/1.1",
+		"POST /v1/messages?beta=true HTTP/1.1 ",
+		"post /v1/messages?beta=true HTTP/1.1",
+	}
+	for _, line := range accepted {
+		if !isControlMessagesRequestLine(line) {
+			t.Fatalf("accepted shape rejected: %q", line)
+		}
+	}
+	for _, line := range rejected {
+		if isControlMessagesRequestLine(line) {
+			t.Fatalf("unrelated request line accepted: %q", line)
+		}
+	}
+
+	powerShell, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh unavailable")
+	}
+	repositoryRoot, err := filepath.Abs(filepath.Clean(filepath.Join("..", "..")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(repositoryRoot, "scripts", "capture-claude-request.ps1")
+	var checks strings.Builder
+	checks.WriteString(". '" + quotePowerShellLiteral(script) + "'; ")
+	for _, line := range accepted {
+		checks.WriteString(fmt.Sprintf(
+			"if (-not (Test-ControlMessagesRequestLine -RequestLine '%s')) { throw 'accepted_rejected:%s' }; ",
+			quotePowerShellLiteral(line), quotePowerShellLiteral(line),
+		))
+	}
+	for _, line := range rejected {
+		checks.WriteString(fmt.Sprintf(
+			"if (Test-ControlMessagesRequestLine -RequestLine '%s') { throw 'rejected_accepted:%s' }; ",
+			quotePowerShellLiteral(line), quotePowerShellLiteral(line),
+		))
+	}
+	checks.WriteString("Write-Output 'request_line_shapes_ok'")
+	output, err := runPowerShellCommand(powerShell, repositoryRoot, checks.String())
+	if err != nil {
+		t.Fatalf("PowerShell allowlist parity: %v (%s)", err, output)
+	}
+	if strings.TrimSpace(output) != "request_line_shapes_ok" {
+		t.Fatalf("PowerShell allowlist output = %q", output)
+	}
 }
 
 func runCaptureScript(powerShell, repositoryRoot, script string, arguments ...string) (string, error) {

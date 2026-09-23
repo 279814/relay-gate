@@ -392,6 +392,20 @@ function Find-HeaderTerminator {
     return -1
 }
 
+# Exact allowlist for control-capture request-targets. The bare path covers the
+# fake CLI fixture; ?beta=true is the §3.1 measured Claude Code messages shape.
+# Anything else (count_tokens, chat, absolute-form, extra query) stays rejected.
+function Test-ControlMessagesRequestLine {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$RequestLine)
+    switch -Exact -CaseSensitive ($RequestLine) {
+        'POST /v1/messages HTTP/1.0' { return $true }
+        'POST /v1/messages HTTP/1.1' { return $true }
+        'POST /v1/messages?beta=true HTTP/1.0' { return $true }
+        'POST /v1/messages?beta=true HTTP/1.1' { return $true }
+        default { return $false }
+    }
+}
+
 function Read-ControlRequest {
     param(
         [Parameter(Mandatory)][System.Net.Sockets.NetworkStream]$Stream,
@@ -417,7 +431,7 @@ function Read-ControlRequest {
     $headerBytes = $received[0..($headerIndex - 1)]
     $headerText = [System.Text.Encoding]::ASCII.GetString($headerBytes)
     $lines = $headerText -split "`r`n"
-    if ($lines.Count -lt 1 -or -not $lines[0].StartsWith('POST /v1/messages ', [System.StringComparison]::Ordinal)) {
+    if ($lines.Count -lt 1 -or -not (Test-ControlMessagesRequestLine -RequestLine $lines[0])) {
         throw "capture_unexpected_request_line"
     }
     $headers = [ordered]@{}
