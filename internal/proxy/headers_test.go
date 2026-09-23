@@ -163,6 +163,8 @@ func TestPrepareOutboundHeaders_StripsHopByHop(t *testing.T) {
 	in.Set("Upgrade", "websocket")
 	in.Set("Proxy-Authorization", "Basic abc")
 	in.Set("Proxy-Authenticate", "Basic")
+	// 非标准但 libcurl 仍发；漏删会被部分上游拒（与 Go ReverseProxy 同列）。
+	in.Set("Proxy-Connection", "keep-alive")
 
 	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
 	for _, k := range hopByHopHeaders {
