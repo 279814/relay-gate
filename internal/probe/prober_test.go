@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -848,6 +849,51 @@ func TestProbe_IgnoresAuthHeaderOverrideFromProbeHeaders(t *testing.T) {
 				if contains(value, leaked) {
 					t.Errorf("probe_headers 里的假 key 漏进了出站请求头 %s: %q", name, value)
 				}
+			}
+		}
+	}
+}
+
+// 库里若已有带 CRLF 的 probe_headers 脏行，应用点必须跳过，不能把注入头发出去。
+// 配置写入层另有 Validate 拒绝；这里覆盖「脏行已经落库」的纵深防御。
+func TestProbeHeaders_SkipsCRLFInjectionAtApply(t *testing.T) {
+	var got http.Header
+	var sawRequest bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	up := upstreamFor(srv.URL)
+	up.ProbeHeaders = map[string]string{
+		"x-custom":                 "ok-value",
+		"x-evil":                   "a\r\nX-Injected: y",
+		"x-bad\r\nX-Injected-Name": "z",
+	}
+	proberFor(up).L1(context.Background(), up, fastSettings())
+
+	if !sawRequest {
+		t.Fatal("探活应仍发出请求（脏行被跳过，干净覆盖仍生效）")
+	}
+	if got.Get("X-Custom") != "ok-value" {
+		t.Errorf("干净覆盖应生效，得到 X-Custom=%q", got.Get("X-Custom"))
+	}
+	if got.Get("X-Injected") != "" || got.Get("X-Injected-Name") != "" {
+		t.Fatalf("注入头不得出现在上游请求上：X-Injected=%q X-Injected-Name=%q",
+			got.Get("X-Injected"), got.Get("X-Injected-Name"))
+	}
+	for name, values := range got {
+		if strings.ContainsAny(name, "\r\n\x00") {
+			t.Fatalf("上游请求头名含控制字符：%q", name)
+		}
+		for _, value := range values {
+			if strings.ContainsAny(value, "\r\n\x00") {
+				t.Fatalf("上游请求头 %q 值含控制字符：%q", name, value)
+			}
+			if strings.Contains(value, "X-Injected") {
+				t.Fatalf("上游请求头 %q 值含注入痕迹：%q", name, value)
 			}
 		}
 	}

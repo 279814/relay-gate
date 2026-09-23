@@ -230,6 +230,9 @@ func applyManualHeaders(ctx context.Context, header http.Header, in AuthInput) (
 		if name == "" {
 			return nil, fmt.Errorf("%w: manual auth header 缺少名字", ErrAuthConfig)
 		}
+		if model.HeaderFieldHasCRLFOrNUL(name) || model.HeaderFieldHasCRLFOrNUL(template.Name) {
+			return nil, fmt.Errorf("%w: manual auth header name 含 CR/LF/NUL", ErrAuthConfig)
+		}
 		if model.IsAuthHeader(name) {
 			return nil, fmt.Errorf("%w: manual_headers 不能写标准认证头 %q，"+
 				"那会同时发出两种认证方式", ErrAuthConfig, name)

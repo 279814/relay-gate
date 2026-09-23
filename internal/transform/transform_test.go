@@ -16,9 +16,40 @@ func TestCompile_RejectsProtectedHeaderAndCRLF(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected CR/LF rejection")
 	}
+	_, err = Compile(Version{Rules: []Rule{{Kind: KindSetHeader, Name: "X-Custom\r\nX-Injected", Value: "y"}}})
+	if err == nil {
+		t.Fatal("expected header name CR/LF rejection")
+	}
+	_, err = Compile(Version{Rules: []Rule{{Kind: KindSetHeader, Name: "X-Custom", Value: "a\x00b"}}})
+	if err == nil {
+		t.Fatal("expected NUL rejection")
+	}
 	_, err = Compile(Version{Rules: []Rule{{Kind: KindSetHeader, Name: "X-Custom", Value: "<script>x</script>"}}})
 	if err == nil {
 		t.Fatal("expected script rejection")
+	}
+}
+
+func TestApplyRequest_RejectsStoredHeaderNameWithCRLF(t *testing.T) {
+	// 编译期通常已拒绝；这里模拟脏 Compiled（例如旧库行）在应用点仍不得写出。
+	c := &Compiled{
+		Version: Version{
+			ReqFailPolicy: FailClosed,
+			Rules:         []Rule{{Kind: KindSetHeader, Name: "X-Ok\r\nX-Injected", Value: "y"}},
+		},
+	}
+	in := RequestInput{Header: http.Header{}, Body: []byte(`{}`)}
+	out := c.ApplyRequest(in)
+	if out.Err == nil {
+		t.Fatal("apply must reject CR/LF in stored header name")
+	}
+	if got := out.Header.Get("X-Injected"); got != "" {
+		t.Fatalf("injected header must not appear, got %q", got)
+	}
+	for name := range out.Header {
+		if strings.ContainsAny(name, "\r\n\x00") {
+			t.Fatalf("outbound header map must not keep dirty name %q", name)
+		}
 	}
 }
 

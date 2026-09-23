@@ -22,13 +22,15 @@ import (
 
 // applyUpstreamHeaderOverrides 叠加 Upstream 级 probe_headers（§3.6.4）。
 //
-// 给「按 UA 白名单拦截」这类站单独调指纹用。三条语义：
+// 给「按 UA 白名单拦截」这类站单独调指纹用。四条语义：
 //
 //   - 空值 = 删掉这个头。有站会因为多一个头而拒绝请求，所以需要一个能减头的
 //     手段，而不只是加和改。
 //   - 认证头静默跳过。这里在探活的热路径上，没有能把错误呈现给用户的位置；
 //     配置层已经拒绝了这种输入（model.Validate），这里是纵深防御 ——
 //     万一有人手改了库，也不能让明文 key 生效。
+//   - 头名或头值含 CR/LF/NUL 时静默跳过。配置层同样已拒绝；库里若已有脏行，
+//     直接 Set 会把注入字节抄进出站 Header（甚至让整次发送失败）。
 //   - 其余 Set（覆盖而非追加）：probe_headers 是 map[string]string，
 //     一个名字只有一个值，追加会在重复调用时越积越多。
 //
@@ -41,6 +43,9 @@ func applyUpstreamHeaderOverrides(header http.Header, up *model.Upstream) {
 	}
 	for name, value := range up.ProbeHeaders {
 		if model.IsAuthHeader(name) {
+			continue
+		}
+		if model.HeaderFieldHasCRLFOrNUL(name) || model.HeaderFieldHasCRLFOrNUL(value) {
 			continue
 		}
 		if value == "" {

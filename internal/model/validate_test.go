@@ -126,6 +126,33 @@ func TestProbeHeadersRejectAuth(t *testing.T) {
 	}
 }
 
+// probe_headers 名或值里的 CR/LF/NUL 是请求头注入入口：配置写入必须挡掉。
+func TestProbeHeadersRejectCRLFOrNUL(t *testing.T) {
+	cases := []struct {
+		name string
+		hdrs map[string]string
+	}{
+		{"value CRLF", map[string]string{"x-custom": "a\r\nX-Injected: y"}},
+		{"value LF", map[string]string{"x-custom": "a\nX-Injected: y"}},
+		{"value NUL", map[string]string{"x-custom": "a\x00b"}},
+		{"name CRLF", map[string]string{"x-custom\r\nX-Injected": "y"}},
+		{"name LF", map[string]string{"x-custom\nX-Injected": "y"}},
+		{"name NUL", map[string]string{"x-custom\x00y": "z"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &Upstream{
+				Name: "t", BaseURL: "https://a.com", APIKey: "k",
+				ProbeHeaders: tc.hdrs,
+			}
+			up.Defaults()
+			if err := up.Validate(); err == nil {
+				t.Fatal("含 CR/LF/NUL 的 probe_headers 必须被拒绝")
+			}
+		})
+	}
+}
+
 func TestUpstreamDefaults(t *testing.T) {
 	u := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: "k"}
 	u.Defaults()
