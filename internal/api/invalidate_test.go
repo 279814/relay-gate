@@ -7,6 +7,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/transform"
 )
 
 // recordingInvalidator 记录每次触发，用于断言「改这个字段会不会重探」。
@@ -612,4 +613,92 @@ func (r *recordingCaps) has(routeID int64) bool {
 		}
 	}
 	return false
+}
+
+// §9.2: Transform publish/rollback must Forget RouteHealth for the bound Route.
+// Leaving an old alive verdict would keep selecting a Route whose outbound
+// request shape just changed.
+func TestInvalidate_TransformPublishClearsAliveRouteHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	tr := health.NewTracker(fs)
+	gate := health.NewRecoveryGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
+	inner := &recordingInvalidator{}
+	reg := transform.NewRegistry(20)
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+	}).WithTransformRegistry(reg).Routes(testAdminPW)
+
+	const routeID int64 = 77
+	tr.Report(health.Report{RouteID: routeID, Verdict: health.VerdictOK, Source: health.SourceReal})
+	if tr.State(routeID) != model.StateAlive {
+		t.Fatalf("setup state=%s want alive", tr.State(routeID))
+	}
+	if _, ok := gate.TryAcquire(routeID); !ok {
+		t.Fatal("setup: acquire RecoveryGate")
+	}
+
+	rec := do(t, h, "POST", "/admin/api/transforms", `{"name":"pub-clear"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create transform set: %d %s", rec.Code, rec.Body.String())
+	}
+	setID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	rec = do(t, h, "PUT", "/admin/api/transforms/"+itoa(setID)+"/draft",
+		`{"rules":[{"kind":"replace_bytes","from":"A","to":"B"}]}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draft: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":3}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish: %d %s", rec.Code, rec.Body.String())
+	}
+	firstVersionID := int64(decodeBody[map[string]any](t, rec)["version"].(map[string]any)["id"].(float64))
+	if got := tr.State(routeID); got != model.StateUnknown {
+		t.Fatalf("after publish RouteHealth=%s want unknown", got)
+	}
+	if gate.InFlight(routeID) {
+		t.Fatal("after publish RecoveryGate slot must be released")
+	}
+	if !caps.has(routeID) {
+		t.Fatalf("after publish Capability scope must clear, cleared=%v", caps.cleared)
+	}
+	routes, _, _ := inner.counts()
+	if routes < 1 {
+		t.Fatal("publish must call InvalidateRoute")
+	}
+
+	// Publish a second version, re-seed alive, then rollback to the first.
+	rec = do(t, h, "PUT", "/admin/api/transforms/"+itoa(setID)+"/draft",
+		`{"rules":[{"kind":"replace_bytes","from":"A","to":"C"}]}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second draft: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":3}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second publish: %d %s", rec.Code, rec.Body.String())
+	}
+	tr.Report(health.Report{RouteID: routeID, Verdict: health.VerdictOK, Source: health.SourceReal})
+	if tr.State(routeID) != model.StateAlive {
+		t.Fatalf("re-seed state=%s want alive", tr.State(routeID))
+	}
+	beforeRollback, _, _ := inner.counts()
+	rec = do(t, h, "POST", "/admin/api/transforms/rollback",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":3,"version_id":`+itoa(firstVersionID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rollback: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(routeID); got != model.StateUnknown {
+		t.Fatalf("after rollback RouteHealth=%s want unknown", got)
+	}
+	afterRollback, _, _ := inner.counts()
+	if afterRollback <= beforeRollback {
+		t.Fatalf("rollback must call InvalidateRoute (before=%d after=%d)", beforeRollback, afterRollback)
+	}
 }
