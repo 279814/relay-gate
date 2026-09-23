@@ -12,8 +12,8 @@ import (
 // Writer 把样本落库。由 store 实现，这里只依赖接口便于测试。
 type Writer interface {
 	InsertSample(s *model.Sample) error
-	// PruneSamples 按条数与天数滚动清理，返回删除条数。pinned 豁免。
-	PruneSamples(keepCount, keepDays int) (int64, error)
+	// PruneSamples 按条数、天数与磁盘配额滚动清理，返回删除条数。pinned 豁免。
+	PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, error)
 }
 
 // pruneEvery 是每写入多少条样本触发一次清理。
@@ -140,7 +140,7 @@ func (r *Recorder) write(s *model.Sample) {
 }
 
 func (r *Recorder) prune() {
-	keepCount, keepDays := defaultRetention()
+	keepCount, keepDays, maxBytes := defaultRetention()
 	if r.retention != nil {
 		s, err := r.retention.Settings()
 		if err != nil {
@@ -148,11 +148,11 @@ func (r *Recorder) prune() {
 			// 那段时间样本会无上限堆积，而它正是最需要留出磁盘的时候。
 			r.log.Warn("读取保留策略失败，按默认值清理", "err", err)
 		} else {
-			keepCount, keepDays = s.SampleKeepCount, s.SampleKeepDays
+			keepCount, keepDays, maxBytes = s.SampleKeepCount, s.SampleKeepDays, s.SampleDiskQuotaBytes
 		}
 	}
 
-	n, err := r.w.PruneSamples(keepCount, keepDays)
+	n, err := r.w.PruneSamples(keepCount, keepDays, maxBytes)
 	if err != nil {
 		r.log.Error("清理样本失败", "err", err)
 		return
@@ -162,9 +162,9 @@ func (r *Recorder) prune() {
 	}
 }
 
-func defaultRetention() (keepCount, keepDays int) {
+func defaultRetention() (keepCount, keepDays int, maxBytes int64) {
 	d := model.DefaultSettings()
-	return d.SampleKeepCount, d.SampleKeepDays
+	return d.SampleKeepCount, d.SampleKeepDays, d.SampleDiskQuotaBytes
 }
 
 // Close 停止后台 writer 并等它排空队列。

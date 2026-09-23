@@ -94,7 +94,8 @@ type Settings struct {
 	//
 	// 代价是磁盘与内存，且**由上游的响应大小决定**，不再由我们封顶：
 	//   - 磁盘：最坏约 keep_count × (in + out + resp)。300 条 × 单条几 MB
-	//     可以到 GB 级；靠 keep_count(300) 与 keep_days(7) 兜住。
+	//     可以到 GB 级；靠 keep_count(300)、keep_days(7) 与
+	//     disk_quota_bytes(默认 5 GiB) 三者共同兜住。
 	//   - 内存：每个**在途**请求会在 RAM 里攒一份完整响应副本（采集用 tee）。
 	//     并发 N 路就是 N 份。
 	// 磁盘或内存吃紧时，把这三项调回非零即恢复原来的封顶行为。
@@ -108,7 +109,10 @@ type Settings struct {
 	SampleRespTailBytes int `json:"sample_resp_tail_bytes"`
 	SampleKeepCount     int `json:"sample_keep_count"`
 	SampleKeepDays      int `json:"sample_keep_days"`
-	SampleQueueSize     int `json:"sample_queue_size"`
+	// SampleDiskQuotaBytes 是 sample 表正文 BLOB 的总磁盘配额（§5.4 默认 5 GiB）。
+	// 0 = 该维度不限；超限时优先删除最旧未置顶行。
+	SampleDiskQuotaBytes int64 `json:"sample_disk_quota_bytes"`
+	SampleQueueSize      int   `json:"sample_queue_size"`
 
 	// ── 请求日志（M6）──────────────────────────────────────
 	//
@@ -169,13 +173,14 @@ func DefaultSettings() Settings {
 		RetryMaxAttempts: 3, // 初次 + 最多 2 次重试（§3.5）
 		RetryPolicy:      RetryPolicyBalanced,
 
-		SampleEnabled:       true,
-		SampleMaxBodyBytes:  0, // 0 = 不截断，完整保留入站与出站请求体
-		SampleRespHeadBytes: 0, // 0 = 完整保留响应（不再分头尾）
-		SampleRespTailBytes: 0,
-		SampleKeepCount:     300, // 从 500 降至 300
-		SampleKeepDays:      7,
-		SampleQueueSize:     256,
+		SampleEnabled:        true,
+		SampleMaxBodyBytes:   0, // 0 = 不截断，完整保留入站与出站请求体
+		SampleRespHeadBytes:  0, // 0 = 完整保留响应（不再分头尾）
+		SampleRespTailBytes:  0,
+		SampleKeepCount:      300, // 从 500 降至 300
+		SampleKeepDays:       7,
+		SampleDiskQuotaBytes: 5 << 30, // §5.4 默认 5 GiB
+		SampleQueueSize:      256,
 
 		// 日志比样本留得多得多：一行几百字节，5000 条客户端请求
 		// 也就几 MB，而「最近一周的重试到底有没有用」需要足够的样本量
@@ -268,10 +273,13 @@ func (s *Settings) Validate() error {
 	//
 	// 不设**上限**是刻意的：这几个值的作用就是封顶，给封顶再封一层顶
 	// 只会让「我要完整留档」这个明确的意图变成一个需要绕过的限制。
-	// 磁盘由 sample_keep_count / sample_keep_days 兜住。
+	// 磁盘由 sample_keep_count / sample_keep_days / sample_disk_quota_bytes 兜住。
 	if s.SampleMaxBodyBytes < 0 || s.SampleRespHeadBytes < 0 || s.SampleRespTailBytes < 0 {
 		return invalid("sample_max_body_bytes / sample_resp_head_bytes / " +
 			"sample_resp_tail_bytes 不能为负（0 表示不限，即完整留档）")
+	}
+	if s.SampleDiskQuotaBytes < 0 {
+		return invalid("sample_disk_quota_bytes 不能为负（0 表示该维度不限）")
 	}
 
 	// 总时长必须容得下首 Token，否则总超时会先触发，首 Token 超时形同虚设。

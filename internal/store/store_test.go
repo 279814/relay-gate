@@ -310,6 +310,10 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 		t.Errorf("升级时缺失的 retry_max_attempts 应回落默认 3，得到 %d"+
 			"（若为 0，升级后每个请求都不会发出任何尝试）", got.RetryMaxAttempts)
 	}
+	if got.SampleDiskQuotaBytes != 5<<30 {
+		t.Errorf("升级时缺失的 sample_disk_quota_bytes 应回落默认 5 GiB，得到 %d",
+			got.SampleDiskQuotaBytes)
+	}
 }
 
 func TestRunStatePersistence(t *testing.T) {

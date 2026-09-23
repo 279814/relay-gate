@@ -276,7 +276,7 @@ func TestPruneSamples_ByCount(t *testing.T) {
 		}
 	}
 
-	n, err := st.PruneSamples(5, 0) // 只留 5 条，天数不限
+	n, err := st.PruneSamples(5, 0, 0) // 只留 5 条，天数/磁盘不限
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestPruneSamples_ByDays(t *testing.T) {
 		}
 	}
 
-	n, err := st.PruneSamples(0, 7) // 只留 7 天，条数不限
+	n, err := st.PruneSamples(0, 7, 0) // 只留 7 天，条数/磁盘不限
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestPruneSamples_PinnedExempt(t *testing.T) {
 		}
 	}
 
-	if _, err := st.PruneSamples(3, 7); err != nil {
+	if _, err := st.PruneSamples(3, 7, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -371,15 +371,142 @@ func TestPruneSamples_ZeroMeansUnlimited(t *testing.T) {
 		}
 	}
 
-	n, err := st.PruneSamples(0, 0)
+	n, err := st.PruneSamples(0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Errorf("两个维度都不限时不该删任何东西，删了 %d 条", n)
+		t.Errorf("三个维度都不限时不该删任何东西，删了 %d 条", n)
 	}
 	if cnt, _ := st.CountSamples(); cnt != 5 {
 		t.Errorf("应剩 5 条，得到 %d", cnt)
+	}
+}
+
+// §5.4：总磁盘配额超限时优先删除最旧未置顶行；置顶豁免；明文与信封行同等计入。
+func TestPruneSamples_ByDiskQuota(t *testing.T) {
+	st := testStore(t)
+	base := time.Now().UnixMilli()
+	body := bytes.Repeat([]byte("x"), 2048)
+
+	var ids []int64
+	for i := 0; i < 5; i++ {
+		s := mkSample(base + int64(i))
+		s.InBody = body
+		s.OutBody = body
+		s.RespBody = body
+		if err := st.InsertSample(s); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, s.ID)
+	}
+
+	used, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used <= 0 {
+		t.Fatal("应有正的正文磁盘占用")
+	}
+	per := used / 5
+	if per <= 0 {
+		t.Fatalf("单行占用异常 used=%d", used)
+	}
+
+	// 只留约两行的配额，应删掉最旧的三条。
+	maxBytes := per*2 + per/2
+	n, err := st.PruneSamples(0, 0, maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("应删除 3 条，得到 %d (used=%d max=%d per≈%d)", n, used, maxBytes, per)
+	}
+	after, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after > maxBytes {
+		t.Fatalf("清理后仍超配额：%d > %d", after, maxBytes)
+	}
+	for _, id := range ids[:3] {
+		if _, err := st.GetSample(id); err != ErrNotFound {
+			t.Fatalf("最旧样本 %d 应被删，err=%v", id, err)
+		}
+	}
+	for _, id := range ids[3:] {
+		if _, err := st.GetSample(id); err != nil {
+			t.Fatalf("较新样本 %d 应保留：%v", id, err)
+		}
+	}
+
+	// 置顶行占磁盘但不被删；配额无法靠删未置顶降到目标时停在只剩置顶。
+	pinned := mkSample(base + 100)
+	pinned.InBody = bytes.Repeat([]byte("p"), 4096)
+	pinned.OutBody = pinned.InBody
+	pinned.RespBody = pinned.InBody
+	pinned.Pinned = true
+	if err := st.InsertSample(pinned); err != nil {
+		t.Fatal(err)
+	}
+	n, err = st.PruneSamples(0, 0, 1) // 极小配额
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatalf("应至少删掉未置顶行，deleted=%d", n)
+	}
+	if _, err := st.GetSample(pinned.ID); err != nil {
+		t.Fatalf("置顶样本不应被磁盘配额删除：%v", err)
+	}
+}
+
+// 磁盘清理不得只删信封行或只删明文行——两种存盘形态都必须能进淘汰队列。
+func TestPruneSamples_DiskQuotaDeletesPlaintextAndEnvelope(t *testing.T) {
+	st := testStore(t)
+	plain := bytes.Repeat([]byte("plain-legacy-body"), 128)
+	res, err := st.db.Exec(`INSERT INTO sample (
+		req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
+		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
+		in_method, in_path, in_query, in_headers, in_body,
+		out_url, out_headers, out_body,
+		resp_status, resp_headers, resp_body,
+		outcome, error, truncated, pinned
+	) VALUES ('plain-1', ?,0,0,0, '/v1/messages','m','m',1,1,1,
+		'POST','/v1/messages','','{}',?,
+		'https://ex','{}',?,
+		200,'{}',?,
+		'ok','',0,0)`, time.Now().UnixMilli()-1000, plain, plain, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainID, _ := res.LastInsertId()
+
+	env := mkSample(time.Now().UnixMilli())
+	env.InBody = bytes.Repeat([]byte("envelope-body"), 128)
+	env.OutBody = env.InBody
+	env.RespBody = env.InBody
+	if err := st.InsertSample(env); err != nil {
+		t.Fatal(err)
+	}
+
+	used, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 配额比当前占用少 1 字节：必须删最旧的明文行（证明不是「只删信封」）。
+	n, err := st.PruneSamples(0, 0, used-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatalf("应删除至少 1 条，got %d", n)
+	}
+	if _, err := st.GetSample(plainID); err != ErrNotFound {
+		t.Fatalf("明文行应被配额删除，err=%v", err)
+	}
+	if _, err := st.GetSample(env.ID); err != nil {
+		t.Fatalf("较新信封行应保留：%v", err)
 	}
 }
 
