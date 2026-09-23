@@ -35,6 +35,57 @@ func TestEncryptRoundTrip(t *testing.T) {
 	}
 }
 
+// TestActivateMaster_EncryptStillDecrypts pins Encrypt (upstream api_key /
+// probe secrets) across live Master Key rotation: pre-rotate ciphertext stays
+// readable via retired masters (§5.4), while seals after ActivateMaster use
+// only the new active key (no dependency on the retired master).
+func TestActivateMaster_EncryptStillDecrypts(t *testing.T) {
+	oldMaster := "old-master-key-for-encrypt-aaaa"
+	newMaster := "new-master-key-for-encrypt-bbbb"
+	c, err := NewCipher(oldMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := "sk-upstream-api-key-before-rotate"
+	oldEnc, err := c.Encrypt(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ActivateMaster(newMaster); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Decrypt(oldEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != plain {
+		t.Fatalf("pre-rotate Encrypt decrypt: got %q want %q", got, plain)
+	}
+
+	newPlain := "sk-upstream-api-key-after-rotate"
+	newEnc, err := c.Encrypt(newPlain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fresh cipher with only the new master must decrypt post-rotate seals
+	// without any retired key retained.
+	onlyNew, err := NewCipher(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNew, err := onlyNew.Decrypt(newEnc)
+	if err != nil {
+		t.Fatalf("post-rotate Encrypt requires retired key: %v", err)
+	}
+	if gotNew != newPlain {
+		t.Fatalf("post-rotate Encrypt decrypt: got %q want %q", gotNew, newPlain)
+	}
+	if _, err := onlyNew.Decrypt(oldEnc); err == nil {
+		t.Fatal("pre-rotate ciphertext unexpectedly decrypts with new master alone")
+	}
+}
+
 // GCM 下 nonce 复用会泄露明文异或值，所以每次加密都必须用新 nonce。
 // 表现为：同一明文两次加密的密文必须不同。
 func TestEncryptUsesFreshNonce(t *testing.T) {
