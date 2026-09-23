@@ -1140,8 +1140,20 @@ func main() {
 		os.Exit(2)
 	}
 	prompt := arguments[len(arguments)-1]
+	base := strings.TrimRight(os.Getenv("ANTHROPIC_BASE_URL"), "/")
+	hello, err := http.NewRequest(http.MethodHead, base+"/api/hello", nil)
+	if err != nil {
+		panic(err)
+	}
+	helloClient := &http.Client{Timeout: 10 * time.Second}
+	helloResponse, err := helloClient.Do(hello)
+	if err != nil {
+		panic(err)
+	}
+	_, _ = io.Copy(io.Discard, helloResponse.Body)
+	_ = helloResponse.Body.Close()
 	body := []byte(fmt.Sprintf(` + "`" + `{"model":"fixture","max_tokens":1,"stream":true,"messages":[{"role":"user","content":%q}]}` + "`" + `, prompt))
-	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(os.Getenv("ANTHROPIC_BASE_URL"), "/")+"/v1/messages?beta=true", bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, base+"/v1/messages?beta=true", bytes.NewReader(body))
 	if err != nil {
 		panic(err)
 	}
@@ -1193,6 +1205,18 @@ func isControlMessagesRequestLine(requestLine string) bool {
 	}
 }
 
+// isControlHelloRequestLine mirrors scripts/capture-claude-request.ps1
+// Test-ControlHelloRequestLine: exact allowlist only.
+func isControlHelloRequestLine(requestLine string) bool {
+	switch requestLine {
+	case "HEAD /api/hello HTTP/1.0",
+		"HEAD /api/hello HTTP/1.1":
+		return true
+	default:
+		return false
+	}
+}
+
 func TestControlMessagesRequestLineShapes(t *testing.T) {
 	accepted := []string{
 		"POST /v1/messages HTTP/1.0",
@@ -1212,6 +1236,9 @@ func TestControlMessagesRequestLineShapes(t *testing.T) {
 		"POST http://127.0.0.1/v1/messages?beta=true HTTP/1.1",
 		"POST /v1/messages?beta=true HTTP/1.1 ",
 		"post /v1/messages?beta=true HTTP/1.1",
+		"HEAD /api/hello HTTP/1.1",
+		"GET /api/hello HTTP/1.1",
+		"HEAD /api/helloworld HTTP/1.1",
 	}
 	for _, line := range accepted {
 		if !isControlMessagesRequestLine(line) {
@@ -1221,6 +1248,28 @@ func TestControlMessagesRequestLineShapes(t *testing.T) {
 	for _, line := range rejected {
 		if isControlMessagesRequestLine(line) {
 			t.Fatalf("unrelated request line accepted: %q", line)
+		}
+	}
+
+	helloAccepted := []string{
+		"HEAD /api/hello HTTP/1.0",
+		"HEAD /api/hello HTTP/1.1",
+	}
+	helloRejected := []string{
+		"GET /api/hello HTTP/1.1",
+		"HEAD /api/helloworld HTTP/1.1",
+		"HEAD /api/hello?x=1 HTTP/1.1",
+		"POST /api/hello HTTP/1.1",
+		"head /api/hello HTTP/1.1",
+	}
+	for _, line := range helloAccepted {
+		if !isControlHelloRequestLine(line) {
+			t.Fatalf("hello shape rejected: %q", line)
+		}
+	}
+	for _, line := range helloRejected {
+		if isControlHelloRequestLine(line) {
+			t.Fatalf("unrelated hello line accepted: %q", line)
 		}
 	}
 
@@ -1244,6 +1293,18 @@ func TestControlMessagesRequestLineShapes(t *testing.T) {
 	for _, line := range rejected {
 		checks.WriteString(fmt.Sprintf(
 			"if (Test-ControlMessagesRequestLine -RequestLine '%s') { throw 'rejected_accepted:%s' }; ",
+			quotePowerShellLiteral(line), quotePowerShellLiteral(line),
+		))
+	}
+	for _, line := range helloAccepted {
+		checks.WriteString(fmt.Sprintf(
+			"if (-not (Test-ControlHelloRequestLine -RequestLine '%s')) { throw 'hello_accepted_rejected:%s' }; ",
+			quotePowerShellLiteral(line), quotePowerShellLiteral(line),
+		))
+	}
+	for _, line := range helloRejected {
+		checks.WriteString(fmt.Sprintf(
+			"if (Test-ControlHelloRequestLine -RequestLine '%s') { throw 'hello_rejected_accepted:%s' }; ",
 			quotePowerShellLiteral(line), quotePowerShellLiteral(line),
 		))
 	}

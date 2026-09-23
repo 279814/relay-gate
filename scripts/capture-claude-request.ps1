@@ -406,7 +406,25 @@ function Test-ControlMessagesRequestLine {
     }
 }
 
-function Read-ControlRequest {
+# Current Claude Code probes ANTHROPIC_BASE_URL with HEAD /api/hello before messages.
+function Test-ControlHelloRequestLine {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$RequestLine)
+    switch -Exact -CaseSensitive ($RequestLine) {
+        'HEAD /api/hello HTTP/1.0' { return $true }
+        'HEAD /api/hello HTTP/1.1' { return $true }
+        default { return $false }
+    }
+}
+
+function Write-ControlHelloResponse {
+    param([Parameter(Mandatory)][System.Net.Sockets.NetworkStream]$Stream)
+    $head = "HTTP/1.1 200 OK`r`nContent-Length: 0`r`nConnection: close`r`n`r`n"
+    $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+    $Stream.Write($headBytes, 0, $headBytes.Length)
+    $Stream.Flush()
+}
+
+function Read-ControlExchange {
     param(
         [Parameter(Mandatory)][System.Net.Sockets.NetworkStream]$Stream,
         [Parameter(Mandatory)][string]$FakeKey,
@@ -431,7 +449,14 @@ function Read-ControlRequest {
     $headerBytes = $received[0..($headerIndex - 1)]
     $headerText = [System.Text.Encoding]::ASCII.GetString($headerBytes)
     $lines = $headerText -split "`r`n"
-    if ($lines.Count -lt 1 -or -not (Test-ControlMessagesRequestLine -RequestLine $lines[0])) {
+    if ($lines.Count -lt 1) {
+        throw "capture_unexpected_request_line"
+    }
+    if (Test-ControlHelloRequestLine -RequestLine $lines[0]) {
+        Write-ControlHelloResponse -Stream $Stream
+        return [ordered]@{ Kind = 'hello' }
+    }
+    if (-not (Test-ControlMessagesRequestLine -RequestLine $lines[0])) {
         throw "capture_unexpected_request_line"
     }
     $headers = [ordered]@{}
@@ -487,6 +512,7 @@ function Read-ControlRequest {
         throw "capture_control_nonce_missing"
     }
     return [ordered]@{
+        Kind = 'messages'
         RequestLine = $lines[0]
         Headers = $headers
         Body = $bodyBytes
@@ -630,17 +656,36 @@ function Invoke-ControlCapture {
             -Prompt $prompt `
             -SelectedModel $SelectedModel
 
-        if (-not $accept.Wait([TimeSpan]::FromSeconds(30))) {
-            throw "capture_request_timeout"
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+        $helloSeen = 0
+        while ($null -eq $request) {
+            $remaining = $deadline - [DateTimeOffset]::UtcNow
+            if ($remaining -le [TimeSpan]::Zero) {
+                throw "capture_request_timeout"
+            }
+            if (-not $accept.Wait($remaining)) {
+                throw "capture_request_timeout"
+            }
+            $client = $accept.Result
+            $accept = $listener.AcceptTcpClientAsync()
+            $client.ReceiveTimeout = 30000
+            $client.SendTimeout = 30000
+            $stream = $client.GetStream()
+            $exchange = Read-ControlExchange -Stream $stream -FakeKey $fakeKey -Nonce $nonce
+            if ($exchange.Kind -eq 'hello') {
+                $helloSeen++
+                if ($helloSeen -gt 3) {
+                    throw "capture_unexpected_request_line"
+                }
+                $client.Close()
+                $client = $null
+                continue
+            }
+            $request = $exchange
+            Write-ControlResponse -Stream $stream
+            $client.Close()
+            $client = $null
         }
-        $client = $accept.Result
-        $client.ReceiveTimeout = 30000
-        $client.SendTimeout = 30000
-        $stream = $client.GetStream()
-        $request = Read-ControlRequest -Stream $stream -FakeKey $fakeKey -Nonce $nonce
-        Write-ControlResponse -Stream $stream
-        $client.Close()
-        $client = $null
 
         if (-not $process.WaitForExit(30000)) {
             $process.Kill($true)
