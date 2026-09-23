@@ -132,13 +132,18 @@ func (t *Tracker) TryAcquire(routeID int64, limit int) (release func(), ok bool)
 
 	// 返回闭包而不是配对的 Acquire/Release：调用方 defer 一下就不可能
 	// 记错 routeID，也不可能重复释放（once 兜住）。
+	//
+	// 用占位时的 *routeState 指针比对，而不是按 id 再查：Forget/RetainOnly
+	// 删掉条目后，迟到的 release 必须是 no-op。若只按 id 减计数，同 id 新
+	// Route 的在途会被旧请求偷减，进而突破 max_concurrency。
+	held := rs
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			t.mu.Lock()
 			defer t.mu.Unlock()
-			if rs := t.state[routeID]; rs != nil && rs.inFlight > 0 {
-				rs.inFlight--
+			if cur := t.state[routeID]; cur == held && held.inFlight > 0 {
+				held.inFlight--
 			}
 		})
 	}, true

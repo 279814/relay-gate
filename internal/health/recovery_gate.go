@@ -10,12 +10,13 @@ import (
 // ordinary slots), at most one recovering/dead probe Attempt may hold the gate.
 type RecoveryGate struct {
 	mu   sync.Mutex
-	held map[int64]bool
+	held map[int64]uint64 // routeID → acquire generation while held
+	seq  uint64           // monotonic token source for held values
 }
 
 // NewRecoveryGate constructs an empty gate.
 func NewRecoveryGate() *RecoveryGate {
-	return &RecoveryGate{held: map[int64]bool{}}
+	return &RecoveryGate{held: map[int64]uint64{}}
 }
 
 // TryAcquire attempts to take the recovery slot for routeID.
@@ -27,15 +28,21 @@ func (g *RecoveryGate) TryAcquire(routeID int64) (release func(), ok bool) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.held[routeID] {
+	if _, taken := g.held[routeID]; taken {
 		return nil, false
 	}
-	g.held[routeID] = true
+	g.seq++
+	token := g.seq
+	g.held[routeID] = token
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			g.mu.Lock()
-			delete(g.held, routeID)
+			// Only clear if this acquire still owns the slot. Forget + reuse of
+			// the same route id must not let a stale release drop the new hold.
+			if g.held[routeID] == token {
+				delete(g.held, routeID)
+			}
 			g.mu.Unlock()
 		})
 	}, true
@@ -57,7 +64,7 @@ func (g *RecoveryGate) Reset() {
 		return
 	}
 	g.mu.Lock()
-	g.held = map[int64]bool{}
+	g.held = map[int64]uint64{}
 	g.mu.Unlock()
 }
 
@@ -68,5 +75,6 @@ func (g *RecoveryGate) InFlight(routeID int64) bool {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.held[routeID]
+	_, ok := g.held[routeID]
+	return ok
 }
