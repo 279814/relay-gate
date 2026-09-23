@@ -380,6 +380,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	// Published binding only; unbound → passthrough (§15.1).
 	var compiled *transform.Compiled
 	var verID int64
+	redactKeys := h.credentialsOf(r, cand)
 	if h.transforms != nil && target.EndpointID != 0 {
 		var terr error
 		compiled, verID, terr = h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
@@ -389,7 +390,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		}
 		if compiled != nil {
 			beforeBody := outBody
-			tr := compiled.ApplyRequest(transform.RequestInput{Header: outHeader, Body: outBody})
+			// Resolve upstream_api_key for secret_ref / {{SECRET:…}} on the
+			// live path; rendered plaintext is tainted for sample redaction.
+			var secrets transform.SecretMap
+			if key := cand.Upstream.APIKey; key != "" {
+				secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
+			}
+			tr := compiled.ApplyRequestSecrets(
+				transform.RequestInput{Header: outHeader, Body: outBody}, secrets)
 			if tr.Err != nil && tr.PolicyUsed == transform.FailClosed {
 				h.transforms.RecordExecution(transform.ExecutionRecord{
 					RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: verID,
@@ -411,6 +419,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 					InputHash: transform.HashBytes(beforeBody), OutputHash: transform.HashBytes(outBody),
 					Error: errText,
 				})
+			}
+			// Post-transform sample redaction must include tainted secrets
+			// (§5.4 / §16.3): body PrepareBody already scans credentialsOf,
+			// but custom headers and any secret distinct from APIKey need
+			// the taint set merged in before store/encrypt.
+			if tr.Taint != nil {
+				redactKeys = append(redactKeys, tr.Taint.Secrets()...)
 			}
 		}
 	}
@@ -481,7 +496,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 
 	return &liveAttempt{
 		cand: cand, at: at, tee: tee, secTee: secTee,
-		keys: h.credentialsOf(r, cand),
+		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
 		instr:    instr,
 		compiled: compiled, verID: verID, endpointID: target.EndpointID,
