@@ -230,17 +230,39 @@ func (s *Service) GetVersion(ctx context.Context, versionID int64) (model.ProbeR
 }
 
 func (s *Service) DisableRecipe(ctx context.Context, recipeID, expectedRevision int64) (model.ProbeRecipe, error) {
+	recipe, err := s.GetRecipe(ctx, recipeID)
+	if err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	if err := s.store.DisableRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
+	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
 	return s.GetRecipe(ctx, recipeID)
 }
 
 func (s *Service) ArchiveRecipe(ctx context.Context, recipeID, expectedRevision int64) (model.ProbeRecipe, error) {
+	recipe, err := s.GetRecipe(ctx, recipeID)
+	if err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	if err := s.store.ArchiveRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
+	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
 	return s.GetRecipe(ctx, recipeID)
+}
+
+func (s *Service) invalidateRecipeScope(scope model.RecipeScope, scopeID int64) {
+	if s == nil || s.invalidator == nil || scopeID <= 0 {
+		return
+	}
+	switch scope {
+	case model.RecipeScopeRoute:
+		s.invalidator.InvalidateRoute(scopeID)
+	case model.RecipeScopeUpstream:
+		s.invalidator.InvalidateUpstream(scopeID)
+	}
 }
 
 func (s *Service) ListExecutions(ctx context.Context, f model.ProbeExecutionFilter) (model.Page[model.ProbeExecution], error) {

@@ -272,29 +272,9 @@ func runServer() error {
 	janitor := probe.NewRetentionJanitor(st, log)
 
 	calibrator := probe.NewCalibrationService(st, executor, probe.WallClock(), log, cfgSrc.Settings, capRegistry)
-	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, sched)
-	var bg sync.WaitGroup
-	bg.Add(6)
-	go func() { defer bg.Done(); sched.Run(bgCtx) }()
-	go func() { defer bg.Done(); persister.Run(bgCtx) }()
-	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
-	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
-	go func() { defer bg.Done(); traffic.Run(bgCtx) }()
-	go func() { defer bg.Done(); janitor.Run(bgCtx) }()
-	defer func() {
-		stopBG()
-		bg.Wait()
-	}()
-
-	mux := http.NewServeMux()
-	// WithRuntime 把在途计数、样本与日志的丢弃数接到 /admin/api/runtime ——
-	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
-	// 日志的丢弃更要紧：它会让重试统计偏低，而那个统计正是用来决定
-	// 「要不要保留重试」的。
-	//
-	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
-	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
-	// 只是慢一点，不会变成「改了不生效」。
+	// §9.2 SemanticInvalidator must wrap Scheduler before probe admin / calibration
+	// write paths: Endpoint/Auth/Recipe mutations must Forget RouteHealth, not only
+	// reschedule probes.
 	semanticInv := health.NewSemanticInvalidator(tracker, sharedRecovery, capRegistry, sched, nil)
 	inv := &api.SemanticConfigInvalidator{
 		Semantic: semanticInv,
@@ -324,6 +304,30 @@ func runServer() error {
 			return ids
 		},
 	}
+	calibrator.WithInvalidator(inv)
+	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv)
+	var bg sync.WaitGroup
+	bg.Add(6)
+	go func() { defer bg.Done(); sched.Run(bgCtx) }()
+	go func() { defer bg.Done(); persister.Run(bgCtx) }()
+	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
+	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
+	go func() { defer bg.Done(); traffic.Run(bgCtx) }()
+	go func() { defer bg.Done(); janitor.Run(bgCtx) }()
+	defer func() {
+		stopBG()
+		bg.Wait()
+	}()
+
+	mux := http.NewServeMux()
+	// WithRuntime 把在途计数、样本与日志的丢弃数接到 /admin/api/runtime ——
+	// 丢弃是静默的，没有出口的话「样本怎么少了几条」就无从查起。
+	// 日志的丢弃更要紧：它会让重试统计偏低，而那个统计正是用来决定
+	// 「要不要保留重试」的。
+	//
+	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它**只**触发探活，
+	// 不负责配置生效 —— 那仍由 livecfg 的 2s TTL 保证，所以漏调一处
+	// 只是慢一点，不会变成「改了不生效」。
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).

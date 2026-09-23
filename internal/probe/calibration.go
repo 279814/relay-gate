@@ -84,6 +84,8 @@ type CalibrationService struct {
 	builtins *BuiltinSet
 	settings func() (model.Settings, error)
 	capReg   *CapabilityRegistry
+	// invalidator clears §9.2 RouteHealth after Auth Profile / Probe Recipe publish.
+	invalidator ConfigInvalidator
 
 	mu      sync.Mutex
 	wake    chan struct{}
@@ -115,6 +117,14 @@ func NewCalibrationService(st CalibrationStore, executor *Executor, clock Clock,
 // WithBuiltins 注入内置模板集合（测试用）。
 func (s *CalibrationService) WithBuiltins(set *BuiltinSet) *CalibrationService {
 	s.builtins = set
+	return s
+}
+
+// WithInvalidator wires §9.2 RouteHealth Forget after Auth/Recipe publish.
+func (s *CalibrationService) WithInvalidator(inv ConfigInvalidator) *CalibrationService {
+	if s != nil {
+		s.invalidator = inv
+	}
 	return s
 }
 
@@ -598,6 +608,11 @@ func (s *CalibrationService) finishFromExecution(ctx context.Context, run *model
 		}
 		if s.capReg != nil {
 			s.capReg.InvalidateAfterCalibration(run.RouteID, route.UpstreamID, run.Endpoint)
+		}
+		// §9.2: CommitCalibrationSuccess publishes Probe Recipe and rewrites Auth
+		// Profile — Forget RouteHealth immediately (Capability-only clear is not enough).
+		if s.invalidator != nil && run.RouteID > 0 {
+			s.invalidator.InvalidateRoute(run.RouteID)
 		}
 		return nil
 	}
