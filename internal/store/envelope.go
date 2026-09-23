@@ -10,31 +10,53 @@ import (
 const sampleEnvelopePrefix = "v1:"
 
 // EncryptEnvelope returns v1:<key-id>:<base64(nonce||ciphertext)> (§12.4).
+// Always uses the live active master (§12.7 key_activated+).
 func (c *Cipher) EncryptEnvelope(plain string) (string, error) {
-	inner, err := c.Encrypt(plain)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	inner, err := encryptWith(c.aead, plain)
 	if err != nil {
 		return "", err
 	}
-	return sampleEnvelopePrefix + c.KeyID() + ":" + inner, nil
+	return sampleEnvelopePrefix + keyIDOf(c.rootKey) + ":" + inner, nil
 }
 
 // DecryptEnvelope accepts v1:key-id:payload or legacy bare base64 from Encrypt.
+// After ActivateMaster, envelopes whose key-id matches a retired master still
+// decrypt (§5.4: Master Key rotation does not re-encrypt all large samples).
 func (c *Cipher) DecryptEnvelope(encoded string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if strings.HasPrefix(encoded, sampleEnvelopePrefix) {
 		parts := strings.SplitN(encoded, ":", 3)
 		if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
 			return "", fmt.Errorf("信封格式无效")
 		}
-		if parts[1] != c.KeyID() {
-			return "", fmt.Errorf("信封 key-id 不匹配（可能未完成 Master Key 轮换）")
+		kid := parts[1]
+		if kid == keyIDOf(c.rootKey) {
+			return decryptWith(c.aead, parts[2])
 		}
-		return c.Decrypt(parts[2])
+		for _, prev := range c.previous {
+			if kid == keyIDOf(prev.rootKey) {
+				return decryptWith(prev.aead, parts[2])
+			}
+		}
+		return "", fmt.Errorf("信封 key-id 不匹配（可能未完成 Master Key 轮换）")
 	}
 	// Legacy: reject accidental non-base64 to keep errors clear.
 	if _, err := base64.StdEncoding.DecodeString(encoded); err != nil && strings.Contains(encoded, ":") {
 		return "", fmt.Errorf("无法识别的密文信封")
 	}
-	return c.Decrypt(encoded)
+	plain, err := decryptWith(c.aead, encoded)
+	if err == nil {
+		return plain, nil
+	}
+	for _, prev := range c.previous {
+		if p, e := decryptWith(prev.aead, encoded); e == nil {
+			return p, nil
+		}
+	}
+	return "", err
 }
 
 // EncryptSampleBlob wraps sample body bytes in a v1 envelope. Empty stays empty.

@@ -12,13 +12,24 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 )
 
 // Cipher 用 AES-256-GCM 加解密上游 api_key。
 //
 // 选 GCM 而不是 CBC：GCM 自带完整性校验，密文被改过会解密失败而不是静默返回垃圾。
 // 若返回垃圾 key，症状是上游 401，你会以为是站挂了 —— 那种排查方向完全是错的。
+//
+// ActivateMaster 在 Master Key 轮换完成后就地切换 active；previous 仅用于解密
+// 轮换前写成的信封（§5.4：不重加密全部大样本）。加密始终只用 active。
 type Cipher struct {
+	mu       sync.RWMutex
+	aead     cipher.AEAD
+	rootKey  [sha256.Size]byte
+	previous []retiredMaster
+}
+
+type retiredMaster struct {
 	aead    cipher.AEAD
 	rootKey [sha256.Size]byte
 }
@@ -32,25 +43,59 @@ var ErrNoKey = errors.New("未设置 ENCRYPTION_KEY")
 // 不面对离线爆破场景（能读到环境变量的人也能读到数据库文件）。
 // 上 argon2 只会增加依赖，不增加实际安全性。
 func NewCipher(passphrase string) (*Cipher, error) {
+	aead, root, err := deriveMaster(passphrase)
+	if err != nil {
+		return nil, err
+	}
+	return &Cipher{aead: aead, rootKey: root}, nil
+}
+
+func deriveMaster(passphrase string) (cipher.AEAD, [sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	if strings.TrimSpace(passphrase) == "" {
-		return nil, ErrNoKey
+		return nil, zero, ErrNoKey
 	}
 	sum := sha256.Sum256([]byte(passphrase))
 	block, err := aes.NewCipher(sum[:])
 	if err != nil {
-		return nil, fmt.Errorf("初始化 AES: %w", err)
+		return nil, zero, fmt.Errorf("初始化 AES: %w", err)
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("初始化 GCM: %w", err)
+		return nil, zero, fmt.Errorf("初始化 GCM: %w", err)
 	}
-	return &Cipher{aead: aead, rootKey: sum}, nil
+	return aead, sum, nil
+}
+
+// ActivateMaster switches the live active key after Keyring key_activated (§12.7).
+// The prior active key is retained for Decrypt / DecryptEnvelope so sample
+// envelopes written before rotation stay readable (§5.4).
+func (c *Cipher) ActivateMaster(passphrase string) error {
+	aead, root, err := deriveMaster(passphrase)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if root == c.rootKey {
+		return nil
+	}
+	c.previous = append(c.previous, retiredMaster{aead: c.aead, rootKey: c.rootKey})
+	c.aead = aead
+	c.rootKey = root
+	return nil
 }
 
 // KeyID returns a short, irreversible identifier used to pair encrypted
 // backups with the configured ENCRYPTION_KEY. It never exposes key material.
 func (c *Cipher) KeyID() string {
-	return hex.EncodeToString(c.rootKey[:])[:16]
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return keyIDOf(c.rootKey)
+}
+
+func keyIDOf(root [sha256.Size]byte) string {
+	return hex.EncodeToString(root[:])[:16]
 }
 
 // SumRequestURL returns a keyed digest suitable for URL evidence. A plain
@@ -65,37 +110,60 @@ func (c *Cipher) Fingerprint(kind string, plain []byte) string {
 }
 
 func (c *Cipher) domainDigest(domain string, value []byte) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	derive := hmac.New(sha256.New, c.rootKey[:])
 	_, _ = derive.Write([]byte("relay-gate/hmac-key/v1\x00" + domain))
 	subkey := derive.Sum(nil)
 
 	digest := hmac.New(sha256.New, subkey)
 	_, _ = digest.Write(value)
-	return c.KeyID() + ":" + hex.EncodeToString(digest.Sum(nil))
+	return keyIDOf(c.rootKey) + ":" + hex.EncodeToString(digest.Sum(nil))
 }
 
 // Encrypt 返回 base64(nonce || ciphertext)。
 // nonce 每次随机生成并前置存储 —— GCM 下 nonce 复用会直接泄露明文异或值，
 // 所以绝不能用固定 nonce 或计数器。
 func (c *Cipher) Encrypt(plain string) (string, error) {
-	nonce := make([]byte, c.aead.NonceSize())
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return encryptWith(c.aead, plain)
+}
+
+func encryptWith(aead cipher.AEAD, plain string) (string, error) {
+	nonce := make([]byte, aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", fmt.Errorf("生成 nonce: %w", err)
 	}
-	out := c.aead.Seal(nonce, nonce, []byte(plain), nil)
+	out := aead.Seal(nonce, nonce, []byte(plain), nil)
 	return base64.StdEncoding.EncodeToString(out), nil
 }
 
 func (c *Cipher) Decrypt(encoded string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	plain, err := decryptWith(c.aead, encoded)
+	if err == nil {
+		return plain, nil
+	}
+	for _, prev := range c.previous {
+		if p, e := decryptWith(prev.aead, encoded); e == nil {
+			return p, nil
+		}
+	}
+	return "", err
+}
+
+func decryptWith(aead cipher.AEAD, encoded string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", fmt.Errorf("密文 base64 解码失败: %w", err)
 	}
-	ns := c.aead.NonceSize()
+	ns := aead.NonceSize()
 	if len(raw) < ns {
 		return "", errors.New("密文长度不足，数据可能已损坏")
 	}
-	plain, err := c.aead.Open(nil, raw[:ns], raw[ns:], nil)
+	plain, err := aead.Open(nil, raw[:ns], raw[ns:], nil)
 	if err != nil {
 		// 最常见的原因是 ENCRYPTION_KEY 换了。明确指出来，
 		// 否则会被当成「数据库坏了」而去做无谓的恢复操作。
