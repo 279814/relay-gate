@@ -16,6 +16,9 @@ const (
 	longDeadL2Short = 30 * time.Second
 	longDeadL2Mid   = 120 * time.Second
 	longDeadL2Long  = 300 * time.Second
+	// aliveL2IntervalFloor：§8.10 alive Route L2 默认间隔。
+	// 存库/内存里若为 0 或负值，每个 tick 都会发合成 L2；按下限钳回，不另发明更严的数。
+	aliveL2IntervalFloor = 600 * time.Second
 )
 
 // intervalFor 按状态返回 L1/L2 间隔（§4.6 / §8.10）。
@@ -29,11 +32,21 @@ func intervalFor(rs *routeState, s model.Settings, now time.Time) (l1, l2 time.D
 		l2 = deadL2Interval(rs, s, now)
 	case model.StateAlive:
 		l1 = time.Duration(s.L1IntervalAliveSec) * time.Second
-		l2 = time.Duration(s.L2IntervalAliveSec) * time.Second
+		l2 = aliveL2Interval(s)
 	default: // unknown：立即探，两级都要
 		return 0, 0
 	}
 	return l1, l2
+}
+
+// aliveL2Interval 返回 alive Route 的合成 L2 间隔（§8.10）。
+// 正数配置原样采用；0/负值钳到文档默认 600s，避免每个调度 tick 连发探活。
+func aliveL2Interval(s model.Settings) time.Duration {
+	base := time.Duration(s.L2IntervalAliveSec) * time.Second
+	if base <= 0 {
+		return aliveL2IntervalFloor
+	}
+	return base
 }
 
 func deadL2Interval(rs *routeState, s model.Settings, now time.Time) time.Duration {
