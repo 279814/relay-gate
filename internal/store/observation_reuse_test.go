@@ -119,7 +119,8 @@ func TestCommitProbeObservation_ReusedRouteIDSameCapabilityRevisionIsConfigStale
 		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
 		UpstreamCreatedAt: upstream.CreatedAt,
 		EndpointID:        endpoint.ID, EndpointRevision: endpoint.Revision,
-		ModelCapability: modelName.CapabilityRevision, RouteCapability: route.CapabilityRevision,
+		EndpointCreatedAt: endpoint.CreatedAt,
+		ModelCapability:   modelName.CapabilityRevision, RouteCapability: route.CapabilityRevision,
 		RouteCreatedAt: route.CreatedAt,
 		AuthProfile:    endpoint.AuthProfile.Revision, RecipeIdentity: identity,
 		RecipeBindingRevision:    1,
@@ -215,7 +216,8 @@ func TestCommitProbeObservation_ReusedUpstreamIDSameNetworkRevisionCapabilityIsC
 		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
 		UpstreamCreatedAt: upstream.CreatedAt,
 		EndpointID:        endpoint.ID, EndpointRevision: endpoint.Revision,
-		AuthProfile: endpoint.AuthProfile.Revision, RecipeIdentity: identity,
+		EndpointCreatedAt: endpoint.CreatedAt,
+		AuthProfile:       endpoint.AuthProfile.Revision, RecipeIdentity: identity,
 		RecipeBindingRevision:    1,
 		ProbeSettingsFingerprint: revisioncodec.ProbeSettingsFingerprint(capPolicy),
 	}
@@ -288,6 +290,116 @@ func TestCommitProbeObservation_ReusedUpstreamIDSameNetworkRevisionCapabilityIsC
 	}
 	if result.Capability != model.ApplyConfigStale {
 		t.Fatalf("disposition=%s want config_stale (UpstreamCreatedAt incarnation mismatch)", result.Capability)
+	}
+	if reducer.capCalls != 0 {
+		t.Fatalf("capability reducer must not run for stale incarnation, calls=%d", reducer.capCalls)
+	}
+}
+
+// Delete + recreate can reuse a SQLite endpoint rowid under the same still-
+// living upstream (especially if the sequence is reset). EndpointRevision alone
+// restarts at 1 and UpstreamCreatedAt is unchanged, so a late capability
+// observation that started on the old endpoint row must not ApplyCurrent on
+// the new incarnation.
+func TestCommitProbeObservation_ReusedEndpointIDSameRevisionIsConfigStale(t *testing.T) {
+	st := testStore(t)
+	upstream := disabledUpstreamWithEndpoints(t, st, "ep-cap-reuse")
+	endpoint := endpointOf(t, st, upstream.ID, model.EndpointModels)
+	oldEndpointID := endpoint.ID
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	settings := model.DefaultSettings()
+	capPolicy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := model.RecipeIdentity{
+		Storage: model.RecipeStorageEmbedded, Origin: model.RecipeBasic,
+		TemplateID: "builtin:models", Revision: 1,
+	}
+	semanticRevision := model.SemanticRevision{
+		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
+		UpstreamCreatedAt: upstream.CreatedAt,
+		EndpointID:        endpoint.ID, EndpointRevision: endpoint.Revision,
+		EndpointCreatedAt: endpoint.CreatedAt,
+		AuthProfile:       endpoint.AuthProfile.Revision, RecipeIdentity: identity,
+		RecipeBindingRevision:    1,
+		ProbeSettingsFingerprint: revisioncodec.ProbeSettingsFingerprint(capPolicy),
+	}
+	facts := model.RecipeBindingFacts{Use: model.BindingResolved, ResolvedLayer: model.ResolvedEmbedded}
+	capExpectation := &model.SemanticExpectation{
+		Target: model.SemanticTarget{
+			Scope: model.RecipeScopeUpstream, UpstreamID: upstream.ID, Endpoint: model.EndpointModels,
+		},
+		PolicySelector: selector, Revision: semanticRevision, BindingFacts: facts,
+		ObservationToken: revisioncodec.NewObservationToken(semanticRevision),
+	}
+	late := model.ProbeExecution{
+		ID: "late-ep-cap-reuse", Trigger: model.TriggerScheduled, UpstreamID: upstream.ID,
+		UpstreamNetworkRevision: upstream.NetworkRevision, UpstreamCredentialRevision: upstream.CredentialRevision,
+		CapabilityPolicySelector: selector, ProbeSettingsFingerprint: semanticRevision.ProbeSettingsFingerprint,
+		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
+		AuthProfileRevision: endpoint.AuthProfile.Revision, Endpoint: model.EndpointModels,
+		RecipeBindingUse: model.BindingResolved, RecipeStorage: identity.Storage, RecipeOrigin: identity.Origin,
+		TemplateID: identity.TemplateID, RecipeIdentityRevision: identity.Revision,
+		RecipeBindingRevision: semanticRevision.RecipeBindingRevision, RecipeBindingFacts: facts,
+		CapabilityToken: capExpectation.ObservationToken, EvidenceHash: "ev-ep-cap-reuse",
+		ErrorClass: model.ErrorNone, Capability: model.CapabilitySupported, Scope: model.ScopeUpstreamEndpoint,
+		Reachable: true, Final: true, Success: true, SemanticSeen: true, NormalEndSeen: true,
+		ObservationOrder: 50, SentAtMS: 1, DoneAtMS: 2,
+	}
+
+	// Clear every endpoint so a sequence reset can reuse the original models id
+	// while the parent upstream row (and UpstreamCreatedAt) stays put.
+	for _, kind := range []model.EndpointKind{
+		model.EndpointModels, model.EndpointMessages, model.EndpointResponses,
+		model.EndpointChatCompletions, model.EndpointCountTokens,
+	} {
+		row := endpointOf(t, st, upstream.ID, kind)
+		if err := st.DeleteEndpoint(row.ID, row.Revision); err != nil {
+			t.Fatalf("delete %s: %v", kind, err)
+		}
+	}
+	if _, err := st.db.Exec(`DELETE FROM sqlite_sequence WHERE name='upstream_endpoint'`); err != nil {
+		t.Fatalf("reset endpoint sequence: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	neu := &model.UpstreamEndpoint{
+		UpstreamID: upstream.ID, Kind: model.EndpointModels,
+		URLMode: model.EndpointURLCanonical,
+		AuthProfile: model.EndpointAuthProfile{
+			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
+		},
+	}
+	if err := st.CreateEndpoint(neu); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if neu.ID != oldEndpointID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", neu.ID, oldEndpointID)
+	}
+	if neu.Revision != semanticRevision.EndpointRevision {
+		t.Fatalf("EndpointRevision=%d want %d (incarnation must not rely on a bump)",
+			neu.Revision, semanticRevision.EndpointRevision)
+	}
+	if neu.CreatedAt == semanticRevision.EndpointCreatedAt {
+		t.Fatal("recreated endpoint must have a distinct created_at")
+	}
+	reread, err := st.GetUpstream(upstream.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reread.CreatedAt != semanticRevision.UpstreamCreatedAt {
+		t.Fatalf("parent UpstreamCreatedAt changed: %d want %d", reread.CreatedAt, semanticRevision.UpstreamCreatedAt)
+	}
+
+	reducer := &fakeStateReducer{allowCap: true}
+	result, err := st.CommitProbeObservation(context.Background(), &model.ProbeObservation{
+		Execution: late, CapabilityExpectation: capExpectation, CapabilityPolicy: &capPolicy.State,
+	}, reducer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Capability != model.ApplyConfigStale {
+		t.Fatalf("disposition=%s want config_stale (EndpointCreatedAt incarnation mismatch)", result.Capability)
 	}
 	if reducer.capCalls != 0 {
 		t.Fatalf("capability reducer must not run for stale incarnation, calls=%d", reducer.capCalls)

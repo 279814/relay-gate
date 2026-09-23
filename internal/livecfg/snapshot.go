@@ -127,6 +127,7 @@ func (s *ProbeSnapshot) SemanticExpectation(target model.SemanticTarget, identit
 		UpstreamCreatedAt:        up.CreatedAt,
 		EndpointID:               endpoint.ID,
 		EndpointRevision:         endpoint.Revision,
+		EndpointCreatedAt:        endpoint.CreatedAt,
 		AuthProfile:              endpoint.AuthProfile.Revision,
 		RecipeIdentity:           identity,
 		RecipeBindingRevision:    factsBindingRevision(facts, identity),
