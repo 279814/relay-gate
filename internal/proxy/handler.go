@@ -69,8 +69,12 @@ type Handler struct {
 	// transforms provides published declarative transforms (§15). Optional.
 	transforms *transform.Registry
 
-	// relayKeys 是入站合法凭据集合。
+	// relayKeys 是入站合法凭据集合（静态；测试与未装配热更新时使用）。
 	relayKeys map[string]bool
+
+	// relayAuth 是 §12.6 热路径鉴权快照（轮换 / grace / 撤销）。非 nil 时
+	// 优先于 relayKeys，保证管理端轮换立刻影响模型流量。
+	relayAuth RelayKeyValidator
 
 	// transports 按网络身份（含 connect 预算）分组连接池（§7.3）。
 	// 与探活共用同一个 Manager —— 各建一套就丢掉了连接复用的收益。
@@ -94,9 +98,22 @@ type CountTokensCapability interface {
 	Effective(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind, expectedToken string) model.CapabilityState
 }
 
+// RelayKeyValidator is the hot-path relay auth snapshot (§12.6).
+// Implemented by credential.Service (active + grace + also-keys).
+type RelayKeyValidator interface {
+	ValidRelayKey(key string) bool
+}
+
 // WithCountTokensCapability injects Capability lookup for multi-route count_tokens.
 func (h *Handler) WithCountTokensCapability(c CountTokensCapability) *Handler {
 	h.countCaps = c
+	return h
+}
+
+// WithRelayKeyValidator wires live relay-key auth (rotate / grace / revoke).
+// When set, authOK consults the validator and ignores the static relayKeys map.
+func (h *Handler) WithRelayKeyValidator(v RelayKeyValidator) *Handler {
+	h.relayAuth = v
 	return h
 }
 
@@ -698,10 +715,19 @@ func inboundCredentials(h http.Header) []string {
 
 // authOK 三个位置都认，因为不同协议的客户端习惯不同（§3.2）。
 func (h *Handler) authOK(r *http.Request) bool {
+	creds := inboundCredentials(r.Header)
+	if h.relayAuth != nil {
+		for _, c := range creds {
+			if h.relayAuth.ValidRelayKey(c) {
+				return true
+			}
+		}
+		return false
+	}
 	if len(h.relayKeys) == 0 {
 		return false // 未配置 key 时一律拒绝，绝不放开
 	}
-	for _, c := range inboundCredentials(r.Header) {
+	for _, c := range creds {
 		if h.relayKeys[c] {
 			return true
 		}

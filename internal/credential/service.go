@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,8 +31,12 @@ type Service struct {
 
 	relayActive string
 	relayGrace  string
-	graceUntil  time.Time
-	graceSec    int
+	// relayAlso holds extra bootstrap keys (comma-separated RELAY_KEYS) that
+	// remain accepted alongside active/grace. Rotation moves only relayActive
+	// into grace; also-keys are unchanged (§12.6 single active + docs/03 multi).
+	relayAlso  map[string]struct{}
+	graceUntil time.Time
+	graceSec   int
 
 	audit []AuditEvent
 	max   int
@@ -56,11 +61,40 @@ func New() *Service {
 
 // SetActiveRelayKey installs the primary relay key (bootstrap / env import).
 func (s *Service) SetActiveRelayKey(key string) {
+	s.SetActiveRelayKeys([]string{key})
+}
+
+// SetActiveRelayKeys installs the accepted relay key set from env / bootstrap.
+// The first non-empty key becomes active; the rest are also-keys.
+func (s *Service) SetActiveRelayKeys(keys []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.relayActive = key
+	s.relayActive = ""
+	s.relayAlso = nil
 	s.relayGrace = ""
 	s.graceUntil = time.Time{}
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if s.relayActive == "" {
+			s.relayActive = key
+			continue
+		}
+		if s.relayAlso == nil {
+			s.relayAlso = make(map[string]struct{})
+		}
+		s.relayAlso[key] = struct{}{}
+	}
+}
+
+// WithNow overrides the time source (tests: grace expiry without sleeping).
+func (s *Service) WithNow(now func() time.Time) *Service {
+	if now != nil {
+		s.now = now
+	}
+	return s
 }
 
 // Status returns a non-secret snapshot for the credentials page.
@@ -81,7 +115,7 @@ func (s *Service) Status() map[string]any {
 	}
 }
 
-// ValidRelayKey reports whether key matches active or in-grace key.
+// ValidRelayKey reports whether key matches active, in-grace, or also-key.
 func (s *Service) ValidRelayKey(key string) bool {
 	if key == "" {
 		return false
@@ -89,7 +123,11 @@ func (s *Service) ValidRelayKey(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expireGraceLocked()
-	return key == s.relayActive || (s.relayGrace != "" && key == s.relayGrace)
+	if key == s.relayActive || (s.relayGrace != "" && key == s.relayGrace) {
+		return true
+	}
+	_, ok := s.relayAlso[key]
+	return ok
 }
 
 // ActiveRelayKeys returns keys currently accepted for proxy auth.
@@ -103,6 +141,9 @@ func (s *Service) ActiveRelayKeys() []string {
 	}
 	if s.relayGrace != "" {
 		out = append(out, s.relayGrace)
+	}
+	for k := range s.relayAlso {
+		out = append(out, k)
 	}
 	return out
 }

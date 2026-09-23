@@ -101,10 +101,7 @@ func runServer() error {
 		return fmt.Errorf("初始化 keyring: %w", err)
 	}
 	credSvc := credential.New()
-	for _, k := range cfg.RelayKeys {
-		credSvc.SetActiveRelayKey(k)
-		break
-	}
+	credSvc.SetActiveRelayKeys(cfg.RelayKeys)
 	st, err := store.Open(cfg.DBPath, cipher)
 	if err != nil {
 		return err
@@ -182,6 +179,7 @@ func runServer() error {
 	}
 
 	fwd := proxy.NewHandler(cfgSrc, tracker, recorder, cfg.RelayKeys, log).
+		WithRelayKeyValidator(credSvc).
 		WithTargets(targets, st).
 		WithTransports(transports).
 		WithHealthReporter(probe.NewReporter(tracker)).
