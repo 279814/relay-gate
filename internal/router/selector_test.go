@@ -562,6 +562,31 @@ func TestMatchModelName_NotFound(t *testing.T) {
 	}
 }
 
+// 空前缀绝不能当「匹配一切」：strings.HasPrefix(s, "") 对任意 s 为 true。
+// Validate 会拒写入，但坏行仍可能进快照；匹配器必须自行跳过。
+func TestMatchModelName_EmptyPrefixDoesNotMatchAll(t *testing.T) {
+	mns := []*model.ModelName{
+		{ID: 1, Name: "", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 2, Name: "   ", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+	}
+	ups := []*model.Upstream{{ID: 10, Name: "s", Enabled: true}}
+	rts := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+
+	if _, err := MatchModelName(snap, "claude-opus", model.ProtoAnthropic); !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("空前缀不得匹配 claude-opus，得到 %v", err)
+	}
+	// Select 也不得给出 Candidate —— 否则会出网上游（零上游调用）。
+	if cand, err := Select(snap, newFakeHealth(), "claude-opus", model.ProtoAnthropic); !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("空前缀 Select 应失败且零上游，得到 cand=%v err=%v", cand, err)
+	}
+}
+
 // 停用的 ModelName 不参与匹配，包括不能当兜底。
 func TestMatchModelName_SkipsDisabled(t *testing.T) {
 	mns := []*model.ModelName{

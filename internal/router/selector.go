@@ -107,6 +107,12 @@ func MatchModelName(snap *Snapshot, inModel string,
 		if !mn.Enabled {
 			continue
 		}
+		// 空 name（含仅空白）不能参与匹配：Validate 会拒写入，但坏行仍可能
+		// 经手工 SQL 等路径进快照。尤其 prefix + "" 时 strings.HasPrefix(s, "")
+		// 对任意 s 都为 true，会把所有入站 model 吸进同一条 Route。
+		if strings.TrimSpace(mn.Name) == "" {
+			continue
+		}
 		if mn.MatchMode == model.MatchExact && mn.Name == inModel {
 			return mn, nil // 精确匹配优先级最高，直接返回
 		}

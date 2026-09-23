@@ -135,6 +135,8 @@ func validateBaseURL(raw string, fullURLMode bool) error {
 }
 
 func (m *ModelName) Validate() error {
+	// 空 / 仅空白 name 一律拒绝。prefix 模式下空串会让 strings.HasPrefix
+	// 匹配任意入站 model，等于悄悄变成全量兜底。
 	if strings.TrimSpace(m.Name) == "" {
 		return invalid("name 不能为空")
 	}
