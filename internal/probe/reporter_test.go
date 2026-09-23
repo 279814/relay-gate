@@ -65,9 +65,21 @@ func TestClassifyReal_HTTP200WithContentStillOK(t *testing.T) {
 		Status:       200,
 		ErrBody:      nil,
 		BytesWritten: 120,
+		SemanticSeen: true,
 	})
 	if out.Verdict != health.VerdictOK {
-		t.Fatalf("normal 200 with bytes should be OK, got %s", out.Verdict)
+		t.Fatalf("normal 200 with semantic evidence should be OK, got %s", out.Verdict)
+	}
+}
+
+func TestClassifyReal_HTTP200BytesWithoutSemanticIsFakeAlive(t *testing.T) {
+	out := classifyReal(&proxy.ResultView{
+		Status:       200,
+		BytesWritten: 512,
+		SemanticSeen: false,
+	})
+	if out.Verdict != health.VerdictUnavailable {
+		t.Fatalf("200 with bytes but no semantic evidence should be unavailable, got %s", out.Verdict)
 	}
 }
 
@@ -75,6 +87,55 @@ func TestClassifyReal_HTTP200EmptyIsFakeAlive(t *testing.T) {
 	out := classifyReal(&proxy.ResultView{Status: 200, BytesWritten: 0})
 	if out.Verdict != health.VerdictUnavailable {
 		t.Fatalf("empty 200 should be unavailable, got %s", out.Verdict)
+	}
+}
+
+func TestReportResult_HTML200DoesNotRefreshLastRealOK(t *testing.T) {
+	tr := health.NewTracker(nil)
+	tr.Report(health.Report{RouteID: 9, Verdict: health.VerdictOK, Source: health.SourceReal})
+	seeded := tr.Status(9).LastRealOKAt
+	if seeded == 0 {
+		t.Fatal("seed real OK should set lastRealOKAt")
+	}
+
+	rep := NewReporter(tr)
+	rep.ReportResult(9, 0, &proxy.ResultView{
+		Status:       200,
+		BytesWritten: 240,
+		SemanticSeen: false, // HTML / 空壳 200：有字节但无语义证据
+	})
+
+	after := tr.Status(9)
+	if after.LastRealOKAt != seeded {
+		t.Fatalf("HTML 200 must not refresh lastRealOKAt: before=%d after=%d",
+			seeded, after.LastRealOKAt)
+	}
+	if after.ConsecutiveFail < 1 {
+		t.Fatalf("HTML 200 should count as failure, consecutive_fail=%d", after.ConsecutiveFail)
+	}
+}
+
+func TestReportResult_TextDeltaStillPiggybacks(t *testing.T) {
+	tr := health.NewTracker(nil)
+	tr.Report(health.Report{RouteID: 10, Verdict: health.VerdictOK, Source: health.SourceReal})
+	seeded := tr.Status(10).LastRealOKAt
+
+	// LastRealOKAt 精度是毫秒；同毫秒内两次 OK 看不出刷新。
+	time.Sleep(2 * time.Millisecond)
+
+	rep := NewReporter(tr)
+	rep.ReportResult(10, 0, &proxy.ResultView{
+		Status:       200,
+		BytesWritten: 180,
+		SemanticSeen: true,
+	})
+
+	after := tr.Status(10)
+	if after.LastRealOKAt == seeded {
+		t.Fatal("normal text delta must refresh lastRealOKAt for piggyback")
+	}
+	if after.ConsecutiveFail != 0 {
+		t.Fatalf("semantic 200 should reset failure streak, fail=%d", after.ConsecutiveFail)
 	}
 }
 
