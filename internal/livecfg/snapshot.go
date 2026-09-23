@@ -124,6 +124,7 @@ func (s *ProbeSnapshot) SemanticExpectation(target model.SemanticTarget, identit
 	revision := model.SemanticRevision{
 		UpstreamNetwork:          up.NetworkRevision,
 		UpstreamCredential:       up.CredentialRevision,
+		UpstreamCreatedAt:        up.CreatedAt,
 		EndpointID:               endpoint.ID,
 		EndpointRevision:         endpoint.Revision,
 		AuthProfile:              endpoint.AuthProfile.Revision,

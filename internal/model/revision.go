@@ -96,10 +96,16 @@ type SecretRevision struct {
 type SemanticRevision struct {
 	UpstreamNetwork    int64
 	UpstreamCredential int64
-	EndpointID         int64
-	EndpointRevision   int64
-	ModelCapability    int64
-	RouteCapability    int64
+	// UpstreamCreatedAt is the upstream row's created_at. Network/Credential
+	// revisions alone are not incarnation keys: delete + recreate can reuse
+	// the same upstream id (and, with a reset sequence, the same EndpointID)
+	// with revisions at 1 again; a late upstream-scope capability commit must
+	// not ApplyCurrent on the new row. Not encoded in the Observation Token.
+	UpstreamCreatedAt int64
+	EndpointID        int64
+	EndpointRevision  int64
+	ModelCapability   int64
+	RouteCapability   int64
 	// RouteCreatedAt is the route row's created_at when Scope is route.
 	// RouteCapability alone is not an incarnation key: delete + recreate can
 	// reuse the same route id with CapabilityRevision=1 again, and a late

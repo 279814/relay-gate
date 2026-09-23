@@ -144,7 +144,8 @@ func TestCommitProbeObservationAppliesReachabilityWhenCapabilityIsConfigStale(t 
 	}
 	semanticRevision := model.SemanticRevision{
 		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
-		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
+		UpstreamCreatedAt: upstream.CreatedAt,
+		EndpointID:        endpoint.ID, EndpointRevision: endpoint.Revision,
 		ModelCapability: modelName.CapabilityRevision, RouteCapability: route.CapabilityRevision,
 		RouteCreatedAt: route.CreatedAt,
 		AuthProfile:    endpoint.AuthProfile.Revision, RecipeIdentity: identity,
