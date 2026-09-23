@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/semanticevidence"
 )
 
 // WireFormat 是响应正文的线协议格式。
@@ -774,6 +775,11 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 	case model.ProtoOpenAIChat:
 		classifyChat(&event, name, object)
 	}
+	// §8.8：正数 output usage 单独即判活。与真实流量共用
+	// semanticevidence.PositiveOutputUsage，不在探活侧再写一份比较。
+	if semanticevidence.PositiveOutputUsage(object) {
+		event.Semantic = true
+	}
 	if event.Semantic {
 		event.Kind = EventSemantic
 	} else if event.OutputTokens > 0 {
@@ -782,9 +788,10 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 	// 结束标记的判定必须排在最后。response.completed 同时是终结事件**和**
 	// usage 的载体，先判 usage 的话它会被归成 EventUsage，于是「协议正常结束」
 	// 这个事实丢失 —— 而 §6.8 要求真实流量必须见到它才算成功。
+	// 正数 usage 的 Semantic 必须保留：否则 usage-only 的 completed 会被当成
+	// 纯结束标记，与 §8.8「正数 output usage」判活矛盾。
 	if terminal, ok := protocolTerminalEvents[d.spec.Protocol]; ok && name == terminal {
 		event.Kind = EventProtocolEnd
-		event.Semantic = false
 	}
 	return []ProtocolEvent{event}, nil
 }
@@ -809,7 +816,8 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 		if usage, ok := object["usage"]; ok {
 			var value map[string]json.RawMessage
 			if json.Unmarshal(usage, &value) == nil {
-				// 只记数，不设 Semantic：token 数不是内容证据（§8.8）。
+				// 记数；§8.8 正数 output usage 的 Semantic 由 eventFromObject
+				// 统一经 semanticevidence.PositiveOutputUsage 置位。
 				event.OutputTokens = tokenCount(value, "output_tokens")
 			}
 		}

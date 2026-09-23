@@ -57,6 +57,15 @@ func TestHasSemanticEvidence_PositiveUsageAndRefusal(t *testing.T) {
 	if HasSemanticEvidence([]byte(`{"usage":{"completion_tokens":0}}`), "application/json") {
 		t.Fatal("completion_tokens:0 must not count as semantic")
 	}
+	if HasSemanticEvidence([]byte(`{"usage":{"input_tokens":9}}`), "application/json") {
+		t.Fatal("input_tokens alone must not count as semantic")
+	}
+	if HasSemanticEvidence([]byte(`{"usage":{"prompt_tokens":8,"completion_tokens":0}}`), "application/json") {
+		t.Fatal("prompt_tokens with zero completion must not count as semantic")
+	}
+	if HasSemanticEvidence([]byte(`{"usage":{"output_tokens":-1}}`), "application/json") {
+		t.Fatal("negative output_tokens must not count as positive")
+	}
 	chatUsage := []byte(`{"choices":[],"usage":{"completion_tokens":3}}`)
 	if !HasSemanticEvidence(chatUsage, "application/json") {
 		t.Fatal("positive completion_tokens on empty choices must be semantic")

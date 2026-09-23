@@ -320,8 +320,6 @@ func TestNonSemanticEventsNeverSucceed(t *testing.T) {
 		{"ping only", []ProtocolEvent{{Kind: EventKeepalive, EventName: "ping"}}},
 		{"empty delta", []ProtocolEvent{{Kind: EventMetadata, EventName: "content_block_delta"}}},
 		{"zero output usage", []ProtocolEvent{{Kind: EventUsage, EventName: "message_delta", OutputTokens: 0}}},
-		{"positive usage without semantic", []ProtocolEvent{
-			{Kind: EventUsage, EventName: "message_delta", OutputTokens: 5}}},
 		{"protocol end only", []ProtocolEvent{{Kind: EventProtocolEnd, EventName: "message_stop"}}},
 		{"metadata then end", []ProtocolEvent{
 			{Kind: EventMetadata, EventName: "message_start"},
@@ -347,23 +345,51 @@ func TestNonSemanticEventsNeverSucceed(t *testing.T) {
 	}
 }
 
-// 正数 output usage 进 Decision 的 token 汇总，但不构成语义证据。
-//
-// 这是 P0-07 定下的分工，这里钉住 Classifier 那一侧：「有没有内容证据」
-// 与「花了多少 token」是两件事。把正数 usage 也算成判活的话，一个只回
-// usage 就收尾的站与真正吐出内容的站不可区分 —— 而 §8.8 明确把
-// 「只有结束标记」列为不能判活。
-func TestUsageTokensAccumulateWithoutImplyingSemantic(t *testing.T) {
+// §8.8：正数 output usage（Decoder 已置 Semantic）是判活证据。
+func TestPositiveOutputUsageSetsSemanticInProbe(t *testing.T) {
 	classifier := messagesClassifier(200)
-	classifier.Observe(ProtocolEvent{Kind: EventUsage, InputTokens: 10, OutputTokens: 3})
-	classifier.Observe(ProtocolEvent{Kind: EventUsage, OutputTokens: 4})
-	decision := classifier.Finish(nil, nil)
-	if decision.SemanticSeen {
-		t.Fatal("usage events must not set SemanticSeen")
+	decision, final := classifier.Observe(ProtocolEvent{
+		Kind: EventUsage, EventName: "message_delta", Semantic: true, OutputTokens: 3, InputTokens: 10,
+	})
+	if !final || !decision.Success || !decision.SemanticSeen {
+		t.Fatalf("positive usage must succeed in probe mode: final=%v decision=%+v", final, decision)
 	}
-	if decision.ObservedInputTokens != 10 || decision.ObservedOutputTokens != 7 {
-		t.Fatalf("tokens = in:%d out:%d, want in:10 out:7",
+	if decision.ObservedInputTokens != 10 || decision.ObservedOutputTokens != 3 {
+		t.Fatalf("tokens = in:%d out:%d, want in:10 out:3",
 			decision.ObservedInputTokens, decision.ObservedOutputTokens)
+	}
+}
+
+// Real 模式下 Semantic 的 usage 仍累加 token，且须等协议结束。
+func TestPositiveOutputUsageAccumulatesTokensInRealMode(t *testing.T) {
+	classifier := NewResponseClassifier(ObserveReal, model.EndpointMessages, 200, nil, headerAt)
+	if _, final := classifier.Observe(ProtocolEvent{
+		Kind: EventUsage, Semantic: true, InputTokens: 10, OutputTokens: 3,
+	}); final {
+		t.Fatal("real mode must not finish on first usage alone")
+	}
+	classifier.Observe(ProtocolEvent{Kind: EventUsage, Semantic: true, OutputTokens: 4})
+	classifier.Observe(ProtocolEvent{Kind: EventProtocolEnd, EventName: "message_stop"})
+	got := classifier.Finish(nil, nil)
+	if !got.Success || !got.SemanticSeen {
+		t.Fatalf("decision = %+v", got)
+	}
+	if got.ObservedInputTokens != 10 || got.ObservedOutputTokens != 7 {
+		t.Fatalf("tokens = in:%d out:%d, want in:10 out:7",
+			got.ObservedInputTokens, got.ObservedOutputTokens)
+	}
+}
+
+// Decoder 未置 Semantic 的 usage 只记数：Classifier 不二次发明判活。
+func TestUsageWithoutSemanticFlagDoesNotSetSemanticSeen(t *testing.T) {
+	classifier := messagesClassifier(200)
+	classifier.Observe(ProtocolEvent{Kind: EventUsage, OutputTokens: 5})
+	decision := classifier.Finish(nil, nil)
+	if decision.SemanticSeen || decision.Success {
+		t.Fatalf("usage without Semantic flag must not succeed: %+v", decision)
+	}
+	if decision.ObservedOutputTokens != 5 {
+		t.Fatalf("ObservedOutputTokens = %d, want 5", decision.ObservedOutputTokens)
 	}
 }
 

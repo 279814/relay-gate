@@ -95,8 +95,8 @@
       "request_file": "requests/anthropic_messages.json",
       "response_file": "responses/anthropic_usage_only_no_content.bin",
       "chunk_plan": {"name": "single_byte"},
-      "expected_events": [{"type": "message_delta"}, {"type": "message_stop"}],
-      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "fake_alive"}
+      "expected_events": [{"type": "message_delta", "semantic": true}, {"type": "message_stop"}],
+      "expected_decision": {"success": true, "capability": "supported", "error_class": "none"}
     },
     {
       "id": "anthropic_context_1m_required",
@@ -121,7 +121,7 @@
       "request_file": "requests/openai_responses.json",
       "response_file": "responses/responses_output_text_delta.bin",
       "chunk_plan": {"name": "utf8_midpoint"},
-      "expected_events": [{"type": "response.output_text.delta", "semantic": true}, {"type": "response.completed"}],
+      "expected_events": [{"type": "response.output_text.delta", "semantic": true}, {"type": "response.completed", "semantic": true}],
       "expected_decision": {"success": true, "capability": "supported", "error_class": "none"}
     },
     {
@@ -134,7 +134,7 @@
       "request_file": "requests/openai_responses.json",
       "response_file": "responses/responses_refusal_delta.bin",
       "chunk_plan": {"name": "random", "seed": 2026081303},
-      "expected_events": [{"type": "response.refusal.delta", "semantic": true}, {"type": "response.completed"}],
+      "expected_events": [{"type": "response.refusal.delta", "semantic": true}, {"type": "response.completed", "semantic": true}],
       "expected_decision": {"success": true, "capability": "supported", "error_class": "none"}
     },
     {
@@ -173,7 +173,7 @@
       "request_file": "requests/openai_responses.json",
       "response_file": "responses/ndjson_semantic_then_end.bin",
       "chunk_plan": {"name": "random", "seed": 2026081304},
-      "expected_events": [{"type": "response.output_text.delta", "semantic": true}, {"type": "response.completed"}],
+      "expected_events": [{"type": "response.output_text.delta", "semantic": true}, {"type": "response.completed", "semantic": true}],
       "expected_decision": {"success": true, "capability": "supported", "error_class": "none"}
     },
     {
