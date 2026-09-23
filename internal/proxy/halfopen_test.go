@@ -20,8 +20,9 @@ func TestHandler_HalfOpenWhenAllDead(t *testing.T) {
 	if rec.Code != 200 {
 		t.Errorf("半开应放行一次试探,得到 %d", rec.Code)
 	}
-	if rec.Header().Get("X-Relay-Half-Open") != "1" {
-		t.Error("半开放行时应打标记,否则日志里分不清是正常选路还是试探")
+	// §2.3: 半开成功后仍是上游响应，不得新增 X-Relay-Half-Open；标记进 request_log。
+	if rec.Header().Get("X-Relay-Half-Open") != "" {
+		t.Error("半开成功的上游响应不该带 X-Relay-Half-Open")
 	}
 	if hs.gotReq.method == "" {
 		t.Error("半开应实际转发到上游")
@@ -151,4 +152,28 @@ func TestHandler_HalfOpenRecoveryGateEvenWhenMaxConcurrencyUnlimited(t *testing.
 	}
 	close(release)
 	<-done
+}
+
+// §2.3: 半开试探若连不上上游、由网关自生成 502/504，应带 X-Relay-Half-Open；
+// 成功透传上游响应则不得带（见 TestHandler_HalfOpenWhenAllDead）。
+func TestHandler_HalfOpenGatewayErrorCarriesHeader(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	})
+	hs.cfg.settings.HalfOpenEnabled = true
+	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealResponseHeaderSec = 1
+	hs.cfg.settings.RealFirstByteSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
+	hs.cfg.settings.RealConnectSec = 1
+	hs.cfg.settings.RealTotalSec = 5
+	hs.health.dead[100] = true
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+	if rec.Code != http.StatusGatewayTimeout && rec.Code != http.StatusBadGateway {
+		t.Fatalf("半开失败应回网关错误，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Relay-Half-Open") != "1" {
+		t.Error("半开失败的网关错误应带 X-Relay-Half-Open=1")
+	}
 }

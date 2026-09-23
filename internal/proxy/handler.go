@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -417,7 +418,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
 	// 不写的话 net/http 会在 handler 返回时补一个 HTTP 200 空 body ——
 	// 客户端拿到「成功但没内容」，既看不到原因也不会重试。
+	//
+	// §2.3：X-Relay-Attempts / X-Relay-Half-Open 只允许出现在网关自生成
+	// 错误响应上；透传的上游响应（含换站后成功的 200）不得新增它们。
 	if res.Err != nil && !res.HeadersSent {
+		if oc.attempts > 1 {
+			w.Header().Set("X-Relay-Attempts", strconv.Itoa(oc.attempts))
+		}
+		if oc.halfOpen {
+			w.Header().Set("X-Relay-Half-Open", "1")
+		}
 		h.writeForwardError(w, res.Err, proto, oc.cand, keys)
 	}
 
