@@ -66,6 +66,14 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		if err != nil || cand == nil {
 			return false
 		}
+		// recovering 须占 RecoveryGate（§9.1 / §9.4）；拿不到则跳过，不排队。
+		wrapped, ok := h.wrapRecoveryIfNeeded(cand)
+		if !ok {
+			tried[cand.Route.ID] = true
+			cand.Release()
+			continue
+		}
+		cand = wrapped
 		tried[cand.Route.ID] = true
 		reason := h.proxyCountTokens(w, r, pre, cand)
 		cand.Release()
