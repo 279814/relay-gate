@@ -26,7 +26,13 @@ type fakeWriter struct {
 	written chan struct{}
 
 	pruneCalls atomic.Int32
-	pruneArgs  []([2]int)
+	pruneArgs  []pruneCall
+}
+
+type pruneCall struct {
+	keepCount int
+	keepDays  int
+	maxBytes  int64
 }
 
 func (f *fakeWriter) InsertSample(s *model.Sample) error {
@@ -46,10 +52,10 @@ func (f *fakeWriter) InsertSample(s *model.Sample) error {
 	return nil
 }
 
-func (f *fakeWriter) PruneSamples(keepCount, keepDays int) (int64, error) {
+func (f *fakeWriter) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, error) {
 	f.pruneCalls.Add(1)
 	f.mu.Lock()
-	f.pruneArgs = append(f.pruneArgs, [2]int{keepCount, keepDays})
+	f.pruneArgs = append(f.pruneArgs, pruneCall{keepCount, keepDays, maxBytes})
 	f.mu.Unlock()
 	return 0, nil
 }
@@ -231,10 +237,11 @@ func TestRecorder_PrunesPeriodically(t *testing.T) {
 	}
 	// 清理参数必须来自 Settings，写死的话改配置不生效
 	w.mu.Lock()
-	args := append([][2]int(nil), w.pruneArgs...)
+	args := append([]pruneCall(nil), w.pruneArgs...)
 	w.mu.Unlock()
-	if len(args) == 0 || args[0] != [2]int{500, 7} {
-		t.Errorf("清理参数应取自 Settings，得到 %v", args)
+	want := pruneCall{500, 7, s.SampleDiskQuotaBytes}
+	if len(args) == 0 || args[0] != want {
+		t.Errorf("清理参数应取自 Settings %+v，得到 %v", want, args)
 	}
 
 	r.Close()
@@ -321,14 +328,15 @@ func TestRecorder_RetentionIsHotReloaded(t *testing.T) {
 	r.Close()
 
 	w.mu.Lock()
-	args := append([][2]int(nil), w.pruneArgs...)
+	args := append([]pruneCall(nil), w.pruneArgs...)
 	w.mu.Unlock()
 
 	if len(args) == 0 {
 		t.Fatal("Close 应收尾清理一次")
 	}
-	if last := args[len(args)-1]; last != [2]int{50, 1} {
-		t.Errorf("清理应用改后的保留策略 {50 1}，得到 %v —— 配置改了不生效", last)
+	if last := args[len(args)-1]; last != (pruneCall{50, 1, s.SampleDiskQuotaBytes}) {
+		t.Errorf("清理应用改后的保留策略 {50 1 %d}，得到 %+v —— 配置改了不生效",
+			s.SampleDiskQuotaBytes, last)
 	}
 }
 
@@ -346,16 +354,16 @@ func TestRecorder_PrunesWithDefaultsWhenSettingsFail(t *testing.T) {
 	r.Close() // 收尾清理
 
 	w.mu.Lock()
-	args := append([][2]int(nil), w.pruneArgs...)
+	args := append([]pruneCall(nil), w.pruneArgs...)
 	w.mu.Unlock()
 
 	if len(args) != 1 {
 		t.Fatalf("读配置失败也应清理一次，得到 %d 次", len(args))
 	}
 	d := model.DefaultSettings()
-	if args[0] != [2]int{d.SampleKeepCount, d.SampleKeepDays} {
-		t.Errorf("应回退到默认保留策略 {%d %d}，得到 %v",
-			d.SampleKeepCount, d.SampleKeepDays, args[0])
+	want := pruneCall{d.SampleKeepCount, d.SampleKeepDays, d.SampleDiskQuotaBytes}
+	if args[0] != want {
+		t.Errorf("应回退到默认保留策略 %+v，得到 %+v", want, args[0])
 	}
 }
 

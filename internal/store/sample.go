@@ -216,10 +216,13 @@ func (s *Store) SetSamplePinned(id int64, pinned bool) error {
 	return checkAffected(res)
 }
 
-// PruneSamples 按条数与天数清理，两者取**先到者**（§3.6.3c）。pinned 豁免。
+// PruneSamples 按条数、天数与磁盘配额清理，各维度独立取先到者（§5.4）。
+// pinned 豁免删除，但仍计入磁盘配额。
 //
-// keepCount / keepDays <= 0 表示该维度不限。
-func (s *Store) PruneSamples(keepCount, keepDays int) (int64, error) {
+// keepCount / keepDays / maxBytes <= 0 表示该维度不限。
+// 磁盘配额按 in_body/out_body/resp_body 存盘 BLOB 字节合计（信封或明文均计入），
+// 超限时优先删除最旧未置顶行；只删 sample 表整行，不按信封形态筛选。
+func (s *Store) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, error) {
 	var total int64
 
 	if keepDays > 0 {
@@ -244,7 +247,74 @@ func (s *Store) PruneSamples(keepCount, keepDays int) (int64, error) {
 		n, _ := res.RowsAffected()
 		total += n
 	}
+
+	if maxBytes > 0 {
+		n, err := s.pruneSamplesByDiskQuota(maxBytes)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
 	return total, nil
+}
+
+// sampleBodyDiskBytesSQL 是正文 BLOB 存盘字节合计表达式。
+// 用 LENGTH(存盘列) 而不是解密后明文，才对得上实际占用的磁盘。
+const sampleBodyDiskBytesSQL = `COALESCE(LENGTH(in_body),0)+COALESCE(LENGTH(out_body),0)+COALESCE(LENGTH(resp_body),0)`
+
+// SampleDiskBytes 返回 sample 表正文 BLOB 的存盘字节合计。
+func (s *Store) SampleDiskBytes() (int64, error) {
+	var n sql.NullInt64
+	err := s.db.QueryRow(`SELECT SUM(` + sampleBodyDiskBytesSQL + `) FROM sample`).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	if !n.Valid {
+		return 0, nil
+	}
+	return n.Int64, nil
+}
+
+func (s *Store) pruneSamplesByDiskQuota(maxBytes int64) (int64, error) {
+	used, err := s.SampleDiskBytes()
+	if err != nil {
+		return 0, fmt.Errorf("统计样本磁盘: %w", err)
+	}
+	if used <= maxBytes {
+		return 0, nil
+	}
+
+	rows, err := s.db.Query(`SELECT id, `+sampleBodyDiskBytesSQL+` AS sz
+		FROM sample WHERE pinned = 0 ORDER BY id ASC`)
+	if err != nil {
+		return 0, fmt.Errorf("列举待删样本: %w", err)
+	}
+	defer rows.Close()
+
+	var toDelete []int64
+	for rows.Next() && used > maxBytes {
+		var id, sz int64
+		if err := rows.Scan(&id, &sz); err != nil {
+			return 0, err
+		}
+		toDelete = append(toDelete, id)
+		used -= sz
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	_ = rows.Close()
+
+	var deleted int64
+	for _, id := range toDelete {
+		res, err := s.db.Exec(`DELETE FROM sample WHERE id = ? AND pinned = 0`, id)
+		if err != nil {
+			return deleted, fmt.Errorf("按磁盘配额清理样本: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		deleted += n
+	}
+	return deleted, nil
 }
 
 // CountSamples 返回样本总数，供 UI 展示。

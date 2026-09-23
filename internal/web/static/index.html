@@ -1086,6 +1086,7 @@
                 <div class="note" style="margin-bottom:10px">
                   三个体积上限填 <b>0 = 不限</b>（完整留档，当前默认）。完整留档才能拿去逐字节比对，
                   代价是磁盘与内存随上游响应大小增长 —— 吃紧时填回非零即恢复封顶。
+                  另有总磁盘配额（默认 5 GiB）与条数/天数一起滚动清理。
                 </div>
                 <div class="row">
                   <div class="field">
@@ -1105,11 +1106,16 @@
                   <div class="field">
                     <label>保留条数</label>
                     <input type="number" min="1" x-model.number="settings.sample_keep_count">
-                    <div class="note">与天数取先到者。不限体积时，这是磁盘的主要闸门</div>
+                    <div class="note">与天数、磁盘配额取先到者</div>
                   </div>
                   <div class="field">
                     <label>保留天数</label>
                     <input type="number" min="1" x-model.number="settings.sample_keep_days">
+                  </div>
+                  <div class="field">
+                    <label>总磁盘配额 (B)</label>
+                    <input type="number" min="0" x-model.number="settings.sample_disk_quota_bytes">
+                    <div class="note">默认 5 GiB。0 = 该维度不限；超限删最旧未置顶</div>
                   </div>
                   <div class="field">
                     <label>队列容量</label>
