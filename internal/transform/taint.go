@@ -147,3 +147,13 @@ func kindAllowsSecretRef(kind string) bool {
 		return false
 	}
 }
+
+// ruleUsesSecret reports secret_ref or {{SECRET:name}} in the rule. Response
+// apply must reject these: docs/01 §15.4 lists Secret refs under request rules
+// only; resolving them into a client response header would echo upstream keys.
+func ruleUsesSecret(rule Rule) bool {
+	if strings.TrimSpace(rule.SecretRef) != "" {
+		return true
+	}
+	return len(secretRefsInValue(rule.Value)) > 0
+}
