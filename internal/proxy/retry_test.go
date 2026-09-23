@@ -559,6 +559,32 @@ func TestRetry_DiscardedAttemptCarriesErrBody(t *testing.T) {
 	}
 }
 
+// §8.12：被丢弃的「HTTP 200 结构化 error」也必须带上 ErrBody，否则
+// classifyReal 会按 200+字节判活并 piggyback。
+func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
+	hs := newMultiHarness(t,
+		respondStatus(200, `{"type":"error","error":{"type":"server_error","message":"boom"}}`),
+		respondOK(`{"id":"ok"}`))
+	spy := &multiReporter{}
+	hs.h.WithHealthReporter(spy)
+
+	if rec := hs.serve(hs.req()); rec.Code != 200 {
+		t.Fatalf("应换站成功，得到 %d", rec.Code)
+	}
+
+	got := spy.all()
+	if len(got) < 1 {
+		t.Fatal("应有回写")
+	}
+	if !strings.Contains(string(got[0].errBody), `"type":"error"`) &&
+		!strings.Contains(string(got[0].errBody), `"type": "error"`) {
+		t.Errorf("被丢弃的 200 结构化 error 应带 ErrBody，得到 %q", got[0].errBody)
+	}
+	if got[0].status != 200 {
+		t.Errorf("status=%d want 200", got[0].status)
+	}
+}
+
 // 每次尝试的 ErrBody 必须用**那一次自己的** key 脱敏。
 //
 // 用第一次的 key 去脱敏第二次的响应体,B 站回显的 key 就会明文流进

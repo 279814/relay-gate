@@ -44,6 +44,14 @@ const (
 	payloadContent
 )
 
+// IsStructuredErrorPayload 报告前缀是否为确认的结构化错误载荷（§6.8 / §8.12）。
+//
+// 供真实流量健康回写与 piggyback 复用：与重试侧 classifyPayload 同一判据，
+// 拿不准（半截 JSON / 未决）时返回 false，避免假阳性把好响应判死。
+func IsStructuredErrorPayload(prefix []byte, contentType string) bool {
+	return classifyPayload(prefix, contentType) == payloadError
+}
+
 // classifyPayload 判断一段响应前缀是不是错误载荷。
 //
 // prefix 是**已经读到的**字节，可能是被截断的半截 JSON —— 解析失败时

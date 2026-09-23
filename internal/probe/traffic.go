@@ -342,8 +342,11 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 	if v.ClientCanceled || v.ServiceCanceled {
 		exec.ErrorClass = model.ErrorIgnored
 	}
-	if status >= 200 && status < 300 && exec.ErrorClass == "" {
-		exec.Success = true
+	// §6.8 / §8.12：旁路观察器当前不解析 body（TryChunk 未接线），不得仅凭
+	// 2xx 置 Success 或调用 ObserveRealSuccess —— 否则 `{"type":"error"}`
+	// 会把 Route 拉活并 piggyback 掉合成 L2。真实成功由 ReportResult →
+	// classifyReal → VerdictOK 写入 lastRealOKAt（§8.10）。
+	if status > 0 && exec.ErrorClass == "" {
 		exec.Reachable = true
 	}
 
@@ -352,17 +355,6 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 	case o.m.queue <- obs:
 	default:
 		o.m.persistDrops.Add(1)
-	}
-
-	if status >= 200 && status < 300 && !v.ClientCanceled && !v.ServiceCanceled && incomplete == "" {
-		if o.m.sched != nil && o.target.RouteID > 0 {
-			o.m.sched.ObserveRealSuccess(ScheduleKey{
-				UpstreamID: o.target.UpstreamID,
-				ScopeType:  model.RecipeScopeRoute,
-				ScopeID:    o.target.RouteID,
-				Endpoint:   o.target.Endpoint,
-			}, time.Now())
-		}
 	}
 }
 
