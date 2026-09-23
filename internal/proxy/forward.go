@@ -41,6 +41,11 @@ type Timeouts struct {
 // 各阶段上限取**最小的那个**：Budget 的四个观察点都从 SentAt 起算，而
 // forward.go 现在只有一个「首字节前」的计时器，能表达的只有其中最紧的那条。
 // 取最大值会让配得更紧的那个阶段静默失效。
+//
+// 投影后再抬到 MinRealFirstSemanticSec：配置层只卡 real_first_semantic_sec，
+// 但这里 FirstToken 兼管响应头 / 首字节 / 首语义，任一阶段配短都会经 min
+// 把长思考砍到五分钟以下（与探活侧 PR #93 同类）。Total 已被 CapTotal 夹到
+// 低于该下限时不抬，否则会越过一次客户端请求共享的总预算。
 func TimeoutsFrom(budget outbound.Budget) Timeouts {
 	firstToken := budget.Total
 	for _, stage := range []time.Duration{
@@ -49,6 +54,10 @@ func TimeoutsFrom(budget outbound.Budget) Timeouts {
 		if stage > 0 && stage < firstToken {
 			firstToken = stage
 		}
+	}
+	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
+	if firstToken > 0 && firstToken < floor && (budget.Total <= 0 || budget.Total >= floor) {
+		firstToken = floor
 	}
 	return Timeouts{
 		Connect:    budget.Connect,
