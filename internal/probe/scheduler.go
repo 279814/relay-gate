@@ -131,8 +131,8 @@ type Scheduler struct {
 // （分层间隔、piggyback、并发闸、事件驱动），用假实现测比造一个
 // 真 Tracker + 控时钟更直接。
 type Tracker interface {
-	ClaimL1(routeID int64) bool
-	ClaimL2(routeID int64) bool
+	ClaimL1(routeID int64) (generation uint64, ok bool)
+	ClaimL2(routeID int64) (generation uint64, ok bool)
 	TriggerL1(routeID int64)
 	TriggerL2(routeID int64)
 	Report(rep health.Report) bool
@@ -427,7 +427,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	//
 	// beginL1 有两道闸（见其注释）：l1Scheduled 收本轮 tick 内同时到期的
 	// 多条 Route，inflightL1 收跨 tick 仍在跑的 L1。
-	if s.track.ClaimL1(rt.ID) && s.beginL1(up.ID) {
+	if _, ok := s.track.ClaimL1(rt.ID); ok && s.beginL1(up.ID) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -443,7 +443,8 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	if !s.gate.OKAt(up.ID, up.NetworkRevision) {
 		return
 	}
-	if !s.track.ClaimL2(rt.ID) {
+	gen, ok := s.track.ClaimL2(rt.ID)
+	if !ok {
 		return
 	}
 	if !s.beginL2(up.ID, rt.ID) {
@@ -458,7 +459,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 		defer s.wg.Done()
 		defer s.endL2(up.ID, rt.ID)
 		defer s.completeL2(rt.ID)
-		s.runL2(ctx, up, mn, rt, settings)
+		s.runL2(ctx, up, mn, rt, settings, gen)
 	}()
 }
 
@@ -584,7 +585,7 @@ func (s *Scheduler) triggerDeadRoutes(upstreamID int64) int {
 }
 
 func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
-	mn *model.ModelName, rt *model.Route, settings model.Settings) {
+	mn *model.ModelName, rt *model.Route, settings model.Settings, generation uint64) {
 
 	var out Outcome
 	if s.executor != nil {
@@ -609,7 +610,8 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	s.countL2(rt.ID, mn, out)
 
 	changed := s.track.Report(health.Report{
-		RouteID: rt.ID, Verdict: out.Verdict, Source: health.SourceL2,
+		RouteID: rt.ID, Generation: generation,
+		Verdict: out.Verdict, Source: health.SourceL2,
 		Err: out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
 	})
 
@@ -826,6 +828,9 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		return l1, l2, errNoModelName
 	}
 
+	// 绑定世代：手动探活过程中若 Route 被 Forget，迟到结论不得污染同 id 新行。
+	generation := ensureRouteGeneration(s.track, rt.ID)
+
 	if s.executor != nil {
 		kind, ok := mn.Protocol.Endpoint()
 		if !ok {
@@ -857,7 +862,8 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	if l2.Verdict != health.VerdictIgnore {
 		s.countL2(rt.ID, mn, l2)
 		s.track.Report(health.Report{
-			RouteID: rt.ID, Verdict: l2.Verdict, Source: health.SourceL2,
+			RouteID: rt.ID, Generation: generation,
+			Verdict: l2.Verdict, Source: health.SourceL2,
 			Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
 		})
 	}
@@ -905,6 +911,14 @@ func findModelName(snap *router.Snapshot, id int64) *model.ModelName {
 		}
 	}
 	return nil
+}
+
+// ensureRouteGeneration 在未先 Claim 的路径上绑定世代（手动探活 / piggyback）。
+func ensureRouteGeneration(track Tracker, routeID int64) uint64 {
+	if eg, ok := track.(interface{ EnsureGeneration(int64) uint64 }); ok {
+		return eg.EnsureGeneration(routeID)
+	}
+	return 0
 }
 
 // ── 配置变更触发即时探活（§4.5）─────────────────

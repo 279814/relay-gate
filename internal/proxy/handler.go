@@ -429,7 +429,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
 	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
-		h.reporter.ReportResult(oc.cand.Route.ID, viewOf(res, keys))
+		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, viewOf(res, keys))
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
@@ -502,7 +502,7 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 		if !ok {
 			continue
 		}
-		release, ok := h.health.TryAcquire(rt.ID, rt.MaxConcurrency)
+		release, gen, ok := h.health.TryAcquire(rt.ID, rt.MaxConcurrency)
 		if !ok {
 			relGate()
 			continue
@@ -513,7 +513,7 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 			release()
 			relGate()
 		}
-		return router.NewCandidate(rt, up, mn, combined)
+		return router.NewCandidate(rt, up, mn, combined, gen)
 	}
 	return nil
 }

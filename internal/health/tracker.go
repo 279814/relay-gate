@@ -19,6 +19,11 @@ type Tracker struct {
 	mu    sync.RWMutex
 	state map[int64]*routeState
 
+	// nextGen 给每个新建的 *routeState 分配单调世代。Forget 删掉条目后，
+	// 同 id 新 Route 会拿到更大的 generation；仍持旧世代的迟到 Report
+	// 必须被丢弃，否则会把新 Route 判死/判活。
+	nextGen uint64
+
 	// settings 提供阈值与间隔。现读而不是定格 —— 用户改了 fail_threshold
 	// 就该立刻按新值判定，定格会变成「改了不生效」。
 	settings SettingsSource
@@ -33,6 +38,9 @@ type SettingsSource interface {
 
 // routeState 是单个 Route 的全部运行时状态。
 type routeState struct {
+	// generation 在本条目创建时分配，Forget 后同 id 新条目不会复用该值。
+	generation uint64
+
 	state    model.HealthState
 	inFlight int
 
@@ -71,10 +79,34 @@ func NewTracker(settings SettingsSource) *Tracker {
 func (t *Tracker) get(routeID int64) *routeState {
 	rs := t.state[routeID]
 	if rs == nil {
-		rs = &routeState{state: model.StateUnknown}
+		t.nextGen++
+		rs = &routeState{state: model.StateUnknown, generation: t.nextGen}
 		t.state[routeID] = rs
 	}
 	return rs
+}
+
+// GenerationOf 返回 routeID 当前条目的世代；无条目时为 0。
+//
+// 不创建行。调用方若已 Claim / TryAcquire，应使用当时返回的 generation，
+// 而不是再 Peek —— Forget 之后 Peek 会变成 0 或新世代。
+func (t *Tracker) GenerationOf(routeID int64) uint64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if rs := t.state[routeID]; rs != nil {
+		return rs.generation
+	}
+	return 0
+}
+
+// EnsureGeneration 取或建 routeID 的条目并返回其世代。
+//
+// 用于手动探活 / piggyback 等未先 Claim 的路径：先绑定世代再跑，
+// 这样过程中若发生 Forget，迟到 Report 仍会因世代不匹配被丢弃。
+func (t *Tracker) EnsureGeneration(routeID int64) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.get(routeID).generation
 }
 
 // State 返回 Route 的健康状态。未知的 Route 返回 StateUnknown（视为可用，乐观）。
@@ -120,14 +152,18 @@ func (t *Tracker) InFlight(routeID int64) int {
 //
 // 成功时返回的 release 必须在请求结束时调用，漏掉的后果隐蔽且永久：
 // 计数只增不减，该 Route 会被永远排除在选路之外。ok 为 false 时 release 为 nil。
-func (t *Tracker) TryAcquire(routeID int64, limit int) (release func(), ok bool) {
+//
+// generation 是占位时的 RouteHealth 世代，须原样带进后续 Report：Forget 后
+// 同 id 新 Route 世代不同，迟到的真实流量结论不得改写新行。
+func (t *Tracker) TryAcquire(routeID int64, limit int) (release func(), generation uint64, ok bool) {
 	t.mu.Lock()
 	rs := t.get(routeID)
 	if limit > 0 && rs.inFlight >= limit {
 		t.mu.Unlock()
-		return nil, false
+		return nil, 0, false
 	}
 	rs.inFlight++
+	gen := rs.generation
 	t.mu.Unlock()
 
 	// 返回闭包而不是配对的 Acquire/Release：调用方 defer 一下就不可能
@@ -146,7 +182,7 @@ func (t *Tracker) TryAcquire(routeID int64, limit int) (release func(), ok bool)
 				held.inFlight--
 			}
 		})
-	}, true
+	}, gen, true
 }
 
 // Snapshot 返回所有非零在途计数的副本，供管理界面展示。
@@ -166,13 +202,25 @@ func (t *Tracker) Snapshot() map[int64]int {
 //
 // 返回 changed 是为了让调用方决定要不要落库与打日志：探活每 20 秒跑一次，
 // 每次都写库、每次都打一行「still alive」，会把日志和磁盘都刷满。
+//
+// Generation > 0 时必须与当前 *routeState 世代一致；Forget 后或同 id 新
+// Route 世代不匹配时丢弃（且不得经 get 重建行）。Generation == 0 表示
+// 未绑定世代的调用（测试 / 站级 L1 连坐当前快照），仍按 id 取或建。
 func (t *Tracker) Report(rep Report) (changed bool) {
 	s := t.currentSettings()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	rs := t.get(rep.RouteID)
+	var rs *routeState
+	if rep.Generation > 0 {
+		rs = t.state[rep.RouteID]
+		if rs == nil || rs.generation != rep.Generation {
+			return false
+		}
+	} else {
+		rs = t.get(rep.RouteID)
+	}
 	before := rs.state
 	now := t.now()
 

@@ -610,7 +610,7 @@ type reportedView struct {
 	err     error
 }
 
-func (m *multiReporter) ReportResult(routeID int64, res *ResultView) {
+func (m *multiReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.got = append(m.got, reportedView{routeID: routeID, status: res.Status,

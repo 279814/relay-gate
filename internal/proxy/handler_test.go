@@ -82,12 +82,12 @@ func (c *countingHealth) State(id int64) model.HealthState {
 }
 func (c *countingHealth) CoolingDown(int64) bool { return false }
 
-func (c *countingHealth) TryAcquire(routeID int64, limit int) (func(), bool) {
+func (c *countingHealth) TryAcquire(routeID int64, limit int) (func(), uint64, bool) {
 	c.mu.Lock()
 	if limit > 0 && c.open >= limit {
 		c.refused++
 		c.mu.Unlock()
-		return nil, false
+		return nil, 0, false
 	}
 	c.acquired = append(c.acquired, routeID)
 	c.open++
@@ -103,7 +103,7 @@ func (c *countingHealth) TryAcquire(routeID int64, limit int) (func(), bool) {
 			c.open--
 			c.mu.Unlock()
 		})
-	}, true
+	}, 1, true
 }
 
 func (c *countingHealth) stats() (acquired []int64, open, peak int) {

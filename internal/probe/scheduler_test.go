@@ -98,24 +98,24 @@ func newRecordingTracker() *recordingTracker {
 	return &recordingTracker{states: map[int64]model.HealthState{}}
 }
 
-func (r *recordingTracker) ClaimL1(id int64) bool {
+func (r *recordingTracker) ClaimL1(id int64) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.l1Allowed != nil && !r.l1Allowed[id] {
-		return false
+		return 0, false
 	}
 	r.l1Claims = append(r.l1Claims, id)
-	return true
+	return 1, true
 }
 
-func (r *recordingTracker) ClaimL2(id int64) bool {
+func (r *recordingTracker) ClaimL2(id int64) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.l2Allowed != nil && !r.l2Allowed[id] {
-		return false
+		return 0, false
 	}
 	r.l2Claims = append(r.l2Claims, id)
-	return true
+	return 1, true
 }
 
 func (r *recordingTracker) TriggerL2(id int64) {

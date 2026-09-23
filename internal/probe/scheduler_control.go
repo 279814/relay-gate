@@ -223,8 +223,10 @@ func (s *Scheduler) ObserveRealSuccess(key ScheduleKey, observedAt time.Time) {
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
+	generation := ensureRouteGeneration(s.track, key.ScopeID)
 	s.track.Report(health.Report{
-		RouteID: key.ScopeID, Verdict: health.VerdictOK, Source: health.SourceReal,
+		RouteID: key.ScopeID, Generation: generation,
+		Verdict: health.VerdictOK, Source: health.SourceReal,
 	})
 	if completer, ok := s.track.(interface {
 		CompleteL2(routeID int64, completedAt time.Time, jitter float64)

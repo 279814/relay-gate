@@ -262,7 +262,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
 		if h.reporter != nil {
-			h.reporter.ReportResult(la.cand.Route.ID, viewOf(la.at.Result(), la.keys))
+			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, viewOf(la.at.Result(), la.keys))
 		}
 		la.cand.Release()
 		cand = next
@@ -325,7 +325,7 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 	return router.NewCandidate(rt, up, mn, func() {
 		prevRelease()
 		relGate()
-	}), true
+	}, cand.HealthGeneration), true
 }
 
 // dispatch 重建全部出站产物并发出请求。

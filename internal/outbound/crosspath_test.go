@@ -471,8 +471,8 @@ type alwaysAliveHealth struct{}
 
 func (alwaysAliveHealth) State(int64) model.HealthState { return model.StateAlive }
 func (alwaysAliveHealth) CoolingDown(int64) bool        { return false }
-func (alwaysAliveHealth) TryAcquire(int64, int) (func(), bool) {
-	return func() {}, true
+func (alwaysAliveHealth) TryAcquire(int64, int) (func(), uint64, bool) {
+	return func() {}, 1, true
 }
 
 func discardLogger() *slog.Logger {

@@ -62,6 +62,11 @@ type Report struct {
 	RouteID int64
 	Verdict Verdict
 
+	// Generation 是 Claim / TryAcquire 时绑定的 RouteHealth 世代。
+	// >0 时与当前条目不一致（含 Forget 后同 id 复用）则丢弃本次判定。
+	// 0 表示未绑定（测试或按当前快照连坐的站级 L1）。
+	Generation uint64
+
 	// Source 标明这次判定来自哪里，决定两件事：
 	// 真实请求成功可以让 unknown 直接升 alive（§4.4），
 	// 且真实请求成功会刷新 piggyback 时间戳（§4.6）。

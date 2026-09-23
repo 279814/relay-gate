@@ -20,9 +20,12 @@ import (
 type HealthReporter interface {
 	// ReportResult 上报一次真实转发的结果。
 	//
+	// generation 是选路 TryAcquire 时绑定的 RouteHealth 世代；Forget 后同
+	// id 新 Route 世代不同，迟到结论必须丢弃。
+	//
 	// 实现必须是**非阻塞**的：它在转发的收尾路径上被调用，阻塞就等于
 	// 让健康统计拖慢真实请求。
-	ReportResult(routeID int64, res *ResultView)
+	ReportResult(routeID int64, generation uint64, res *ResultView)
 
 	// TriggerProbe 请求对该 Route 立即探活一次（§4.5：真实请求失败即触发）。
 	TriggerProbe(routeID int64)
