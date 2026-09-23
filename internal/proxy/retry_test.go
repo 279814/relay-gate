@@ -441,7 +441,14 @@ func TestRetry_SharesTotalTimeBudget(t *testing.T) {
 	}
 	hs := newMultiHarness(t, stall, stall, stall)
 	hs.cfg.settings.RetryMaxAttempts = 3
+	// All stage budgets must match: TimeoutsFrom takes min(ResponseHead,
+	// FirstByte, …, Total). Leaving ResponseHeaderSec at testSettings' 2s
+	// while Total=2s makes header timer and Total race → intermittent 502
+	// (ErrConnect) instead of 504 (ErrFirstTokenTimeout) under -race.
 	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealResponseHeaderSec = 1
+	hs.cfg.settings.RealFirstByteSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealConnectSec = 1
 	// 预算只够一次尝试多一点：第一次吃掉 1s，剩下 0.5s 不足一次连接成本(1s)
 	hs.cfg.settings.RealTotalSec = 2
