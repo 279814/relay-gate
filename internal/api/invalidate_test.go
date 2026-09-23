@@ -320,11 +320,11 @@ type fakeSettingsForInvalidate struct {
 func (f *fakeSettingsForInvalidate) Settings() (model.Settings, error) { return f.s, nil }
 
 type recordingSemantic struct {
-	routes           []int64
-	upstreams        []int64
-	upstreamRoutes   [][]int64
-	modelNames       []int64
-	modelNameRoutes  [][]int64
+	routes          []int64
+	upstreams       []int64
+	upstreamRoutes  [][]int64
+	modelNames      []int64
+	modelNameRoutes [][]int64
 }
 
 func (r *recordingSemantic) InvalidateRoute(routeID int64) {
