@@ -2,6 +2,7 @@ package health
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -293,6 +294,31 @@ func TestClaim_IsAtomicAndPreventsDoubleProbe(t *testing.T) {
 	*now = now.Add(61 * time.Second)
 	if _, ok := tr.ClaimL1(1); !ok {
 		t.Error("间隔已过，应重新到期")
+	}
+}
+
+// alive L2：存库间隔为 0 或负值时仍至少等 §8.10 的 600s，不能每个 tick 连发。
+func TestClaim_AliveL2ZeroOrNegativeUsesDocFloor(t *testing.T) {
+	for _, interval := range []int{0, -30} {
+		t.Run(strconv.Itoa(interval), func(t *testing.T) {
+			tr, fs, now := newTestTracker(t)
+			fs.s.OKThreshold = 1
+			fs.s.PiggybackEnabled = false
+			fs.s.L2IntervalAliveSec = interval
+
+			report(tr, 1, VerdictOK, SourceL2) // → alive
+			if _, ok := tr.ClaimL2(1); !ok {
+				t.Fatal("首次应到期")
+			}
+			*now = now.Add(599 * time.Second)
+			if _, ok := tr.ClaimL2(1); ok {
+				t.Fatalf("interval=%d 仍须遵守 §8.10 的 600s 下限，599s 不应再探", interval)
+			}
+			*now = now.Add(2 * time.Second) // 累计 601s
+			if _, ok := tr.ClaimL2(1); !ok {
+				t.Fatalf("超过 600s 后应到期，interval=%d", interval)
+			}
+		})
 	}
 }
 
