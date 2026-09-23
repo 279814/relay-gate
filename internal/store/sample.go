@@ -284,7 +284,7 @@ func (s *Store) pruneSamplesByDiskQuota(maxBytes int64) (int64, error) {
 		return 0, nil
 	}
 
-	rows, err := s.db.Query(`SELECT id, `+sampleBodyDiskBytesSQL+` AS sz
+	rows, err := s.db.Query(`SELECT id, ` + sampleBodyDiskBytesSQL + ` AS sz
 		FROM sample WHERE pinned = 0 ORDER BY id ASC`)
 	if err != nil {
 		return 0, fmt.Errorf("列举待删样本: %w", err)
