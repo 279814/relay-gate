@@ -1,12 +1,14 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"sync"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -700,5 +702,94 @@ func TestInvalidate_TransformPublishClearsAliveRouteHealth(t *testing.T) {
 	afterRollback, _, _ := inner.counts()
 	if afterRollback <= beforeRollback {
 		t.Fatalf("rollback must call InvalidateRoute (before=%d after=%d)", beforeRollback, afterRollback)
+	}
+}
+
+// §9.2: Endpoint URL / Auth Profile updates must Forget child RouteHealth.
+// probe.Service alone only reaches Scheduler; the admin handler must also hit
+// SemanticInvalidator via invalidateUpstream.
+func TestInvalidate_EndpointURLChangeClearsAliveRouteHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	tr := health.NewTracker(fs)
+	gate := health.NewRecoveryGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
+	inner := &recordingInvalidator{}
+	probeAdmin := probe.NewService(s.st, nil, nil, nil, nil, nil)
+	h := s.WithProbeAdmin(probeAdmin).WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfUpstream: func(upstreamID int64) []int64 {
+			routes, err := s.st.ListRoutes(0)
+			if err != nil {
+				return nil
+			}
+			var ids []int64
+			for _, rt := range routes {
+				if rt.UpstreamID == upstreamID {
+					ids = append(ids, rt.ID)
+				}
+			}
+			return ids
+		},
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h, `{"name":"ep-url-u","base_url":"https://ep.example.com","api_key":"sk-eeeeeeeeeeee"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"ep-url-m","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name 失败：%s", rec.Body.String())
+	}
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route 失败：%s", rec.Body.String())
+	}
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictOK, Source: health.SourceReal})
+	if tr.State(rtID) != model.StateAlive {
+		t.Fatalf("setup state=%s want alive", tr.State(rtID))
+	}
+	if _, ok := gate.TryAcquire(rtID); !ok {
+		t.Fatal("setup: acquire RecoveryGate")
+	}
+
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints?upstream_id="+itoa(upID), "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list endpoints: %d %s", rec.Code, rec.Body.String())
+	}
+	page := decodeBody[model.Page[model.UpstreamEndpoint]](t, rec)
+	if len(page.Items) == 0 {
+		t.Fatal("expected auto-created endpoints")
+	}
+	ep := page.Items[0]
+	ep.URLOverride = "https://ep.example.com/v1/custom"
+	body, err := json.Marshal(struct {
+		model.UpstreamEndpoint
+		ExpectedRevision int64 `json:"expected_revision"`
+	}{UpstreamEndpoint: ep, ExpectedRevision: ep.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(ep.ID), string(body), true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update endpoint: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("after Endpoint URL change RouteHealth=%s want unknown", got)
+	}
+	if gate.InFlight(rtID) {
+		t.Fatal("after Endpoint URL change RecoveryGate slot must be released")
+	}
+	if !caps.has(rtID) {
+		t.Fatalf("after Endpoint URL change Capability must clear, cleared=%v", caps.cleared)
+	}
+	_, ups, _ := inner.counts()
+	if ups < 1 {
+		t.Fatal("Endpoint URL change must call InvalidateUpstream")
 	}
 }
