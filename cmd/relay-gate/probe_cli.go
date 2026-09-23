@@ -206,7 +206,16 @@ func runProbeCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 	}
 
 	warnOnlineCost(stderr, rows, manifest)
-	client := &http.Client{Transport: ct, Timeout: 120 * time.Second}
+	// 禁止跟随重定向：默认 Client 最多跟 10 次，会把上游 API key
+	// 带到 Location 指向的另一台主机。与真实转发 / 探活 Executor 一样，
+	// 302 等状态原样交给分类器，不发第二次请求。
+	client := &http.Client{
+		Transport: ct,
+		Timeout:   120 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	results := make([]probeResultRow, 0)
 	compatFail := false

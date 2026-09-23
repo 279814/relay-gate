@@ -175,6 +175,33 @@ func TestL1_Verdicts(t *testing.T) {
 	}
 }
 
+// 上游 302 不得跟随 Location：默认 http.Client 会把 API key 带到另一主机。
+// Prober 走 Transport.RoundTrip，必须只看到 302，且 Location 主机零请求。
+func TestL1_DoesNotFollowRedirect(t *testing.T) {
+	var otherHits int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits++
+		w.WriteHeader(200)
+	}))
+	defer other.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", other.URL+"/v1/models")
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(`{"redirect":true}`))
+	}))
+	defer srv.Close()
+
+	out := testProber().L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+	if out.Status != http.StatusFound {
+		t.Fatalf("探活应观察到 302，得到 status=%d verdict=%s err=%v",
+			out.Status, out.Verdict, out.Err)
+	}
+	if otherHits != 0 {
+		t.Fatalf("Location 主机不得收到任何请求，hits=%d", otherHits)
+	}
+}
+
 // L1 必须带上鉴权与 Claude Code 指纹。M0 实测有站按 UA 白名单拦截，
 // 探活不带 UA 会把活站判成死站。
 func TestL1_SendsAuthAndClaudeCodeFingerprint(t *testing.T) {

@@ -175,6 +175,58 @@ func TestProbeCLI_MockMatrix_UsesDecoderClassifier(t *testing.T) {
 	}
 }
 
+// 上游 302 不得跟随 Location：未设 CheckRedirect 的 http.Client 会把
+// 上游 key 带到另一主机。CLI 必须停在 302，且 Location 主机零请求。
+func TestProbeCLI_DoesNotFollowRedirect(t *testing.T) {
+	var otherHits int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits++
+		w.WriteHeader(200)
+	}))
+	defer other.Close()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", other.URL+r.URL.Path)
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(`{"redirect":true}`))
+	}))
+	defer up.Close()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.json")
+	tsv := filepath.Join(dir, "in.tsv")
+	writeFile(t, tsv, "a\t"+up.URL+"\tsk-secret\tclaude-x\t-\tok\n")
+
+	code := runProbeCLI([]string{
+		"probe-one", "--online", "--accept-probe-cost",
+		"--input", tsv, "--name", "a", "--output", out,
+	}, nil, io.Discard, io.Discard, probeCLIDeps{
+		now: func() time.Time { return time.Unix(1, 0) },
+	})
+	if code != exitOK && code != exitFail {
+		t.Fatalf("unexpected code=%d", code)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []probeResultRow
+	if err := json.Unmarshal(data, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("expected probe rows")
+	}
+	for _, r := range rows {
+		if r.HTTPStatus != http.StatusFound {
+			t.Fatalf("endpoint %s: want HTTP 302, got %d", r.Endpoint, r.HTTPStatus)
+		}
+	}
+	if otherHits != 0 {
+		t.Fatalf("Location 主机不得收到任何请求，hits=%d", otherHits)
+	}
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
