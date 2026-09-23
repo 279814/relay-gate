@@ -179,6 +179,11 @@ func (s *Server) transformBindAction(w http.ResponseWriter, r *http.Request, act
 		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
 		return
 	}
+	// §9.2: publish changes the live request Transform binding; clear RouteHealth
+	// immediately. Shadow only points a non-live pointer — do not Forget.
+	if action == "publish" {
+		s.invalidateRoute(body.RouteID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"binding": b, "version": v, "action": action})
 }
 
@@ -201,6 +206,8 @@ func (s *Server) postTransformRollback(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
 		return
 	}
+	// §9.2: rollback retargets the published Transform — Forget old RouteHealth.
+	s.invalidateRoute(body.RouteID)
 	writeJSON(w, http.StatusOK, b)
 }
 
