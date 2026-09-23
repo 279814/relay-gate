@@ -150,6 +150,19 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	// 诊断头。半开/重试信息进 request_log；诊断头只在 writeForwardError
 	// 等网关自生成错误响应上补。
 
+	// held tracks the Candidate whose max_concurrency / RecoveryGate slot we
+	// own. §9.4 requires release on panic: net/http recovers the handler so the
+	// process stays up, but without defer the slot would stick for the life of
+	// the process. Do not recover here — a panic must not start another
+	// upstream attempt. Release is idempotent (sync.Once); normal paths clear
+	// held after an explicit Release so the defer is a no-op.
+	held := cand
+	defer func() {
+		if held != nil {
+			held.Release()
+		}
+	}()
+
 	// reqID 在这里生成而不是在写日志时：同一次客户端请求的所有尝试
 	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
 	reqID := sample.NewReqID()
@@ -163,12 +176,14 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		la, status := h.dispatch(w, r, proto, pre, cand, time.Until(plan.deadline))
 		if status == dispatchFatal {
 			cand.Release()
+			held = nil
 			return nil, false
 		}
 		if status == dispatchRouteLocal {
 			// §6.5 / §15.7: Transform fail_closed is route-local — no upstream
 			// send, no maxAttempts burn; skip to the next Route.
 			cand.Release()
+			held = nil
 			localSkips++
 			h.log.Info("route-local 请求转换失败，跳过本 Route",
 				"route", cand.Route.ID, "local_skips", localSkips,
@@ -183,6 +198,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				return nil, false
 			}
 			cand = next
+			held = cand
 			continue
 		}
 		attempt++
@@ -203,6 +219,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 					writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
 					finishObserver(la, health.AttemptFinish{})
 					la.cand.Release()
+					held = nil
 					return nil, false
 				}
 			} else {
@@ -210,6 +227,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			}
 			finishObserver(la, health.AttemptFinish{ClientCommitted: oc.res != nil && oc.res.BytesWritten > 0})
 			la.cand.Release()
+			held = nil
 
 			// 最后一行日志要在 Commit **之后**记：BytesWritten 与 DoneAt
 			// 都是流式写完才有的，提前记会把每个成功响应的字节数记成 0。
@@ -248,6 +266,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		}
 		la.cand.Release()
 		cand = next
+		held = cand
 	}
 }
 
