@@ -128,11 +128,11 @@ v1.0.0 要做成什么样见 [需求与设计](docs/01-需求与设计.md)。做
 
 分两层看，不要混在一起。
 
-**今天能部署的**是 v1.0.0 之前的网关：主动探活、优先级路由、严格透传、样本留档都在。按上面的 Docker Compose，或 [服务器部署与配置](docs/03-部署与配置.md)，跑起来的就是这一层。它还不包含 v1.0.0 里的一行 IP 部署、三密钥轮换界面、最近错误弹窗、懒探活和声明式转换。那些分别在 P1–P4，现在没有。
+**今天能部署的**是 `main` 上的网关：主动探活、优先级路由、严格透传、样本留档，以及已合入的 P1–P5 离线能力（懒探活、三凭据/Keyring、内容安全、声明式转换、发布门禁等）。本地一行部署：`deploy.ps1 -Local` / `./deploy.sh --local`（拒绝未验证的公网 IP 模式）。公网域名 / 已有 nginx 仍看 [服务器部署与配置](docs/03-部署与配置.md)。阶段记录见 docs/05–09。
 
-**正在做的**是 v1.0.0。P0 至 P1 已在 main。本分支做 P2 局部（keyring 文件、最近错误弹窗、本地 `deploy.ps1 -Local` / `./deploy.sh --local`）；公网仍看 [docs/03](docs/03-部署与配置.md)。详见 [docs/06](docs/06-P2-部署与管理安全.md)。
+**尚未冒充完成的**见 [发布说明](docs/RELEASE-NOTES-v1.0.0.md) Deferred：真实公网 IP 证书与容器 smoke、多日 soak、确认后的旧 sample 明文 dual-read 清理。公网 IP HTTPS 验证前不得删除 docs/03 / Caddyfile / `scripts/deploy-nginx.sh`。
 
-当前这一层仍待真实流量验证的三项（都需要接上 Claude Code 才能做）：
+当前仍待真实流量验证的三项（都需要接上 Claude Code 才能做）：
 `/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准、
 公网模式下长思考不被 Caddy 中途掐断（配置已通过 `caddy validate`，
 但「解析器接受」不等于「运行时按预期生效」）。
@@ -173,6 +173,7 @@ go build ./...
 go test ./...
 go vet ./...
 sh scripts/check-p0.sh          # P0 离线 gate（CI 已接入）
+sh scripts/check-p5.sh          # P5 离线 release gate（CI 已接入）
 ```
 
 前端是单页 HTML + Alpine.js，通过 `go:embed` 打进二进制 —— 没有构建链，
