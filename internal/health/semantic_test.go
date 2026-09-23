@@ -55,6 +55,27 @@ func TestSemanticInvalidatorClearsTrackerGateCapsSchedule(t *testing.T) {
 	}
 }
 
+// Upstream network-origin change (§9.2) must Forget child RouteHealth: an old
+// alive verdict must not keep selecting routes for the new host.
+func TestSemanticInvalidatorInvalidateUpstreamClearsAliveRouteHealth(t *testing.T) {
+	tr, _, _ := newTestTracker(t)
+	tr.Report(Report{RouteID: 21, Verdict: VerdictOK, Source: SourceReal})
+	tr.Report(Report{RouteID: 22, Verdict: VerdictOK, Source: SourceReal})
+	if tr.State(21) != model.StateAlive || tr.State(22) != model.StateAlive {
+		t.Fatalf("setup alive: %s %s", tr.State(21), tr.State(22))
+	}
+	// Unrelated route stays intact.
+	tr.Report(Report{RouteID: 99, Verdict: VerdictOK, Source: SourceReal})
+	inv := NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	inv.InvalidateUpstream(3, []int64{21, 22})
+	if tr.State(21) != model.StateUnknown || tr.State(22) != model.StateUnknown {
+		t.Fatalf("want forgotten→unknown, got %s %s", tr.State(21), tr.State(22))
+	}
+	if tr.State(99) != model.StateAlive {
+		t.Fatalf("unrelated route must stay alive, got %s", tr.State(99))
+	}
+}
+
 // ModelName Protocol/Name/probe 变更必须立刻丢掉旧 RouteHealth（§9.2），
 // 且不得经 ScheduleClearer 去 TriggerL1（那是站级 /models）。
 func TestSemanticInvalidatorInvalidateModelNameClearsHealthWithoutSchedule(t *testing.T) {

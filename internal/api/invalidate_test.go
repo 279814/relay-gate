@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 )
 
@@ -199,6 +200,8 @@ func TestProbeAffectingUpstream_FieldMatrix(t *testing.T) {
 		{"auth_style 变", func(u *model.Upstream) { u.AuthStyle = model.AuthBearer }, true},
 		{"full_url_mode 变", func(u *model.Upstream) { u.FullURLMode = true }, true},
 		{"proxy_url 变", func(u *model.Upstream) { u.ProxyURL = "http://127.0.0.1:1080" }, true},
+		{"host_override 变", func(u *model.Upstream) { u.HostOverride = "real.example.com" }, true},
+		{"tls_server_name 变", func(u *model.Upstream) { u.TLSServerName = "sni.example.com" }, true},
 		{"l1_path 变", func(u *model.Upstream) { u.L1Path = "" }, true},
 		{"probe_headers 值变", func(u *model.Upstream) {
 			u.ProbeHeaders = map[string]string{"user-agent": "other"}
@@ -278,9 +281,48 @@ func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T)
 	}
 }
 
+// network-origin fields bump NetworkRevision; InvalidateUpstream must Forget
+// child RouteHealth so an old alive/dead verdict cannot select for the new host (§9.2).
+func TestSemanticConfigInvalidator_UpstreamNetworkChangeClearsAliveRouteHealth(t *testing.T) {
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	tr := health.NewTracker(fs)
+	tr.Report(health.Report{RouteID: 41, Verdict: health.VerdictOK, Source: health.SourceReal})
+	if tr.State(41) != model.StateAlive {
+		t.Fatalf("setup state=%s", tr.State(41))
+	}
+	sem := health.NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	inner := &recordingInvalidator{}
+	wrap := &SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfUpstream: func(upstreamID int64) []int64 {
+			if upstreamID != 9 {
+				t.Fatalf("unexpected upstreamID %d", upstreamID)
+			}
+			return []int64{41}
+		},
+	}
+	// Same path updateUpstream takes after BaseURL / HostOverride / TLS change.
+	wrap.InvalidateUpstream(9)
+	if got := tr.State(41); got != model.StateUnknown {
+		t.Fatalf("after network-origin invalidate, RouteHealth=%s want unknown (not old alive)", got)
+	}
+	_, ups, _ := inner.counts()
+	if ups != 1 {
+		t.Fatalf("inner InvalidateUpstream count=%d", ups)
+	}
+}
+
+type fakeSettingsForInvalidate struct {
+	s model.Settings
+}
+
+func (f *fakeSettingsForInvalidate) Settings() (model.Settings, error) { return f.s, nil }
+
 type recordingSemantic struct {
 	routes          []int64
 	upstreams       []int64
+	upstreamRoutes  [][]int64
 	modelNames      []int64
 	modelNameRoutes [][]int64
 }
@@ -289,8 +331,10 @@ func (r *recordingSemantic) InvalidateRoute(routeID int64) {
 	r.routes = append(r.routes, routeID)
 }
 
-func (r *recordingSemantic) InvalidateUpstream(upstreamID int64, _ []int64) {
+func (r *recordingSemantic) InvalidateUpstream(upstreamID int64, routeIDs []int64) {
 	r.upstreams = append(r.upstreams, upstreamID)
+	cp := append([]int64(nil), routeIDs...)
+	r.upstreamRoutes = append(r.upstreamRoutes, cp)
 }
 
 func (r *recordingSemantic) InvalidateModelName(modelNameID int64, routeIDs []int64) {
