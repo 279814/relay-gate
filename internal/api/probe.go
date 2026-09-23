@@ -125,6 +125,9 @@ func (s *Server) createUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	// §9.2: Endpoint URL / Auth Profile changes clear child RouteHealth.
+	// Create also invalidates: a new kind/URL is part of the request identity.
+	s.invalidateUpstream(ep.UpstreamID)
 	writeJSON(w, http.StatusCreated, ep)
 }
 
@@ -151,6 +154,9 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	// §9.2: Endpoint 来源/URL and Auth Profile must Forget RouteHealth immediately
+	// (probe.Service alone only reaches Scheduler, not SemanticInvalidator).
+	s.invalidateUpstream(ep.UpstreamID)
 	writeJSON(w, http.StatusOK, ep)
 }
 
@@ -165,9 +171,14 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	expected, _ := strconv.ParseInt(r.URL.Query().Get("expected_revision"), 10, 64)
+	// Read UpstreamID before DELETE so §9.2 Forget still targets the right station.
+	cur, getErr := s.probeAdmin.GetEndpoint(r.Context(), id)
 	if err := s.probeAdmin.DeleteEndpoint(r.Context(), id, expected); err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	if getErr == nil && cur.UpstreamID > 0 {
+		s.invalidateUpstream(cur.UpstreamID)
 	}
 	writeJSON(w, http.StatusNoContent, nil)
 }
