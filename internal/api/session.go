@@ -71,7 +71,7 @@ func newSessionStore() *sessionStore {
 }
 
 // clientHost 从 RemoteAddr 取出 host，去掉端口。解析失败则原样返回
-//（httptest 默认空串、或无端口的地址仍可作稳定 key）。
+// （httptest 默认空串、或无端口的地址仍可作稳定 key）。
 func clientHost(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
