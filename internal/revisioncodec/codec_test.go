@@ -215,6 +215,26 @@ func TestObservationTokenIgnoresUpstreamCreatedAt(t *testing.T) {
 	}
 }
 
+func TestObservationTokenIgnoresEndpointCreatedAt(t *testing.T) {
+	revision := model.SemanticRevision{
+		UpstreamNetwork: 1, UpstreamCredential: 2, EndpointID: 3, EndpointRevision: 4, EndpointCreatedAt: 80,
+		ModelCapability: 5, RouteCapability: 6, AuthProfile: 7,
+		RecipeIdentity: model.RecipeIdentity{
+			Storage: model.RecipeStorageEmbedded, Origin: model.RecipeBasic, TemplateID: "builtin:models", Revision: 1,
+		},
+		RecipeBindingRevision: 1, ProbeSettingsFingerprint: "fp", RequestTransform: 0,
+	}
+	changed := revision
+	changed.EndpointCreatedAt = 999
+	if NewObservationToken(changed) != NewObservationToken(revision) {
+		t.Fatal("EndpointCreatedAt must not affect capability observation token")
+	}
+	changed.EndpointRevision++
+	if NewObservationToken(changed) == NewObservationToken(revision) {
+		t.Fatal("EndpointRevision must still affect capability observation token")
+	}
+}
+
 func TestProbeEvidenceHashExcludesApplyDispositionButBindsNilAndDecision(t *testing.T) {
 	observation := model.ProbeObservation{Execution: model.ProbeExecution{
 		ID: "execution-1", Trigger: model.TriggerScheduled, UpstreamID: 7,

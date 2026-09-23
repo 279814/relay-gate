@@ -104,6 +104,12 @@ type SemanticRevision struct {
 	UpstreamCreatedAt int64
 	EndpointID        int64
 	EndpointRevision  int64
+	// EndpointCreatedAt is the endpoint row's created_at. EndpointID and
+	// EndpointRevision alone are not incarnation keys: delete + recreate under
+	// the same still-living upstream can reuse the same endpoint id (with a
+	// reset sequence) with revision at 1 again; a late capability commit must
+	// not ApplyCurrent on the new row. Not encoded in the Observation Token.
+	EndpointCreatedAt int64
 	ModelCapability   int64
 	RouteCapability   int64
 	// RouteCreatedAt is the route row's created_at when Scope is route.

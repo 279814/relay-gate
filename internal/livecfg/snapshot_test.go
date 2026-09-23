@@ -66,6 +66,10 @@ func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	if cap.Revision.UpstreamCreatedAt != up.CreatedAt {
 		t.Fatalf("capability UpstreamCreatedAt=%d want %d", cap.Revision.UpstreamCreatedAt, up.CreatedAt)
 	}
+	messagesEP := snap.Endpoints[upID][model.EndpointMessages]
+	if messagesEP == nil || cap.Revision.EndpointCreatedAt != messagesEP.CreatedAt {
+		t.Fatalf("capability EndpointCreatedAt=%d want endpoint created_at", cap.Revision.EndpointCreatedAt)
+	}
 
 	modelsCap, err := snap.SemanticExpectation(model.SemanticTarget{
 		Scope: model.RecipeScopeUpstream, UpstreamID: upID, Endpoint: model.EndpointModels,
@@ -76,7 +80,9 @@ func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modelsCap.Revision.UpstreamCreatedAt != up.CreatedAt || modelsCap.Revision.RouteCreatedAt != 0 {
+	modelsEP := snap.Endpoints[upID][model.EndpointModels]
+	if modelsCap.Revision.UpstreamCreatedAt != up.CreatedAt || modelsCap.Revision.RouteCreatedAt != 0 ||
+		modelsEP == nil || modelsCap.Revision.EndpointCreatedAt != modelsEP.CreatedAt {
 		t.Fatalf("upstream-scope capability=%+v", modelsCap.Revision)
 	}
 
