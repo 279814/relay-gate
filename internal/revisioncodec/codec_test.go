@@ -166,6 +166,13 @@ func TestReachabilityTokenGoldenVector(t *testing.T) {
 	if NewReachabilityToken(changedNetwork) == NewReachabilityToken(revision) || NewReachabilityToken(changedSettings) == NewReachabilityToken(revision) {
 		t.Fatal("network and settings revisions must both affect reachability token")
 	}
+	// CreatedAt is an incarnation key for Commit equality, not the observation token:
+	// token stays network+settings so read-side Effective needs no schema column.
+	changedCreated := revision
+	changedCreated.CreatedAt = 99
+	if NewReachabilityToken(changedCreated) != NewReachabilityToken(revision) {
+		t.Fatal("CreatedAt must not affect reachability observation token")
+	}
 }
 
 func TestProbeEvidenceHashExcludesApplyDispositionButBindsNilAndDecision(t *testing.T) {

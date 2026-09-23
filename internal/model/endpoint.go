@@ -221,6 +221,7 @@ type ProbeUpstreamConfig struct {
 	Revision           int64
 	NetworkRevision    int64
 	CredentialRevision int64
+	CreatedAt          int64
 }
 
 // EndpointURLOverride 把旧的 full_url_mode 与 l1_path 两个站级开关，翻译成
@@ -264,5 +265,6 @@ func (u *Upstream) ProbeConfig() *ProbeUpstreamConfig {
 		Revision:           u.Revision,
 		NetworkRevision:    u.NetworkRevision,
 		CredentialRevision: u.CredentialRevision,
+		CreatedAt:          u.CreatedAt,
 	}
 }

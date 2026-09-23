@@ -109,7 +109,11 @@ type SemanticRevision struct {
 }
 
 type ReachabilityRevision struct {
-	NetworkRevision     int64
+	NetworkRevision int64
+	// CreatedAt is the upstream row's created_at. NetworkRevision alone is not
+	// an incarnation key: delete + recreate can reuse the same id with
+	// NetworkRevision=1 again, and a late L1 must not ApplyCurrent on the new row.
+	CreatedAt           int64
 	SettingsFingerprint string
 }
 

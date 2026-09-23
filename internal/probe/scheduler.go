@@ -464,6 +464,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 }
 
 func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings model.Settings) {
+	gateGen := s.gate.EnsureGeneration(up.ID)
 	var out Outcome
 	var reachable bool
 	if s.executor != nil {
@@ -502,7 +503,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 	}
 
 	s.countL1(up.ID, reachable)
-	recovered := s.gate.Report(up.ID, reachable, out.Err)
+	recovered := s.gate.Report(up.ID, gateGen, reachable, out.Err)
 
 	if !reachable {
 		// 只有真正拿不到响应头才连坐 RouteHealth（§8.9）。

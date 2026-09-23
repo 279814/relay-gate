@@ -16,15 +16,19 @@ import (
 //
 // 生产路径由 ResultRecorder.ApplyCommitted 写入 ReachabilityTracker；Report
 // 仍更新 legacy 视图，以便未接 Commit 的单元测试（旧 Prober 路径）保持原语义。
+// Report 绑定 generation：Forget 后同 id 新站不得被迟到的 L1 写回。
 type UpstreamGate struct {
 	tracker *ReachabilityTracker
 
-	mu  sync.Mutex
-	ups map[int64]*upstreamState
-	now func() time.Time
+	mu      sync.Mutex
+	ups     map[int64]*upstreamState
+	nextGen uint64
+	now     func() time.Time
 }
 
 type upstreamState struct {
+	// generation 在本条目创建时分配，Forget 后同 id 新条目不会复用该值。
+	generation uint64
 	// ok 是最近一次 L1 的结论。初始 true（乐观）：没探过的站不该被当成挂了，
 	// 否则重启后所有站在首轮 L1 跑完前都不可用。
 	ok        bool
@@ -46,19 +50,47 @@ func (g *UpstreamGate) WithTracker(tracker *ReachabilityTracker) *UpstreamGate {
 // Tracker 返回底层 ReachabilityTracker（可能为 nil）。
 func (g *UpstreamGate) Tracker() *ReachabilityTracker { return g.tracker }
 
+// EnsureGeneration 取或建 upstreamID 的 legacy 条目并返回其世代。
+//
+// 探活开始时绑定，结束时原样带进 Report：Forget 后同 id 新站世代不同，
+// 迟到结论必须丢弃。
+func (g *UpstreamGate) EnsureGeneration(upstreamID int64) uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.getLocked(upstreamID).generation
+}
+
+func (g *UpstreamGate) getLocked(upstreamID int64) *upstreamState {
+	st := g.ups[upstreamID]
+	if st == nil {
+		g.nextGen++
+		st = &upstreamState{ok: true, generation: g.nextGen}
+		g.ups[upstreamID] = st
+	}
+	return st
+}
+
 // Report 记录一次 L1 结论，返回该站是否**从失败转为成功**。
 //
 // 返回 recovered 是 §4.4b 的触发点：L1 一旦转通，立即对该 Upstream 下
 // 所有 dead 的 Route 触发一轮 L2，不等 L2 自己的周期。站级恢复的发现延迟
 // 因此收敛到 L1 周期（20 秒），而不是 L2 周期。
-func (g *UpstreamGate) Report(upstreamID int64, ok bool, err error) (recovered bool) {
+//
+// generation > 0 时必须与当前条目一致；Forget 后或同 id 新站不匹配则丢弃
+// （且不得经 get 重建行）。generation == 0 表示未绑定世代的调用（测试），
+// 仍按 id 取或建。
+func (g *UpstreamGate) Report(upstreamID int64, generation uint64, ok bool, err error) (recovered bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	st := g.ups[upstreamID]
-	if st == nil {
-		st = &upstreamState{ok: true}
-		g.ups[upstreamID] = st
+	var st *upstreamState
+	if generation > 0 {
+		st = g.ups[upstreamID]
+		if st == nil || st.generation != generation {
+			return false
+		}
+	} else {
+		st = g.getLocked(upstreamID)
 	}
 
 	// 只有「探过且失败」之后的成功才算恢复。没探过的站初始是 ok，
@@ -121,6 +153,9 @@ func (g *UpstreamGate) Status(upstreamID int64) UpstreamStatus {
 		if row := g.tracker.Snapshot(upstreamID); row != nil {
 			return statusFromRow(upstreamID, row, g.tracker.Effective(upstreamID, row.ObservedNetworkRevision))
 		}
+		// Tracker 已接但无行：不得回落 legacy Report（Forget 后迟到
+		// Report 可能仍写在 ups 里），一律乐观「未探过」。
+		return UpstreamStatus{UpstreamID: upstreamID, OK: true}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -149,6 +184,7 @@ func (g *UpstreamGate) StatusAt(upstreamID, networkRevision int64) UpstreamStatu
 			}
 			return statusFromRow(upstreamID, row, g.tracker.Effective(upstreamID, networkRevision))
 		}
+		return UpstreamStatus{UpstreamID: upstreamID, OK: true}
 	}
 	return g.Status(upstreamID)
 }

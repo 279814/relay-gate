@@ -81,7 +81,7 @@ func TestInvalidateUpstream_ForgetsGateVerdict(t *testing.T) {
 	// 直接跳过 L2 —— 用户明明改对了 key，界面上却一直显示不可用，
 	// 而唯一的出路是等一次 L1 周期。
 	sched, _, _ := invHarness()
-	sched.gate.Report(10, false, nil) // 模拟 L1 失败
+	sched.gate.Report(10, 0, false, nil) // 模拟 L1 失败（generation=0：测试未绑定世代）
 	if sched.gate.OK(10) {
 		t.Fatal("前置条件不成立：gate 应为失败态")
 	}

@@ -96,7 +96,8 @@ func TestResultRecorder_RealStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	revision := model.ReachabilityRevision{
-		NetworkRevision: upstream.NetworkRevision, SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
+		NetworkRevision: upstream.NetworkRevision, CreatedAt: upstream.CreatedAt,
+		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
 	}
 	expectation := &model.ReachabilityExpectation{
 		UpstreamID: upstream.ID, PolicySelector: selector, Revision: revision,
