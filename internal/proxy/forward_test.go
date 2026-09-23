@@ -166,6 +166,75 @@ type flushRecorder struct {
 
 func (f *flushRecorder) Flush() { f.flushes++; f.ResponseRecorder.Flush() }
 
+// §6.8 / §8.12：HTTP 200 SSE 在写出内容后出现协议错误事件，不得按 200 判活。
+// Commit 路径必须把错误帧写入 ErrBody，供 classifyReal 拒绝 piggyback。
+func TestCommit_MidStreamSSEErrorCapturesErrBody(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` +
+			"\n\n"))
+		fl.Flush()
+		_, _ = w.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\"}}\n\n"))
+		fl.Flush()
+	}))
+	defer up.Close()
+
+	f := testForwarder(t, fastTimeouts())
+	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, []byte("{}"))
+	if at.Failed() {
+		t.Fatalf("Send: %v", at.Result().Err)
+	}
+	rec := httptest.NewRecorder()
+	res := at.Commit(rec)
+	if res.Err != nil {
+		t.Fatalf("Commit: %v", res.Err)
+	}
+	if res.Status != 200 {
+		t.Fatalf("status=%d", res.Status)
+	}
+	if len(res.ErrBody) == 0 {
+		t.Fatal("mid-stream SSE error must fill ErrBody for health")
+	}
+	if !IsStructuredErrorPayload(res.ErrBody, "text/event-stream") {
+		t.Fatalf("ErrBody must be structured error, got %q", res.ErrBody)
+	}
+	if !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Fatalf("client must still receive prior content, body=%q", rec.Body.String())
+	}
+}
+
+// 正文里出现字母 error 的正常 delta 不得填 ErrBody。
+func TestCommit_TextDeltaSpellingErrorLeavesErrBodyEmpty(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,` +
+			`"delta":{"type":"text_delta","text":"error"}}` + "\n\n"))
+		fl.Flush()
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+		fl.Flush()
+	}))
+	defer up.Close()
+
+	f := testForwarder(t, fastTimeouts())
+	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, []byte("{}"))
+	if at.Failed() {
+		t.Fatalf("Send: %v", at.Result().Err)
+	}
+	res := at.Commit(httptest.NewRecorder())
+	if res.Err != nil {
+		t.Fatalf("Commit: %v", res.Err)
+	}
+	if len(res.ErrBody) != 0 {
+		t.Fatalf("text spelling \"error\" must not fill ErrBody, got %q", res.ErrBody)
+	}
+}
+
 // 首 Token 超时：上游收下请求但迟迟不吐字节。
 func TestForward_FirstTokenTimeout(t *testing.T) {
 	release := make(chan struct{})
