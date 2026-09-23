@@ -56,7 +56,8 @@ func (f *fakeConfig) RunState() (store.RunState, error) {
 // 额度的「占」与「放」都在 router.Select / Candidate.Release 里，
 // 所以这两件事必须由同一个替身观察 —— 拆开就看不出计数窗口是否覆盖转发。
 type countingHealth struct {
-	dead map[int64]bool
+	dead       map[int64]bool
+	recovering map[int64]bool
 
 	mu       sync.Mutex
 	acquired []int64 // 按顺序记录占位的 routeID
@@ -66,12 +67,15 @@ type countingHealth struct {
 }
 
 func newCountingHealth() *countingHealth {
-	return &countingHealth{dead: map[int64]bool{}}
+	return &countingHealth{dead: map[int64]bool{}, recovering: map[int64]bool{}}
 }
 
 func (c *countingHealth) State(id int64) model.HealthState {
 	if c.dead[id] {
 		return model.StateDead
+	}
+	if c.recovering[id] {
+		return model.StateRecovering
 	}
 	return model.StateAlive
 }

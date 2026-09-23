@@ -222,6 +222,50 @@ func TestCountTokens_FallsBackWhenAllRoutesDead(t *testing.T) {
 	}
 }
 
+// recovering 选路须占 RecoveryGate（§9.1 / §9.4）。count_tokens 是真实上游流量，
+// 闸被占时不得再打 recovering 的高优先级 Route，应落到健康的低优先级站。
+func TestCountTokens_RecoveringRequiresRecoveryGate(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"input_tokens":9}`))
+	})
+	up2 := &model.Upstream{ID: 20, Name: "backup", BaseURL: hs.up.URL,
+		APIKey: "sk-backup", AuthStyle: model.AuthAuto, Enabled: true}
+	rt2 := &model.Route{ID: 200, ModelNameID: 1, UpstreamID: 20,
+		Priority: 2, Weight: 100, Enabled: true}
+	hs.cfg.snap.Upstreams[20] = up2
+	hs.cfg.snap.RoutesByModelName[1] = append(hs.cfg.snap.RoutesByModelName[1], rt2)
+
+	hs.health.recovering[100] = true
+	hold, ok := hs.h.recovery.TryAcquire(100)
+	if !ok {
+		t.Fatal("pre-hold RecoveryGate on recovering Route")
+	}
+	defer hold()
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+	if v := rec.Header().Get("X-Relay-Count-Tokens"); v == "estimated" {
+		t.Fatal("gate 忙时应改走健康低优先级 Route，而不是本地粗算")
+	}
+	if got := decodeInputTokens(t, rec.Body.String()); got != 9 {
+		t.Errorf("input_tokens = %d, want 9（上游 backup）", got)
+	}
+	acq, open, _ := hs.health.stats()
+	if open != 0 {
+		t.Errorf("in-flight after request = %d, want 0", open)
+	}
+	if len(acq) == 0 || acq[len(acq)-1] != 200 {
+		t.Fatalf("last acquired Route = %v, want …200（跳过 gate 忙的 recovering 100）", acq)
+	}
+	if !hs.h.recovery.InFlight(100) {
+		t.Error("pre-held RecoveryGate must remain held")
+	}
+}
+
 // 上游把 key 回显在错误消息里时，日志里**不能**出现明文 key。
 //
 // `{"error":"Invalid API key: sk-xxx"}` 是公益站 401 的常见格式，而 401 正是
