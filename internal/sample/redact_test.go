@@ -16,7 +16,7 @@ func TestRedactHeaders_MasksCredentialsKeepsStructure(t *testing.T) {
 	in.Set("User-Agent", "claude-cli/2.1.220 (external, sdk-cli)")
 	in.Set("Anthropic-Version", "2023-06-01")
 
-	out := RedactHeaders(in)
+	out := RedactHeaders(in, nil)
 
 	// 凭据一个字都不能留
 	for k, vs := range out {
@@ -48,7 +48,7 @@ func TestRedactHeaders_DoesNotMutateInput(t *testing.T) {
 	in := http.Header{}
 	in.Set("X-Api-Key", key)
 
-	RedactHeaders(in)
+	RedactHeaders(in, nil)
 
 	if in.Get("X-Api-Key") != key {
 		t.Error("脱敏修改了原 header —— 这会影响转发路径")
@@ -56,10 +56,10 @@ func TestRedactHeaders_DoesNotMutateInput(t *testing.T) {
 }
 
 func TestRedactHeaders_NilAndEmpty(t *testing.T) {
-	if got := RedactHeaders(nil); got == nil || len(got) != 0 {
+	if got := RedactHeaders(nil, nil); got == nil || len(got) != 0 {
 		t.Errorf("nil 应返回空 Header 而不是 nil，得到 %v", got)
 	}
-	if got := RedactHeaders(http.Header{}); len(got) != 0 {
+	if got := RedactHeaders(http.Header{}, nil); len(got) != 0 {
 		t.Errorf("空应返回空，得到 %v", got)
 	}
 }
@@ -72,7 +72,7 @@ func TestRedactHeaders_CaseInsensitive(t *testing.T) {
 		"X-API-KEY":     {key},
 		"api-key":       {key},
 	}
-	out := RedactHeaders(in)
+	out := RedactHeaders(in, nil)
 	for k, vs := range out {
 		for _, v := range vs {
 			if strings.Contains(v, key) {
@@ -87,7 +87,7 @@ func TestRedactHeaders_AllValuesOfMultiValue(t *testing.T) {
 	const k1, k2 = "sk-first-secret-key-here", "sk-second-secret-key-here"
 	in := http.Header{"X-Api-Key": {k1, k2}}
 
-	out := RedactHeaders(in)
+	out := RedactHeaders(in, nil)
 	if len(out["X-Api-Key"]) != 2 {
 		t.Fatalf("应保留 2 个值，得到 %v", out["X-Api-Key"])
 	}
@@ -95,6 +95,23 @@ func TestRedactHeaders_AllValuesOfMultiValue(t *testing.T) {
 		if v == k1 || v == k2 {
 			t.Errorf("多值头的值未全部脱敏: %q", v)
 		}
+	}
+}
+
+// Non-auth headers still scan known secrets (§5.4): transform secret_ref can
+// place the upstream key on X-Custom; name-only masking would leave plaintext.
+func TestRedactHeaders_ScansKnownKeysInNonAuthHeaders(t *testing.T) {
+	const key = "sk-distinctive-xform-in-custom-hdr"
+	in := http.Header{}
+	in.Set("X-Site-Token", key)
+	in.Set("User-Agent", "keep-me")
+
+	out := RedactHeaders(in, []string{key})
+	if strings.Contains(out.Get("X-Site-Token"), key) {
+		t.Fatalf("custom header still has raw key: %q", out.Get("X-Site-Token"))
+	}
+	if out.Get("User-Agent") != "keep-me" {
+		t.Fatalf("unrelated header changed: %q", out.Get("User-Agent"))
 	}
 }
 

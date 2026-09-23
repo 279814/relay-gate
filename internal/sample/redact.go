@@ -53,7 +53,12 @@ func IsSensitiveHeader(name string) bool {
 
 // RedactHeaders 返回脱敏后的头副本。原 header 不被修改 ——
 // 它可能还在被转发路径读，改它就违反了「绝不影响转发」。
-func RedactHeaders(h http.Header) http.Header {
+//
+// keys 是已知 Secret（上游 key、relay key、transform secret_ref 渲染值）。
+// 敏感头名整值打码；非敏感头仍要扫 keys（§5.4：请求头扫描已知 Secret）——
+// request transform 可把 upstream key 写进 X-Custom 之类的非认证头，
+// 只靠头名清单会把明文留进样本，管理员解密后仍能看见。
+func RedactHeaders(h http.Header, keys []string) http.Header {
 	if h == nil {
 		return http.Header{}
 	}
@@ -65,7 +70,7 @@ func RedactHeaders(h http.Header) http.Header {
 			if sensitiveHeaders[ck] {
 				cp[i] = redactValue(v)
 			} else {
-				cp[i] = v
+				cp[i] = RedactText(v, keys)
 			}
 		}
 		out[ck] = cp

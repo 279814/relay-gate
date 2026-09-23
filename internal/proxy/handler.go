@@ -630,17 +630,17 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		// 而 full_url_mode 的 base_url 会被整段存进 out_url。
 		// 只清头和 body 满足不了 §9.4 的「真 key 全表 grep 零命中」。
 		InQuery:   sample.RedactText(r.URL.RawQuery, keys),
-		InHeaders: sample.RedactHeaders(r.Header),
+		InHeaders: sample.RedactHeaders(r.Header, keys),
 		InBody:    inTrunc,
 
 		OutURL:     sample.RedactText(oc.outURL, keys),
-		OutHeaders: sample.RedactHeaders(oc.outHeader),
+		OutHeaders: sample.RedactHeaders(oc.outHeader, keys),
 		OutBody:    outTrunc,
 
 		RespStatus: res.Status,
 		// 响应头也要过脱敏：上游可能回 Set-Cookie，也可能把 key 回显在
 		// 自定义头里。三组头走同一条规则，不留例外。
-		RespHeaders: sample.RedactHeaders(res.RespHeaders),
+		RespHeaders: sample.RedactHeaders(res.RespHeaders, keys),
 		RespBody:    respSafe,
 
 		Outcome:   classifyOutcome(res),

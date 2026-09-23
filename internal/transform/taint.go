@@ -25,6 +25,24 @@ func (t *TaintBag) note(plain []byte) {
 	t.plains = append(t.plains, append([]byte(nil), plain...))
 }
 
+// Secrets returns rendered plaintext values for sample redaction (§5.4 /
+// §16.3). Callers merge these into the known-secret set before storing
+// post-transform body/headers; encrypting an unredacted key is not enough
+// because admin sample view decrypts back to plaintext.
+func (t *TaintBag) Secrets() []string {
+	if t == nil || len(t.plains) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.plains))
+	for _, p := range t.plains {
+		if len(p) == 0 {
+			continue
+		}
+		out = append(out, string(p))
+	}
+	return out
+}
+
 func (t *TaintBag) Redact(s string) string {
 	if t == nil || s == "" {
 		return s
