@@ -358,18 +358,13 @@ func TestEmptyDeltasAndZeroUsageAreNotSemantic(t *testing.T) {
 	}
 }
 
-// 正数 output usage 必须带出准确的 token 数，且不算语义证据。
-//
-// 刻意不断言 Semantic：manifest 里 responses_output_text_delta 的
-// response.completed 带 usage 却标记为非 semantic，也就是「有没有内容证据」
-// 与「产生了多少 token」是两件事。把 usage 也算成内容证据的话，一个
-// 只回 usage 就收尾的站会和真正吐出内容的站不可区分 —— 而那正是 §8.8
-// 列为「不能单独判活」的一条。判活规则属于 P0-08 的 Classifier。
+// 正数 output usage 必须带出准确的 token 数，并按 §8.8 置 Semantic。
 //
 // Kind 按 case 声明而不是一律 EventUsage：response.completed 同时是
 // Responses 协议的**结束标记**，它的 Kind 必须是 EventProtocolEnd
 // （否则 Real 模式看不到协议正常结束，见 protocolTerminalEvents）。
-// token 不会因此丢失 —— Classifier 与 Kind 无关地累加。
+// token 与 Semantic 不会因此丢失 —— Classifier 与 Kind 无关地累加，
+// 并对 ProtocolEnd 上的 Semantic 置位 SemanticSeen。
 func TestPositiveOutputUsageIsReportedWithAccurateTokens(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -383,7 +378,7 @@ func TestPositiveOutputUsageIsReportedWithAccurateTokens(t *testing.T) {
 			spec:     eventSpec(model.EndpointMessages, model.ProtoAnthropic),
 			wire:     "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
 			tokens:   1,
-			wantKind: EventUsage,
+			wantKind: EventSemantic,
 		},
 		{
 			name:     "responses",
@@ -397,7 +392,7 @@ func TestPositiveOutputUsageIsReportedWithAccurateTokens(t *testing.T) {
 			spec:     eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat),
 			wire:     "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
 			tokens:   3,
-			wantKind: EventUsage,
+			wantKind: EventSemantic,
 		},
 	}
 	for _, tc := range tests {
@@ -412,8 +407,53 @@ func TestPositiveOutputUsageIsReportedWithAccurateTokens(t *testing.T) {
 			if events[0].Kind != tc.wantKind || events[0].OutputTokens != tc.tokens {
 				t.Fatalf("event = %#v, want %s with %d output tokens", events[0], tc.wantKind, tc.tokens)
 			}
-			if events[0].Semantic {
-				t.Fatalf("usage must not be semantic evidence: %#v", events[0])
+			if !events[0].Semantic {
+				t.Fatalf("positive output usage must be semantic evidence: %#v", events[0])
+			}
+		})
+	}
+}
+
+// output_tokens:0 / 缺失不得判活（§8.8「不能单独判活」）。
+func TestZeroOutputUsageIsNotSemantic(t *testing.T) {
+	wire := "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n\n"
+	events, err := decodeChunks(t, eventSpec(model.EndpointMessages, model.ProtoAnthropic), WireSSE, wire)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(events) != 1 || events[0].Semantic || events[0].Kind == EventSemantic {
+		t.Fatalf("zero usage must not be semantic: %#v", events)
+	}
+}
+
+// 仅 input_tokens / prompt_tokens 不得经 PositiveOutputUsage 判活。
+func TestInputOnlyUsageIsNotSemantic(t *testing.T) {
+	tests := []struct {
+		name string
+		spec DecoderSpec
+		wire string
+	}{
+		{
+			name: "anthropic input only",
+			spec: eventSpec(model.EndpointMessages, model.ProtoAnthropic),
+			wire: "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":9}}\n\n",
+		},
+		{
+			name: "chat prompt only",
+			spec: eventSpec(model.EndpointChatCompletions, model.ProtoOpenAIChat),
+			wire: "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8}}\n\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events, err := decodeChunks(t, tc.spec, WireSSE, tc.wire)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, event := range events {
+				if event.Semantic || event.Kind == EventSemantic {
+					t.Fatalf("input-only usage must not be semantic: %#v", event)
+				}
 			}
 		})
 	}

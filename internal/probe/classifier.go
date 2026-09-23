@@ -155,8 +155,8 @@ func (classifier *ResponseClassifier) Observe(event ProtocolEvent) (Decision, bo
 			classifier.semanticSeen = true
 		}
 	case EventUsage:
-		// count_tokens 的正整数 input 是它唯一的成功证据，Decoder 已在那条
-		// 路径上设了 Semantic。模型端点的 usage 不设，所以不会误判活。
+		// count_tokens 的正整数 input、以及模型端点的正数 output usage，
+		// 都由 Decoder 经 §8.8 判据置 Semantic；这里只认那一面旗帜。
 		if event.Semantic {
 			classifier.semanticSeen = true
 		}
@@ -164,6 +164,10 @@ func (classifier *ResponseClassifier) Observe(event ProtocolEvent) (Decision, bo
 		classifier.modelListOK = classifier.modelListOK || event.ModelListRecognized
 	case EventProtocolEnd:
 		classifier.normalEndSeen = true
+		// Responses 的 response.completed 可同时携带正数 usage（§8.8）。
+		if event.Semantic {
+			classifier.semanticSeen = true
+		}
 	case EventRemoteError:
 		// 只留第一个错误。后续错误多半是同一次故障的回声（上游先发
 		// overloaded 再发 stream 中断），而按最后一个分类会让结论取决于

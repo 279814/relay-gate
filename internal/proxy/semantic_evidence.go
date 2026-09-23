@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+
+	"github.com/279814/relay-gate/internal/semanticevidence"
 )
 
 // HasSemanticEvidence 报告一段响应前缀/事件是否含 §8.8 判活证据。
@@ -106,7 +108,7 @@ func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 			return true
 		}
 		// choices 可为空壳，但仍可能带正数 usage（探活 Decoder 同路径）。
-		if positiveOutputUsage(top) {
+		if semanticevidence.PositiveOutputUsage(top) {
 			return true
 		}
 		return false
@@ -126,55 +128,12 @@ func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 		}
 	}
 
-	// §8.8：正数 output usage 单独即判活（usage 路径与探活 Decoder 一致）。
-	if positiveOutputUsage(top) {
+	// §8.8：正数 output usage 单独即判活（与探活 Decoder 共用 semanticevidence）。
+	if semanticevidence.PositiveOutputUsage(top) {
 		return true
 	}
 
 	return false
-}
-
-// positiveOutputUsage 读探活 Decoder 已识别的 usage 路径：顶层 usage、
-// 以及 Responses response.completed 嵌套的 response.usage。正数
-// completion_tokens / output_tokens 才算；0 与缺失不算。
-func positiveOutputUsage(top map[string]json.RawMessage) bool {
-	if usageHasPositiveOutput(top["usage"]) {
-		return true
-	}
-	if raw, ok := top["response"]; ok {
-		var body map[string]json.RawMessage
-		if json.Unmarshal(raw, &body) == nil && usageHasPositiveOutput(body["usage"]) {
-			return true
-		}
-	}
-	return false
-}
-
-func usageHasPositiveOutput(raw json.RawMessage) bool {
-	var usage map[string]json.RawMessage
-	if len(raw) == 0 || json.Unmarshal(raw, &usage) != nil {
-		return false
-	}
-	if n := jsonTokenCount(usage, "completion_tokens"); n > 0 {
-		return true
-	}
-	return jsonTokenCount(usage, "output_tokens") > 0
-}
-
-func jsonTokenCount(object map[string]json.RawMessage, name string) int64 {
-	raw, ok := object[name]
-	if !ok {
-		return 0
-	}
-	var number json.Number
-	if json.Unmarshal(raw, &number) != nil {
-		return 0
-	}
-	value, err := number.Int64()
-	if err != nil || value < 0 {
-		return 0
-	}
-	return value
 }
 
 func anthropicDeltaSemantic(raw json.RawMessage) bool {
