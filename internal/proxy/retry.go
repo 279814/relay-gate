@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
@@ -61,6 +60,9 @@ type forwardOutcome struct {
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
 	attempts int
+	// halfOpen 表示最终这次尝试是 §4.4c 半开试探。只用于网关自生成
+	// 错误响应上的 X-Relay-Half-Open；成功的上游响应不得带该头（§2.3）。
+	halfOpen bool
 	// reqID 把这次客户端请求的样本与它的多行日志串起来。
 	reqID string
 	// logs 是**全部**尝试的日志（含被丢弃的），等 attempts 定下来之后
@@ -139,16 +141,14 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		h.writeSelectError(w, err, proto, pre.inModel)
 		return nil, false
 	}
-	// 立刻设好，而不是等到 Commit：这次尝试可能会失败并走
-	// writeForwardError，而那条路径上的 502 同样需要带这个标记 ——
-	// 「这是一次对 dead 站的试探」正是它失败时最该说明的事。
-	//
 	// 半开之后不会有重试：半开的前提是全部 Route 都 dead，而重试用的
 	// SelectExcluding 只挑非 dead 的，必然选不到。也就是说 §4.4c 的
 	// 「放行一次」是结构上保证的，不需要额外的开关去限制它。
-	if halfOpen {
-		w.Header().Set("X-Relay-Half-Open", "1")
-	}
+	//
+	// X-Relay-Half-Open / X-Relay-Attempts 不得写在这里：Commit 会把上游
+	// 响应原样交给客户端，§2.3 禁止成功（及任何透传）上游响应新增网关
+	// 诊断头。半开/重试信息进 request_log；诊断头只在 writeForwardError
+	// 等网关自生成错误响应上补。
 
 	// reqID 在这里生成而不是在写日志时：同一次客户端请求的所有尝试
 	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
@@ -189,19 +189,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 
 		next := h.nextCandidate(r, pre, proto, plan, la, attempt)
 		if next == nil {
-			// 不再重试。两个响应头必须在 Commit 之前设好 —— Commit 会
-			// WriteHeader，之后再改 Header() 是静默无效的。
-			//
-			// 只在真的重试过时才写 X-Relay-Attempts：正常的一次过响应
-			// 必须与 M5 逐字节相同，凭空多一个头就不是「严格透传」了。
-			if attempt > 1 {
-				w.Header().Set("X-Relay-Attempts", strconv.Itoa(attempt))
-			}
-
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
 				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
-				res: la.at.Result(), attempts: attempt, reqID: reqID,
+				res: la.at.Result(), attempts: attempt, halfOpen: halfOpen,
+				reqID: reqID,
 			}
 			if la.at.CanCommit() {
 				oc.res = h.commitLive(w, la)

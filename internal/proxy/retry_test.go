@@ -227,8 +227,9 @@ func TestRetry_RetryableConditionsSwitchStation(t *testing.T) {
 			if !strings.Contains(rec.Body.String(), "from-good-station") {
 				t.Errorf("客户端应拿到好站的响应，得到 %q", rec.Body.String())
 			}
-			if got := rec.Header().Get("X-Relay-Attempts"); got != "2" {
-				t.Errorf("X-Relay-Attempts 应为 2，得到 %q", got)
+			// §2.3: 成功的上游响应不得新增 X-Relay-Attempts；次数进 request_log。
+			if got := rec.Header().Get("X-Relay-Attempts"); got != "" {
+				t.Errorf("换站成功后的上游响应不该带 X-Relay-Attempts，得到 %q", got)
 			}
 			hs.assertHits(t, 1, 1)
 		})
@@ -367,8 +368,9 @@ func TestRetry_StopsAtMaxAttempts(t *testing.T) {
 		t.Errorf("应是第 3 个站的响应体，得到 %q", rec.Body.String())
 	}
 	hs.assertHits(t, 1, 1, 1, 0)
-	if got := rec.Header().Get("X-Relay-Attempts"); got != "3" {
-		t.Errorf("X-Relay-Attempts 应为 3，得到 %q", got)
+	// §2.3: 透传的上游 500 不是网关自生成错误，不得带 X-Relay-Attempts。
+	if got := rec.Header().Get("X-Relay-Attempts"); got != "" {
+		t.Errorf("透传上游响应不该带 X-Relay-Attempts，得到 %q", got)
 	}
 }
 
@@ -471,6 +473,30 @@ func TestRetry_SharesTotalTimeBudget(t *testing.T) {
 	}
 	if hits > 2 {
 		t.Errorf("预算耗尽后不该继续重试，实际打了 %d 个站", hits)
+	}
+}
+
+// §2.3: 网关自生成的错误响应（无上游头可透传）在真重试过时必须带
+// X-Relay-Attempts；成功/透传上游响应不得带（见上方换站成功用例）。
+func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
+	stall := func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}
+	hs := newMultiHarness(t, stall, stall)
+	hs.cfg.settings.RetryMaxAttempts = 2
+	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealResponseHeaderSec = 1
+	hs.cfg.settings.RealFirstByteSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
+	hs.cfg.settings.RealConnectSec = 1
+	hs.cfg.settings.RealTotalSec = 30
+
+	rec := hs.serve(hs.req())
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Relay-Attempts"); got != "2" {
+		t.Errorf("网关错误在重试后应带 X-Relay-Attempts=2，得到 %q", got)
 	}
 }
 
