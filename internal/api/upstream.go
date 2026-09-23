@@ -119,6 +119,11 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// Invalidate before DELETE: RoutesOfUpstream reads the live SQL table, and
+	// ON DELETE CASCADE removes child Routes with the Upstream. After delete,
+	// SemanticConfigInvalidator would see zero route IDs and leave their
+	// RouteHealth / RecoveryGate / Capability in memory (§9.2).
+	s.invalidateUpstream(id)
 	if err := s.st.DeleteUpstream(id); err != nil {
 		s.writeErr(w, err)
 		return

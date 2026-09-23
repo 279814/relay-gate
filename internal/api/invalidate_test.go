@@ -392,3 +392,156 @@ func TestInvalidate_RouteModelMappingChangeTriggersProbe(t *testing.T) {
 		t.Errorf("改模型映射应触发 1 次重探，得到 %d", after-before)
 	}
 }
+
+// Delete must drop in-memory RouteHealth / RecoveryGate / Capability (§9.2).
+// Scheduler RetainOnly is too late: a reused id (or any lookup by the old id)
+// would otherwise inherit StateDead or a held recovery slot.
+func TestInvalidate_DeleteRouteClearsDeadRouteHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	gate := health.NewRecoveryGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
+	inner := &recordingInvalidator{}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h, `{"name":"del-rt-u","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"del-rt-m","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name 失败：%s", rec.Body.String())
+	}
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route 失败：%s", rec.Body.String())
+	}
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	if tr.State(rtID) != model.StateDead {
+		t.Fatalf("setup state=%s want dead", tr.State(rtID))
+	}
+	if _, ok := gate.TryAcquire(rtID); !ok {
+		t.Fatal("setup: acquire RecoveryGate")
+	}
+
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID), "", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("删除 route 失败 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("delete 后 RouteHealth=%s want unknown（不得保留 StateDead）", got)
+	}
+	if gate.InFlight(rtID) {
+		t.Fatal("delete 后 RecoveryGate 槽必须释放")
+	}
+	if !caps.has(rtID) {
+		t.Fatalf("delete 后 Capability scope 必须 InvalidateScope，cleared=%v", caps.cleared)
+	}
+	routes, _, _ := inner.counts()
+	if routes < 1 {
+		t.Fatal("delete 应调用 InvalidateRoute")
+	}
+
+	// Re-create the same (model, upstream) mapping: even if SQLite reuses the
+	// rowid, the new Route must not see the previous dead verdict.
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("重建 route 失败：%s", rec.Body.String())
+	}
+	newID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	if tr.State(newID) != model.StateUnknown {
+		t.Fatalf("重建后 RouteHealth=%s want unknown（id=%d 不得继承旧 dead）", tr.State(newID), newID)
+	}
+}
+
+// Delete Upstream cascades child Routes in SQL; invalidate must run first so
+// RoutesOfUpstream still returns those ids for Semantic Forget.
+func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	gate := health.NewRecoveryGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
+	inner := &recordingInvalidator{}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfUpstream: func(upstreamID int64) []int64 {
+			routes, err := s.st.ListRoutes(0)
+			if err != nil {
+				return nil
+			}
+			var ids []int64
+			for _, rt := range routes {
+				if rt.UpstreamID == upstreamID {
+					ids = append(ids, rt.ID)
+				}
+			}
+			return ids
+		},
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h, `{"name":"del-up-u","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"del-up-m","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name 失败：%s", rec.Body.String())
+	}
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route 失败：%s", rec.Body.String())
+	}
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	if tr.State(rtID) != model.StateDead {
+		t.Fatalf("setup state=%s want dead", tr.State(rtID))
+	}
+
+	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upID), "", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("删除 upstream 失败 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("delete upstream 后 child RouteHealth=%s want unknown", got)
+	}
+	if !caps.has(rtID) {
+		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	}
+	_, ups, _ := inner.counts()
+	if ups < 1 {
+		t.Fatal("delete upstream 应调用 InvalidateUpstream")
+	}
+}
+
+type recordingCaps struct {
+	cleared []int64
+}
+
+func (r *recordingCaps) InvalidateScope(scope model.RecipeScope, scopeID int64) {
+	if scope == model.RecipeScopeRoute {
+		r.cleared = append(r.cleared, scopeID)
+	}
+}
+
+func (r *recordingCaps) has(routeID int64) bool {
+	for _, id := range r.cleared {
+		if id == routeID {
+			return true
+		}
+	}
+	return false
+}
