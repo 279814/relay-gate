@@ -9,6 +9,8 @@ import (
 )
 
 // InsertSecurityFinding persists one finding (plain-text evidence only).
+// Callers must already redact secrets from Detail (§14.5 / §16.4); this
+// method stores the provided fields as-is.
 func (s *Store) InsertSecurityFinding(f security.Finding) error {
 	if s == nil {
 		return fmt.Errorf("store nil")

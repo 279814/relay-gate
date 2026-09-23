@@ -23,6 +23,7 @@ type ObserveJob struct {
 	Upstream string
 	RouteID  int64
 	ReqID    string
+	Keys     []string // upstream/relay secrets for Detail redaction (§14.5)
 }
 
 // Observer runs passive scans off the forward path (§14.2–14.3).
@@ -99,7 +100,7 @@ func (o *Observer) loop() {
 
 func (o *Observer) scan(job ObserveJob) {
 	text := string(job.Body)
-	found := ScanText(text, "traffic")
+	found := ScanText(text, "traffic", job.Keys...)
 	if len(found) == 0 && len(job.Body) >= MaxScanBytes {
 		found = []Finding{{
 			Severity:         SeverityInfo,
