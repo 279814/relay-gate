@@ -147,6 +147,7 @@ func TestCompileRejectsEveryHopByHopHeader(t *testing.T) {
 		{name: "upgrade", headers: []model.HeaderTemplate{{Name: "Upgrade", Values: []string{"websocket"}}}},
 		{name: "proxy-authorization", headers: []model.HeaderTemplate{{Name: "Proxy-Authorization", Values: []string{"Basic x"}}}},
 		{name: "proxy-authenticate", headers: []model.HeaderTemplate{{Name: "Proxy-Authenticate", Values: []string{"Basic"}}}},
+		{name: "proxy-connection", headers: []model.HeaderTemplate{{Name: "Proxy-Connection", Values: []string{"keep-alive"}}}},
 		{name: "te", headers: []model.HeaderTemplate{{Name: "TE", Values: []string{"trailers"}}}},
 		{name: "trailer", headers: []model.HeaderTemplate{{Name: "Trailer", Values: []string{"Expires"}}}},
 		{name: "transfer-encoding", headers: []model.HeaderTemplate{{Name: "Transfer-Encoding", Values: []string{"chunked"}}}},

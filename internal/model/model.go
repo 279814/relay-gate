@@ -87,7 +87,11 @@ func IsAuthHeader(name string) bool {
 	return false
 }
 
-// HopByHopHeaders 是 RFC 7230 §6.1 的逐跳头，**唯一**清单。
+// HopByHopHeaders 是转发与模板编译共用的逐跳头**唯一**清单。
+//
+// 主体取自 RFC 7230 §6.1；另含非标准的 Proxy-Connection —— libcurl 等客户端
+// 仍会发送，而部分上游（如 Google）会因此拒请求。Go 的 ReverseProxy 同样
+// 把它列为逐跳头；漏删就会把客户端与本网关之间的连接管理字段送给上游。
 //
 // 它们由传输层管，不得由配置提供。两条路径依赖这份清单：
 //   - 转发时逐跳清理（漏一个就是把上游连接的 keep-alive 参数当成客户端的）
@@ -104,6 +108,7 @@ var HopByHopHeaders = []string{
 	"Keep-Alive",
 	"Proxy-Authenticate",
 	"Proxy-Authorization",
+	"Proxy-Connection",
 	"TE",
 	"Trailer",
 	"Transfer-Encoding",
