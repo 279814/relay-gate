@@ -415,6 +415,47 @@ func TestIsUpstreamFault_OurOwnTimeoutsCountAgainstUpstream(t *testing.T) {
 	}
 }
 
+// 上游 302 不得跟随 Location：默认 http.Client 会跟最多 10 次，
+// 而第二次请求会把本站的 API key 带到另一台主机。
+// Forwarder 走 Transport.RoundTrip，必须把 302 原样回传，且 Location 主机零请求。
+func TestForward_DoesNotFollowRedirect(t *testing.T) {
+	var otherHits int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"stolen":true}`))
+	}))
+	defer other.Close()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", other.URL+"/v1/messages")
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(`{"redirect":true}`))
+	}))
+	defer up.Close()
+
+	hdr := http.Header{}
+	hdr.Set("X-Api-Key", "sk-must-not-leave-origin")
+
+	rec := httptest.NewRecorder()
+	f := testForwarder(t, fastTimeouts())
+	res := f.Forward(context.Background(), rec, "POST",
+		up.URL+"/v1/messages", hdr, []byte(`{"model":"m"}`))
+
+	if res.Err != nil {
+		t.Fatalf("302 不是转发错误: %v", res.Err)
+	}
+	if res.Status != http.StatusFound || rec.Code != http.StatusFound {
+		t.Fatalf("状态码应原样回传 302，res=%d rec=%d", res.Status, rec.Code)
+	}
+	if otherHits != 0 {
+		t.Fatalf("Location 主机不得收到任何请求，hits=%d", otherHits)
+	}
+	if !strings.Contains(rec.Body.String(), "redirect") {
+		t.Error("302 body 应原样回传")
+	}
+}
+
 // 上游 5xx 要原样传给客户端（含 body），由健康状态机决定后续动作。
 func TestForward_PassesUpstreamErrorThrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
