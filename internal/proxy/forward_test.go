@@ -631,3 +631,33 @@ func TestRealTimeouts(t *testing.T) {
 		t.Error("所有超时值都必须非零")
 	}
 }
+
+// 配置层只卡 real_first_semantic_sec ≥ 300，但 TimeoutsFrom 取各阶段最小值。
+// 短 response_header / first_byte 若原样落入 FirstToken，会把长思考砍到五分钟以下。
+func TestRealTimeouts_ShortHeaderCannotUndercutSemanticFloor(t *testing.T) {
+	s := model.DefaultSettings()
+	s.RealResponseHeaderSec = 60
+	s.RealFirstByteSec = 60
+	s.RealFirstSemanticSec = 1200
+	if err := s.Validate(); err != nil {
+		t.Fatalf("合法 settings 必须通过校验：%v", err)
+	}
+	to := RealTimeouts(s)
+	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
+	if to.FirstToken != floor {
+		t.Fatalf("FirstToken = %v, want floor %v", to.FirstToken, floor)
+	}
+}
+
+// CapTotal 把剩余总预算夹到低于 5 分钟时，不得把 FirstToken 抬过 Total，
+// 否则共享总预算会失真（TestRetry_SharesTotalTimeBudget 依赖这条）。
+func TestTimeoutsFrom_CapTotalBelowFloorNotRaised(t *testing.T) {
+	budget := outbound.RealBudget(model.DefaultSettings()).CapTotal(90 * time.Second)
+	to := TimeoutsFrom(budget)
+	if to.FirstToken != 90*time.Second {
+		t.Fatalf("FirstToken = %v, want remaining total 90s (must not raise above CapTotal)", to.FirstToken)
+	}
+	if to.Total != 90*time.Second {
+		t.Fatalf("Total = %v, want 90s", to.Total)
+	}
+}
