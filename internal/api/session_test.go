@@ -337,6 +337,100 @@ func TestLogin_SuccessResetsFailureCount(t *testing.T) {
 	}
 }
 
+// TestLogin_BackoffIsPerIPAndGlobal 钉住 §12.9「按来源 IP 和全局」：
+// 某一 IP 的失败桶不单独拖慢另一 IP；跨 IP 累计足够失败仍触发全局退避。
+func TestLogin_BackoffIsPerIPAndGlobal(t *testing.T) {
+	s := newSessionStore()
+	var slept []time.Duration
+	s.sleep = func(d time.Duration) { slept = append(slept, d) }
+
+	const a, b = "192.0.2.1", "192.0.2.2"
+
+	// A 单独打满 per-IP 阈值并超标；全局同步升高。
+	for i := 0; i < loginLockThreshold+1; i++ {
+		s.noteFailure(a)
+	}
+	s.throttle(a)
+	if len(slept) != 1 {
+		t.Fatalf("A 超阈值后应延迟，得到 %d 次", len(slept))
+	}
+
+	// 人为只保留 A 的 per-IP 桶、清掉全局：B 不应继承 A 的 per-IP 延迟。
+	s.mu.Lock()
+	s.failures = 0
+	s.mu.Unlock()
+	slept = slept[:0]
+	s.throttle(b)
+	if len(slept) != 0 {
+		t.Fatal("B 不应仅因 A 的 per-IP 失败而被延迟")
+	}
+	s.throttle(a)
+	if len(slept) != 1 {
+		t.Fatal("A 自身的 per-IP 退避仍应生效")
+	}
+
+	// 全局：每个 peer 各失败一次，谁都未过 per-IP 阈值，但累计过全局阈值。
+	s2 := newSessionStore()
+	slept = nil
+	s2.sleep = func(d time.Duration) { slept = append(slept, d) }
+	peers := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"}
+	for i, p := range peers {
+		s2.noteFailure(p)
+		before := len(slept)
+		s2.throttle(p)
+		if i < loginLockThreshold {
+			if len(slept) != before {
+				t.Fatalf("第 %d 次跨 IP 失败（全局尚未超阈值）不该延迟", i+1)
+			}
+			continue
+		}
+		if len(slept) != before+1 {
+			t.Fatalf("跨 IP 累计超过全局阈值后应延迟，第 %d 次得到 sleeps=%d", i+1, len(slept))
+		}
+	}
+}
+
+// TestLogin_RemoteAddrDrivesPerIPBucket 经 HTTP 确认 RemoteAddr host 分桶，
+// 且带端口的地址只按 host 计。
+func TestLogin_RemoteAddrDrivesPerIPBucket(t *testing.T) {
+	s, h := newTestServer(t)
+	var slept []time.Duration
+	s.sessions.sleep = func(d time.Duration) { slept = append(slept, d) }
+
+	loginWrong := func(addr string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/admin/api/login", strings.NewReader(`{"password":"wrong"}`))
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("错误口令应 401，得到 %d", rec.Code)
+		}
+		return rec
+	}
+
+	for i := 0; i < loginLockThreshold+1; i++ {
+		loginWrong("203.0.113.10:54321")
+	}
+	if len(slept) != 1 {
+		t.Fatalf("同一 host 超阈值应延迟一次，得到 %d", len(slept))
+	}
+	slept = slept[:0]
+
+	// 同 host 不同端口仍是同一 per-IP 桶；此时全局也已超标，必延迟。
+	loginWrong("203.0.113.10:9999")
+	if len(slept) != 1 {
+		t.Fatalf("同 host 不同端口应继续命中退避，得到 %d", len(slept))
+	}
+	slept = slept[:0]
+
+	// 另一 host：全局已超阈值，仍延迟（全局半边）；但说明请求用了新 RemoteAddr。
+	loginWrong("203.0.113.20:1234")
+	if len(slept) != 1 {
+		t.Fatalf("全局退避应对新 RemoteAddr 仍生效，得到 %d", len(slept))
+	}
+}
+
 func TestSessionStore_ConcurrentAccessDoesNotRace(t *testing.T) {
 	// sessionStore 持有一个 map，而 issue 会在持锁时遍历它做 GC。
 	// 并发是真实的：浏览器开多个标签页、或者一边登录一边有请求在校验

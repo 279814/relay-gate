@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -31,11 +32,14 @@ const sessionTTL = 7 * 24 * time.Hour
 //   - 延迟对暴破的抑制是乘法级的：每次 1 秒，10 万次就是 27 小时，
 //     而对正常人只是「输错三次后感觉卡了一下」
 //
-// 计数不按 IP 分桶，是全局的：单人自用的服务没有「别的用户在正常登录」
-// 这种需要保护的并发场景，而按 IP 分桶反而给了换 IP 绕过的余地。
+// §12.9：「登录按来源 IP 和全局进行退避」。两边都计连续失败，任一侧
+// 超过阈值就延迟；换 IP 绕不过全局，单 IP 狂打也会被自己的桶挡住。
+// 来源 IP 取 TCP 对端（RemoteAddr 去端口），不读转发头。
+// loginIPFailCap 限制 per-IP map 体积；满了只忽略新 key，全局计数照常。
 const (
 	loginLockThreshold = 3
 	loginLockDelay     = time.Second
+	loginIPFailCap     = 256
 )
 
 // sessionStore 是内存会话表。
@@ -49,21 +53,34 @@ type sessionStore struct {
 	toks map[string]time.Time // token → 过期时刻
 	now  func() time.Time     // 测试注入时钟
 
-	// failures 是连续登录失败次数，成功即归零。
+	// failures 是全局连续登录失败次数，成功即归零。
 	failures int
+	// ipFailures 按来源 host（RemoteAddr 去端口）计连续失败。
+	ipFailures map[string]int
 	// sleep 可注入，让测试不必真的等一秒。
 	sleep func(time.Duration)
 }
 
 func newSessionStore() *sessionStore {
 	return &sessionStore{
-		toks:  map[string]time.Time{},
-		now:   time.Now,
-		sleep: time.Sleep,
+		toks:       map[string]time.Time{},
+		ipFailures: map[string]int{},
+		now:        time.Now,
+		sleep:      time.Sleep,
 	}
 }
 
-// throttle 在连续失败超过阈值后延迟本次响应。
+// clientHost 从 RemoteAddr 取出 host，去掉端口。解析失败则原样返回
+// （httptest 默认空串、或无端口的地址仍可作稳定 key）。
+func clientHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// throttle 在全局或该来源 IP 的连续失败超过阈值后延迟本次响应。
 //
 // 延迟发生在**校验之后、响应之前**，且成功路径不延迟：
 // 正常登录永远是快的，即使之前失败过很多次。
@@ -71,25 +88,31 @@ func newSessionStore() *sessionStore {
 // 判定用 `>` 而不是 `>=`：调用方在 noteFailure 之后才调它，所以第 N 次
 // 失败时计数已经是 N。用 `>=` 的话阈值 3 会让第 3 次就开始延迟，
 // 而语义应当是「连续错满 3 次之后」。
-func (s *sessionStore) throttle() {
+//
+// 两侧阈值相同、延迟相同，取「或」：任一侧超标只 sleep 一次，不叠成 2D。
+func (s *sessionStore) throttle(peer string) {
 	s.mu.Lock()
-	n, sleep := s.failures, s.sleep
+	n, ipN, sleep := s.failures, s.ipFailures[peer], s.sleep
 	s.mu.Unlock()
-	if n > loginLockThreshold {
+	if n > loginLockThreshold || ipN > loginLockThreshold {
 		sleep(loginLockDelay)
 	}
 }
 
-func (s *sessionStore) noteFailure() {
+func (s *sessionStore) noteFailure(peer string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures++
+	if _, ok := s.ipFailures[peer]; ok || len(s.ipFailures) < loginIPFailCap {
+		s.ipFailures[peer]++
+	}
 }
 
-func (s *sessionStore) noteSuccess() {
+func (s *sessionStore) noteSuccess(peer string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures = 0
+	delete(s.ipFailures, peer)
 }
 
 // issue 生成一个新会话令牌。
@@ -174,19 +197,21 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	peer := clientHost(r.RemoteAddr)
+
 	// 无可用凭据（无 env 明文且无 Argon2id 哈希）时无人能登录，理由同 bearerOK。
 	if !s.passwordOK(body.Password) {
-		s.sessions.noteFailure()
+		s.sessions.noteFailure(peer)
 		// 连续失败到阈值后延迟响应，抑制暴力破解。放在这里而不是入口：
 		// 正常登录永远不被延迟，即使之前失败过很多次。
-		s.sessions.throttle()
+		s.sessions.throttle(peer)
 		// 不区分「口令为空」与「口令错误」：两者都是没登录成功，
 		// 分开说等于告诉调用方「这次至少格式对了」。
 		s.log.Warn("管理界面登录失败", "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, errBody{"口令错误"})
 		return
 	}
-	s.sessions.noteSuccess()
+	s.sessions.noteSuccess(peer)
 
 	tok, err := s.sessions.issue()
 	if err != nil {
