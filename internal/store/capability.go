@@ -441,17 +441,18 @@ func loadPublishedBinding(ctx context.Context, tx *sql.Tx, scope model.RecipeSco
 
 func currentSemanticRevision(ctx context.Context, tx *sql.Tx, expectation *model.SemanticExpectation) (model.SemanticRevision, error) {
 	current := expectation.Revision
-	var upstreamNetwork, upstreamCredential, endpointID, endpointRevision, authRevision int64
-	if err := tx.QueryRowContext(ctx, `SELECT u.network_revision,u.credential_revision,e.id,e.revision,e.auth_profile_revision
+	var upstreamNetwork, upstreamCredential, upstreamCreatedAt, endpointID, endpointRevision, authRevision int64
+	if err := tx.QueryRowContext(ctx, `SELECT u.network_revision,u.credential_revision,u.created_at,e.id,e.revision,e.auth_profile_revision
 		FROM upstream u JOIN upstream_endpoint e ON e.upstream_id=u.id AND e.endpoint=? WHERE u.id=?`,
 		expectation.Target.Endpoint, expectation.Target.UpstreamID).Scan(&upstreamNetwork, &upstreamCredential,
-		&endpointID, &endpointRevision, &authRevision); errors.Is(err, sql.ErrNoRows) {
+		&upstreamCreatedAt, &endpointID, &endpointRevision, &authRevision); errors.Is(err, sql.ErrNoRows) {
 		return model.SemanticRevision{}, ErrNotFound
 	} else if err != nil {
 		return model.SemanticRevision{}, err
 	}
 	current.UpstreamNetwork = upstreamNetwork
 	current.UpstreamCredential = upstreamCredential
+	current.UpstreamCreatedAt = upstreamCreatedAt
 	current.EndpointID = endpointID
 	current.EndpointRevision = endpointRevision
 	current.AuthProfile = authRevision

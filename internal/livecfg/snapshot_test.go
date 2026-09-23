@@ -63,6 +63,22 @@ func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	if cap.Revision.RouteCapability != rt.CapabilityRevision || cap.Revision.RouteCreatedAt != rt.CreatedAt {
 		t.Fatalf("capability expectation=%+v route created_at=%d", cap.Revision, rt.CreatedAt)
 	}
+	if cap.Revision.UpstreamCreatedAt != up.CreatedAt {
+		t.Fatalf("capability UpstreamCreatedAt=%d want %d", cap.Revision.UpstreamCreatedAt, up.CreatedAt)
+	}
+
+	modelsCap, err := snap.SemanticExpectation(model.SemanticTarget{
+		Scope: model.RecipeScopeUpstream, UpstreamID: upID, Endpoint: model.EndpointModels,
+	}, model.RecipeIdentity{
+		Storage: model.RecipeStorageEmbedded, Origin: model.RecipeBasic,
+		TemplateID: "builtin:models", Revision: 1,
+	}, model.RecipeBindingFacts{Use: model.BindingResolved, ResolvedLayer: model.ResolvedEmbedded}, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modelsCap.Revision.UpstreamCreatedAt != up.CreatedAt || modelsCap.Revision.RouteCreatedAt != 0 {
+		t.Fatalf("upstream-scope capability=%+v", modelsCap.Revision)
+	}
 
 	s.Invalidate()
 	if _, err := s.ProbeSnapshot(); err == nil {

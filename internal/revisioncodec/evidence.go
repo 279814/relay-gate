@@ -242,6 +242,7 @@ func (encoder *canonicalEncoder) recipeBindingFacts(value model.RecipeBindingFac
 func (encoder *canonicalEncoder) semanticRevision(value model.SemanticRevision) {
 	encoder.int64(value.UpstreamNetwork)
 	encoder.int64(value.UpstreamCredential)
+	encoder.int64(value.UpstreamCreatedAt)
 	encoder.int64(value.EndpointID)
 	encoder.int64(value.EndpointRevision)
 	encoder.int64(value.ModelCapability)
