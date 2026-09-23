@@ -129,6 +129,12 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+	// flush 之后再判语义：body 已完整缓冲在 transform 路径，不额外读上游。
+	if res.Status >= 200 && res.Status < 400 &&
+		!IsStructuredErrorPayload(out.Body, out.Header.Get("Content-Type")) &&
+		HasSemanticEvidence(out.Body, out.Header.Get("Content-Type")) {
+		res.SemanticSeen = true
+	}
 	now := time.Now()
 	if n > 0 && res.FirstByteAt.IsZero() {
 		res.FirstByteAt = now
@@ -193,6 +199,17 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	flusher, canFlush := w.(http.Flusher)
 	var total int64
 	var hitAll []string
+	ct := ""
+	if res.RespHeaders != nil {
+		ct = res.RespHeaders.Get("Content-Type")
+	}
+	if ct == "" && at.resp != nil {
+		ct = at.resp.Header.Get("Content-Type")
+	}
+	var semSniffer *streamSemanticSniffer
+	if res.Status >= 200 && res.Status < 400 {
+		semSniffer = newStreamSemanticSniffer(ct)
+	}
 
 	writeEv := func(ev transform.SSEEvent) error {
 		if len(ev.Raw) == 0 {
@@ -205,6 +222,12 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		}
 		if canFlush {
 			flusher.Flush()
+		}
+		if semSniffer != nil && !semSniffer.Seen() && wn > 0 {
+			semSniffer.Feed(ev.Raw[:wn], ct)
+			if semSniffer.Seen() {
+				res.SemanticSeen = true
+			}
 		}
 		if res.FirstByteAt.IsZero() && wn > 0 {
 			res.FirstByteAt = time.Now()

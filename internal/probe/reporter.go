@@ -62,7 +62,8 @@ func (r *Reporter) TriggerProbe(routeID int64) { r.track.TriggerL2(routeID) }
 // classifyReal 把一次真实转发的结果归类。
 //
 // 判定顺序：先看传输层错误（连不上、超时、客户端断开），再看 HTTP 状态码，
-// 再看「200 结构化 error」（§6.8 / §8.12），最后才是「200 但没吐字节」的假活。
+// 再看「200 结构化 error」（§6.8 / §8.12），再看「200 但没吐字节」的假活，
+// 最后要求 SemanticSeen（§6.8 / §8.8）—— 有字节的 HTML/空壳流也不能 piggyback。
 // 顺序不能反 —— 传输层失败时 Status 可能是 0（连响应头都没拿到），按状态码
 // 判会当成「未知的成功」；结构化 error 若按 200 判活会跳过 L2 并把 Route 拉活。
 func classifyReal(res *proxy.ResultView) Outcome {
@@ -104,6 +105,18 @@ func classifyReal(res *proxy.ResultView) Outcome {
 		return Outcome{
 			Verdict: health.VerdictUnavailable,
 			Err:     fmt.Errorf("假活：HTTP %d 但未返回任何内容", res.Status),
+			Status:  res.Status,
+			TTFT:    res.TTFT,
+		}
+	}
+
+	// §6.8 / §8.8：2xx 结束但从未出现 Semantic Evidence 不得判活、不得
+	// piggyback。空 200 已在上面挡住；这里挡住「有字节但无模型输出」
+	//（HTML 错误页、只有 message_start/ping 的流等）。
+	if !res.SemanticSeen {
+		return Outcome{
+			Verdict: health.VerdictUnavailable,
+			Err:     fmt.Errorf("假活：HTTP %d 但未见语义证据", res.Status),
 			Status:  res.Status,
 			TTFT:    res.TTFT,
 		}

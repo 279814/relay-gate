@@ -117,6 +117,12 @@ type Result struct {
 	//
 	// 正常成功响应不攒副本：可能是几 MB 的 SSE 流。
 	ErrBody []byte
+
+	// SemanticSeen 表示流式/非流式响应里已出现 §8.8 判活证据
+	//（非空 text/thinking/tool delta 或非流式非空模型输出）。
+	// 由 streamBody 在客户端 flush 之后增量嗅探置位，不缓冲整段流、
+	// 不改变写出字节。classifyReal 必须见到它才 VerdictOK / piggyback。
+	SemanticSeen bool
 }
 
 // maxErrBodyCapture 是 ErrBody 的上限。
@@ -571,6 +577,13 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 	if !captureErr && isSSEContentType(ct) && !IsStructuredErrorPayload(res.ErrBody, ct) {
 		sniffer = &streamErrorSniffer{}
 	}
+	// §6.8 / §8.8：2xx 判活与 piggyback 需要语义证据。flush 之后增量嗅探，
+	// 不推迟客户端写出、不缓冲整段流。
+	var semSniffer *streamSemanticSniffer
+	if !captureErr && res.Status >= 200 && res.Status < 400 &&
+		!IsStructuredErrorPayload(res.ErrBody, ct) {
+		semSniffer = newStreamSemanticSniffer(ct)
+	}
 
 	var total int64
 	// timer 回调写、主循环读，必须用原子操作（-race 会抓这个）
@@ -635,6 +648,12 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 				sniffer.Feed(buf[:n])
 				if sniffer.Found() && len(res.ErrBody) == 0 {
 					res.ErrBody = sniffer.Sample()
+				}
+			}
+			if semSniffer != nil && !semSniffer.Seen() {
+				semSniffer.Feed(buf[:n], ct)
+				if semSniffer.Seen() {
+					res.SemanticSeen = true
 				}
 			}
 			if werr != nil {

@@ -45,6 +45,8 @@ type ResultView struct {
 	TTFT time.Duration
 	// BytesWritten 用于识别假活：200 但一个字节都没吐（§4.3）。
 	BytesWritten int64
+	// SemanticSeen 是 §8.8 判活证据；缺它时 2xx+字节仍不能 piggyback。
+	SemanticSeen bool
 }
 
 // viewOf 从完整结果里摘出健康判定需要的部分。
@@ -68,5 +70,6 @@ func viewOf(res *Result, redactKeys []string) *ResultView {
 		Header:       res.RespHeaders,
 		TTFT:         res.TTFT(),
 		BytesWritten: res.BytesWritten,
+		SemanticSeen: res.SemanticSeen,
 	}
 }
