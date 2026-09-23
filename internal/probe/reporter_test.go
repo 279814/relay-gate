@@ -107,6 +107,33 @@ func TestReportResult_Structured200DoesNotRefreshLastRealOK(t *testing.T) {
 	}
 }
 
+// §6.8：已有语义输出后的 SSE error 事件是 partial_failure —— 不得 piggyback。
+func TestReportResult_MidStreamSSEErrorDoesNotPiggyback(t *testing.T) {
+	tr := health.NewTracker(nil)
+	tr.Report(health.Report{RouteID: 11, Verdict: health.VerdictOK, Source: health.SourceReal})
+	seeded := tr.Status(11).LastRealOKAt
+
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	// streamBody 嗅探后只留下最小错误帧（不是整段流）。
+	errFrame := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\"}}\n\n"
+	rep := NewReporter(tr)
+	rep.ReportResult(11, 0, &proxy.ResultView{
+		Status:       200,
+		Header:       h,
+		ErrBody:      []byte(errFrame),
+		BytesWritten: 400,
+	})
+
+	after := tr.Status(11)
+	if after.LastRealOKAt != seeded {
+		t.Fatalf("mid-stream SSE error must not refresh lastRealOKAt")
+	}
+	if after.ConsecutiveFail < 1 {
+		t.Fatalf("mid-stream SSE error should count as failure, fail=%d", after.ConsecutiveFail)
+	}
+}
+
 type recordingSched struct {
 	n int
 }

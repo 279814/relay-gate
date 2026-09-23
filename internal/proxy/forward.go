@@ -110,7 +110,10 @@ type Result struct {
 	// ErrBody 是响应体的开头若干字节，供健康判定：
 	//   - Status >= 400：始终填充；
 	//   - Status 2xx 且载荷为结构化 error（§8.12）：也填充，否则
-	//     classifyReal 会按 200 判活并 piggyback。
+	//     classifyReal 会按 200 判活并 piggyback；
+	//   - Status 2xx SSE 流中后出现的协议错误事件（§6.8 partial_failure /
+	//     §8.8「HTTP 200 SSE error event」）：由 streamBody 增量嗅探后填充
+	//     最小错误帧，不缓冲整段流。
 	//
 	// 正常成功响应不攒副本：可能是几 MB 的 SSE 流。
 	ErrBody []byte
@@ -554,8 +557,20 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 	buf := make([]byte, 32*1024)
 
 	// 只有错误响应才攒副本供健康判定用。正常响应可能是几 MB 的 SSE 流，
-	// 为了判定攒一份纯属浪费 —— 而正常响应的判定根本不需要看 body。
+	// 为了判定攒一份纯属浪费。
 	captureErr := res.Status >= 400
+
+	// §6.8 / §8.12：2xx SSE 上后出现的协议错误事件不得按 200 判活。
+	// 重试侧 classifySSEPrefix 在内容之后收手；健康侧必须继续嗅探。
+	// 前缀已确认结构化 error（Commit 填过 ErrBody）则不必再扫。
+	ct := ""
+	if res.RespHeaders != nil {
+		ct = res.RespHeaders.Get("Content-Type")
+	}
+	var sniffer *streamErrorSniffer
+	if !captureErr && isSSEContentType(ct) && !IsStructuredErrorPayload(res.ErrBody, ct) {
+		sniffer = &streamErrorSniffer{}
+	}
 
 	var total int64
 	// timer 回调写、主循环读，必须用原子操作（-race 会抓这个）
@@ -614,6 +629,13 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 					room = n
 				}
 				res.ErrBody = append(res.ErrBody, buf[:room]...)
+			}
+			// 2xx SSE 协议错误：flush 之后增量嗅探，不推迟客户端写出。
+			if sniffer != nil && !sniffer.Found() {
+				sniffer.Feed(buf[:n])
+				if sniffer.Found() && len(res.ErrBody) == 0 {
+					res.ErrBody = sniffer.Sample()
+				}
 			}
 			if werr != nil {
 				// 客户端断开。不是上游的问题，不该计入健康失败。
