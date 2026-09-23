@@ -126,11 +126,16 @@ func (s *Server) invalidateModelName(modelNameID int64) {
 // enabled 不在这里判：它由调用方单独处理 —— 从停用变启用要探（那是
 // 「刚配好，想知道通不通」的时刻），而启用变停用不必探（都停了）。
 func probeAffectingUpstream(before, after *model.Upstream) bool {
+	// HostOverride / TLSServerName bump NetworkRevision (store.networkChanged) and
+	// are §9.2 network-origin fields: must invalidate so RouteHealth is forgotten
+	// for the new origin, not only BaseURL / ProxyURL / FullURLMode.
 	if before.BaseURL != after.BaseURL ||
 		before.APIKey != after.APIKey ||
 		before.AuthStyle != after.AuthStyle ||
 		before.FullURLMode != after.FullURLMode ||
 		before.ProxyURL != after.ProxyURL ||
+		before.HostOverride != after.HostOverride ||
+		before.TLSServerName != after.TLSServerName ||
 		before.L1Path != after.L1Path {
 		return true
 	}
