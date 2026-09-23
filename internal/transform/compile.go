@@ -8,8 +8,8 @@ import (
 	"unicode/utf8"
 )
 
-// Compile validates rules and prepares RE2 patterns. Rejects scripts, CR/LF
-// in header values, protected headers as final control, and oversized regex.
+// Compile validates rules and prepares RE2 patterns. Rejects scripts, CR/LF/NUL
+// in header names and values, protected headers as final control, and oversized regex.
 func Compile(v Version) (*Compiled, error) {
 	if len(v.Rules) == 0 {
 		return nil, fmt.Errorf("version has no rules")
@@ -68,12 +68,15 @@ func validateRule(i int, rule Rule) error {
 		if strings.TrimSpace(rule.Name) == "" {
 			return fmt.Errorf("rule %d: header name required", i)
 		}
+		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
+			return fmt.Errorf("rule %d: header name: %w", i, err)
+		}
 		if isProtectedHeader(rule.Name) {
 			return fmt.Errorf("rule %d: cannot control protected header %q", i, rule.Name)
 		}
 		if kind == KindSetHeader {
 			if strings.TrimSpace(rule.SecretRef) == "" {
-				if err := rejectCRLFinHeaderValue(rule.Value); err != nil {
+				if err := rejectForbiddenHeaderField(rule.Value); err != nil {
 					return fmt.Errorf("rule %d: %w", i, err)
 				}
 			}
@@ -82,11 +85,14 @@ func validateRule(i int, rule Rule) error {
 		if strings.TrimSpace(rule.From) == "" || strings.TrimSpace(rule.To) == "" {
 			return fmt.Errorf("rule %d: rename requires from and to", i)
 		}
+		if err := rejectForbiddenHeaderField(rule.From); err != nil {
+			return fmt.Errorf("rule %d: rename from: %w", i, err)
+		}
+		if err := rejectForbiddenHeaderField(rule.To); err != nil {
+			return fmt.Errorf("rule %d: rename to: %w", i, err)
+		}
 		if isProtectedHeader(rule.From) || isProtectedHeader(rule.To) {
 			return fmt.Errorf("rule %d: cannot rename protected header", i)
-		}
-		if err := rejectCRLFinHeaderValue(rule.To); err != nil {
-			return fmt.Errorf("rule %d: %w", i, err)
 		}
 	case KindReplaceBytes:
 		if rule.From == "" {
@@ -168,14 +174,19 @@ func validateRule(i int, rule Rule) error {
 	return nil
 }
 
-func rejectCRLFinHeaderValue(v string) error {
-	if strings.ContainsAny(v, "\r\n") {
-		return fmt.Errorf("header value must not contain CR/LF")
+func rejectForbiddenHeaderField(v string) error {
+	if strings.ContainsAny(v, "\r\n\x00") {
+		return fmt.Errorf("header field must not contain CR/LF/NUL")
 	}
 	if !utf8.ValidString(v) {
-		return fmt.Errorf("header value must be valid UTF-8")
+		return fmt.Errorf("header field must be valid UTF-8")
 	}
 	return nil
+}
+
+// rejectCRLFinHeaderValue keeps the historical name used by apply-site call sites.
+func rejectCRLFinHeaderValue(v string) error {
+	return rejectForbiddenHeaderField(v)
 }
 
 func looksLikeScript(s string) bool {

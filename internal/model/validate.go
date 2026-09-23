@@ -42,12 +42,26 @@ func (u *Upstream) Validate() error {
 	}
 	// 探活头里不允许出现鉴权头：key 由 Upstream.APIKey 统一注入，
 	// 在这里再写一个会造成「两个 key 来源」，出问题时无从排查。
-	for k := range u.ProbeHeaders {
+	for k, v := range u.ProbeHeaders {
 		if IsAuthHeader(k) {
 			return invalid("probe_headers 不能包含鉴权头 %q，key 由 api_key 字段统一注入", k)
 		}
+		if HeaderFieldHasCRLFOrNUL(k) {
+			return invalid("probe_headers 头名不能含 CR/LF/NUL")
+		}
+		if HeaderFieldHasCRLFOrNUL(v) {
+			return invalid("probe_headers 头值不能含 CR/LF/NUL（会构造出请求头注入）")
+		}
 	}
 	return nil
+}
+
+// HeaderFieldHasCRLFOrNUL 报告配置里的头名或头值是否带 CR/LF/NUL。
+//
+// 这三项一旦被抄进出站 http.Header 或拼进原始请求，就是请求头注入
+// （例如值 "x\r\nX-Injected: y"）。写入路径与应用路径都应拒绝或跳过。
+func HeaderFieldHasCRLFOrNUL(s string) bool {
+	return strings.ContainsAny(s, "\r\n\x00")
 }
 
 func (endpoint *UpstreamEndpoint) Validate() error {
@@ -85,12 +99,15 @@ func (endpoint *UpstreamEndpoint) Validate() error {
 	if endpoint.AuthProfile.SecretRef == "" {
 		return invalid("auth secret_ref 不能为空")
 	}
+	if HeaderFieldHasCRLFOrNUL(endpoint.AuthProfile.HeaderName) {
+		return invalid("auth header_name 不能含 CR/LF/NUL")
+	}
 	for _, header := range endpoint.AuthProfile.ManualHeaders {
-		if strings.TrimSpace(header.Name) == "" || strings.ContainsAny(header.Name, "\r\n\x00") {
+		if strings.TrimSpace(header.Name) == "" || HeaderFieldHasCRLFOrNUL(header.Name) {
 			return invalid("manual auth header name 无效")
 		}
 		for _, value := range header.Values {
-			if strings.ContainsAny(value, "\r\n\x00") {
+			if HeaderFieldHasCRLFOrNUL(value) {
 				return invalid("manual auth header value 含控制字符")
 			}
 		}

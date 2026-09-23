@@ -118,6 +118,9 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult, sec *ap
 	name := "r" + strconv.Itoa(i) + ":" + rule.Kind
 	switch rule.Kind {
 	case KindSetHeader:
+		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
+			return err
+		}
 		val, err := sec.resolveRuleValue(rule)
 		if err != nil {
 			return err
@@ -128,9 +131,18 @@ func (c *Compiled) applyOneRequest(i int, rule Rule, out *RequestResult, sec *ap
 		out.Header.Set(rule.Name, val)
 		out.HitRules = append(out.HitRules, name)
 	case KindDeleteHeader:
+		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
+			return err
+		}
 		out.Header.Del(rule.Name)
 		out.HitRules = append(out.HitRules, name)
 	case KindRenameHeader:
+		if err := rejectForbiddenHeaderField(rule.From); err != nil {
+			return err
+		}
+		if err := rejectForbiddenHeaderField(rule.To); err != nil {
+			return err
+		}
 		vals := out.Header.Values(rule.From)
 		if len(vals) == 0 {
 			return nil
@@ -263,6 +275,9 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *
 	name := "r" + strconv.Itoa(i) + ":" + rule.Kind
 	switch rule.Kind {
 	case KindSetHeader:
+		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
+			return err
+		}
 		val, err := sec.resolveRuleValue(rule)
 		if err != nil {
 			return err
@@ -273,9 +288,18 @@ func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *
 		out.Header.Set(rule.Name, val)
 		out.HitRules = append(out.HitRules, name)
 	case KindDeleteHeader:
+		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
+			return err
+		}
 		out.Header.Del(rule.Name)
 		out.HitRules = append(out.HitRules, name)
 	case KindRenameHeader:
+		if err := rejectForbiddenHeaderField(rule.From); err != nil {
+			return err
+		}
+		if err := rejectForbiddenHeaderField(rule.To); err != nil {
+			return err
+		}
 		vals := out.Header.Values(rule.From)
 		if len(vals) == 0 {
 			return nil
