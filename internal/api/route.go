@@ -106,6 +106,10 @@ func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// §9.2 / Forget：删掉 SQL 行不够。内存 RouteHealth / RecoveryGate /
+	// Capability 仍按 id 索引；若不 Forget，调度器 RetainOnly 之前（或 id
+	// 被复用时）新行会继承 StateDead / 旧 capability。
+	s.invalidateRoute(id)
 	s.log.Info("删除 route", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
