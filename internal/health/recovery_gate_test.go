@@ -61,3 +61,39 @@ func TestRecoveryGateConcurrent(t *testing.T) {
 		t.Fatal("expected at least one winner")
 	}
 }
+
+// Forget 后迟到的 release 不得清掉同 id 新持有者的闸，也不得把计数弄成
+// 「空闸可再 acquire 却实际仍有旧语义」的错乱。
+func TestRecoveryGate_ReleaseAfterForgetDoesNotPoisonReusedID(t *testing.T) {
+	g := NewRecoveryGate()
+	const id int64 = 11
+
+	oldRel, ok := g.TryAcquire(id)
+	if !ok {
+		t.Fatal("acquire before forget")
+	}
+	g.Forget(id)
+	if g.InFlight(id) {
+		t.Fatal("Forget should drop the slot")
+	}
+	oldRel() // no-op: nothing held
+	if g.InFlight(id) {
+		t.Fatal("stale release must not re-create a held slot")
+	}
+
+	newRel, ok := g.TryAcquire(id)
+	if !ok {
+		t.Fatal("reused id must acquire fresh gate")
+	}
+	oldRel()
+	if !g.InFlight(id) {
+		t.Fatal("stale release cleared the new holder's RecoveryGate")
+	}
+	if _, ok := g.TryAcquire(id); ok {
+		t.Fatal("single-flight broken after stale release on reused id")
+	}
+	newRel()
+	if g.InFlight(id) {
+		t.Fatal("live release should clear")
+	}
+}

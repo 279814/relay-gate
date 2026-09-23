@@ -236,6 +236,9 @@ func applyJitter(base time.Duration, factor float64) time.Duration {
 // 不清理的话 map 会随「反复增删 Route」单调增长。虽然量级很小
 // （每个 Route 一个小结构体），但删掉的 Route 若 ID 被复用，
 // 残留的失败计数会被新 Route 继承 —— 那是个说不清的 bug。
+//
+// 在途请求的 release 闭包在 Forget 之后必须是 no-op（见 TryAcquire）：
+// 既不能经 get() 重建行，也不能按 id 去减同 id 新 Route 的 inFlight。
 func (t *Tracker) Forget(routeID int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

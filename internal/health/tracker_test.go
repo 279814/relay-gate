@@ -214,6 +214,84 @@ func TestTracker_TryAcquireNoOversubscribeUnderRace(t *testing.T) {
 	}
 }
 
+// Forget 后迟到的 release 不得按 id 再减：否则同 id 新 Route 的额度会被旧
+// 请求偷走，max_concurrency=1 时会出现双开。也不该经 get() 重建健康行。
+func TestTracker_ReleaseAfterForgetDoesNotPoisonReusedID(t *testing.T) {
+	tr := NewTracker(nil)
+	const id int64 = 42
+
+	oldRel, ok := tr.TryAcquire(id, 1)
+	if !ok {
+		t.Fatal("acquire before forget")
+	}
+	tr.Report(Report{RouteID: id, Verdict: VerdictUnavailable, Source: SourceL2})
+	tr.Forget(id)
+	if tr.State(id) != model.StateUnknown {
+		t.Fatalf("forgotten route should read unknown, got %s", tr.State(id))
+	}
+	if tr.InFlight(id) != 0 {
+		t.Fatalf("forgotten route inflight=%d want 0", tr.InFlight(id))
+	}
+
+	// 迟到 release：无条目时必须 no-op，不能 create 出新行。
+	oldRel()
+	if tr.State(id) != model.StateUnknown {
+		t.Fatalf("stale release must not recreate health row, state=%s", tr.State(id))
+	}
+	if _, exists := tr.state[id]; exists {
+		t.Fatal("stale release must not insert a routeState for a forgotten id")
+	}
+
+	// 同 id 新 Route 占位后，旧 release（已 once）与第二次「假想」路径都已耗尽；
+	// 再 acquire 一个新的并确认旧闭包不会让计数穿零或超发。
+	newRel, ok := tr.TryAcquire(id, 1)
+	if !ok {
+		t.Fatal("reused id must acquire a fresh slot")
+	}
+	if tr.InFlight(id) != 1 {
+		t.Fatalf("new route inflight=%d want 1", tr.InFlight(id))
+	}
+	oldRel() // once 已跑过；即便再调也不得动新计数
+	if tr.InFlight(id) != 1 {
+		t.Fatalf("stale release poisoned reused id: inflight=%d", tr.InFlight(id))
+	}
+	if _, ok := tr.TryAcquire(id, 1); ok {
+		t.Fatal("reused id with limit=1 must stay single-flight while new holder is live")
+	}
+	if tr.State(id) == model.StateDead {
+		t.Fatal("reused id must not inherit prior dead health")
+	}
+	newRel()
+	if tr.InFlight(id) != 0 {
+		t.Fatalf("live release should clear, inflight=%d", tr.InFlight(id))
+	}
+}
+
+// 更尖锐：Forget 后同 id 已重新占位，此时才调旧 release —— 必须仍是 no-op。
+func TestTracker_StaleReleaseAfterReuseDoesNotUndercount(t *testing.T) {
+	tr := NewTracker(nil)
+	const id int64 = 7
+
+	oldRel, ok := tr.TryAcquire(id, 1)
+	if !ok {
+		t.Fatal("old acquire")
+	}
+	tr.Forget(id)
+
+	newRel, ok := tr.TryAcquire(id, 1)
+	if !ok {
+		t.Fatal("new acquire on reused id")
+	}
+	oldRel()
+	if got := tr.InFlight(id); got != 1 {
+		t.Fatalf("stale release undercounted reused id: inflight=%d want 1", got)
+	}
+	if _, ok := tr.TryAcquire(id, 1); ok {
+		t.Fatal("limit=1 oversubscribed after stale release")
+	}
+	newRel()
+}
+
 // Snapshot 是副本，改它不能影响内部状态。
 func TestTracker_SnapshotIsCopy(t *testing.T) {
 	tr := NewTracker(nil)
