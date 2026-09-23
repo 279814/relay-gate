@@ -4,12 +4,6 @@ import (
 	"bytes"
 )
 
-// maxSniffLine 是嗅探器单行上限。
-//
-// 与 §15 / 资源上限里的「单个 SSE 事件」同量级。超长行多半是异常或恶意输入，
-// 为嗅探撑住整行会把内存交给上游；丢掉这一行最多漏判，假阳性更糟。
-const maxSniffLine = 256 << 10
-
 // streamErrorSniffer 在 2xx SSE 流上增量嗅探协议错误事件（§6.8 / §8.12）。
 //
 // 与 classifySSEPrefix 的差异：重试侧「先看到内容就收手」（字节已在写给
@@ -18,6 +12,11 @@ const maxSniffLine = 256 << 10
 //
 // 判据与 errorpayload 一致：只认 `event: error` 与顶层结构化 error 载荷，
 // 绝不子串匹配正文里的 "error"。Feed 放在客户端 flush 之后，不推迟写出。
+//
+// 行缓冲与 sample 共用 maxErrBodyCapture：与 streamBody / captureDrain 的
+// ErrBody 上限一致。超长无换行流或单行若无界攒副本，会在客户端已 Flush
+// 后仍占住整段响应；丢掉超限行最多漏判，假阳性更糟（与 classify 对截断
+// 半截 JSON 返回 undecided 同一方向）。
 type streamErrorSniffer struct {
 	lineBuf  []byte
 	curEvent []byte
@@ -34,11 +33,18 @@ func (s *streamErrorSniffer) Feed(chunk []byte) {
 	for {
 		i := bytes.IndexByte(s.lineBuf, '\n')
 		if i < 0 {
-			if len(s.lineBuf) > maxSniffLine {
+			if len(s.lineBuf) > maxErrBodyCapture {
 				s.lineBuf = s.lineBuf[:0]
 				s.curEvent = nil
 			}
 			return
+		}
+		if i > maxErrBodyCapture {
+			// 整行已超过 ErrBody 上限：丢弃本行并继续同步，不把超限载荷
+			// 交给分类（与有界前缀截断后半截 JSON → undecided 同向 fail closed）。
+			s.lineBuf = s.lineBuf[i+1:]
+			s.curEvent = nil
+			continue
 		}
 		line := s.lineBuf[:i]
 		s.lineBuf = s.lineBuf[i+1:]

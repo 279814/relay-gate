@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -80,11 +81,61 @@ func TestStreamErrorSniffer_IgnoresCommentAndPing(t *testing.T) {
 
 func TestStreamErrorSniffer_DropsOverlongLine(t *testing.T) {
 	s := &streamErrorSniffer{}
-	s.Feed([]byte("data: " + strings.Repeat("x", maxSniffLine+10)))
+	over := []byte("data: " + strings.Repeat("x", maxErrBodyCapture+10))
+	s.Feed(over)
+	if len(s.lineBuf) > maxErrBodyCapture {
+		t.Fatalf("lineBuf must not retain past maxErrBodyCapture, got %d", len(s.lineBuf))
+	}
 	s.Feed([]byte("\n"))
+	if len(s.lineBuf) != 0 {
+		t.Fatalf("after overlong resync, lineBuf must be empty, got %d", len(s.lineBuf))
+	}
 	// 超长行被丢弃；随后的真错误仍应能识别。
 	s.Feed([]byte("event: error\ndata: {\"type\":\"error\"}\n\n"))
 	if !s.Found() {
 		t.Fatal("after dropping overlong line, later error event must still match")
+	}
+}
+
+func TestStreamErrorSniffer_OverlongLineDoesNotRetainTail(t *testing.T) {
+	s := &streamErrorSniffer{}
+	// 单 chunk 内带换行的超长行：不得为分类保留尾部，也不得把超限 data 当成错误。
+	line := "data: {\"error\":{\"message\":\"" + strings.Repeat("z", maxErrBodyCapture) + "\"}}\n"
+	chunk := []byte(line)
+	orig := append([]byte(nil), chunk...)
+	s.Feed(chunk)
+	if !bytes.Equal(chunk, orig) {
+		t.Fatal("Feed must not mutate caller chunk (client bytes already flushed)")
+	}
+	if len(s.lineBuf) > maxErrBodyCapture {
+		t.Fatalf("lineBuf retained %d bytes past cap", len(s.lineBuf))
+	}
+	if s.Found() {
+		t.Fatalf("over-cap error-shaped line must fail closed, sample=%q", s.Sample())
+	}
+	if got := s.Sample(); got != nil {
+		t.Fatalf("Sample must stay nil on over-cap drop, got %q", got)
+	}
+}
+
+func TestStreamErrorSniffer_NormalErrorUnderCap(t *testing.T) {
+	s := &streamErrorSniffer{}
+	frame := []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n")
+	if len(frame) > maxErrBodyCapture {
+		t.Fatalf("test frame must be under cap, got %d", len(frame))
+	}
+	orig := append([]byte(nil), frame...)
+	s.Feed(frame)
+	if !bytes.Equal(frame, orig) {
+		t.Fatal("Feed must not mutate caller chunk")
+	}
+	if !s.Found() {
+		t.Fatal("normal-sized event: error under cap must set sample")
+	}
+	if len(s.Sample()) == 0 || len(s.Sample()) > maxErrBodyCapture {
+		t.Fatalf("sample length %d outside (0, maxErrBodyCapture]", len(s.Sample()))
+	}
+	if !IsStructuredErrorPayload(s.Sample(), "text/event-stream") {
+		t.Fatalf("sample must classify as structured error, got %q", s.Sample())
 	}
 }
