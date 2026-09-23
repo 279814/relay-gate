@@ -14,7 +14,7 @@
 |---|---|---|
 | P0 | docs/04 | 探活基础门禁至 P0-17 schema3 cutover / 离线 restore（PR #57） |
 | P1 | docs/05 | RecoveryGate、RetryPolicy、duplicate_risk DB 列、重复 model、语义失效、count_tokens 多 Route、Lazy 恢复（PR #58 / #64） |
-| P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；**续期可观测** `RenewWatch`（成功/失败/reload 保留旧证/剩余有效期告警，本地 fake）；Runtime Controller **maintenance 叠加态 + 暖机进度**；首次凭据 **bootstrap journal**；旧环境变量 **migration journal**、**reset-admin**、登录/Bearer **Argon2id**（仍兼容 env 明文）；启动时可从 **keyring / bootstrap-credentials** 加载 ENCRYPTION_KEY / RELAY_KEYS（env 优先）；**未**签发真实公网证书 |
+| P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；**续期可观测** `RenewWatch`（成功/失败/reload 保留旧证/剩余有效期告警，本地 fake）；Runtime Controller **maintenance 叠加态 + 暖机进度**；首次凭据 **bootstrap journal**；旧环境变量 **migration journal**、**reset-admin**、登录/Bearer **Argon2id**（仍兼容 env 明文）；启动时可从 **keyring / bootstrap-credentials** 加载 ENCRYPTION_KEY / RELAY_KEYS（env 优先；未完成 journal 拒绝启动）；**未**签发真实公网证书 |
 | P3 | docs/07 | 被动扫描旁路、SMTP 假服务器、Active 手动 canary、finding 持久化、Security Center 模块（PR #60 / #66） |
 | P4 | docs/08 | 声明式编译器/API（PR #61）；schema 6 持久化 + proxy 请求/响应/SSE（PR #67 / #68 / #71）；UI（PR #73）；JSON Patch；body_template；Secret 污点；执行预算二次确认审计 |
 | P5 | docs/09 | 离线发布门禁 `check-p5` + 本说明；旧 sample 信封迁移（PR #69 / #72） |

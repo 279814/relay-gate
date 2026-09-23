@@ -35,6 +35,40 @@ func HasAdminHash(dataDir string) bool {
 	return err == nil && doc.AdminPasswordHash != ""
 }
 
+// ErrMigrationIncomplete tells the long-running server to refuse start until
+// credentials migrate finishes (imported → completed).
+var ErrMigrationIncomplete = errors.New("凭据未完成 migrate；请运行: relay-gate credentials migrate")
+
+// RefuseIncompleteJournals blocks long-running start when a bootstrap or
+// migration journal exists but has not reached its terminal phase (§12.3 / §12.8).
+//
+// Without this gate, credentials_persisted / imported artifacts under
+// data/secrets/ would satisfy config.Load while plaintext was never delivered
+// (or migration never completed) — leaving live Relay Keys and admin hashes
+// the operator cannot recover except by guessing.
+func RefuseIncompleteJournals(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	boot := &Bootstrap{DataDir: dataDir}
+	bphase, err := boot.Phase()
+	if err != nil {
+		return err
+	}
+	if bphase != "" && bphase != PhaseDisplayed {
+		return fmt.Errorf("%w（bootstrap journal 阶段=%s）", ErrBootstrapIncomplete, bphase)
+	}
+	mig := &Migration{DataDir: dataDir}
+	mphase, err := mig.Phase()
+	if err != nil {
+		return err
+	}
+	if mphase != "" && mphase != MigPhaseCompleted {
+		return fmt.Errorf("%w（migration journal 阶段=%s）", ErrMigrationIncomplete, mphase)
+	}
+	return nil
+}
+
 // LoadPersistedFile reads bootstrap-credentials.json without requiring journal phase.
 func LoadPersistedFile(dataDir string) (Persisted, error) {
 	raw, err := os.ReadFile(CredentialsFile(dataDir))

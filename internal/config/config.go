@@ -57,8 +57,14 @@ func (c *Config) DataDir() string {
 // Precedence: a non-empty environment variable always wins over on-disk
 // bootstrap/migrate artifacts. Existing env-only deployments are unchanged.
 // Secret bytes are never included in returned errors.
+//
+// Incomplete bootstrap/migration journals refuse start even when files exist
+// (§12.3 / §12.8): undelivered credentials must not satisfy long-running Load.
 func (c *Config) fillFromSecretsArtifacts() error {
 	dataDir := c.DataDir()
+	if err := credential.RefuseIncompleteJournals(dataDir); err != nil {
+		return err
+	}
 	if c.EncKey == "" {
 		_, master, err := keyring.Open(dataDir).LoadActive()
 		switch {
