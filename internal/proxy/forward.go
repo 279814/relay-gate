@@ -107,15 +107,12 @@ type Result struct {
 	HeadersSent bool
 	Err         error
 
-	// ErrBody 是响应体的开头若干字节，**仅在 Status >= 400 时**填充。
+	// ErrBody 是响应体的开头若干字节，供健康判定：
+	//   - Status >= 400：始终填充；
+	//   - Status 2xx 且载荷为结构化 error（§8.12）：也填充，否则
+	//     classifyReal 会按 200 判活并 piggyback。
 	//
-	// 健康判定需要它：401 与 500 都是「失败」，但一个要立即判死并提示用户
-	// 改配置，另一个等它自己恢复（§4.3）。而「模型不存在」与「参数不合法」
-	// 同为 400，区别只在 body 里的那几个关键词 —— 没有 body 就只能一律
-	// 按最保守的方式处理，等于放弃了致命类的快速判定。
-	//
-	// 只在错误时收集是刻意的：正常响应可能是几 MB 的 SSE 流，为了健康判定
-	// 攒一份副本纯属浪费；而错误响应通常只有几百字节。
+	// 正常成功响应不攒副本：可能是几 MB 的 SSE 流。
 	ErrBody []byte
 }
 
@@ -428,6 +425,18 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 
+	// §8.12：HTTP 200 结构化 error 不得按 200 判活。Commit 路径不会走
+	// captureDrain，必须在这里把已确认的错误前缀留给健康回写。
+	if res.Status >= 200 && res.Status < 400 && len(res.ErrBody) == 0 {
+		ct := ""
+		if res.RespHeaders != nil {
+			ct = res.RespHeaders.Get("Content-Type")
+		}
+		if IsStructuredErrorPayload(at.peeked, ct) {
+			res.ErrBody = append([]byte(nil), at.peeked...)
+		}
+	}
+
 	// 预读走的字节要接回流的最前面。漏掉它就是**静默吞掉响应的开头** ——
 	// 客户端收到的 SSE 少了 message_start，或 JSON 少了左半边。
 	var src io.Reader = at.resp.Body
@@ -491,9 +500,19 @@ const discardDrainLimit = 4 << 10
 // 在「有没有走重试」两条路径上会给出不同长度的 last_error，
 // 而那正是 UI 上用来比对的字段。
 func (at *Attempt) captureDrain() {
-	// 只有错误响应才留。被丢弃的 200（载荷是 error）走不到健康判定的
-	// ErrBody 分支，攒了也没人看。
-	if at.res.Status < 400 || len(at.res.ErrBody) > 0 {
+	if len(at.res.ErrBody) > 0 {
+		io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
+		return
+	}
+
+	ct := ""
+	if at.res.RespHeaders != nil {
+		ct = at.res.RespHeaders.Get("Content-Type")
+	}
+	// 4xx/5xx 与「200 但载荷是结构化 error」都要留给健康判定（§8.12）。
+	// 普通 2xx 成功响应不攒副本。
+	keep := at.res.Status >= 400 || IsStructuredErrorPayload(at.peeked, ct)
+	if !keep {
 		io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
 		return
 	}
