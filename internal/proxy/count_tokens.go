@@ -75,8 +75,12 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		}
 		cand = wrapped
 		tried[cand.Route.ID] = true
-		reason := h.proxyCountTokens(w, r, pre, cand)
-		cand.Release()
+		// §9.4: Release on panic after acquire (defer runs while unwinding;
+		// do not recover here — panic must not start another upstream attempt).
+		reason := func() string {
+			defer cand.Release()
+			return h.proxyCountTokens(w, r, pre, cand)
+		}()
 		if reason == "" {
 			return true
 		}
