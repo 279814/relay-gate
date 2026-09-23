@@ -16,6 +16,11 @@ const (
 	longDeadL2Short = 30 * time.Second
 	longDeadL2Mid   = 120 * time.Second
 	longDeadL2Long  = 300 * time.Second
+	// aliveL1IntervalFloor：§8.10 reachable Upstream /models 默认间隔。
+	// 存库/内存里若为 0 或负值，每个 tick 都会发合成 L1；按下限钳回，不另发明更严的数。
+	aliveL1IntervalFloor = 60 * time.Second
+	// deadL1IntervalFloor：§8.10 unreachable 连接恢复检查默认间隔。
+	deadL1IntervalFloor = 20 * time.Second
 	// aliveL2IntervalFloor：§8.10 alive Route L2 默认间隔。
 	// 存库/内存里若为 0 或负值，每个 tick 都会发合成 L2；按下限钳回，不另发明更严的数。
 	aliveL2IntervalFloor = 600 * time.Second
@@ -28,15 +33,35 @@ const (
 func intervalFor(rs *routeState, s model.Settings, now time.Time) (l1, l2 time.Duration) {
 	switch rs.state {
 	case model.StateDead:
-		l1 = time.Duration(s.L1IntervalDeadSec) * time.Second
+		l1 = deadL1Interval(s)
 		l2 = deadL2Interval(rs, s, now)
 	case model.StateAlive:
-		l1 = time.Duration(s.L1IntervalAliveSec) * time.Second
+		l1 = aliveL1Interval(s)
 		l2 = aliveL2Interval(s)
 	default: // unknown：立即探，两级都要
 		return 0, 0
 	}
 	return l1, l2
+}
+
+// aliveL1Interval 返回 alive/reachable 的合成 L1（/models）间隔（§8.10）。
+// 正数配置原样采用；0/负值钳到文档默认 60s，避免每个调度 tick 连发探活。
+func aliveL1Interval(s model.Settings) time.Duration {
+	base := time.Duration(s.L1IntervalAliveSec) * time.Second
+	if base <= 0 {
+		return aliveL1IntervalFloor
+	}
+	return base
+}
+
+// deadL1Interval 返回 dead/unreachable 的连接恢复检查间隔（§8.10）。
+// 正数配置原样采用；0/负值钳到文档默认 20s。
+func deadL1Interval(s model.Settings) time.Duration {
+	base := time.Duration(s.L1IntervalDeadSec) * time.Second
+	if base <= 0 {
+		return deadL1IntervalFloor
+	}
+	return base
 }
 
 // aliveL2Interval 返回 alive Route 的合成 L2 间隔（§8.10）。

@@ -297,6 +297,54 @@ func TestClaim_IsAtomicAndPreventsDoubleProbe(t *testing.T) {
 	}
 }
 
+// alive L1（/models）：存库间隔为 0 或负值时仍至少等 §8.10 的 60s，不能每个 tick 连发。
+func TestClaim_AliveL1ZeroOrNegativeUsesDocFloor(t *testing.T) {
+	for _, interval := range []int{0, -30} {
+		t.Run(strconv.Itoa(interval), func(t *testing.T) {
+			tr, fs, now := newTestTracker(t)
+			fs.s.OKThreshold = 1
+			fs.s.L1IntervalAliveSec = interval
+
+			report(tr, 1, VerdictOK, SourceL1) // → alive
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatal("首次应到期")
+			}
+			*now = now.Add(59 * time.Second)
+			if _, ok := tr.ClaimL1(1); ok {
+				t.Fatalf("interval=%d 仍须遵守 §8.10 的 60s 下限，59s 不应再探", interval)
+			}
+			*now = now.Add(2 * time.Second) // 累计 61s
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatalf("超过 60s 后应到期，interval=%d", interval)
+			}
+		})
+	}
+}
+
+// dead L1（连接恢复检查）：存库间隔为 0 或负值时仍至少等 §8.10 的 20s。
+func TestClaim_DeadL1ZeroOrNegativeUsesDocFloor(t *testing.T) {
+	for _, interval := range []int{0, -30} {
+		t.Run(strconv.Itoa(interval), func(t *testing.T) {
+			tr, fs, now := newTestTracker(t)
+			fs.s.FailThreshold = 1
+			fs.s.L1IntervalDeadSec = interval
+
+			report(tr, 1, VerdictUnavailable, SourceL2) // → dead
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatal("首次应到期")
+			}
+			*now = now.Add(19 * time.Second)
+			if _, ok := tr.ClaimL1(1); ok {
+				t.Fatalf("interval=%d 仍须遵守 §8.10 的 20s 下限，19s 不应再探", interval)
+			}
+			*now = now.Add(2 * time.Second) // 累计 21s
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatalf("超过 20s 后应到期，interval=%d", interval)
+			}
+		})
+	}
+}
+
 // alive L2：存库间隔为 0 或负值时仍至少等 §8.10 的 600s，不能每个 tick 连发。
 func TestClaim_AliveL2ZeroOrNegativeUsesDocFloor(t *testing.T) {
 	for _, interval := range []int{0, -30} {
