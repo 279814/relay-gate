@@ -292,6 +292,11 @@ func (s *Scheduler) attachExpectations(ctx context.Context, req *ExecutionReques
 	}
 	req.ReachabilityExpectation, req.ReachabilityPolicy = reach, reachPol
 	req.CapabilityExpectation, req.CapabilityPolicy = cap, capPol
+	timeout := recipe.TimeoutProfile
+	if timeout == "" {
+		timeout = model.TimeoutL2Standard
+	}
+	req.Budget = outbound.L2BudgetForProfile(snap.Settings, timeout)
 	_ = mn
 }
 

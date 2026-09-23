@@ -35,10 +35,6 @@ func BuildCapabilityEvidencePolicy(settings model.Settings, selector model.Evide
 	if err != nil {
 		return model.CapabilityEvidencePolicy{}, err
 	}
-	if selector.TimeoutProfile == model.TimeoutL2LongThink && stages.FirstSemantic < int64(model.MinRealFirstSemanticSec)*1000 {
-		return model.CapabilityEvidencePolicy{}, model.WrapValidation(
-			"l2_long_thinking first_semantic 不得低于 %d 秒", model.MinRealFirstSemanticSec)
-	}
 	return model.CapabilityEvidencePolicy{
 		Selector:            selector,
 		Stages:              stages,
@@ -137,6 +133,18 @@ func stageBudget(settings model.Settings, selector model.EvidencePolicySelector)
 			return model.StageBudgetMS{}, err
 		}
 		*value.target = milliseconds
+	}
+	// 原生长思考档：first_semantic 硬下限 5 分钟（§7.4）。标准档可更短；
+	// 这里抬高而不是拒掉，避免「policy 建失败 → expectation 跳过 → 仍用短
+	// L2Budget 出网」的静默缩短。
+	if selector.Kind == model.EvidenceL2 && selector.TimeoutProfile == model.TimeoutL2LongThink {
+		floor := int64(model.MinRealFirstSemanticSec) * 1000
+		if stages.FirstSemantic < floor {
+			stages.FirstSemantic = floor
+		}
+		if stages.Total < stages.FirstSemantic {
+			stages.Total = stages.FirstSemantic
+		}
 	}
 	if stages.Connect > stages.Total || stages.ResponseHeader > stages.Total || stages.FirstByte > stages.Total ||
 		stages.FirstEvent > stages.Total || stages.FirstSemantic > stages.Total {

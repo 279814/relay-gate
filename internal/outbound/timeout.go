@@ -61,6 +61,9 @@ func L1Budget(settings model.Settings) Budget {
 // 与真实请求**完全独立**，这正是「容忍长思考」与「快速判死」能同时成立的
 // 原因：L2 只等 300 秒就判死，而真实请求可以等 1200 秒。共用一份的话，
 // 想让死站更快被发现就必然砍掉正常的长思考。
+//
+// 标准最小配方可以配得更短；原生长思考档必须走 L2BudgetForProfile，
+// 否则会静默用上低于 5 分钟的 first_semantic（§7.4）。
 func L2Budget(settings model.Settings) Budget {
 	return Budget{
 		Connect:       seconds(settings.L2ConnectSec),
@@ -71,6 +74,33 @@ func L2Budget(settings model.Settings) Budget {
 		Idle:          seconds(settings.L2IdleSec),
 		Total:         seconds(settings.L2TotalSec),
 	}
+}
+
+// L2BudgetForProfile 按超时档取出 L2 预算。
+//
+// l2_long_thinking 的 first_semantic 不得低于 MinRealFirstSemanticSec（5 分钟）：
+// 普通 l2_standard 仍可用更短观察窗，但长思考档不能静默继承那个短值。
+// Total 若短于抬高后的 first_semantic，一并抬到同一下限，否则阶段上限越过 total。
+func L2BudgetForProfile(settings model.Settings, profile model.ProbeTimeoutProfile) Budget {
+	return ApplyLongThinkFirstSemanticFloor(L2Budget(settings), profile)
+}
+
+// ApplyLongThinkFirstSemanticFloor 在预算已算好后按超时档补齐长思考硬下限。
+//
+// Executor 在解析出配方 TimeoutProfile 后再调用一次：调用方若只传了 L2Budget
+// （不知道档位），这里仍能挡住「长思考探活却只等不到 5 分钟」的静默缩短。
+func ApplyLongThinkFirstSemanticFloor(budget Budget, profile model.ProbeTimeoutProfile) Budget {
+	if profile != model.TimeoutL2LongThink {
+		return budget
+	}
+	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
+	if budget.FirstSemantic < floor {
+		budget.FirstSemantic = floor
+	}
+	if budget.Total < budget.FirstSemantic {
+		budget.Total = budget.FirstSemantic
+	}
+	return budget
 }
 
 // CountTokensBudget 是 count_tokens 的预算。

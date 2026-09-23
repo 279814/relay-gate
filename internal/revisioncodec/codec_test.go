@@ -136,13 +136,21 @@ func TestEvidencePolicySelectorRejectsInvalidCombinations(t *testing.T) {
 	longThink := model.EvidencePolicySelector{
 		Kind: model.EvidenceL2, Endpoint: model.EndpointMessages, TimeoutProfile: model.TimeoutL2LongThink,
 	}
-	if _, err := BuildCapabilityEvidencePolicy(settings, longThink); err == nil {
-		t.Fatal("long-thinking policy below 300 seconds accepted")
+	longPolicy, err := BuildCapabilityEvidencePolicy(settings, longThink)
+	if err != nil {
+		t.Fatalf("long-thinking policy should raise to the floor, not reject: %v", err)
+	}
+	if got, want := longPolicy.Stages.FirstSemantic, int64(model.MinRealFirstSemanticSec)*1000; got != want {
+		t.Fatalf("long-thinking first_semantic = %d, want floor %d", got, want)
 	}
 	standard := longThink
 	standard.TimeoutProfile = model.TimeoutL2Standard
-	if _, err := BuildCapabilityEvidencePolicy(settings, standard); err != nil {
+	standardPolicy, err := BuildCapabilityEvidencePolicy(settings, standard)
+	if err != nil {
 		t.Fatalf("standard policy may use a shorter semantic budget: %v", err)
+	}
+	if got, want := standardPolicy.Stages.FirstSemantic, int64(299)*1000; got != want {
+		t.Fatalf("standard first_semantic = %d, want configured %d", got, want)
 	}
 }
 

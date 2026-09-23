@@ -459,12 +459,11 @@ func (s *CalibrationService) sendCandidate(ctx context.Context, run *model.Calib
 			settings = loaded
 		}
 	}
-	budget := outbound.L2Budget(settings)
-
 	timeout := version.TimeoutProfile
 	if timeout == "" {
 		timeout = model.TimeoutL2Standard
 	}
+	budget := outbound.L2BudgetForProfile(settings, timeout)
 	selector := model.EvidencePolicySelector{
 		Kind: model.EvidenceL2, Endpoint: run.Endpoint, TimeoutProfile: timeout,
 	}

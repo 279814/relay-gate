@@ -196,6 +196,44 @@ func TestBudgets_ProbeTimeoutsDoNotAffectReal(t *testing.T) {
 	}
 }
 
+// 原生长思考 L2 不得继承标准档可配的短 first_semantic（§7.4）。
+func TestL2BudgetForProfile_LongThinkRaisesFirstSemanticFloor(t *testing.T) {
+	settings := model.DefaultSettings()
+	settings.L2FirstSemanticSec = 120
+	settings.L2FirstTokenSec = 120
+	settings.L2TotalSec = 600
+
+	standard := L2BudgetForProfile(settings, model.TimeoutL2Standard)
+	if standard.FirstSemantic != 120*time.Second {
+		t.Fatalf("standard may keep a short semantic window: got %v", standard.FirstSemantic)
+	}
+
+	longThink := L2BudgetForProfile(settings, model.TimeoutL2LongThink)
+	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
+	if longThink.FirstSemantic != floor {
+		t.Fatalf("long-thinking first_semantic = %v, want floor %v", longThink.FirstSemantic, floor)
+	}
+	if longThink.Total != 600*time.Second {
+		t.Fatalf("total should stay when already covering the floor: got %v", longThink.Total)
+	}
+
+	settings.L2TotalSec = 200
+	raised := L2BudgetForProfile(settings, model.TimeoutL2LongThink)
+	if raised.FirstSemantic != floor || raised.Total != floor {
+		t.Fatalf("total shorter than floor must rise with first_semantic: got semantic=%v total=%v",
+			raised.FirstSemantic, raised.Total)
+	}
+
+	// 调用方已算出短预算、事后才知道档位：仍须补齐，不能静默更短。
+	short := L2Budget(settings)
+	if got := ApplyLongThinkFirstSemanticFloor(short, model.TimeoutL2LongThink); got.FirstSemantic != floor {
+		t.Fatalf("ApplyLongThinkFirstSemanticFloor = %v, want %v", got.FirstSemantic, floor)
+	}
+	if got := ApplyLongThinkFirstSemanticFloor(short, model.TimeoutL2Standard); got.FirstSemantic != short.FirstSemantic {
+		t.Fatalf("standard profile must not raise: got %v", got.FirstSemantic)
+	}
+}
+
 // ── 剩余预算夹取（重试路径要用）────────────────────────────
 
 // 一次客户端请求的多次尝试共享同一份总预算。不夹的话，3 次尝试各拿一份
