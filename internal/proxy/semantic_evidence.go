@@ -76,7 +76,15 @@ func jsonBytesHaveSemanticEvidence(b []byte) bool {
 }
 
 func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
+	// 与 classifyJSONObject 同向：顶层结构化 error 不得因伴生 text/content/
+	// choices 被当成语义成功（§6.8 / §8.8 / §8.12）。
+	if v, ok := top["error"]; ok && !isJSONNull(v) {
+		return false
+	}
 	name := jsonStringField(top, "type")
+	if name == "error" {
+		return false
+	}
 
 	// Anthropic streaming deltas.
 	if name == "content_block_delta" {
