@@ -204,6 +204,22 @@ func TestRouteValidate(t *testing.T) {
 	}
 }
 
+// 空 / 仅空白 name 必须在写入时拒绝：prefix + "" 会匹配任意入站 model。
+func TestModelNameValidate_RejectsEmptyName(t *testing.T) {
+	for _, name := range []string{"", " ", "\t", "  \n"} {
+		m := &ModelName{Name: name, Protocol: ProtoAnthropic, MatchMode: MatchPrefix}
+		m.Defaults()
+		if err := m.Validate(); err == nil {
+			t.Errorf("name %q 应被拒绝", name)
+		}
+	}
+	ok := &ModelName{Name: "claude-", Protocol: ProtoAnthropic, MatchMode: MatchPrefix}
+	ok.Defaults()
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("非空前缀应合法：%v", err)
+	}
+}
+
 func TestRouteDefaults(t *testing.T) {
 	r := &Route{ModelNameID: 1, UpstreamID: 1}
 	r.Defaults()
