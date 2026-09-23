@@ -527,6 +527,74 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 	}
 }
 
+// Delete ModelName cascades child Routes in SQL; invalidate must run first so
+// RoutesOfModelName still returns those ids for Semantic Forget.
+func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	gate := health.NewRecoveryGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
+	inner := &recordingInvalidator{}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfModelName: func(modelNameID int64) []int64 {
+			routes, err := s.st.ListRoutes(modelNameID)
+			if err != nil {
+				return nil
+			}
+			ids := make([]int64, 0, len(routes))
+			for _, rt := range routes {
+				ids = append(ids, rt.ID)
+			}
+			return ids
+		},
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h, `{"name":"del-mn-u","base_url":"https://c.example.com","api_key":"sk-cccccccccccc"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"del-mn-m","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name 失败：%s", rec.Body.String())
+	}
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route 失败：%s", rec.Body.String())
+	}
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	if tr.State(rtID) != model.StateDead {
+		t.Fatalf("setup state=%s want dead", tr.State(rtID))
+	}
+	if _, ok := gate.TryAcquire(rtID); !ok {
+		t.Fatal("setup: acquire RecoveryGate")
+	}
+
+	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnID), "", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("删除 model_name 失败 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("delete model_name 后 child RouteHealth=%s want unknown", got)
+	}
+	if gate.InFlight(rtID) {
+		t.Fatal("delete model_name 后 RecoveryGate 槽必须释放")
+	}
+	if !caps.has(rtID) {
+		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	}
+	_, _, mns := inner.counts()
+	if mns < 1 {
+		t.Fatal("delete model_name 应调用 InvalidateModelName")
+	}
+}
+
 type recordingCaps struct {
 	cleared []int64
 }

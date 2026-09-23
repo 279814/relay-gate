@@ -85,6 +85,11 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// Invalidate before DELETE: RoutesOfModelName reads the live SQL table, and
+	// ON DELETE CASCADE removes child Routes with the ModelName. After delete,
+	// SemanticConfigInvalidator would see zero route IDs and leave their
+	// RouteHealth / RecoveryGate / Capability in memory (§9.2).
+	s.invalidateModelName(id)
 	if err := s.st.DeleteModelName(id); err != nil {
 		s.writeErr(w, err)
 		return
