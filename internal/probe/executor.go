@@ -304,7 +304,9 @@ func (t *sendTiming) applyTrace(trace *outbound.Trace) {
 
 // send 执行单次 RoundTrip 与分阶段读流。
 func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *preparedProbe) (ExecutionResult, error) {
-	budget := req.Budget
+	// 配方档位在 prepare 之后才确定：这里再补一次长思考 first_semantic 硬下限，
+	// 挡住调用方只塞了 L2Budget（标准短窗）却跑 l2_long_thinking 的静默缩短。
+	budget := outbound.ApplyLongThinkFirstSemanticFloor(req.Budget, prepared.recipe.TimeoutProfile)
 
 	// 取连接池：网络身份含 connect 预算（§7.3）。
 	network := outbound.NetworkFor(req.Upstream.ProbeConfig(), budget.Connect)
