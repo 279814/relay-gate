@@ -14,8 +14,8 @@ type ConfigInvalidator interface {
 	// InvalidateUpstream 触发某个 Upstream 下所有 Route 的 L1 + L2。
 	// 改 key、改 base_url、改探活头都属于这一类：影响的是整站。
 	InvalidateUpstream(upstreamID int64)
-	// InvalidateModelName 触发某个 ModelName 下所有 Route 的 L2。
-	// 改 probe_prompt / probe_max_tokens 只影响 L2 的内容，L1 与它无关。
+	// InvalidateModelName 清除该 ModelName 下所有 Route 的 §9.2 运行时状态，
+	// 并触发 L2（改 Protocol / Name / probe_prompt 等；L1 与它无关）。
 	InvalidateModelName(modelNameID int64)
 }
 
@@ -24,9 +24,11 @@ type SemanticConfigInvalidator struct {
 	Semantic interface {
 		InvalidateRoute(routeID int64)
 		InvalidateUpstream(upstreamID int64, routeIDs []int64)
+		InvalidateModelName(modelNameID int64, routeIDs []int64)
 	}
-	Inner            ConfigInvalidator
-	RoutesOfUpstream func(upstreamID int64) []int64
+	Inner             ConfigInvalidator
+	RoutesOfUpstream  func(upstreamID int64) []int64
+	RoutesOfModelName func(modelNameID int64) []int64
 }
 
 func (s *SemanticConfigInvalidator) InvalidateRoute(routeID int64) {
@@ -60,6 +62,13 @@ func (s *SemanticConfigInvalidator) InvalidateUpstream(upstreamID int64) {
 func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
 	if s == nil {
 		return
+	}
+	var routeIDs []int64
+	if s.RoutesOfModelName != nil {
+		routeIDs = s.RoutesOfModelName(modelNameID)
+	}
+	if s.Semantic != nil {
+		s.Semantic.InvalidateModelName(modelNameID, routeIDs)
 	}
 	if s.Inner != nil {
 		s.Inner.InvalidateModelName(modelNameID)
