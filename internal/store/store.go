@@ -98,6 +98,15 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 	return &Store{db: db, cipher: c, lock: lock}, nil
 }
 
+// ActivateMaster switches the live Cipher after Keyring key_activated (§12.7).
+// New sample envelopes encrypt under the new key; prior envelopes still decrypt (§5.4).
+func (s *Store) ActivateMaster(passphrase string) error {
+	if s == nil || s.cipher == nil {
+		return ErrNoKey
+	}
+	return s.cipher.ActivateMaster(passphrase)
+}
+
 func defaultMigrationBackupIdentity() MigrationBackupIdentity {
 	return MigrationBackupIdentity{
 		PairedBuildID:  "relay-gate-pre-p0",

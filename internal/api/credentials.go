@@ -239,6 +239,12 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			s.writeErr(w, err)
 			return
 		}
+		// Live Cipher must follow key_activated (same class as stale relay-key map).
+		if err := s.st.ActivateMaster(body.NewMaster); err != nil {
+			exitMaint = false
+			s.writeErr(w, err)
+			return
+		}
 		if err := s.keyring.MarkCleaned(rid); err != nil {
 			exitMaint = false
 			s.writeErr(w, err)
@@ -251,7 +257,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			"rotation_id": rid,
 			"new_key_id":  newID,
 			"phase":       keyring.PhaseCleaned,
-			"note":        "Keyring active 已切换；信封密文需用新 key-id 重加密（EncryptEnvelope）",
+			"note":        "Keyring active 与 live Cipher 已切换；新信封用新 key-id，旧样本信封仍可读（§5.4）",
 		})
 		return
 	}
@@ -270,6 +276,10 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
+	if err := s.st.ActivateMaster(body.NewMaster); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	if err := s.keyring.MarkCleaned(rid); err != nil {
 		s.writeErr(w, err)
 		return
@@ -281,7 +291,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		"rotation_id": rid,
 		"new_key_id":  newID,
 		"phase":       keyring.PhaseCleaned,
-		"note":        "Keyring active 已切换；信封密文需用新 key-id 重加密（EncryptEnvelope）",
+		"note":        "Keyring active 与 live Cipher 已切换；新信封用新 key-id，旧样本信封仍可读（§5.4）",
 	})
 }
 
