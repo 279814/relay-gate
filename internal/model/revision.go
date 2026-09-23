@@ -100,6 +100,11 @@ type SemanticRevision struct {
 	EndpointRevision         int64
 	ModelCapability          int64
 	RouteCapability          int64
+	// RouteCreatedAt is the route row's created_at when Scope is route.
+	// RouteCapability alone is not an incarnation key: delete + recreate can
+	// reuse the same route id with CapabilityRevision=1 again, and a late
+	// capability commit must not ApplyCurrent on the new row.
+	RouteCreatedAt           int64
 	AuthProfile              int64
 	RecipeIdentity           RecipeIdentity
 	RecipeBindingRevision    int64

@@ -146,7 +146,8 @@ func TestCommitProbeObservationAppliesReachabilityWhenCapabilityIsConfigStale(t 
 		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
 		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
 		ModelCapability: modelName.CapabilityRevision, RouteCapability: route.CapabilityRevision,
-		AuthProfile: endpoint.AuthProfile.Revision, RecipeIdentity: identity,
+		RouteCreatedAt: route.CreatedAt,
+		AuthProfile:    endpoint.AuthProfile.Revision, RecipeIdentity: identity,
 		RecipeBindingRevision:    1,
 		ProbeSettingsFingerprint: revisioncodec.ProbeSettingsFingerprint(capPolicy),
 	}

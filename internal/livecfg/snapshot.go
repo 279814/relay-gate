@@ -139,6 +139,7 @@ func (s *ProbeSnapshot) SemanticExpectation(target model.SemanticTarget, identit
 			return model.SemanticExpectation{}, fmt.Errorf("%w: route %d", store.ErrNotFound, target.RouteID)
 		}
 		revision.RouteCapability = route.CapabilityRevision
+		revision.RouteCreatedAt = route.CreatedAt
 		if mn := s.ModelNames[route.ModelNameID]; mn != nil {
 			revision.ModelCapability = mn.CapabilityRevision
 		}

@@ -9,7 +9,7 @@ import (
 
 func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	st := testStore(t)
-	_, upID, _ := seed(t, st)
+	_, upID, rtID := seed(t, st)
 	s, _ := newSource(t, st)
 	if err := s.Refresh(); err != nil {
 		t.Fatal(err)
@@ -42,6 +42,26 @@ func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	if reach.ObservationToken == "" || reach.Revision.NetworkRevision != up.NetworkRevision ||
 		reach.Revision.CreatedAt != up.CreatedAt {
 		t.Fatalf("reachability expectation=%+v upstream created_at=%d", reach, up.CreatedAt)
+	}
+
+	rt := snap.Routes[rtID]
+	if rt == nil {
+		t.Fatal("missing route in probe snapshot")
+	}
+	capSel := model.EvidencePolicySelector{
+		Kind: model.EvidenceL2, Endpoint: model.EndpointMessages, TimeoutProfile: model.TimeoutL2Standard,
+	}
+	cap, err := snap.SemanticExpectation(model.SemanticTarget{
+		Scope: model.RecipeScopeRoute, UpstreamID: upID, RouteID: rtID, Endpoint: model.EndpointMessages,
+	}, model.RecipeIdentity{
+		Storage: model.RecipeStorageEmbedded, Origin: model.RecipeBasic,
+		TemplateID: "builtin:messages", Revision: 1,
+	}, model.RecipeBindingFacts{Use: model.BindingResolved, ResolvedLayer: model.ResolvedEmbedded}, capSel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap.Revision.RouteCapability != rt.CapabilityRevision || cap.Revision.RouteCreatedAt != rt.CreatedAt {
+		t.Fatalf("capability expectation=%+v route created_at=%d", cap.Revision, rt.CreatedAt)
 	}
 
 	s.Invalidate()

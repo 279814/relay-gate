@@ -82,3 +82,105 @@ func TestCommitProbeObservation_ReusedIDSameNetworkRevisionIsConfigStale(t *test
 		t.Fatalf("reducer must not run for stale incarnation, calls=%d", reducer.reachCalls)
 	}
 }
+
+// Delete + recreate can reuse a SQLite route rowid. CapabilityRevision alone
+// restarts at 1, so a late capability observation that started on the old row
+// must not ApplyCurrent on the new incarnation (same class of hole as L1
+// ReachabilityRevision.CreatedAt).
+func TestCommitProbeObservation_ReusedRouteIDSameCapabilityRevisionIsConfigStale(t *testing.T) {
+	st := testStore(t)
+	upstream := mkUpstream(t, st, "cap-reuse-up")
+	modelName := mkModelName(t, st, "cap-reuse-model", model.ProtoAnthropic)
+	route := &model.Route{ModelNameID: modelName.ID, UpstreamID: upstream.ID, Enabled: true}
+	if err := st.CreateRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	oldID := route.ID
+	endpointPage, err := st.ListEndpointsPage(context.Background(), model.EndpointFilter{
+		UpstreamID: upstream.ID, Endpoint: model.EndpointMessages,
+	})
+	if err != nil || len(endpointPage.Items) != 1 {
+		t.Fatalf("messages endpoint=%+v err=%v", endpointPage, err)
+	}
+	endpoint := endpointPage.Items[0]
+	selector := model.EvidencePolicySelector{
+		Kind: model.EvidenceL2, Endpoint: model.EndpointMessages, TimeoutProfile: model.TimeoutL2Standard,
+	}
+	settings := model.DefaultSettings()
+	capPolicy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := model.RecipeIdentity{
+		Storage: model.RecipeStorageEmbedded, Origin: model.RecipeBasic,
+		TemplateID: "builtin:messages", Revision: 1,
+	}
+	semanticRevision := model.SemanticRevision{
+		UpstreamNetwork: upstream.NetworkRevision, UpstreamCredential: upstream.CredentialRevision,
+		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
+		ModelCapability: modelName.CapabilityRevision, RouteCapability: route.CapabilityRevision,
+		RouteCreatedAt: route.CreatedAt,
+		AuthProfile:    endpoint.AuthProfile.Revision, RecipeIdentity: identity,
+		RecipeBindingRevision:    1,
+		ProbeSettingsFingerprint: revisioncodec.ProbeSettingsFingerprint(capPolicy),
+	}
+	facts := model.RecipeBindingFacts{Use: model.BindingResolved, ResolvedLayer: model.ResolvedEmbedded}
+	capExpectation := &model.SemanticExpectation{
+		Target: model.SemanticTarget{
+			Scope: model.RecipeScopeRoute, UpstreamID: upstream.ID, RouteID: oldID, Endpoint: model.EndpointMessages,
+		},
+		PolicySelector: selector, Revision: semanticRevision, BindingFacts: facts,
+		ObservationToken: revisioncodec.NewObservationToken(semanticRevision),
+	}
+	late := model.ProbeExecution{
+		ID: "late-cap-reuse", Trigger: model.TriggerScheduled, UpstreamID: upstream.ID, RouteID: oldID,
+		UpstreamNetworkRevision: upstream.NetworkRevision, UpstreamCredentialRevision: upstream.CredentialRevision,
+		CapabilityPolicySelector: selector, ProbeSettingsFingerprint: semanticRevision.ProbeSettingsFingerprint,
+		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
+		ModelCapabilityRevision: modelName.CapabilityRevision, RouteCapabilityRevision: route.CapabilityRevision,
+		AuthProfileRevision: endpoint.AuthProfile.Revision, Endpoint: model.EndpointMessages,
+		RecipeBindingUse: model.BindingResolved, RecipeStorage: identity.Storage, RecipeOrigin: identity.Origin,
+		TemplateID: identity.TemplateID, RecipeIdentityRevision: identity.Revision,
+		RecipeBindingRevision: semanticRevision.RecipeBindingRevision, RecipeBindingFacts: facts,
+		CapabilityToken: capExpectation.ObservationToken, EvidenceHash: "ev-cap-reuse",
+		ErrorClass: model.ErrorNone, Capability: model.CapabilitySupported, Scope: model.ScopeRouteEndpoint,
+		Reachable: true, Final: true, Success: true, SemanticSeen: true, NormalEndSeen: true,
+		ObservationOrder: 30, SentAtMS: 1, DoneAtMS: 2,
+	}
+
+	if err := st.DeleteRoute(oldID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := st.db.Exec(`DELETE FROM sqlite_sequence WHERE name='route'`); err != nil {
+		t.Fatalf("reset sequence: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	neu := &model.Route{ModelNameID: modelName.ID, UpstreamID: upstream.ID, Enabled: true}
+	if err := st.CreateRoute(neu); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if neu.ID != oldID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", neu.ID, oldID)
+	}
+	if neu.CapabilityRevision != semanticRevision.RouteCapability {
+		t.Fatalf("CapabilityRevision=%d want %d (incarnation must not rely on a bump)",
+			neu.CapabilityRevision, semanticRevision.RouteCapability)
+	}
+	if neu.CreatedAt == semanticRevision.RouteCreatedAt {
+		t.Fatal("recreated route must have a distinct created_at")
+	}
+
+	reducer := &fakeStateReducer{allowCap: true}
+	result, err := st.CommitProbeObservation(context.Background(), &model.ProbeObservation{
+		Execution: late, CapabilityExpectation: capExpectation, CapabilityPolicy: &capPolicy.State,
+	}, reducer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Capability != model.ApplyConfigStale {
+		t.Fatalf("disposition=%s want config_stale (RouteCreatedAt incarnation mismatch)", result.Capability)
+	}
+	if reducer.capCalls != 0 {
+		t.Fatalf("capability reducer must not run for stale incarnation, calls=%d", reducer.capCalls)
+	}
+}

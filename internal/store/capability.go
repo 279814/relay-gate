@@ -456,13 +456,14 @@ func currentSemanticRevision(ctx context.Context, tx *sql.Tx, expectation *model
 	current.EndpointRevision = endpointRevision
 	current.AuthProfile = authRevision
 	if expectation.Target.Scope == model.RecipeScopeRoute {
-		if err := tx.QueryRowContext(ctx, `SELECT r.capability_revision,m.capability_revision
+		if err := tx.QueryRowContext(ctx, `SELECT r.capability_revision,r.created_at,m.capability_revision
 			FROM route r JOIN model_name m ON m.id=r.model_name_id WHERE r.id=? AND r.upstream_id=?`,
-			expectation.Target.RouteID, expectation.Target.UpstreamID).Scan(&current.RouteCapability, &current.ModelCapability); err != nil {
+			expectation.Target.RouteID, expectation.Target.UpstreamID).Scan(
+			&current.RouteCapability, &current.RouteCreatedAt, &current.ModelCapability); err != nil {
 			return model.SemanticRevision{}, err
 		}
 	} else {
-		current.RouteCapability, current.ModelCapability = 0, 0
+		current.RouteCapability, current.RouteCreatedAt, current.ModelCapability = 0, 0, 0
 	}
 	settings, err := loadSettingsTx(ctx, tx)
 	if err != nil {
