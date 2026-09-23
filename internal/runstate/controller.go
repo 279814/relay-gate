@@ -272,23 +272,34 @@ func (c *Controller) EnterMaintenance(reason string) error {
 	return nil
 }
 
-// ExitMaintenance 退出维护叠加态。若持久化为 running，先 PrepareResume 再渐进复核并开启暖机。
+// ExitMaintenance 退出维护叠加态。若持久化为 running，须在仍 maintenance
+// （Admitting=false）时先同步 PrepareResume，清掉旧正结论，再放下叠加态并
+// ResumeGradually——与 Set(running) 同序，避免「已可准入却仍消费 stale alive」。
 func (c *Controller) ExitMaintenance() error {
 	if c == nil {
 		return errors.New("runstate: Controller 为空")
 	}
-	if !c.maintenance.CompareAndSwap(true, false) {
+	if !c.maintenance.Load() {
 		return nil // 幂等
 	}
-	c.maintenanceReason.Store("")
 
 	c.mu.Lock()
 	synth := c.synth
 	bound := c.bound
 	c.mu.Unlock()
 	base, _ := c.snap.Load().(Snapshot)
+
+	// 仍在 maintenance：Current().Admitting()==false。先 DemotePositive。
 	if bound && synth != nil && base.State == model.RunStateRunning {
 		safePrepareResume(synth)
+	}
+
+	if !c.maintenance.CompareAndSwap(true, false) {
+		return nil // 并发 ExitMaintenance 已清除
+	}
+	c.maintenanceReason.Store("")
+
+	if bound && synth != nil && base.State == model.RunStateRunning {
 		safeResumeGradually(synth)
 		c.markWarmup()
 	}

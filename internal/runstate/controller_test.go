@@ -310,6 +310,57 @@ func TestController_MaintenanceOverlayDoesNotOverwritePaused(t *testing.T) {
 	}
 }
 
+// ExitMaintenance 在持久化 running 时必须先 PrepareResume、仍拒绝准入，
+// 再清除 maintenance——否则代理会在 DemotePositive 前消费旧 alive。
+func TestController_ExitMaintenancePrepareBeforeAdmitting(t *testing.T) {
+	st := newMemStore(model.RunStateRunning, 1)
+	c, err := NewController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var admittedDuringPrepare atomic.Bool
+	base := &fakeSynth{}
+	watch := &exitMaintPrepareWatch{
+		fakeSynth: base,
+		ctrl:      c,
+		admitted:  &admittedDuringPrepare,
+	}
+	if err := c.BindSyntheticController(watch); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnterMaintenance("master_key_rotation"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ExitMaintenance(); err != nil {
+		t.Fatal(err)
+	}
+	if admittedDuringPrepare.Load() {
+		t.Fatal("PrepareResume 期间不得 Admitting（不得先放下 maintenance）")
+	}
+	if base.prepares != 1 || base.resumes != 1 {
+		t.Fatalf("prepare=%d resume=%d", base.prepares, base.resumes)
+	}
+	after := c.Current()
+	if after.Maintenance || !after.Admitting() {
+		t.Fatalf("退出后应可准入: %+v", after)
+	}
+}
+
+type exitMaintPrepareWatch struct {
+	*fakeSynth
+	ctrl     *Controller
+	admitted *atomic.Bool
+}
+
+func (w *exitMaintPrepareWatch) PrepareResume() {
+	if w.ctrl.Current().Admitting() {
+		w.admitted.Store(true)
+	}
+	w.fakeSynth.PrepareResume()
+}
+
 type countWarmup struct {
 	u, a, n, total int
 }
