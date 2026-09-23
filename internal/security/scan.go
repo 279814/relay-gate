@@ -111,17 +111,23 @@ var (
 )
 
 // ScanText runs passive rules on a text body. Does not mutate input.
-func ScanText(text, sourceLabel string) []Finding {
+//
+// keys are upstream/relay secrets known for this scan. They are redacted from
+// Detail before the finding is returned so security_finding never stores the
+// raw matched secret (§14.3 / §14.5 / §16.4). Scanning still uses the original
+// text so pattern detection is unchanged.
+func ScanText(text, sourceLabel string, keys ...string) []Finding {
 	if text == "" {
 		return nil
 	}
+	safeDetail := clip(redactSecrets(text, keys), 512)
 	var out []Finding
 	add := func(sev Severity, cat, summary string) {
 		out = append(out, Finding{
 			Severity: sev,
 			Category: cat,
 			Summary:  summary,
-			Detail:   clip(text, 512),
+			Detail:   safeDetail,
 			Source:   "passive",
 		})
 		_ = sourceLabel
@@ -139,6 +145,30 @@ func ScanText(text, sourceLabel string) []Finding {
 		add(SeverityMedium, "prompt_injection", "检测到常见提示注入措辞")
 	}
 	return out
+}
+
+// redactSecrets replaces known credential values in evidence text.
+// Keep behavior aligned with store.MaskKey (security cannot import store:
+// store already imports this package).
+func redactSecrets(s string, keys []string) string {
+	for _, k := range keys {
+		if k == "" || !strings.Contains(s, k) {
+			continue
+		}
+		s = strings.ReplaceAll(s, k, maskSecret(k))
+	}
+	return s
+}
+
+func maskSecret(key string) string {
+	const keep = 4
+	if key == "" {
+		return ""
+	}
+	if len(key) < keep*2+6 {
+		return strings.Repeat("*", len(key))
+	}
+	return key[:keep] + "…" + key[len(key)-keep:]
 }
 
 func clip(s string, n int) string {

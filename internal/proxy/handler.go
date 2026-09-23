@@ -465,6 +465,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 			Upstream: upName,
 			RouteID:  routeID,
 			ReqID:    oc.reqID,
+			Keys:     oc.keys, // redact Detail before persist (§14.5 / §16.4)
 		})
 	}
 }
@@ -684,8 +685,8 @@ func classifyOutcome(res *Result) model.Outcome {
 // 各列一份的话，新增一个鉴权位置时必然漏掉其中之一，而漏掉的表现是
 // 明文 key 静默落库或进日志，不报错、不失败。
 //
-// 三个消费方共用它：样本落库（recordSample）、健康回写的 ErrBody
-// （viewOf）、count_tokens 的降级日志。
+// 四个消费方共用它：样本落库（recordSample）、健康回写的 ErrBody
+// （viewOf）、count_tokens 的降级日志、被动安全扫描证据脱敏（ObserveJob.Keys）。
 func (h *Handler) credentialsOf(r *http.Request, cand *router.Candidate) []string {
 	keys := make([]string, 0, len(model.AuthHeaders)+1)
 	keys = append(keys, cand.Upstream.APIKey)
