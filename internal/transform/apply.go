@@ -273,6 +273,11 @@ func (c *Compiled) ApplyResponseSecrets(in ResponseInput, secrets SecretMap) Res
 
 func (c *Compiled) applyOneResponse(i int, rule Rule, out *ResponseResult, sec *applySecrets) error {
 	name := "r" + strconv.Itoa(i) + ":" + rule.Kind
+	// Secret refs are request-only (§15.4). Never resolve them into the client
+	// response — set_header / body would otherwise echo the upstream API key.
+	if ruleUsesSecret(rule) {
+		return fmt.Errorf("secret_ref not allowed on response rules")
+	}
 	switch rule.Kind {
 	case KindSetHeader:
 		if err := rejectForbiddenHeaderField(rule.Name); err != nil {
