@@ -30,10 +30,10 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnsafeLockPath, err)
 	}
-	// Fail closed like restore: a symlink/junction database path would take a
-	// different "<path>.lock" than the real file, so two Opens could migrate
-	// and serve the same SQLite file. Refuse before locking.
-	if err := rejectSymlinkDatabasePath(absolute); err != nil {
+	// Fail closed like restore: a symlink/junction or hard-linked database path
+	// would take a different "<path>.lock" than another name for the same inode,
+	// so two Opens could migrate and serve the same SQLite file. Refuse before locking.
+	if err := rejectUnsafeDatabasePath(absolute); err != nil {
 		return nil, err
 	}
 	parent := filepath.Dir(absolute)
@@ -74,9 +74,10 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 	return &instanceLock{file: file}, nil
 }
 
-// rejectSymlinkDatabasePath refuses a configured DB path that is itself a
-// symlink or reparse point. A missing path is allowed (first Open creates it).
-func rejectSymlinkDatabasePath(path string) error {
+// rejectUnsafeDatabasePath refuses a configured DB path that is itself a
+// symlink/reparse point or a hard link (nlink > 1). A missing path is allowed
+// (first Open creates it). Directories are not rejected on link count alone.
+func rejectUnsafeDatabasePath(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -86,6 +87,16 @@ func rejectSymlinkDatabasePath(path string) error {
 	}
 	if isSymlinkOrReparse(info) {
 		return fmt.Errorf("%w: %s 是 symlink/reparse point", ErrUnsafeLockPath, path)
+	}
+	if info.IsDir() {
+		return nil
+	}
+	nlink, err := databaseFileLinkCount(path, info)
+	if err != nil {
+		return fmt.Errorf("%w: 读取硬链接数: %v", ErrUnsafeLockPath, err)
+	}
+	if nlink > 1 {
+		return fmt.Errorf("%w: %s 是硬链接 (nlink=%d)", ErrUnsafeLockPath, path, nlink)
 	}
 	return nil
 }

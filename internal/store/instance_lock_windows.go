@@ -37,3 +37,31 @@ func pathInfoIsReparsePoint(info os.FileInfo) bool {
 	data, ok := info.Sys().(*syscall.Win32FileAttributeData)
 	return ok && data.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
+
+// databaseFileLinkCount reads NumberOfLinks via GetFileInformationByHandle.
+// Lstat's Win32FileAttributeData does not expose link count.
+func databaseFileLinkCount(path string, _ os.FileInfo) (uint64, error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(handle)
+
+	var data windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &data); err != nil {
+		return 0, err
+	}
+	return uint64(data.NumberOfLinks), nil
+}

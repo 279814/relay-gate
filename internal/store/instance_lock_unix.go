@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,3 +30,11 @@ func unlockInstanceFile(file *os.File) error {
 }
 
 func pathInfoIsReparsePoint(os.FileInfo) bool { return false }
+
+func databaseFileLinkCount(_ string, info os.FileInfo) (uint64, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("unexpected FileInfo.Sys type %T", info.Sys())
+	}
+	return uint64(stat.Nlink), nil
+}

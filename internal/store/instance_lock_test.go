@@ -69,10 +69,10 @@ func TestInstanceLockRejectsSymlinkDatabasePath(t *testing.T) {
 	}
 }
 
-func TestRejectSymlinkDatabasePathAllowsMissingAndRegular(t *testing.T) {
+func TestRejectUnsafeDatabasePathAllowsMissingAndRegular(t *testing.T) {
 	directory := t.TempDir()
 	missing := filepath.Join(directory, "missing.db")
-	if err := rejectSymlinkDatabasePath(missing); err != nil {
+	if err := rejectUnsafeDatabasePath(missing); err != nil {
 		t.Fatalf("missing path: %v", err)
 	}
 
@@ -80,8 +80,35 @@ func TestRejectSymlinkDatabasePathAllowsMissingAndRegular(t *testing.T) {
 	if err := os.WriteFile(regular, []byte{}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := rejectSymlinkDatabasePath(regular); err != nil {
+	if err := rejectUnsafeDatabasePath(regular); err != nil {
 		t.Fatalf("regular path: %v", err)
+	}
+
+	lock, err := acquireInstanceLock(regular)
+	if err != nil {
+		t.Fatalf("lock regular existing database file: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+}
+
+func TestInstanceLockRejectsHardLinkedDatabasePath(t *testing.T) {
+	directory := t.TempDir()
+	realPath := filepath.Join(directory, "relay.db")
+	if err := os.WriteFile(realPath, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(directory, "alias.db")
+	if err := os.Link(realPath, aliasPath); err != nil {
+		t.Skipf("hard links unavailable on this platform or filesystem: %v", err)
+	}
+
+	if _, err := acquireInstanceLock(realPath); !errors.Is(err, ErrUnsafeLockPath) {
+		t.Fatalf("hard-linked database path error = %v, want ErrUnsafeLockPath", err)
+	}
+	if _, err := acquireInstanceLock(aliasPath); !errors.Is(err, ErrUnsafeLockPath) {
+		t.Fatalf("hard link alias error = %v, want ErrUnsafeLockPath", err)
 	}
 }
 
