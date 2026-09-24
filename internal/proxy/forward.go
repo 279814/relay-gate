@@ -439,14 +439,15 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 
 	res, f := at.res, at.f
 
-	// 响应头原样回传。ReverseProxy 会做的逐跳清理这里手动做一次。
+	// 响应头原样回传。ReverseProxy 会做的逐跳清理这里手动做一次；
+	// 同时丢掉上游试图覆盖管理会话的 Set-Cookie: relay_session。
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
 	}
-	StripHopByHopResponse(dst)
+	FinalizeClientResponseHeaders(dst)
 	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 

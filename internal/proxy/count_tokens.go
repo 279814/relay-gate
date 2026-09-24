@@ -241,7 +241,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 成功。原样回传上游响应体。
-	StripHopByHopResponse(resp.Header)
+	FinalizeClientResponseHeaders(resp.Header)
 	dst := w.Header()
 	for k, vs := range resp.Header {
 		for _, v := range vs {

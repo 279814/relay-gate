@@ -141,3 +141,36 @@ func StripHopByHopResponse(h http.Header) {
 		h.Del(k)
 	}
 }
+
+// FinalizeClientResponseHeaders 在把上游响应头写给客户端之前做最后清理：
+// 逐跳头 + 本网关会话 Cookie 的 Set-Cookie。
+//
+// 其它 Set-Cookie 照常透传；管理登录走 api 包自己的 SetCookie，不经此路径。
+// 不记录 Cookie 值 —— 会话令牌进日志等于泄露。
+func FinalizeClientResponseHeaders(h http.Header) {
+	StripHopByHopResponse(h)
+	stripGatewaySessionSetCookie(h)
+}
+
+// stripGatewaySessionSetCookie 丢掉 cookie-name 恰为 gatewaySessionCookie
+// 的 Set-Cookie。匹配方式与出站 Cookie 剥离一致：对 cookie 名做大小写敏感
+// 的全等比较，不看 value，也不做子串匹配。
+func stripGatewaySessionSetCookie(h http.Header) {
+	vals := h.Values("Set-Cookie")
+	if len(vals) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(vals))
+	for _, line := range vals {
+		first, _, _ := strings.Cut(line, ";")
+		name, _, _ := strings.Cut(first, "=")
+		if strings.TrimSpace(name) == gatewaySessionCookie {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	h.Del("Set-Cookie")
+	for _, v := range kept {
+		h.Add("Set-Cookie", v)
+	}
+}

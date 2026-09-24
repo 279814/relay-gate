@@ -756,6 +756,38 @@ func TestHandler_PassesUpstreamErrorThrough(t *testing.T) {
 	}
 }
 
+// 上游不能通过 Set-Cookie 覆盖管理会话；其它 Set-Cookie 仍透传。
+// 登录发会话 Cookie 走 api 包，不经本路径（见 TestLogin_CorrectPasswordSetsHttpOnlyCookie）。
+func TestHandler_DropsUpstreamGatewaySessionSetCookie(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("Set-Cookie", gatewaySessionCookie+"=evil-from-upstream; Path=/")
+		w.Header().Add("Set-Cookie", "other=1")
+		w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	})
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != 200 {
+		t.Fatalf("期望 200，得到 %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var sawOther bool
+	for _, line := range rec.Result().Header.Values("Set-Cookie") {
+		first, _, _ := strings.Cut(line, ";")
+		name, _, _ := strings.Cut(first, "=")
+		name = strings.TrimSpace(name)
+		if name == gatewaySessionCookie {
+			t.Fatalf("客户端仍收到会话 Set-Cookie: %q", line)
+		}
+		if name == "other" {
+			sawOther = true
+		}
+	}
+	if !sawOther {
+		t.Errorf("其它 Set-Cookie 应透传，得到 %v", rec.Result().Header.Values("Set-Cookie"))
+	}
+}
+
 // SSE 必须逐块 flush。缓冲会表现为「长时间无输出后一次性刷出」。
 //
 // 事件之间要留间隔：连写的话 TCP 与 Transport 会把它们合并成一次 Read，
