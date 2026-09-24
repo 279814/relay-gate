@@ -15,6 +15,13 @@ import (
 // 是「看起来在防、实际没防」。
 var hopByHopHeaders = model.HopByHopHeaders
 
+// gatewaySessionCookie 是管理界面会话 Cookie 名，必须与 api 包的
+// sessionCookie（"relay_session"）保持一致。
+//
+// 黑名单透传会把 Cookie 原样带给上游；会话令牌只属于本进程，绝不能
+// 离开网关。只剥这一颗，其它 Cookie 继续透传 —— 不做通用 Cookie 策略。
+const gatewaySessionCookie = "relay_session"
+
 // PrepareOutboundHeaders 构造出站请求头。
 //
 // 规则是**黑名单**而非白名单（§3.3.3）：除本函数显式处理的那几项外，
@@ -76,9 +83,45 @@ func PrepareOutboundHeaders(in http.Header, proto model.Protocol) http.Header {
 		out[ck] = cp
 	}
 
-	// 3. 认证由 outbound.ApplyAuth 写入（§7.2）。这里只保证入站的认证头
+	// 3. 剥掉本网关的管理会话 Cookie，其它 Cookie 保留。
+	stripGatewaySessionCookie(out)
+
+	// 4. 认证由 outbound.ApplyAuth 写入（§7.2）。这里只保证入站的认证头
 	//    已全部删除 —— 上面的 skip 表已经做到了。
 	return out
+}
+
+// stripGatewaySessionCookie 从出站 Cookie 头里去掉 gatewaySessionCookie。
+// 只剩会话 Cookie 时删掉整个 Cookie 头；其它 Cookie 原样留下。
+// 不记录 Cookie 值 —— 会话令牌进日志等于泄露。
+func stripGatewaySessionCookie(h http.Header) {
+	vals := h.Values("Cookie")
+	if len(vals) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(vals))
+	for _, line := range vals {
+		parts := strings.Split(line, ";")
+		filtered := make([]string, 0, len(parts))
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name, _, _ := strings.Cut(part, "=")
+			if strings.TrimSpace(name) == gatewaySessionCookie {
+				continue
+			}
+			filtered = append(filtered, part)
+		}
+		if len(filtered) > 0 {
+			kept = append(kept, strings.Join(filtered, "; "))
+		}
+	}
+	h.Del("Cookie")
+	for _, v := range kept {
+		h.Add("Cookie", v)
+	}
 }
 
 // StripHopByHopResponse 清理上游响应里的逐跳头。
