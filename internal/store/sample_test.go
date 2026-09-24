@@ -362,6 +362,76 @@ func TestPruneSamples_PinnedExempt(t *testing.T) {
 	}
 }
 
+// §5.4：Sample Group 含 request_log；清理样本时必须删掉同 req_id 的日志，
+// 置顶样本的日志保留；无对应样本的独立日志不动。
+func TestPruneSamples_RemovesRequestLogsForDeletedGroups(t *testing.T) {
+	st := testStore(t)
+	now := time.Now().UnixMilli()
+
+	gone := mkSample(now)
+	gone.ReqID = "req-gone"
+	keep := mkSample(now + 1)
+	keep.ReqID = "req-keep"
+	pinned := mkSample(now - 30*24*time.Hour.Milliseconds())
+	pinned.ReqID = "req-pinned"
+	pinned.Pinned = true
+	for _, s := range []*model.Sample{gone, keep, pinned} {
+		if err := st.InsertSample(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 每个 Group 两次 Attempt；另留一条无样本的独立日志。
+	for _, l := range []*model.RequestLog{
+		mkLog("req-gone", 1, 2, model.OutcomeUpstreamError),
+		mkLog("req-gone", 2, 2, model.OutcomeOK),
+		mkLog("req-keep", 1, 1, model.OutcomeOK),
+		mkLog("req-pinned", 1, 1, model.OutcomeOK),
+		mkLog("req-orphan", 1, 1, model.OutcomeOK),
+	} {
+		if err := st.InsertRequestLog(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 条数只留 1 条未置顶 → 删掉 req-gone 样本（更旧），保留 req-keep + 置顶。
+	if _, err := st.PruneSamples(1, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	goneLogs, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-gone", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(goneLogs) != 0 {
+		t.Fatalf("已删样本的 request_log 应清空，仍剩 %d 行", len(goneLogs))
+	}
+
+	keepLogs, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-keep", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keepLogs) != 1 {
+		t.Fatalf("保留样本的 request_log 应仍在，得到 %d 行", len(keepLogs))
+	}
+
+	pinnedLogs, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-pinned", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pinnedLogs) != 1 {
+		t.Fatalf("置顶样本的 request_log 应保留，得到 %d 行", len(pinnedLogs))
+	}
+
+	orphanLogs, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-orphan", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphanLogs) != 1 {
+		t.Fatalf("无样本的独立 request_log 不应被样本清理误删，得到 %d 行", len(orphanLogs))
+	}
+}
+
 // 0 表示该维度不限，不能理解成「全删」。
 func TestPruneSamples_ZeroMeansUnlimited(t *testing.T) {
 	st := testStore(t)
