@@ -101,15 +101,21 @@ type Snapshot struct {
 // 前缀按 name 长度降序是必须的：同时配了 "claude-opus" 与 "claude-opus-5" 时，
 // 入站 "claude-opus-5-thinking" 应命中更具体的那个。若按任意顺序遍历，
 // 结果取决于 map 迭代顺序，会变成随机行为。
+//
+// 已配置但停用的精确名视为「名称已命中」：不交给前缀或兜底去换另一条
+// ModelName 的上游（客户端点名了该模型）。返回 ErrNoRouteAvailable。
 func MatchModelName(snap *Snapshot, inModel string,
 	endpointProto model.Protocol) (*model.ModelName, error) {
 
 	if inModel == "" {
 		return nil, fmt.Errorf("%w: 入站 model 为空", ErrModelNotFound)
 	}
-	nameMatches, fallback := orderedModelNameMatches(snap, inModel, endpointProto)
+	nameMatches, fallback, disabledExact := orderedModelNameMatches(snap, inModel, endpointProto)
 	if len(nameMatches) > 0 {
 		return nameMatches[0], nil
+	}
+	if disabledExact {
+		return nil, fmt.Errorf("%w: ModelName %q 已停用", ErrNoRouteAvailable, inModel)
 	}
 	if fallback != nil {
 		return fallback, nil
@@ -124,19 +130,26 @@ func MatchModelName(snap *Snapshot, inModel string,
 // nameMatches 继续尝试前缀，避免「精确因 config_error 被排除」却丢掉仍能
 // 匹配的健康前缀（§6.4）。名称已命中时不回落到兜底——兜底只服务「从未
 // 命中名称」的入站 model，与 MatchModelName 一致。
+//
+// disabledExact 表示存在同名但 Enabled=false 的精确 ModelName，且没有任何
+// 启用的精确命中。此时不得把前缀或兜底塞进 nameMatches/fallback 出口：
+// 否则客户端点名的停用模型会被静默换成另一条上游。
 func orderedModelNameMatches(snap *Snapshot, inModel string,
-	endpointProto model.Protocol) (nameMatches []*model.ModelName, fallback *model.ModelName) {
+	endpointProto model.Protocol) (nameMatches []*model.ModelName, fallback *model.ModelName, disabledExact bool) {
 
 	var exacts, prefixes []*model.ModelName
 
 	for _, mn := range snap.ModelNames {
-		if !mn.Enabled {
-			continue
-		}
 		// 空 name（含仅空白）不能参与匹配：Validate 会拒写入，但坏行仍可能
 		// 经手工 SQL 等路径进快照。尤其 prefix + "" 时 strings.HasPrefix(s, "")
 		// 对任意 s 都为 true，会把所有入站 model 吸进同一条 Route。
 		if strings.TrimSpace(mn.Name) == "" {
+			continue
+		}
+		if !mn.Enabled {
+			if mn.MatchMode == model.MatchExact && mn.Name == inModel {
+				disabledExact = true
+			}
 			continue
 		}
 		if mn.MatchMode == model.MatchExact && mn.Name == inModel {
@@ -163,10 +176,18 @@ func orderedModelNameMatches(snap *Snapshot, inModel string,
 		})
 	}
 
-	nameMatches = make([]*model.ModelName, 0, len(exacts)+len(prefixes))
-	nameMatches = append(nameMatches, exacts...)
-	nameMatches = append(nameMatches, prefixes...)
-	return nameMatches, fallback
+	if len(exacts) > 0 {
+		nameMatches = make([]*model.ModelName, 0, len(exacts)+len(prefixes))
+		nameMatches = append(nameMatches, exacts...)
+		nameMatches = append(nameMatches, prefixes...)
+		return nameMatches, fallback, false
+	}
+	if disabledExact {
+		// 点名停用精确名：不启用前缀、不清空后的兜底出口。
+		return nil, nil, true
+	}
+	nameMatches = append([]*model.ModelName(nil), prefixes...)
+	return nameMatches, fallback, false
 }
 
 // Select 按 §3.4 完成选路。endpointProto 是入站端点隐含的协议。
@@ -198,9 +219,12 @@ func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 	if inModel == "" {
 		return nil, fmt.Errorf("%w: 入站 model 为空", ErrModelNotFound)
 	}
-	nameMatches, fallback := orderedModelNameMatches(snap, inModel, endpointProto)
+	nameMatches, fallback, disabledExact := orderedModelNameMatches(snap, inModel, endpointProto)
 	matches := nameMatches
 	if len(matches) == 0 {
+		if disabledExact {
+			return nil, fmt.Errorf("%w: ModelName %q 已停用", ErrNoRouteAvailable, inModel)
+		}
 		if fallback == nil {
 			return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
 		}

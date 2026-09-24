@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -654,6 +655,59 @@ func TestHandler_SelectErrors(t *testing.T) {
 				t.Error("选路失败的请求不该转发到上游")
 			}
 		})
+	}
+}
+
+// 点名已配置但停用的精确 ModelName 时，不得落到兜底上游（零 RoundTrip）。
+// 从未配置的名字仍可走兜底；启用精确名仍正常转发。
+func TestHandler_DisabledExactModelNameZeroUpstream(t *testing.T) {
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+	up := hs.cfg.snap.Upstreams[10]
+	disabled := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: false}
+	fallback := &model.ModelName{ID: 9, Name: "catch-all",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, IsFallback: true, Enabled: true}
+	enabled := &model.ModelName{ID: 3, Name: "claude-sonnet-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	fbRoute := &model.Route{ID: 900, ModelNameID: 9, UpstreamID: 10,
+		Priority: 1, Weight: 100, Enabled: true}
+	enRoute := &model.Route{ID: 300, ModelNameID: 3, UpstreamID: 10,
+		Priority: 1, Weight: 100, Enabled: true}
+	hs.cfg.snap = router.BuildSnapshot(
+		[]*model.ModelName{disabled, fallback, enabled},
+		[]*model.Upstream{up},
+		[]*model.Route{fbRoute, enRoute},
+	)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 503 {
+		t.Fatalf("disabled exact status=%d want 503 body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("disabled exact RoundTrips=%d want 0", n)
+	}
+
+	hits.Store(0)
+	rec = hs.serve(hs.anthropicRequest(`{"model":"never-configured","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("unknown via fallback status=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("unknown fallback RoundTrips=%d want 1", n)
+	}
+
+	hits.Store(0)
+	rec = hs.serve(hs.anthropicRequest(`{"model":"claude-sonnet-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("enabled exact status=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("enabled exact RoundTrips=%d want 1", n)
 	}
 }
 
