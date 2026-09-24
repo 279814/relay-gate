@@ -318,7 +318,7 @@ func (testHasher) SumRequestURL(raw []byte) string {
 }
 
 // testTargetsWithQuery 给每个 Endpoint 配一个固定 query 模板。
-// 用于「key 放在 query 里」那类站（§3.2）。
+// 用于「key 放在 query 里」那类站（§7.1 FixedQueryTemplate）。
 func testTargetsWithQuery(cfg *fakeConfig, template string) *outbound.Provider {
 	return outbound.NewProvider(testEndpoints{cfg: cfg, fixedQuery: template}, nil,
 		outbound.NewResolver(testHasher{}))
@@ -1266,8 +1266,8 @@ func TestSample_DisabledRecordsNothing(t *testing.T) {
 // key 出现在 URL 里时也必须脱敏（§3.6.3b / §9.4）。
 //
 // 曾经的漏洞：只脱敏了三组头与三份 body，in_query 与 out_url 是原样落库的。
-// 而 §3.2 明确写了「少数中转站也接受 ?key= 查询参数」，full_url_mode 的
-// base_url 正是为这类站准备的 —— 它会被整段存进 out_url。
+// 少数中转站接受 ?key= 查询参数，由 FixedQueryTemplate 表达（§7.1）；
+// base_url 本身不允许 query（§5.1）。出站 URL 会被整段存进 out_url。
 // 验收标准是「真 key 全表 grep 零命中」，漏一个字段就不成立。
 func TestSample_RedactsKeysInURL(t *testing.T) {
 	t.Run("固定 query 里的上游 key", func(t *testing.T) {

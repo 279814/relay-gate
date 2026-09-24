@@ -96,9 +96,9 @@ type ResolvedTarget struct {
 
 // RequestURLHasher 对最终 URL 求带密钥的摘要。由 store.Cipher 实现。
 //
-// 不能用裸 SHA-256：full_url_mode 允许把 key 放在 query 里（§3.2），而
-// 低熵 query 的裸摘要就是一个离线枚举 oracle —— 拿到日志的人可以逐个
-// 猜测并验证。
+// 不能用裸 SHA-256：FixedQueryTemplate / legacy_exact 可能把 key 放在
+// query 里（§7.1），而低熵 query 的裸摘要就是一个离线枚举 oracle ——
+// 拿到日志的人可以逐个猜测并验证。
 type RequestURLHasher interface {
 	SumRequestURL(raw []byte) string
 }
@@ -401,9 +401,9 @@ func joinQuery(fixed, incoming string) string {
 // parseOrigin 解析并校验一个 URL 的 origin 部分。
 //
 // 错误里**绝不包含 raw**。这条不是洁癖：legacy full URL 解密后可能带
-// `?key=<secret>`（§3.2 明确提到这类站），而 url.Parse 的错误文本会原样附上
-// 完整 URL。这些错误一路流进 route_health.last_error（落库）并显示在管理
-// 界面上，所以带上 raw 就等于把明文 key 同时写进数据库和 UI。
+// `?key=<secret>`（由迁移保留的 exact URL，§19.2），而 url.Parse 的错误文本
+// 会原样附上完整 URL。这些错误一路流进 route_health.last_error（落库）并
+// 显示在管理界面上，所以带上 raw 就等于把明文 key 同时写进数据库和 UI。
 //
 // 只报字段名与失败原因，与 store 侧 maskLegacyURL 的口径一致（scheme+host
 // 之外一律不回显）。

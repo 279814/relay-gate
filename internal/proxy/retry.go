@@ -802,8 +802,8 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 	}
 	if res.Err != nil {
 		// 与样本、健康回写同一条脱敏规则。日志会显示在管理界面上，
-		// 而错误文本里可能带出站 URL —— full_url_mode 的 base_url
-		// 允许把 key 放在 query 里（§3.2）。
+		// 而错误文本里可能带出站 URL —— FixedQueryTemplate / legacy_exact
+		// 可能把 key 放在 query 里（§7.1）。
 		l.Error = sample.RedactDiagnosticText(res.Err.Error(), la.keys)
 	}
 	return l

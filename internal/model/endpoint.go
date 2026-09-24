@@ -1,6 +1,9 @@
 package model
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // EndpointKind identifies the upstream API surface without coupling it to a
 // particular logical model or route.
@@ -232,19 +235,30 @@ type ProbeUpstreamConfig struct {
 // full_url_mode 的站会被拼成 base+/v1/messages（旧行为是 base 本身），
 // 自定义 l1_path 的站会被探成 /v1/models。两者都表现为「配置还在、行为变了」。
 //
+// full_url_mode 下 base_url 已是完整端点（可带路径）。L1 必须接到同一
+// origin，不能把 l1_path 再叠到那条路径后面，也不能回落 canonical 让
+// Resolver 做 base+/v1/models —— 两者都会变成「完整端点路径 + L1 路径」。
+//
 // 创建与更新共用它，避免两条路径各写一份而分叉。
 func (u *Upstream) EndpointURLOverride(kind EndpointKind) string {
 	base := strings.TrimRight(u.BaseURL, "/")
 	if kind == EndpointModels {
 		switch u.L1Path {
 		case "/v1/models":
+			if u.FullURLMode {
+				return originOfBaseURL(u.BaseURL) + "/v1/models"
+			}
 			return "" // canonical，不需要 override
 		case "":
 			// 旧行为是 HEAD base_url（连接层探测）。URL 就是 base 本身，
 			// 方法由调用方按 l1_path 为空来决定，不在 URL 里表达。
 			return base
 		default:
-			return base + u.L1Path
+			root := base
+			if u.FullURLMode {
+				root = originOfBaseURL(u.BaseURL)
+			}
+			return root + u.L1Path
 		}
 	}
 	if u.FullURLMode {
@@ -252,6 +266,17 @@ func (u *Upstream) EndpointURLOverride(kind EndpointKind) string {
 		return base
 	}
 	return ""
+}
+
+// originOfBaseURL 只保留 scheme://host[:port]，丢掉 path/query/fragment。
+// full_url_mode 的 L1 接到这个 origin 上，与「不再拼路径」的 messages 端点分开。
+func originOfBaseURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		// Validate 已挡非法 base_url；这里只做防御，避免 panic。
+		return strings.TrimRight(raw, "/")
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 func (u *Upstream) ProbeConfig() *ProbeUpstreamConfig {
 	return &ProbeUpstreamConfig{

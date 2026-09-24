@@ -85,6 +85,38 @@ func TestUpstreamDefaultsToActiveProbeMode(t *testing.T) {
 	}
 }
 
+// full_url_mode 下 base_url 已是完整端点；L1 必须接到 origin，不能叠路径，
+// 也不能回落 canonical 让 Resolver 再拼 /v1/models（docs/01 §5.1 / §7.1，
+// docs/03「不再拼路径」）。
+func TestEndpointURLOverride_FullURLModeDoesNotDoubleAppendL1Path(t *testing.T) {
+	up := &Upstream{
+		BaseURL:     "https://a.com/custom/entry",
+		FullURLMode: true,
+		L1Path:      "/status",
+	}
+	if got, want := up.EndpointURLOverride(EndpointMessages), "https://a.com/custom/entry"; got != want {
+		t.Errorf("messages override = %q, want %q", got, want)
+	}
+	if got, want := up.EndpointURLOverride(EndpointModels), "https://a.com/status"; got != want {
+		t.Errorf("custom l1_path override = %q, want %q（不得变成 /custom/entry/status）", got, want)
+	}
+
+	up.L1Path = "/v1/models"
+	if got, want := up.EndpointURLOverride(EndpointModels), "https://a.com/v1/models"; got != want {
+		t.Errorf("default l1_path override = %q, want %q（不得回落 canonical）", got, want)
+	}
+
+	// 非 full_url_mode：base + L1 路径（docs/01 §7.1）
+	plain := &Upstream{BaseURL: "https://a.com", L1Path: "/status"}
+	if got, want := plain.EndpointURLOverride(EndpointModels), "https://a.com/status"; got != want {
+		t.Errorf("non-full L1 join = %q, want %q", got, want)
+	}
+	plain.L1Path = "/v1/models"
+	if got := plain.EndpointURLOverride(EndpointModels); got != "" {
+		t.Errorf("canonical models 应返回空 override，得到 %q", got)
+	}
+}
+
 func TestRunStateValidity(t *testing.T) {
 	if !RunStateRunning.Valid() || !RunStatePaused.Valid() {
 		t.Fatal("running and paused must be valid run states")

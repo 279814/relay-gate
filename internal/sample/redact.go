@@ -135,9 +135,10 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 
 // RedactText 脱敏一段文本里的 key，用于 URL 与 query string。
 //
-// 为什么 URL 也要扫：§3.2 提到少数中转站接受 `?key=<key>` 查询参数，
-// 而 full_url_mode 的 base_url 正是为这类非标准站准备的 —— 它会被整段
-// 存进样本的 out_url。入站 query 同理（客户端可能两处都带）。
+// 为什么 URL 也要扫：少数中转站接受 `?key=<key>` 查询参数，由
+// FixedQueryTemplate / legacy_exact 表达（§7.1；base_url 本身不允许 query，
+// §5.1）—— 出站 URL 会被整段存进样本的 out_url。入站 query 同理
+// （客户端可能两处都带）。
 // 漏掉这两个字段，§9.4 的「真 key 全表 grep 零命中」就不成立。
 //
 // URL 里的 key 还有一种**编码**形态：`sk-a/b+c` 在 query 里会写成

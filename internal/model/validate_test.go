@@ -17,6 +17,7 @@ func TestBaseURLRejectsPath(t *testing.T) {
 		"ftp://api.example.com", // 错误 scheme
 		"https://",              // 缺 host
 		"https://api.example.com?x=1",
+		"https://user:pass@api.example.com",
 		"",
 	}
 	for _, u := range bad {
@@ -70,10 +71,14 @@ func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
 
 	// full_url_mode 放开的只是「路径」这一条，URL 本身仍必须合法 ——
 	// 否则错误会推迟到出站时才暴露，那时只看到一个没头没尾的转发失败。
+	// query / fragment / userinfo 与开关无关，一律拒绝（§5.1 / §7.1）。
 	bad := []string{
 		"api.example.com/custom",       // 缺 scheme
 		"ftp://api.example.com/custom", // 错误 scheme
 		"https:///custom",              // 缺 host
+		"https://api.example.com/custom?key=1",
+		"https://api.example.com/custom#frag",
+		"https://user:pass@api.example.com/custom",
 		"",
 	}
 	for _, u := range bad {

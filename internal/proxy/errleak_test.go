@@ -11,8 +11,8 @@ import (
 // 写这条测试是为了核实一个怀疑，而不是为了确认一个已知结论：
 // writeForwardError 把 err.Error() 同时放进 X-Relay-Reason 头与 JSON 错误体，
 // 而那个 err 来自 Transport.RoundTrip —— 内容由标准库决定，不由我们决定。
-// 标准库的 *url.Error 会带上完整 URL，而 §3.2 提到少数站把 key 放在 query
-// 里（full_url_mode 正是为它们准备的），于是 base_url 本身就含明文 key。
+// 标准库的 *url.Error 会带上完整 URL，而 FixedQueryTemplate / legacy_exact
+// 可能把 key 放在 query 里（§7.1；base_url 本身不允许 query，§5.1）。
 //
 // 客户端是**外部**的：relay key 的持有者不该看到上游 key。样本落库那条
 // 路径已经按 §3.6.3b 全面脱敏了（三组头 + 三份 body + query + URL），
@@ -33,10 +33,13 @@ func TestErrorResponse_NeverEchoesUpstreamKeyFromURL(t *testing.T) {
 	const secret = "sk-upstream-secret-in-query"
 
 	hs := newHarness(t, nil)
-	// full_url_mode + key 放 query，指向一个不会有服务的端口，
+	// FixedQueryTemplate 把 key 放进 query；base 指向不会有服务的端口，
 	// 让失败发生在响应头阶段（那正是我们自己写错误响应的路径）。
-	hs.cfg.snap.Upstreams[10].FullURLMode = true
-	hs.cfg.snap.Upstreams[10].BaseURL = "http://127.0.0.1:1/v1/messages?key=" + secret
+	up := hs.cfg.snap.Upstreams[10]
+	up.APIKey = secret
+	up.FullURLMode = true
+	up.BaseURL = "http://127.0.0.1:1/v1/messages"
+	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 
