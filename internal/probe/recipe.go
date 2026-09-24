@@ -295,12 +295,14 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 	// 而真实请求的方法由 endpoint 决定。
 	//
 	// 再跑一遍 sanitize：旧行或旁路写入可能仍带 Authorization / Cookie
-	// relay_session；认证必须走 Endpoint auth profile（§7.2），不能从学来的
-	// 形状回放。
-	safe := sanitizeLearnedShape(model.ClientRequestShape{
+	// relay_session，或把客户端 messages/system/tools/认证值写进 BodyTemplate；
+	// 认证必须走 Endpoint auth profile（§7.2），探活 body 物化为紧凑模板，
+	// 不能从学来的原文回放。
+	safe := sanitizeLearnedShape(query.Endpoint, model.ClientRequestShape{
 		SafeHeaders:   profile.SafeHeaders,
 		FixedRawQuery: profile.FixedRawQuery,
 		BodyTemplate:  profile.BodyTemplate,
+		BodyShapeJSON: profile.BodyShapeJSON,
 	})
 	compiled, err := probetemplate.CompileContent(query.Endpoint, probetemplate.TemplateContent{
 		Method:   query.Endpoint.Method(),

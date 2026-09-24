@@ -57,7 +57,7 @@ func (l *Learner) ObserveSuccessful(ctx context.Context, upstreamID int64, endpo
 	if l == nil {
 		return nil
 	}
-	shape = sanitizeLearnedShape(shape)
+	shape = sanitizeLearnedShape(endpoint, shape)
 	hash := ShapeHash(shape)
 	if hash == "" {
 		return nil
@@ -96,14 +96,40 @@ func (l *Learner) ObserveSuccessful(ctx context.Context, upstreamID int64, endpo
 
 // sanitizeLearnedShape 丢掉凭据类字段，只留下可学习的安全形状（§8.4）。
 //
+// BodyTemplate 不信任入站字节：真实请求 body 可能含 messages/system/tools
+// 与认证值。探活用的 body 一律物化成该端点的紧凑探活体（占位符 + 文档
+// 允许的标志），绝不 JSON 往返客户端原文。BodyShapeJSON 仍只作类型图保管。
+//
 // 不记录被丢掉的值 —— 那正是凭据，进日志等于泄露。
-func sanitizeLearnedShape(shape model.ClientRequestShape) model.ClientRequestShape {
+func sanitizeLearnedShape(endpoint model.EndpointKind, shape model.ClientRequestShape) model.ClientRequestShape {
 	return model.ClientRequestShape{
 		SafeHeaders:    filterLearnedHeaders(shape.SafeHeaders),
 		FixedRawQuery:  filterLearnedQuery(shape.FixedRawQuery),
 		QueryShapeJSON: shape.QueryShapeJSON,
-		BodyTemplate:   shape.BodyTemplate,
+		BodyTemplate:   materializeLearnedBodyTemplate(endpoint),
 		BodyShapeJSON:  shape.BodyShapeJSON,
+	}
+}
+
+// materializeLearnedBodyTemplate 生成该端点的紧凑探活 body（§8.4）。
+//
+// 与内置 compact 模板同形：model / 输出上限 / stream（若适用）+ 单条
+// {{PROBE_PROMPT}}，不含 system、tools、metadata、客户端 messages 原文或
+// 认证值。入站 BodyTemplate 一律忽略，避免把真实流量 JSON 拷进探活。
+func materializeLearnedBodyTemplate(endpoint model.EndpointKind) []byte {
+	switch endpoint {
+	case model.EndpointModels:
+		return nil
+	case model.EndpointMessages:
+		return []byte(`{"model":"{{UPSTREAM_MODEL}}","max_tokens":1,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"{{PROBE_PROMPT}}"}]}]}`)
+	case model.EndpointCountTokens:
+		return []byte(`{"model":"{{UPSTREAM_MODEL}}","messages":[{"role":"user","content":[{"type":"text","text":"{{PROBE_PROMPT}}"}]}]}`)
+	case model.EndpointChatCompletions:
+		return []byte(`{"model":"{{UPSTREAM_MODEL}}","messages":[{"role":"user","content":"{{PROBE_PROMPT}}"}],"max_tokens":1,"stream":true}`)
+	case model.EndpointResponses:
+		return []byte(`{"model":"{{UPSTREAM_MODEL}}","input":[{"role":"user","content":[{"type":"input_text","text":"{{PROBE_PROMPT}}"}]}],"max_output_tokens":16,"stream":true}`)
+	default:
+		return nil
 	}
 }
 
