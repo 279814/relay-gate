@@ -333,8 +333,9 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	}
 
 	// SentAt 恰好在 RoundTrip 之前、且在取到连接池之后取（§P0-09 第 2 条）：
-	// 上面取连接池失败会走 finishConfigError（SentAt=0，未发送），
-	// 走到这里就一定会进入 RoundTrip，SentAt 于是与「已发送」严格一致。
+	// 上面取连接池失败会走 finishConfigError（SentAt=0，未发送）。
+	// 进入 RoundTrip 后若 GotConn 从未到达（DNS/dial/TLS 失败），
+	// finishTransportFailure 会清掉发送事实 —— 请求字节从未写出（§8.6）。
 	sentAt := e.clock.Now()
 	timing := sendTiming{sentAtMS: sentAt.UnixMilli()}
 	estInputTokens := int64(prepared.estimatedTokens(req.ModelName))
@@ -571,9 +572,23 @@ func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, bo
 }
 
 // finishTransportFailure 处理拿不到响应头的情形。
+//
+// GotConn 是已有的「连接已到手」观测（outbound.WithTrace）：未到达则 HTTP
+// 请求字节不可能已写出。CostEvidenceFromExecution 以 SentAtMS>0 为发送门禁，
+// 若此处保留 RoundTrip 前写入的 SentAt，会把 DNS/dial/connection refused
+// 记成一次完整探测成本，违反 §8.6「实际发出去那份内容」。GotConn 已到则
+// 可能已写过请求，按「可能已执行」记账，不清发送事实。
 func (e *Executor) finishTransportFailure(ctx context.Context, req ExecutionRequest,
 	prepared *preparedProbe, rtErr error, headerTimedOut bool, requestBytes, estInputTokens int64,
 	timing sendTiming, sentAt time.Time) (ExecutionResult, error) {
+
+	sent := true
+	if timing.gotConnAtMS <= 0 {
+		timing.sentAtMS = 0
+		estInputTokens = 0
+		requestBytes = 0
+		sent = false
+	}
 
 	var cancelCause error
 	if ctx.Err() != nil {
@@ -593,10 +608,10 @@ func (e *Executor) finishTransportFailure(ctx context.Context, req ExecutionRequ
 	}
 
 	outcome := e.transportOutcome(ctx, req, decision, rtErr, headerTimedOut)
-	outcome.Sent = true
+	outcome.Sent = sent
 	exec := e.buildExecution(req, prepared.recipe, decision, timing, requestBytes, 0, estInputTokens, false,
 		prepared.resolvedURLHash, prepared.requestURLHash)
-	result := ExecutionResult{Decision: decision, Outcome: outcome, Execution: exec, Sent: true}
+	result := ExecutionResult{Decision: decision, Outcome: outcome, Execution: exec, Sent: sent}
 	apply, recErr := e.recordExecution(ctx, req, &result.Execution)
 	if recErr != nil {
 		return result, recErr

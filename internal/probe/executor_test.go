@@ -13,6 +13,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 // ── 测试替身 ──────────────────────────────────────────────
@@ -320,7 +321,8 @@ func TestExecutor_RecorderErrorIsGoError(t *testing.T) {
 	}
 }
 
-// 传输层失败：status=0、unreachable、SentAt 非零、不 reachable。
+// 传输层失败且从未 GotConn：status=0、unreachable，发送事实已清（§8.6）。
+// RoundTrip 前写入的 SentAt 不能留下，否则 CostEvidenceFromExecution 会记账。
 func TestExecutor_TransportFailure(t *testing.T) {
 	rt := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("connection refused")
@@ -341,9 +343,75 @@ func TestExecutor_TransportFailure(t *testing.T) {
 	if result.Outcome.Verdict != health.VerdictUnavailable {
 		t.Errorf("传输失败应为 unavailable，实际 %s", result.Outcome.Verdict)
 	}
-	if !result.Sent || result.Execution.SentAtMS == 0 {
-		t.Error("进入过 RoundTrip，Sent/SentAt 应已置")
+	if result.Sent || result.Execution.SentAtMS != 0 {
+		t.Error("GotConn 未到：请求字节未写出，Sent/SentAt 应已清")
 	}
+	if result.Execution.EstimatedInputTokens != 0 {
+		t.Errorf("未写出请求不应带估算 token，实际 %d", result.Execution.EstimatedInputTokens)
+	}
+}
+
+// §8.6：dial/connection refused（GotConn 未到）不得加 token；任意 HTTP 响应
+// （含 401）已写出请求，内置估算必须加一次。
+func TestExecutor_PreWriteDialDoesNotCharge_HTTP401ChargesOnce(t *testing.T) {
+	t.Run("connection_refused", func(t *testing.T) {
+		up := upstreamFor("http://127.0.0.1:1")
+		recorder := &captureRecorder{}
+		exec := newTestExecutorFor(up, http.DefaultTransport, recorder, AlwaysOpenAdmission(), WallClock())
+
+		result, err := exec.Execute(context.Background(), l2RequestFor(up))
+		if err != nil {
+			t.Fatalf("dial 失败是站点结果，不该是 Go error: %v", err)
+		}
+		if result.Execution.GotConnAtMS != 0 {
+			t.Fatalf("connection refused 不应有 GotConn，实际 %d", result.Execution.GotConnAtMS)
+		}
+		if result.Sent || result.Outcome.Sent || result.Execution.SentAtMS != 0 {
+			t.Fatal("预写失败必须清发送事实")
+		}
+		evidence, err := revisioncodec.CostEvidenceFromExecution(result.Execution)
+		if err != nil {
+			t.Fatalf("CostEvidenceFromExecution: %v", err)
+		}
+		if evidence.Requests != 0 || evidence.EstimatedInputTokens != 0 || evidence.Failed != 0 {
+			t.Fatalf("未写出请求不得记账，got requests=%d tokens=%d failed=%d",
+				evidence.Requests, evidence.EstimatedInputTokens, evidence.Failed)
+		}
+	})
+
+	t.Run("http_401", func(t *testing.T) {
+		rt := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+			return respFrom(401, "application/json", `{"error":"unauthorized"}`), nil
+		}}
+		up := upstreamFor("https://example.test")
+		recorder := &captureRecorder{}
+		exec := newTestExecutorFor(up, rt, recorder, AlwaysOpenAdmission(), WallClock())
+
+		result, err := exec.Execute(context.Background(), l2RequestFor(up))
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if result.Decision.StatusCode != 401 {
+			t.Fatalf("期望 401，实际 %d", result.Decision.StatusCode)
+		}
+		if !result.Sent || result.Execution.SentAtMS == 0 {
+			t.Fatal("已收到 HTTP 响应必须保留发送事实")
+		}
+		if result.Execution.EstimatedInputTokens <= 0 {
+			t.Fatalf("401 应按内置估算记账，实际 %d", result.Execution.EstimatedInputTokens)
+		}
+		evidence, err := revisioncodec.CostEvidenceFromExecution(result.Execution)
+		if err != nil {
+			t.Fatalf("CostEvidenceFromExecution: %v", err)
+		}
+		if evidence.Requests != 1 || evidence.EstimatedInputTokens != result.Execution.EstimatedInputTokens {
+			t.Fatalf("401 应加一次估算：requests=%d tokens=%d want tokens=%d",
+				evidence.Requests, evidence.EstimatedInputTokens, result.Execution.EstimatedInputTokens)
+		}
+		if evidence.Failed != 1 {
+			t.Fatalf("401 应记 Failed=1，实际 %d", evidence.Failed)
+		}
+	})
 }
 
 // 200 但流内无语义证据 → fake_alive → unavailable。
