@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probetemplate"
 )
 
@@ -120,6 +121,9 @@ func (store *Store) CreateUpstreamWithEndpoints(ctx context.Context, upstream *m
 		if err := endpoint.Validate(); err != nil {
 			return err
 		}
+		if err := outbound.ValidateURLOverride(upstream.BaseURL, endpoint.URLOverride); err != nil {
+			return err
+		}
 		if err := insertEndpointTx(ctx, tx, endpoint); err != nil {
 			return err
 		}
@@ -191,6 +195,9 @@ func (store *Store) CreateEndpoint(endpoint *model.UpstreamEndpoint) (err error)
 	endpoint.CreatedAt = nowMS()
 	endpoint.UpdatedAt = endpoint.CreatedAt
 	if err := endpoint.Validate(); err != nil {
+		return err
+	}
+	if err := store.validateEndpointURLOverride(endpoint); err != nil {
 		return err
 	}
 	tx, err := store.db.BeginTx(context.Background(), nil)
@@ -319,6 +326,9 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 		return model.WrapValidation("expected revision 必须为正数")
 	}
 	if err := endpoint.Validate(); err != nil {
+		return err
+	}
+	if err := store.validateEndpointURLOverride(endpoint); err != nil {
 		return err
 	}
 	tx, err := store.db.BeginTx(context.Background(), nil)
@@ -486,4 +496,14 @@ func (store *Store) ResolveLegacyURL(ctx context.Context, id, expectedRevision i
 		return nil, err
 	}
 	return []byte(plain), nil
+}
+
+// validateEndpointURLOverride 在写入前用 Upstream.base_url 校验同源（§7.1）。
+// Resolve 也会再验一次；这里挡掉的是「坏 override 进库、界面显示已保存」。
+func (store *Store) validateEndpointURLOverride(endpoint *model.UpstreamEndpoint) error {
+	upstream, err := store.GetUpstream(endpoint.UpstreamID)
+	if err != nil {
+		return err
+	}
+	return outbound.ValidateURLOverride(upstream.BaseURL, endpoint.URLOverride)
 }

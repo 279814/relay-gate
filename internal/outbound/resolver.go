@@ -441,6 +441,27 @@ func parseOrigin(raw, field string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// ValidateURLOverride 是写入路径与 Resolve 共用的同源校验入口（§7.1）。
+//
+// 空 override 表示走 canonical path，直接通过。非空时必须与 base_url 同源，
+// 否则跨 origin 配置会进库、只在真实请求时才炸 —— 管理界面看起来「保存成功」，
+// 出站却全失败。scheme / host / 有效端口任一不同都拒绝；只改 path 的同源
+// override 放行。userinfo / fragment 由 parseOrigin 拒绝（与 base_url 同口径）。
+func ValidateURLOverride(baseURL, override string) error {
+	if override == "" {
+		return nil
+	}
+	base, err := parseOrigin(baseURL, "base_url")
+	if err != nil {
+		return err
+	}
+	parsed, err := parseOrigin(override, "url_override")
+	if err != nil {
+		return err
+	}
+	return requireSameOrigin(base, parsed)
+}
+
 // requireSameOrigin 要求 override / legacy URL 与 base_url 同源。
 //
 // 跨 origin 必须另建 Upstream（§7.1）：Reachability 是站级结论，一个站的

@@ -189,7 +189,15 @@ func TestResolve_RejectsCrossOriginOverride(t *testing.T) {
 			if !strings.Contains(err.Error(), "跨 origin") {
 				t.Errorf("错误应说明跨 origin，得到 %v", err)
 			}
+			// 写入路径共用同一入口：跨 origin 不得只靠 Resolve 挡。
+			if err := ValidateURLOverride(testUpstream().BaseURL, c.override); err == nil ||
+				!strings.Contains(err.Error(), "跨 origin") {
+				t.Errorf("ValidateURLOverride 也应拒绝跨 origin，得到 %v", err)
+			}
 		})
+	}
+	if err := ValidateURLOverride("https://a.example", "https://a.example/custom/chat"); err != nil {
+		t.Errorf("同源 path override 应通过写入校验，得到 %v", err)
 	}
 }
 
