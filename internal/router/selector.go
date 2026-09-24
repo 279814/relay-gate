@@ -106,9 +106,27 @@ func MatchModelName(snap *Snapshot, inModel string,
 	if inModel == "" {
 		return nil, fmt.Errorf("%w: 入站 model 为空", ErrModelNotFound)
 	}
+	nameMatches, fallback := orderedModelNameMatches(snap, inModel, endpointProto)
+	if len(nameMatches) > 0 {
+		return nameMatches[0], nil
+	}
+	if fallback != nil {
+		return fallback, nil
+	}
+	return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
+}
 
-	var prefixes []*model.ModelName
-	var fallback *model.ModelName
+// orderedModelNameMatches 拆出名称命中与兜底。
+//
+// nameMatches 顺序：精确（快照遍历顺序）→ 前缀（最长优先，同长按 ID）。
+// SelectExcluding 在精确命中的 Route 全部被 exclude / 不可用时，只沿
+// nameMatches 继续尝试前缀，避免「精确因 config_error 被排除」却丢掉仍能
+// 匹配的健康前缀（§6.4）。名称已命中时不回落到兜底——兜底只服务「从未
+// 命中名称」的入站 model，与 MatchModelName 一致。
+func orderedModelNameMatches(snap *Snapshot, inModel string,
+	endpointProto model.Protocol) (nameMatches []*model.ModelName, fallback *model.ModelName) {
+
+	var exacts, prefixes []*model.ModelName
 
 	for _, mn := range snap.ModelNames {
 		if !mn.Enabled {
@@ -121,7 +139,8 @@ func MatchModelName(snap *Snapshot, inModel string,
 			continue
 		}
 		if mn.MatchMode == model.MatchExact && mn.Name == inModel {
-			return mn, nil // 精确匹配优先级最高，直接返回
+			exacts = append(exacts, mn)
+			continue
 		}
 		if mn.MatchMode == model.MatchPrefix && strings.HasPrefix(inModel, mn.Name) {
 			prefixes = append(prefixes, mn)
@@ -141,12 +160,12 @@ func MatchModelName(snap *Snapshot, inModel string,
 			// 长度相同时按 ID 定序，保证结果稳定可复现
 			return prefixes[i].ID < prefixes[j].ID
 		})
-		return prefixes[0], nil
 	}
-	if fallback != nil {
-		return fallback, nil
-	}
-	return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
+
+	nameMatches = make([]*model.ModelName, 0, len(exacts)+len(prefixes))
+	nameMatches = append(nameMatches, exacts...)
+	nameMatches = append(nameMatches, prefixes...)
+	return nameMatches, fallback
 }
 
 // Select 按 §3.4 完成选路。endpointProto 是入站端点隐含的协议。
@@ -166,59 +185,85 @@ func Select(snap *Snapshot, hv HealthView, inModel string,
 // 迟早会漏清理，表现是某个站在一次失败之后就再也选不到了。
 //
 // exclude 为 nil 或空时行为与 Select 完全一致，所以既有调用方与测试不受影响。
+//
+// 匹配顺序仍是精确 → 最长前缀 → 兜底；但若当前命中的 ModelName 在排除
+// dead/冷却/exclude 后没有任何可用 Route，则继续尝试下一匹配（例如精确
+// Route 因 config_error 被 selectFor 放入 exclude 后，仍可选健康前缀）。
+// 有可用桶却全部达并发上限时不跨 ModelName 回落——那是额度耗尽，不是
+// 「该匹配不合格」。
 func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 	endpointProto model.Protocol, exclude map[int64]bool) (*Candidate, error) {
 
-	mn, err := MatchModelName(snap, inModel, endpointProto)
-	if err != nil {
-		return nil, err
+	if inModel == "" {
+		return nil, fmt.Errorf("%w: 入站 model 为空", ErrModelNotFound)
 	}
-	// 协议必须一致。配错了要明确报错，而不是把 Anthropic 的 body
-	// 发到 /v1/chat/completions —— 那会得到一个难以理解的上游 400。
-	if mn.Protocol != endpointProto {
-		return nil, fmt.Errorf("%w: 端点是 %s，但 ModelName %q 配置为 %s",
-			ErrProtocolMismatch, endpointProto, mn.Name, mn.Protocol)
-	}
-
-	buckets, reason := viableBuckets(snap, hv, mn, exclude)
-	if len(buckets) == 0 {
-		return nil, fmt.Errorf("%w: ModelName %q %s", ErrNoRouteAvailable, mn.Name, reason)
-	}
-
-	// 按优先级升序找第一个能占到额度的 Route。
-	//
-	// 桶内挑中的那个若占不到（已达上限，或刚被并发请求抢先），就把它从
-	// 候选池里剔掉、在桶内重挑，而不是直接溢出到下一优先级 —— 后者会让
-	// 同桶里明明还有余量的站被白白跳过。整桶都占不到才溢出（§3.4 步骤 7）。
-	for _, prio := range sortedKeys(buckets) {
-		pool := buckets[prio]
-		for len(pool) > 0 {
-			i := weightedPick(pool)
-			chosen := pool[i]
-			// 交换删除。buckets 是 viableBuckets 每次现建的，改它不会
-			// 碰到配置快照；加权随机也不依赖元素顺序。
-			pool[i] = pool[len(pool)-1]
-			pool = pool[:len(pool)-1]
-
-			up := snap.Upstreams[chosen.UpstreamID]
-			if up == nil {
-				// 配置不一致（Route 指向已删除的 Upstream）。跳过而不是崩，
-				// 让其余 Route 仍能服务。
-				continue
-			}
-			// 占位与判定在 TryAcquire 内部一次完成，中间没有让并发请求
-			// 挤进来的窗口。
-			release, gen, ok := hv.TryAcquire(chosen.ID, chosen.MaxConcurrency)
-			if !ok {
-				continue
-			}
-			return &Candidate{Route: chosen, Upstream: up,
-				ModelName: mn, release: release, HealthGeneration: gen}, nil
+	nameMatches, fallback := orderedModelNameMatches(snap, inModel, endpointProto)
+	matches := nameMatches
+	if len(matches) == 0 {
+		if fallback == nil {
+			return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
 		}
+		// 无名称命中时才用兜底；名称已命中但 Route 不可用时不回落兜底。
+		matches = []*model.ModelName{fallback}
 	}
 
-	return nil, fmt.Errorf("%w: ModelName %q 的所有 Route 都已达并发上限",
-		ErrNoRouteAvailable, mn.Name)
+	var lastNoRoute error
+	for _, mn := range matches {
+		// 协议必须一致。配错了要明确报错，而不是把 Anthropic 的 body
+		// 发到 /v1/chat/completions —— 那会得到一个难以理解的上游 400。
+		// 名称已命中时协议错误是 request-global，不跨到下一匹配。
+		if mn.Protocol != endpointProto {
+			return nil, fmt.Errorf("%w: 端点是 %s，但 ModelName %q 配置为 %s",
+				ErrProtocolMismatch, endpointProto, mn.Name, mn.Protocol)
+		}
+
+		buckets, reason := viableBuckets(snap, hv, mn, exclude)
+		if len(buckets) == 0 {
+			lastNoRoute = fmt.Errorf("%w: ModelName %q %s", ErrNoRouteAvailable, mn.Name, reason)
+			continue
+		}
+
+		// 按优先级升序找第一个能占到额度的 Route。
+		//
+		// 桶内挑中的那个若占不到（已达上限，或刚被并发请求抢先），就把它从
+		// 候选池里剔掉、在桶内重挑，而不是直接溢出到下一优先级 —— 后者会让
+		// 同桶里明明还有余量的站被白白跳过。整桶都占不到才溢出（§3.4 步骤 7）。
+		for _, prio := range sortedKeys(buckets) {
+			pool := buckets[prio]
+			for len(pool) > 0 {
+				i := weightedPick(pool)
+				chosen := pool[i]
+				// 交换删除。buckets 是 viableBuckets 每次现建的，改它不会
+				// 碰到配置快照；加权随机也不依赖元素顺序。
+				pool[i] = pool[len(pool)-1]
+				pool = pool[:len(pool)-1]
+
+				up := snap.Upstreams[chosen.UpstreamID]
+				if up == nil {
+					// 配置不一致（Route 指向已删除的 Upstream）。跳过而不是崩，
+					// 让其余 Route 仍能服务。
+					continue
+				}
+				// 占位与判定在 TryAcquire 内部一次完成，中间没有让并发请求
+				// 挤进来的窗口。
+				release, gen, ok := hv.TryAcquire(chosen.ID, chosen.MaxConcurrency)
+				if !ok {
+					continue
+				}
+				return &Candidate{Route: chosen, Upstream: up,
+					ModelName: mn, release: release, HealthGeneration: gen}, nil
+			}
+		}
+
+		// 有候选但全达并发上限：不跨到前缀/兜底（额度问题 ≠ 匹配不合格）。
+		return nil, fmt.Errorf("%w: ModelName %q 的所有 Route 都已达并发上限",
+			ErrNoRouteAvailable, mn.Name)
+	}
+
+	if lastNoRoute != nil {
+		return nil, lastNoRoute
+	}
+	return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
 }
 
 // viableBuckets 按 priority 把可用 Route 分桶。

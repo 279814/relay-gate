@@ -448,6 +448,94 @@ func TestMatchModelName_ExactBeatsPrefix(t *testing.T) {
 	}
 }
 
+// §6.4：精确 Route 因 config_error / exclude 不合格时，仍应选健康前缀；
+// 精确健康时仍优于前缀。selectFor 把 config_error 放进 exclude 再调
+// SelectExcluding，故此处用 exclude 模拟。
+func TestSelectExcluding_ExcludedExactFallsToPrefix(t *testing.T) {
+	mns := []*model.ModelName{
+		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, Enabled: true},
+		{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+	}
+	ups := []*model.Upstream{
+		{ID: 10, Name: "exact-up", Enabled: true},
+		{ID: 20, Name: "prefix-up", Enabled: true},
+	}
+	rts := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+	hv := newFakeHealth()
+
+	// 精确 Route 被排除（config_error）→ 健康前缀。
+	c, err := SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic,
+		map[int64]bool{100: true})
+	if err != nil {
+		t.Fatalf("excluded exact should fall to prefix: %v", err)
+	}
+	if c.Route.ID != 200 || c.ModelName.ID != 2 {
+		t.Fatalf("want prefix route 200 / ModelName 2, got route %d ModelName %d",
+			c.Route.ID, c.ModelName.ID)
+	}
+	c.Release()
+
+	// 精确健康 → 仍选精确，不抢前缀。
+	c, err = SelectExcluding(snap, hv, "claude-opus-5", model.ProtoAnthropic, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Route.ID != 100 || c.ModelName.ID != 1 {
+		t.Fatalf("healthy exact must beat prefix, got route %d ModelName %d",
+			c.Route.ID, c.ModelName.ID)
+	}
+	c.Release()
+}
+
+// 不合格的较短前缀不得压过健康的更长前缀；名称已命中时也不回落兜底。
+func TestSelectExcluding_ExcludedPrefixFallsToLongerNotFallback(t *testing.T) {
+	mns := []*model.ModelName{
+		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 9, Name: "catch-all", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, IsFallback: true, Enabled: true},
+	}
+	ups := []*model.Upstream{
+		{ID: 10, Name: "long", Enabled: true},
+		{ID: 20, Name: "short", Enabled: true},
+		{ID: 90, Name: "fb", Enabled: true},
+	}
+	rts := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 900, ModelNameID: 9, UpstreamID: 90, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+	hv := newFakeHealth()
+
+	// 最长前缀 Route 被排除 → 次长前缀，不是兜底。
+	c, err := SelectExcluding(snap, hv, "claude-opus-5-thinking", model.ProtoAnthropic,
+		map[int64]bool{100: true})
+	if err != nil {
+		t.Fatalf("excluded longest prefix should fall to shorter prefix: %v", err)
+	}
+	if c.Route.ID != 200 || c.ModelName.ID != 2 {
+		t.Fatalf("want shorter prefix route 200, got route %d ModelName %d",
+			c.Route.ID, c.ModelName.ID)
+	}
+	c.Release()
+
+	// 名称命中的前缀全排除 → ErrNoRouteAvailable，不吃兜底。
+	_, err = SelectExcluding(snap, hv, "claude-opus-5-thinking", model.ProtoAnthropic,
+		map[int64]bool{100: true, 200: true})
+	if !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("name-matched but all excluded must not use fallback, got %v", err)
+	}
+}
+
 func TestMatchModelName_Fallback(t *testing.T) {
 	mns := []*model.ModelName{
 		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
