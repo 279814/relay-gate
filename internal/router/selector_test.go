@@ -685,9 +685,81 @@ func TestMatchModelName_SkipsDisabled(t *testing.T) {
 			MatchMode: model.MatchExact, IsFallback: true, Enabled: false},
 	}
 	snap := BuildSnapshot(mns, nil, nil)
-	if _, err := MatchModelName(snap, "m", model.ProtoAnthropic); !errors.Is(err, ErrModelNotFound) {
-		t.Errorf("停用的 ModelName 不应被匹配，得到 %v", err)
+	// 点名停用精确名 → ErrNoRouteAvailable（不是「从未配置」的 404）。
+	if _, err := MatchModelName(snap, "m", model.ProtoAnthropic); !errors.Is(err, ErrNoRouteAvailable) {
+		t.Errorf("停用的精确名应回 ErrNoRouteAvailable，得到 %v", err)
 	}
+}
+
+// 已配置但停用的精确名不得落到启用的前缀或兜底（否则点名模型被静默换站）。
+// 未配置名仍可走兜底；启用精确名仍优先于前缀与兜底。
+func TestMatchModelName_DisabledExactBlocksPrefixAndFallback(t *testing.T) {
+	mns := []*model.ModelName{
+		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, Enabled: false},
+		{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 9, Name: "catch-all", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, IsFallback: true, Enabled: true},
+	}
+	ups := []*model.Upstream{
+		{ID: 20, Name: "prefix-up", Enabled: true},
+		{ID: 90, Name: "fb-up", Enabled: true},
+	}
+	rts := []*model.Route{
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 900, ModelNameID: 9, UpstreamID: 90, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+	hv := newFakeHealth()
+
+	if _, err := MatchModelName(snap, "claude-opus-5", model.ProtoAnthropic); !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("disabled exact must not match prefix/fallback, got %v", err)
+	}
+	if _, err := Select(snap, hv, "claude-opus-5", model.ProtoAnthropic); !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("Select disabled exact must not use prefix/fallback, got %v", err)
+	}
+
+	// 从未配置的名字仍可走兜底。
+	got, err := MatchModelName(snap, "never-configured", model.ProtoAnthropic)
+	if err != nil || got.ID != 9 {
+		t.Fatalf("unknown name should use fallback, got %v err=%v", got, err)
+	}
+	c, err := Select(snap, hv, "never-configured", model.ProtoAnthropic)
+	if err != nil || c.Route.ID != 900 {
+		t.Fatalf("unknown Select should use fallback route 900, got %+v err=%v", c, err)
+	}
+	c.Release()
+}
+
+func TestSelect_EnabledExactStillBeatsPrefixAndFallback(t *testing.T) {
+	mns := []*model.ModelName{
+		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, Enabled: true},
+		{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 9, Name: "catch-all", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, IsFallback: true, Enabled: true},
+	}
+	ups := []*model.Upstream{
+		{ID: 10, Name: "exact-up", Enabled: true},
+		{ID: 20, Name: "prefix-up", Enabled: true},
+		{ID: 90, Name: "fb-up", Enabled: true},
+	}
+	rts := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 900, ModelNameID: 9, UpstreamID: 90, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+	c, err := Select(snap, newFakeHealth(), "claude-opus-5", model.ProtoAnthropic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Route.ID != 100 || c.ModelName.ID != 1 {
+		t.Fatalf("enabled exact must win, got route %d ModelName %d", c.Route.ID, c.ModelName.ID)
+	}
+	c.Release()
 }
 
 // 协议不一致必须明确报错，而不是把 Anthropic 的 body 发到 chat/completions。

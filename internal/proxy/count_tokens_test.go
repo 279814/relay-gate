@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -488,6 +489,40 @@ func TestCountTokens_FallsBackWhenModelNotConfigured(t *testing.T) {
 	}
 	if decodeInputTokens(t, rec.Body.String()) <= 0 {
 		t.Error("兜底应给出正数 token")
+	}
+}
+
+// 点名停用精确名时 count_tokens 不得打到另一 ModelName 的上游（本地粗算可）。
+func TestCountTokens_DisabledExactDoesNotHitFallbackUpstream(t *testing.T) {
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"input_tokens":99}`))
+	})
+	up := hs.cfg.snap.Upstreams[10]
+	disabled := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: false}
+	fallback := &model.ModelName{ID: 9, Name: "catch-all",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, IsFallback: true, Enabled: true}
+	fbRoute := &model.Route{ID: 900, ModelNameID: 9, UpstreamID: 10,
+		Priority: 1, Weight: 100, Enabled: true}
+	hs.cfg.snap = router.BuildSnapshot(
+		[]*model.ModelName{disabled, fallback},
+		[]*model.Upstream{up},
+		[]*model.Route{fbRoute},
+	)
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (local estimate)", rec.Code)
+	}
+	if rec.Header().Get("X-Relay-Count-Tokens") != "estimated" {
+		t.Fatalf("want local estimate header, got %q", rec.Header().Get("X-Relay-Count-Tokens"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("disabled exact must not RoundTrip fallback upstream, hits=%d", n)
 	}
 }
 
