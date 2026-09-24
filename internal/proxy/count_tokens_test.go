@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
@@ -420,6 +421,57 @@ func TestCountTokens_FallsBackWhenUpstreamUnreachable(t *testing.T) {
 	}
 	if decodeInputTokens(t, rec.Body.String()) <= 0 {
 		t.Error("兜底应给出正数 token")
+	}
+}
+
+// §7.4 / §10.3：一次客户端 count_tokens 的多次上游尝试共享同一份
+// count_tokens_total_sec。两个站都卡住时，客户端不得被拖到 2× total；
+// 预算耗尽后停止换站并回本地估算。
+func TestCountTokens_SharesTotalTimeBudget(t *testing.T) {
+	stall := func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}
+	hs := newMultiHarness(t, stall, stall)
+	caps := &memoryCountCaps{}
+	caps.set(100, model.CapabilitySupported)
+	caps.set(200, model.CapabilitySupported)
+	hs.h.WithCountTokensCapability(caps)
+
+	hs.cfg.settings.CountTokensTotalSec = 2
+	hs.cfg.settings.CountTokensConnectSec = 1
+
+	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+	mux := http.NewServeMux()
+	hs.h.Routes(mux)
+	r := httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(body))
+	r.Header = claudeCodeHeaders()
+	r.Header.Set("X-Api-Key", hs.relayPW)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, r)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (local estimate after budget exhausted)", rec.Code)
+	}
+	if got := rec.Header().Get("X-Relay-Count-Tokens"); got != "estimated" {
+		t.Fatalf("X-Relay-Count-Tokens = %q, want estimated", got)
+	}
+	if decodeInputTokens(t, rec.Body.String()) <= 0 {
+		t.Error("local estimate must return positive input_tokens")
+	}
+	// total=2s；若每次尝试各拿完整 total，两站各卡 2s → 客户端 ≥4s。
+	if elapsed >= 4*time.Second {
+		t.Errorf("elapsed %v — each attempt likely took a fresh total (want shared ≤~2s)", elapsed)
+	}
+	hits := 0
+	for _, st := range hs.stations {
+		n, _, _ := st.stats()
+		hits += n
+	}
+	if hits > 1 {
+		t.Errorf("shared budget exhausted must not start another upstream; hits=%d, want ≤1", hits)
 	}
 }
 
