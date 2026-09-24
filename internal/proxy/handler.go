@@ -107,10 +107,12 @@ type Handler struct {
 // count_tokens multi-route (§10.3). MarkCountTokensUnsupported records a
 // 404/405; MarkCountTokensConfigError records a 401/403. Both skip that
 // Route's count_tokens only — never model RouteHealth / messages config_error.
+// generation is the RouteHealth generation from select/TryAcquire; callers must
+// pass Candidate.HealthGeneration so stale marks after id reuse are dropped.
 type CountTokensCapability interface {
 	Effective(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind, expectedToken string) model.CapabilityState
-	MarkCountTokensUnsupported(routeID int64, statusCode int)
-	MarkCountTokensConfigError(routeID int64, statusCode int)
+	MarkCountTokensUnsupported(routeID int64, generation uint64, statusCode int)
+	MarkCountTokensConfigError(routeID int64, generation uint64, statusCode int)
 }
 
 // RelayKeyValidator is the hot-path relay auth snapshot (§12.6).

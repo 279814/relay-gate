@@ -124,7 +124,7 @@ func runServer() error {
 	tracker := health.NewTracker(cfgSrc)
 	reachTracker := health.NewReachabilityTracker(cfgSrc)
 	gate := health.NewUpstreamGate().WithTracker(reachTracker)
-	capRegistry := probe.NewCapabilityRegistry(cfgSrc)
+	capRegistry := probe.NewCapabilityRegistry(cfgSrc).WithRouteGeneration(tracker)
 	obsReducer := health.NewObservationReducer(nil)
 
 	// 样本记录（§3.6）。开关与保留策略都在 Settings 里、都可热改

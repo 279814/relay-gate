@@ -213,7 +213,7 @@ func (m *memoryCountCaps) Effective(_ model.RecipeScope, scopeID int64,
 	return m.states[scopeID]
 }
 
-func (m *memoryCountCaps) MarkCountTokensUnsupported(routeID int64, statusCode int) {
+func (m *memoryCountCaps) MarkCountTokensUnsupported(routeID int64, _ uint64, statusCode int) {
 	if statusCode != http.StatusNotFound && statusCode != http.StatusMethodNotAllowed {
 		return
 	}
@@ -226,7 +226,7 @@ func (m *memoryCountCaps) MarkCountTokensUnsupported(routeID int64, statusCode i
 	m.markedUnsupported++
 }
 
-func (m *memoryCountCaps) MarkCountTokensConfigError(routeID int64, statusCode int) {
+func (m *memoryCountCaps) MarkCountTokensConfigError(routeID int64, _ uint64, statusCode int) {
 	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
 		return
 	}

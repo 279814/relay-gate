@@ -242,9 +242,9 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		if h.countCaps != nil && cand.Route != nil {
 			switch resp.StatusCode {
 			case http.StatusNotFound, http.StatusMethodNotAllowed:
-				h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, resp.StatusCode)
+				h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, cand.HealthGeneration, resp.StatusCode)
 			case http.StatusUnauthorized, http.StatusForbidden:
-				h.countCaps.MarkCountTokensConfigError(cand.Route.ID, resp.StatusCode)
+				h.countCaps.MarkCountTokensConfigError(cand.Route.ID, cand.HealthGeneration, resp.StatusCode)
 			}
 		}
 		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
