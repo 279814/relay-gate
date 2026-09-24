@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
 func TestLegacyCreateUpstreamAtomicallyCreatesCanonicalEndpoints(t *testing.T) {
@@ -204,6 +206,71 @@ func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
 	}
 	if models.Revision <= beforeRevision {
 		t.Errorf("override 变了就必须 bump revision：%d -> %d", beforeRevision, models.Revision)
+	}
+}
+
+// 跨 origin 的 url_override 不得入库；同源只改 path 的必须能存，且 Resolve
+// 出站 authority 仍取 base_url（§7.1）。
+func TestUpdateEndpoint_RejectsCrossOriginURLOverride(t *testing.T) {
+	st := testStore(t)
+	upstream := &model.Upstream{
+		Name: "override-origin", BaseURL: "https://a.example",
+		APIKey: "sk-override-origin", Enabled: true,
+	}
+	if err := st.CreateUpstream(upstream); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListEndpointsPage(context.Background(), model.EndpointFilter{
+		UpstreamID: upstream.ID, Endpoint: model.EndpointMessages,
+	})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("list endpoint = %v, err=%v", page.Items, err)
+	}
+	endpoint := page.Items[0]
+	before := endpoint.URLOverride
+	beforeRev := endpoint.Revision
+
+	endpoint.URLOverride = "https://b.example/v1/messages"
+	err = st.UpdateEndpoint(endpoint, beforeRev)
+	if !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("cross-origin override error = %v, want validation", err)
+	}
+	if !strings.Contains(err.Error(), "跨 origin") {
+		t.Fatalf("error should mention 跨 origin, got %v", err)
+	}
+	got, err := st.GetEndpoint(endpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URLOverride != before || got.Revision != beforeRev {
+		t.Fatalf("cross-origin write must not persist: override=%q rev=%d", got.URLOverride, got.Revision)
+	}
+
+	endpoint.URLOverride = "https://a.example/custom/chat"
+	if err := st.UpdateEndpoint(endpoint, beforeRev); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetEndpoint(endpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URLOverride != "https://a.example/custom/chat" {
+		t.Fatalf("same-origin path override should persist, got %q", got.URLOverride)
+	}
+
+	resolved, err := outbound.NewResolver(st.cipher).Resolve(context.Background(), outbound.ResolveInput{
+		Upstream: &model.ProbeUpstreamConfig{ID: upstream.ID, BaseURL: upstream.BaseURL},
+		Endpoint: got,
+		Use:      outbound.ResolveRealForward,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.RawURL != "https://a.example/custom/chat" {
+		t.Fatalf("wire URL want https://a.example/custom/chat got %q", resolved.RawURL)
+	}
+	if resolved.URL.Host != "a.example" {
+		t.Fatalf("authority must stay base host, got %q", resolved.URL.Host)
 	}
 }
 
