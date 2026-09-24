@@ -222,11 +222,21 @@ func (s *Store) SetSamplePinned(id int64, pinned bool) error {
 // keepCount / keepDays / maxBytes <= 0 表示该维度不限。
 // 磁盘配额按 in_body/out_body/resp_body 存盘 BLOB 字节合计（信封或明文均计入），
 // 超限时优先删除最旧未置顶行；只删 sample 表整行，不按信封形态筛选。
+//
+// §5.4：一个客户端请求形成一个 Sample Group（含 request_log）。删除 Group
+// 时必须一并删掉同 req_id 的 request_log，否则重试产生的多行日志会在样本
+// 被清后无限期残留。置顶样本豁免，其日志也保留。无样本的独立日志仍由
+// PruneRequestLogs 按自身 keep 清理，这里不碰。
 func (s *Store) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, error) {
 	var total int64
 
 	if keepDays > 0 {
 		cutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
+		reqIDs, err := s.listSampleReqIDs(
+			`SELECT req_id FROM sample WHERE pinned = 0 AND ts_recv < ? AND req_id != ''`, cutoff)
+		if err != nil {
+			return total, fmt.Errorf("列举待删样本 req_id: %w", err)
+		}
 		res, err := s.db.Exec(
 			`DELETE FROM sample WHERE pinned = 0 AND ts_recv < ?`, cutoff)
 		if err != nil {
@@ -234,11 +244,20 @@ func (s *Store) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, er
 		}
 		n, _ := res.RowsAffected()
 		total += n
+		if err := s.deleteRequestLogsForPrunedReqIDs(reqIDs); err != nil {
+			return total, err
+		}
 	}
 
 	if keepCount > 0 {
 		// 只数未置顶的：置顶的不参与清理，把它们算进配额会导致
 		// 置顶几条就把正常样本挤掉，越用越少。
+		reqIDs, err := s.listSampleReqIDs(
+			`SELECT req_id FROM sample WHERE pinned = 0 AND req_id != '' AND id NOT IN (
+				SELECT id FROM sample WHERE pinned = 0 ORDER BY id DESC LIMIT ?)`, keepCount)
+		if err != nil {
+			return total, fmt.Errorf("列举待删样本 req_id: %w", err)
+		}
 		res, err := s.db.Exec(`DELETE FROM sample WHERE pinned = 0 AND id NOT IN (
 			SELECT id FROM sample WHERE pinned = 0 ORDER BY id DESC LIMIT ?)`, keepCount)
 		if err != nil {
@@ -246,6 +265,9 @@ func (s *Store) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, er
 		}
 		n, _ := res.RowsAffected()
 		total += n
+		if err := s.deleteRequestLogsForPrunedReqIDs(reqIDs); err != nil {
+			return total, err
+		}
 	}
 
 	if maxBytes > 0 {
@@ -256,6 +278,49 @@ func (s *Store) PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, er
 		total += n
 	}
 	return total, nil
+}
+
+// listSampleReqIDs 执行返回 req_id 列的查询，去掉空串与重复。
+func (s *Store) listSampleReqIDs(query string, args ...any) ([]string, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := map[string]struct{}{}
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// deleteRequestLogsForPrunedReqIDs 删除已无对应 sample 的 request_log。
+// 仍有 sample 行的 req_id（例如置顶豁免）不会被删。
+func (s *Store) deleteRequestLogsForPrunedReqIDs(reqIDs []string) error {
+	for _, id := range reqIDs {
+		if id == "" {
+			continue
+		}
+		_, err := s.db.Exec(`DELETE FROM request_log WHERE req_id = ? AND NOT EXISTS (
+			SELECT 1 FROM sample WHERE req_id = ?)`, id, id)
+		if err != nil {
+			return fmt.Errorf("清理已删样本的请求日志: %w", err)
+		}
+	}
+	return nil
 }
 
 // sampleBodyDiskBytesSQL 是正文 BLOB 存盘字节合计表达式。
@@ -284,20 +349,25 @@ func (s *Store) pruneSamplesByDiskQuota(maxBytes int64) (int64, error) {
 		return 0, nil
 	}
 
-	rows, err := s.db.Query(`SELECT id, ` + sampleBodyDiskBytesSQL + ` AS sz
+	rows, err := s.db.Query(`SELECT id, req_id, ` + sampleBodyDiskBytesSQL + ` AS sz
 		FROM sample WHERE pinned = 0 ORDER BY id ASC`)
 	if err != nil {
 		return 0, fmt.Errorf("列举待删样本: %w", err)
 	}
 	defer rows.Close()
 
-	var toDelete []int64
+	type victim struct {
+		id    int64
+		reqID string
+	}
+	var toDelete []victim
 	for rows.Next() && used > maxBytes {
-		var id, sz int64
-		if err := rows.Scan(&id, &sz); err != nil {
+		var v victim
+		var sz int64
+		if err := rows.Scan(&v.id, &v.reqID, &sz); err != nil {
 			return 0, err
 		}
-		toDelete = append(toDelete, id)
+		toDelete = append(toDelete, v)
 		used -= sz
 	}
 	if err := rows.Err(); err != nil {
@@ -306,13 +376,20 @@ func (s *Store) pruneSamplesByDiskQuota(maxBytes int64) (int64, error) {
 	_ = rows.Close()
 
 	var deleted int64
-	for _, id := range toDelete {
-		res, err := s.db.Exec(`DELETE FROM sample WHERE id = ? AND pinned = 0`, id)
+	var reqIDs []string
+	for _, v := range toDelete {
+		res, err := s.db.Exec(`DELETE FROM sample WHERE id = ? AND pinned = 0`, v.id)
 		if err != nil {
 			return deleted, fmt.Errorf("按磁盘配额清理样本: %w", err)
 		}
 		n, _ := res.RowsAffected()
 		deleted += n
+		if n > 0 && v.reqID != "" {
+			reqIDs = append(reqIDs, v.reqID)
+		}
+	}
+	if err := s.deleteRequestLogsForPrunedReqIDs(reqIDs); err != nil {
+		return deleted, err
 	}
 	return deleted, nil
 }
