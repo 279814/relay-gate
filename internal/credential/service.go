@@ -20,20 +20,24 @@ var ErrNotFound = errors.New("凭据不存在")
 
 // Service holds admin-facing credential operations (§12.3–12.6).
 //
-// Master Key plaintext lives only in Keyring; Relay keys are held here for
-// hot-path auth with optional grace overlap. Admin password verification is
-// delegated to the caller (API compares against configured adminPW).
+// Master Key plaintext lives only in Keyring; Relay key digests are held here
+// for hot-path auth with optional grace overlap (§6.1 / §12.6). Admin password
+// verification is delegated to the caller (API compares against configured adminPW).
 type Service struct {
 	mu sync.Mutex
 
 	revealUntil time.Time
 	revealValue string
 
+	// relayActive / relayGrace / relayAlso store irreversible SHA-256 digests
+	// (hex), never raw key material. ValidRelayKey digests the presented key
+	// before comparing against this snapshot.
 	relayActive string
 	relayGrace  string
-	// relayAlso holds extra bootstrap keys (comma-separated RELAY_KEYS) that
-	// remain accepted alongside active/grace. Rotation moves only relayActive
-	// into grace; also-keys are unchanged (§12.6 single active + docs/03 multi).
+	// relayAlso holds digests of extra bootstrap keys (comma-separated
+	// RELAY_KEYS) that remain accepted alongside active/grace. Rotation moves
+	// only relayActive into grace; also-keys are unchanged (§12.6 single
+	// active + docs/03 multi).
 	relayAlso  map[string]struct{}
 	graceUntil time.Time
 	graceSec   int
@@ -65,7 +69,8 @@ func (s *Service) SetActiveRelayKey(key string) {
 }
 
 // SetActiveRelayKeys installs the accepted relay key set from env / bootstrap.
-// The first non-empty key becomes active; the rest are also-keys.
+// Raw keys are digested on insert; the first non-empty becomes active and the
+// rest are also-keys. Empty input clears the snapshot (all requests rejected).
 func (s *Service) SetActiveRelayKeys(keys []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -78,14 +83,15 @@ func (s *Service) SetActiveRelayKeys(keys []string) {
 		if key == "" {
 			continue
 		}
+		d := digestRelayKey(key)
 		if s.relayActive == "" {
-			s.relayActive = key
+			s.relayActive = d
 			continue
 		}
 		if s.relayAlso == nil {
 			s.relayAlso = make(map[string]struct{})
 		}
-		s.relayAlso[key] = struct{}{}
+		s.relayAlso[d] = struct{}{}
 	}
 }
 
@@ -115,22 +121,24 @@ func (s *Service) Status() map[string]any {
 	}
 }
 
-// ValidRelayKey reports whether key matches active, in-grace, or also-key.
+// ValidRelayKey reports whether key matches active, in-grace, or also-key
+// digests. Empty and unconfigured snapshots always reject.
 func (s *Service) ValidRelayKey(key string) bool {
 	if key == "" {
 		return false
 	}
+	d := digestRelayKey(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expireGraceLocked()
-	if key == s.relayActive || (s.relayGrace != "" && key == s.relayGrace) {
+	if d == s.relayActive || (s.relayGrace != "" && d == s.relayGrace) {
 		return true
 	}
-	_, ok := s.relayAlso[key]
+	_, ok := s.relayAlso[d]
 	return ok
 }
 
-// ActiveRelayKeys returns keys currently accepted for proxy auth.
+// ActiveRelayKeys returns digests currently accepted for proxy auth (not raw keys).
 func (s *Service) ActiveRelayKeys() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,7 +156,9 @@ func (s *Service) ActiveRelayKeys() []string {
 	return out
 }
 
-// RotateRelayKey generates a new active key; old remains in grace.
+// RotateRelayKey generates a new active key; old digest remains in grace.
+// The returned newKey is plaintext for one-time admin display; only its digest
+// is retained in the hot-path snapshot.
 func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -160,7 +170,7 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 		s.relayGrace = s.relayActive
 		s.graceUntil = s.now().Add(time.Duration(s.graceSec) * time.Second)
 	}
-	s.relayActive = newKey
+	s.relayActive = digestRelayKey(newKey)
 	s.noteLocked("relay_rotate", "new active; old in grace")
 	return newKey, s.graceSec, nil
 }
@@ -224,12 +234,22 @@ func (s *Service) noteLocked(action, detail string) {
 	}
 }
 
-func fingerprint(key string) string {
-	if key == "" {
+// digestRelayKey returns the irreversible SHA-256 hex digest used in the
+// hot-path auth snapshot (§6.1 / §12.6). No pepper: digest is hash(raw key).
+func digestRelayKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// fingerprint returns the UI-facing short id from a stored digest (first 8 bytes).
+func fingerprint(digest string) string {
+	if digest == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:8])
+	if len(digest) >= 16 {
+		return digest[:16]
+	}
+	return digest
 }
 
 func randomKey(n int) (string, error) {

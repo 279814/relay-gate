@@ -65,6 +65,53 @@ func TestRelayAlsoKeysSurviveRotate(t *testing.T) {
 	}
 }
 
+// TestRelayDigestSnapshotAuth covers §6.1 / §12.6: hot-path snapshot holds
+// irreversible digests (not raw keys); right/grace accepted; wrong/empty and
+// unconfigured snapshots rejected.
+func TestRelayDigestSnapshotAuth(t *testing.T) {
+	empty := New()
+	if empty.ValidRelayKey("rk_anything") || empty.ValidRelayKey("") {
+		t.Fatal("unconfigured snapshot must reject all keys including empty")
+	}
+
+	const raw = "rk_digest_primary"
+	s := New()
+	s.SetActiveRelayKeys([]string{raw, "rk_also"})
+	if !s.ValidRelayKey(raw) {
+		t.Fatal("correct key must be accepted")
+	}
+	if !s.ValidRelayKey("rk_also") {
+		t.Fatal("also-key must be accepted")
+	}
+	if s.ValidRelayKey("rk_wrong") || s.ValidRelayKey("") {
+		t.Fatal("wrong and empty keys must be rejected")
+	}
+	for _, snap := range s.ActiveRelayKeys() {
+		if snap == raw || snap == "rk_also" {
+			t.Fatalf("snapshot must not store raw key; got %q", snap)
+		}
+		if snap != digestRelayKey(raw) && snap != digestRelayKey("rk_also") {
+			t.Fatalf("unexpected snapshot digest %q", snap)
+		}
+	}
+
+	newKey, _, err := s.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.ValidRelayKey(raw) {
+		t.Fatal("grace key must be accepted during overlap")
+	}
+	if !s.ValidRelayKey(newKey) {
+		t.Fatal("rotated active key must be accepted")
+	}
+	for _, snap := range s.ActiveRelayKeys() {
+		if snap == raw || snap == newKey || snap == "rk_also" {
+			t.Fatalf("snapshot must not equal raw key after rotate; got %q", snap)
+		}
+	}
+}
+
 func TestMasterRevealWindow(t *testing.T) {
 	s := New()
 	now := time.Now()
