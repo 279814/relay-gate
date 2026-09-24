@@ -49,19 +49,22 @@ func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res
 
 // routeGenerationCurrent is the real-traffic analogue of CommitProbeObservation's
 // RouteCreatedAt incarnation check. generation == 0 means unbound (tests /
-// legacy callers) and still applies; generation > 0 must match the current
-// RouteHealth entry after Claim / EnsureGeneration.
+// first mark before TryAcquire): apply only when the live RouteHealth generation
+// is also 0. A zero argument against a non-zero live generation is dropped so a
+// caller that forgot the generation cannot poison a reused id. generation > 0
+// must match the current RouteHealth entry after Claim / EnsureGeneration.
 func (r *Reporter) routeGenerationCurrent(routeID int64, generation uint64) bool {
-	if generation == 0 {
-		return true
-	}
 	viewer, ok := r.track.(interface {
 		GenerationOf(routeID int64) uint64
 	})
 	if !ok {
 		return true
 	}
-	return viewer.GenerationOf(routeID) == generation
+	live := viewer.GenerationOf(routeID)
+	if generation == 0 {
+		return live == 0
+	}
+	return live == generation
 }
 
 func (r *Reporter) applyRouteModelNotFound(routeID int64, endpoint model.EndpointKind, status int) {

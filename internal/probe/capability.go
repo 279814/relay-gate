@@ -223,15 +223,19 @@ func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, ge
 }
 
 // routeGenerationCurrent mirrors Reporter.routeGenerationCurrent for count_tokens
-// marks: generation == 0 is unbound (tests / no viewer) and still applies.
+// marks. generation == 0 is unbound (tests / first mark before TryAcquire): apply
+// only when the live RouteHealth generation is also 0. A zero argument against a
+// non-zero live generation is dropped so a caller that forgot the generation
+// cannot poison a reused id.
 func (registry *CapabilityRegistry) routeGenerationCurrent(routeID int64, generation uint64) bool {
-	if generation == 0 {
-		return true
-	}
 	if registry == nil || registry.routeGen == nil {
 		return true
 	}
-	return registry.routeGen.GenerationOf(routeID) == generation
+	live := registry.routeGen.GenerationOf(routeID)
+	if generation == 0 {
+		return live == 0
+	}
+	return live == generation
 }
 
 // Invalidate 丢弃一行（配置变更后立即 effective unknown）。

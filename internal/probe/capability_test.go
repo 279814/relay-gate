@@ -220,6 +220,49 @@ func TestCapabilityRegistry_MarkCountTokens_LateAfterReuseDoesNotPoison(t *testi
 	}
 }
 
+// A caller that passes generation 0 must not poison a route whose live
+// RouteHealth generation is already non-zero (forgot-gen / unbound misuse).
+// Both-zero first-use still applies when no generation has been assigned yet.
+func TestCapabilityRegistry_MarkCountTokens_ZeroGenAgainstLiveNonZeroDropped(t *testing.T) {
+	const routeID int64 = 55
+	settings := model.DefaultSettings()
+	caps := NewCapabilityRegistry(capSettings{settings})
+	tr := health.NewTracker(nil)
+	caps.WithRouteGeneration(tr)
+
+	tr.EnsureGeneration(routeID) // gen 1
+	tr.Forget(routeID)
+	live := tr.EnsureGeneration(routeID) // gen 2 after reuse
+	if live != 2 {
+		t.Fatalf("live generation=%d want 2", live)
+	}
+
+	caps.MarkCountTokensUnsupported(routeID, 0, 404)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("mark with gen 0 against live %d must leave unknown, got %s", live, got)
+	}
+	caps.MarkCountTokensConfigError(routeID, 0, 401)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("config_error mark with gen 0 against live %d must leave unknown, got %s", live, got)
+	}
+
+	caps.MarkCountTokensUnsupported(routeID, live, 404)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("mark with matching gen %d capability=%s want unsupported", live, got)
+	}
+
+	// Both-zero: no RouteHealth entry yet → unbound mark still applies.
+	const freshID int64 = 56
+	caps2 := NewCapabilityRegistry(capSettings{settings}).WithRouteGeneration(health.NewTracker(nil))
+	if caps2.routeGen.GenerationOf(freshID) != 0 {
+		t.Fatal("fresh route must start at generation 0")
+	}
+	caps2.MarkCountTokensUnsupported(freshID, 0, 404)
+	if got := caps2.Effective(model.RecipeScopeRoute, freshID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("both-zero first mark capability=%s want unsupported", got)
+	}
+}
+
 func TestCapabilityRegistry_CASKeepsHigherOrder(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
