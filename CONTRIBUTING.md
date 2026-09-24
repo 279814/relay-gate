@@ -2,7 +2,7 @@
 
 欢迎 issue 与 PR。这是个人维护的项目，回应速度取决于我的空闲时间。
 
-改 v1.0.0 之前先读两份文档，不要只看 README：`docs/01-需求与设计.md` 是需求基线，`docs/04-P0-探活基础门禁实施计划.md` 文首是当前做到哪一步。README 和 `docs/03-部署与配置.md` 描述的是今天已经能部署的行为。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`；P0-13 真实流量旁路已接线；本分支做 P0-14 探活管理 API。
+改 v1.0.0 之前先读两份文档，不要只看 README：`docs/01-需求与设计.md` 是需求基线，`docs/04-P0-探活基础门禁实施计划.md` 文首是当前做到哪一步。README 描述今天已经能部署的行为（HTTP `IP:port` 一行安装）。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`。
 
 ## 提 issue
 

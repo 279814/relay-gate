@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -77,25 +78,33 @@ func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func runServer() error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// Resolve data dir before Load so first-start can materialize the three
+	// secrets (admin / relay / ENCRYPTION_KEY) via crash-safe bootstrap.
+	dbPath := strings.TrimSpace(os.Getenv("RELAY_DB"))
+	if dbPath == "" {
+		dbPath = "data/relay-gate.db"
+	}
+	dataDir := filepath.Dir(dbPath)
+	if dataDir == "." || dataDir == "" {
+		dataDir = "data"
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("创建数据目录 %s: %w", dataDir, err)
+	}
+	if err := credential.MaybeBootstrap(dataDir, os.Stdout); err != nil {
+		return fmt.Errorf("首次凭据: %w", err)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
-	}
-
-	if dir := filepath.Dir(cfg.DBPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("创建数据目录 %s: %w", dir, err)
-		}
 	}
 
 	cipher, err := store.NewCipher(cfg.EncKey)
 	if err != nil {
 		return err
 	}
-	dataDir := filepath.Dir(cfg.DBPath)
-	if dataDir == "." || dataDir == "" {
-		dataDir = "data"
-	}
+	dataDir = cfg.DataDir()
 	kr := keyring.Open(dataDir)
 	if err := kr.EnsureInitialized(cipher.KeyID(), cfg.EncKey); err != nil {
 		return fmt.Errorf("初始化 keyring: %w", err)

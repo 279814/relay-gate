@@ -12,8 +12,7 @@ import (
 const DefaultLowValidity = 48 * time.Hour
 
 // Renewer is the Certbot renew surface used after live HTTPS is up (§12.2).
-// Tests inject fakes; production wiring still requires a real Certbot 5.4+
-// and public smoke before docs/03 may be removed.
+// Tests inject fakes; this package is not the documented HTTP IP:port install path.
 type Renewer interface {
 	RenewIP(ip string) (certPEM, keyPEM string, notAfter time.Time, err error)
 	Validate(certPEM, keyPEM, expectIP string) error
@@ -28,8 +27,8 @@ type Reloader interface {
 // RenewWatch tracks daily renew attempts, remaining validity, and reload
 // outcomes so §23 "IP 证书自动续期可观测" can be asserted offline with fakes.
 //
-// It never claims a public certificate was issued. Callers must not delete
-// docs/03 / Caddyfile / deploy-nginx.sh until a live public smoke succeeds.
+// It never claims a public certificate was issued. The documented install is
+// HTTP IP:port (README); this watcher is for the §12.2 certificate experiment.
 type RenewWatch struct {
 	mu sync.Mutex
 

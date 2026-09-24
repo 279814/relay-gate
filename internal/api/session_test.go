@@ -431,6 +431,45 @@ func TestLogin_RemoteAddrDrivesPerIPBucket(t *testing.T) {
 	}
 }
 
+// TestLogin_NoIPAllowlist 确认管理登录没有客户端 IP 白名单：
+// 任意 RemoteAddr 都可尝试登录（错口令 401，对口令 200），不会因来源 IP 得 403。
+// 失败退避仍按 IP/全局分桶，那不是 allowlist。
+func TestLogin_NoIPAllowlist(t *testing.T) {
+	s, h := newTestServer(t)
+	s.sessions.sleep = func(time.Duration) {} // 本测试不关心退避耗时
+
+	addrs := []string{
+		"198.51.100.1:54321",
+		"203.0.113.50:9999",
+		"[2001:db8::1]:443",
+		"10.0.0.99:1",
+	}
+	for _, addr := range addrs {
+		req := httptest.NewRequest("POST", "/admin/api/login", strings.NewReader(`{"password":"wrong"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("login must not IP-allowlist; %s got 403", addr)
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s wrong password: want 401, got %d", addr, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest("POST", "/admin/api/login",
+		strings.NewReader(`{"password":"`+testAdminPW+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "198.51.100.200:4444"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("any remote addr may succeed with correct password; got %d body=%s",
+			rec.Code, rec.Body.String())
+	}
+}
+
 func TestSessionStore_ConcurrentAccessDoesNotRace(t *testing.T) {
 	// sessionStore 持有一个 map，而 issue 会在持锁时遍历它做 GC。
 	// 并发是真实的：浏览器开多个标签页、或者一边登录一边有请求在校验

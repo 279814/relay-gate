@@ -37,6 +37,12 @@ if [ "$(id -u)" = "0" ]; then
         fi
         chmod 700 "$DATA_DIR"
 
+        # secrets/ holds bootstrap journal + keyring; must be writable by relay.
+        if [ -d "${DATA_DIR}/secrets" ]; then
+            chown -R "$RELAY_UID:$RELAY_GID" "${DATA_DIR}/secrets"
+            chmod 700 "${DATA_DIR}/secrets"
+        fi
+
         # SQLite 在 WAL 模式下会使用 db-wal / db-shm；回滚日志则叫
         # db-journal。它们都可能在容器重启时已经存在，必须和主库一起
         # 收归 relay，否则非 root 进程会在打开数据库前就被权限挡住。

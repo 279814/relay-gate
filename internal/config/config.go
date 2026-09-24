@@ -26,7 +26,9 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:    env("RELAY_ADDR", "127.0.0.1:18787"),
+		// Default binds all interfaces so Docker / Linux server publish
+		// http://IP:port. Local-only binding is still available via RELAY_ADDR.
+		Addr:    env("RELAY_ADDR", "0.0.0.0:18787"),
 		DBPath:  env("RELAY_DB", "data/relay-gate.db"),
 		EncKey:  strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")),
 		AdminPW: os.Getenv("ADMIN_PASSWORD"),
@@ -96,35 +98,36 @@ func (c *Config) fillFromSecretsArtifacts() error {
 
 // validate 对三项凭据强制要求。
 //
-// 刻意选择「缺失即拒绝启动」而不是「自动生成并打印」：自动生成的值在容器重启后
-// 会变（除非再落库，又绕回同一个问题），而 ENCRYPTION_KEY 变了等于所有上游 key
-// 全部无法解密。宁可启动失败并说清怎么办。
+// 新安装由 cmd/relay-gate 在 Load 之前调用 credential.MaybeBootstrap：缺省时
+// 生成并打印一次，落盘后本函数从 keyring / bootstrap-credentials 读回。
+// 环境变量仍优先于文件；旧部署可继续只设 env。
 //
 // ADMIN_PASSWORD 可被 data/secrets/ 下的 Argon2id 哈希替代（bootstrap/migrate/reset-admin）；
 // ENCRYPTION_KEY / RELAY_KEYS 可在环境变量缺省时分别从 keyring.json /
-// bootstrap-credentials.json 加载（环境变量优先）。环境变量明文仍受支持（旧部署与测试）。
+// bootstrap-credentials.json 加载（环境变量优先）。
 func (c *Config) validate() error {
 	var missing []string
 	if len(c.EncKey) < 16 {
 		missing = append(missing, "ENCRYPTION_KEY（至少 16 字符，用于加密上游 api_key；"+
 			"**丢失后已存的 key 无法恢复**，请妥善备份；"+
-			"可设环境变量，或完成 credentials bootstrap/migrate 写入 data/secrets/keyring.json）")
+			"可设环境变量，或由首次启动 bootstrap 写入 data/secrets/keyring.json）")
 	}
 	if len(c.RelayKeys) == 0 {
 		missing = append(missing, "RELAY_KEYS（本服务发放给客户端的 key，逗号分隔多个；"+
 			"留空等于把你所有上游 key 免费公开；"+
-			"可设环境变量，或完成 credentials bootstrap/migrate 写入 bootstrap-credentials.json）")
+			"可设环境变量，或由首次启动 bootstrap 写入 bootstrap-credentials.json）")
 	}
 	hashOK := credential.HasAdminHash(c.DataDir())
 	if len(c.AdminPW) < 8 && !hashOK {
 		missing = append(missing, "ADMIN_PASSWORD（管理界面登录口令，至少 8 字符；"+
-			"或先完成 credentials bootstrap/migrate 写入 Argon2id 哈希）")
+			"或由首次启动 / credentials bootstrap|migrate|reset-admin 写入 Argon2id 哈希）")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("缺少必需的凭据：\n  - %s\n\n"+
-			"新安装请先运行一次性：relay-gate credentials bootstrap --data-dir <data>\n"+
+			"新安装：清空 data/ 后直接启动，首次会打印三项明文一次；"+
+			"或运行：relay-gate credentials bootstrap --data-dir <data>\n"+
 			"旧部署迁移：relay-gate credentials migrate --data-dir <data> --db <db>\n"+
-			"或设置环境变量（兼容旧部署；与文件同时存在时环境变量优先）。生成随机值：openssl rand -hex 32",
+			"或设置环境变量（与文件同时存在时环境变量优先）。",
 			strings.Join(missing, "\n  - "))
 	}
 	return nil

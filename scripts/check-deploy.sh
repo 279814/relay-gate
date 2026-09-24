@@ -1,9 +1,9 @@
 #!/bin/sh
-# 部署清单的静态检查（M7）。**不需要 Docker**，因此能进 CI。
+# 部署清单的静态检查。不需要 Docker，因此能进 CI。
 #
-# 它盯的是几条「一旦写错就有实际安全后果、但不会报错」的不变量。
-# 真正的容器行为由 scripts/smoke-m7.ps1 验（那个需要 Docker 引擎）；
-# 这里守的是那些光读文件就能判定、且值得每次提交都查的部分。
+# 盯的是「一旦写错就有实际后果、但不会报错」的不变量：
+# HTTP IP:port 发布、无域名/ACME/登录 IP 白名单、凭据不进构建上下文、
+# ENTRYPOINT exec 形式、无 CGO、可选 .env 三项凭据。
 #
 # 跑法：sh scripts/check-deploy.sh
 
@@ -11,10 +11,12 @@ set -eu
 
 root="$(dirname "$0")/.."
 compose="$root/compose.yaml"
-caddyfile="$root/deploy/Caddyfile"
 dockerfile="$root/Dockerfile"
 dockerignore="$root/.dockerignore"
 envexample="$root/.env.example"
+caddyfile="$root/deploy/Caddyfile"
+deploy_nginx="$root/scripts/deploy-nginx.sh"
+docs03="$root/docs/03-部署与配置.md"
 
 fails=0
 fail() {
@@ -23,87 +25,47 @@ fail() {
 }
 pass() { echo "  [PASS] $1"; }
 
-echo "=== 端口只绑 127.0.0.1（§5.2f）==="
-# 这是整份部署里安全后果最重的一行。写成 "18787:18787" 的话 Docker 会插一条
-# iptables 规则把端口直接暴露到公网，**而且绕过 ufw/firewalld** ——
-# 你在防火墙里看不到，`ufw status` 显示一切正常。
-# 那等于把管理界面和所有上游 key 公开。
-if grep -qE '^[[:space:]]*-[[:space:]]*"127\.0\.0\.1:\$\{RELAY_PORT:-[0-9]+\}:[0-9]+"' "$compose"; then
-    pass '网关端口带 127.0.0.1 前缀'
+echo "=== 宿主机端口发布到所有接口（HTTP IP:port）==="
+# 支持的安装形态是 http://IP:port，不再绑 127.0.0.1 或经 Caddy/nginx。
+if grep -qE '^[[:space:]]*-[[:space:]]*"\$\{RELAY_PORT:-[0-9]+\}:[0-9]+"' "$compose"; then
+    pass '网关 ports 发布到所有接口（无 127.0.0.1 前缀）'
 else
-    fail '网关的 ports 没有 127.0.0.1 前缀 —— Docker 会绕过防火墙把它暴露到公网'
+    fail 'compose ports 应为 "${RELAY_PORT:-18787}:18787" 形式（发布到所有接口）'
+fi
+if grep -qE '127\.0\.0\.1:\$\{RELAY_PORT' "$compose"; then
+    fail 'compose 仍把端口绑在 127.0.0.1 —— 与 http://IP:port 安装形态冲突'
+else
+    pass 'compose 未把端口限制在 127.0.0.1'
 fi
 
-echo "=== Caddy 的必填变量不能用 :? 语法 ==="
-# compose 的变量插值发生在 profile 过滤**之前**，所以 caddy 段里一个
-# ${VAR:?...} 会让根本不起 Caddy 的 `docker compose up -d` 直接报错退出 ——
-# 而那是这个项目最常走的路径。（实测踩到过。）
-#
-# 必须**先剥掉注释再匹配**：这份 compose 的注释里就写着「这里不能用
-# ${RELAY_DOMAIN:?...}」这句解释，连着正则一起命中的话，正确的实现会被
-# 自己的说明文字判成违规。（第一版就是这么误报的。）
-if sed 's/#.*//' "$compose" |
-    grep -qE '\$\{RELAY_(DOMAIN|ACME_EMAIL|ALLOW_IPS):\?'; then
-    fail 'caddy 段用了 ${VAR:?...} —— 默认的 docker compose up 会跟着失败'
+echo "=== 已移除域名 / ACME / 登录 IP 白名单部署入口 ==="
+if [ -e "$caddyfile" ]; then
+    fail "仍存在 deploy/Caddyfile —— 旧域名/ACME 路径应已删除"
 else
-    pass '公网变量都用软默认（:-），不拖累默认路径'
+    pass 'deploy/Caddyfile 已删除'
 fi
-
-echo "=== 空 ACME 邮箱不会产生非法 Caddyfile ==="
-# Caddy 的 `email` global option 在值为空时不是「不设置」，而是
-# **语法错误（email 缺参数）** —— 公网 profile 会启动即退出。
-# compose 的 command 用 sed 在邮箱为空时删掉这一行，所以两件事都要成立：
-#   1. compose 里真的有那段条件删除
-#   2. 那个 sed 的正则真的能匹配 Caddyfile 里的那一行
-if grep -q 'RELAY_ACME_EMAIL' "$compose" && grep -q 'sed' "$compose"; then
-    pass 'compose 里有条件删除 email 的逻辑'
+if [ -e "$deploy_nginx" ]; then
+    fail "仍存在 scripts/deploy-nginx.sh —— 旧域名/白名单路径应已删除"
 else
-    fail 'compose 缺少「邮箱为空时删掉 email 行」的处理 —— 公网 profile 会启动即退出'
+    pass 'scripts/deploy-nginx.sh 已删除'
 fi
-
-# 直接跑一遍那个 sed，断言结果里不再有 email 指令。
-# 只检查「compose 里有 sed」不够 —— 正则写错了照样匹配不到，
-# 而症状是 Caddy 报一个与邮箱毫无关系的语法错误。
-remaining=$(sed '/^[[:space:]]*email[[:space:]].*RELAY_ACME_EMAIL.*$/d' "$caddyfile" |
-    grep -c 'email' || true)
-if [ "$remaining" -eq 0 ]; then
-    pass 'sed 的正则确实能删掉 Caddyfile 里那一行'
+if [ -e "$docs03" ]; then
+    fail "仍存在 docs/03 —— 旧域名部署指南应已删除"
 else
-    fail "sed 之后还剩 $remaining 行 email —— 正则与 Caddyfile 的实际缩进对不上"
+    pass 'docs/03 已删除'
 fi
-
-echo "=== 管理面白名单默认拒绝，而不是默认放行 ==="
-# 忘了配 RELAY_ALLOW_IPS 的后果应该是「我进不去管理界面」（立刻发现、
-# 自己动手修），而不是「全世界都能进我的管理界面」（永远不会发现）。
-# 判据是 `not remote_ip`：列表为空时它匹配任何来源，于是全部 403。
-if grep -qE '@notAllowed[[:space:]]+not[[:space:]]+remote_ip[[:space:]]+\{\$RELAY_ALLOW_IPS\}' "$caddyfile"; then
-    pass '白名单为空时管理面全部 403（not remote_ip）'
+if grep -qE 'RELAY_(DOMAIN|ACME_EMAIL|ALLOW_IPS)' "$compose" "$envexample" 2>/dev/null; then
+    fail 'compose / .env.example 仍引用 RELAY_DOMAIN / RELAY_ACME_EMAIL / RELAY_ALLOW_IPS'
 else
-    fail '管理面的白名单判据不是 `not remote_ip {$RELAY_ALLOW_IPS}` —— '\
-'空值可能变成「放行所有人」'
+    pass '部署模板不再要求域名、ACME 邮箱或登录 IP 白名单'
 fi
-
-echo "=== SSE 不能被缓冲 ==="
-# 一旦缓冲，流式输出会变成「长时间无反应后一次性刷出」，
-# 而那正是这个项目要优化的东西。
-if grep -qE '^[[:space:]]*flush_interval[[:space:]]+-1' "$caddyfile"; then
-    pass 'reverse_proxy 显式 flush_interval -1'
+if grep -qE 'profiles:[[:space:]]*\[["'"'"']public' "$compose" || grep -qE 'caddy:' "$compose"; then
+    fail 'compose 仍含 public profile / caddy 服务'
 else
-    fail '缺少 flush_interval -1 —— 将来有人加 buffer 时没有防线'
-fi
-
-echo "=== 长思考的超时必须放宽（§4.2）==="
-# 首 Token 可达 20 分钟，期间连接上没有任何字节。
-# 不放宽的话 Caddy 会在默认超时后掐断一个完全正常的请求。
-if grep -qE 'response_header_timeout[[:space:]]+[0-9]+m' "$caddyfile"; then
-    pass 'response_header_timeout 已按分钟级放宽'
-else
-    fail 'response_header_timeout 没放宽 —— 正常的长思考会被 Caddy 掐断'
+    pass 'compose 仅单容器网关（无 Caddy）'
 fi
 
 echo "=== 优雅关闭的宽限期要大于进程自己的收尾时间 ==="
-# main.go 给在途请求留了 30s。compose 的 stop_grace_period 若小于它，
-# 进程还没收完就被 SIGKILL，每次重启都掐断一次正在进行的对话。
 grace=$(grep -oE '^[[:space:]]*stop_grace_period:[[:space:]]*[0-9]+' "$compose" |
     grep -oE '[0-9]+$' || echo 0)
 if [ "$grace" -gt 30 ]; then
@@ -113,16 +75,7 @@ else
 fi
 
 echo "=== 构建上下文不含凭据 ==="
-# data/ 里有明文样本（完整对话原文），.env 里有三项凭据。
-# 它们不会进最终镜像（运行阶段只 COPY 二进制），但会留在构建缓存层里，
-# 而镜像层是可以逐层导出的。
-#
-# 判据必须是**整行精确匹配**，不能用 grep -F 做子串匹配：
-# 子串匹配下把 `.env` 注释成 `#.env` 仍然会被 `.env.local` 那一行命中，
-# 把 `data/` 注释成 `#data/` 也会被自己命中 —— 检查器全绿，而凭据与
-# 明文对话原文照进构建上下文。（实测：两处注释掉后原版都不报。）
 for pat in 'data/' '.env' 'scripts/upstreams.tsv'; do
-    # 剥掉注释与首尾空白后按整行比对
     if sed 's/#.*//' "$dockerignore" | sed 's/[[:space:]]*$//' |
         grep -qxF "$pat"; then
         pass ".dockerignore 排除了 $pat"
@@ -132,124 +85,50 @@ for pat in 'data/' '.env' 'scripts/upstreams.tsv'; do
 done
 
 echo "=== ENTRYPOINT 必须是 exec 形式 ==="
-# shell 形式会让 PID 1 变成 /bin/sh，它不转发信号，于是优雅关闭
-# （§4.8）完全不执行，docker stop 只能等超时后 SIGKILL。
 if grep -qE '^ENTRYPOINT[[:space:]]*\[' "$dockerfile"; then
     pass 'ENTRYPOINT 用 JSON 数组（exec 形式）'
 else
     fail 'ENTRYPOINT 是 shell 形式 —— PID 1 会是 shell，SIGTERM 不转发'
 fi
 
-echo "=== 镜像必须无 CGO（纯 Go 驱动，交叉编译不用改工具链）==="
+echo "=== 镜像必须无 CGO ==="
 if grep -qE 'CGO_ENABLED=0' "$dockerfile"; then
     pass 'CGO_ENABLED=0'
 else
-    fail '没有 CGO_ENABLED=0 —— alpine(musl) 与 debian(glibc) 的动态链接差异会让「本地好好的，容器里起不来」'
+    fail '没有 CGO_ENABLED=0'
 fi
 
-echo "=== GOPROXY 必须声明为 ARG（未声明的 build-arg 会被静默丢弃）==="
-# 国内服务器连不上 proxy.golang.org，构建时报 dial tcp i/o timeout。
-# 解决手段是 `--build-arg GOPROXY=https://goproxy.cn,direct` —— 但
-# Dockerfile 不声明 `ARG GOPROXY` 的话，这个 build-arg 会被**静默丢弃**
-# （不报错，就是不变），用户传了等于没传，报错原样复现。（实测踩到过。）
+echo "=== GOPROXY 必须声明为 ARG ==="
 if grep -qE '^ARG[[:space:]]+GOPROXY=' "$dockerfile"; then
-    pass 'Dockerfile 声明了 ARG GOPROXY（--build-arg 才不会被静默丢弃）'
+    pass 'Dockerfile 声明了 ARG GOPROXY'
 else
-    fail 'Dockerfile 缺 ARG GOPROXY —— 国内服务器用 --build-arg GOPROXY 会静默无效'
+    fail 'Dockerfile 缺 ARG GOPROXY'
 fi
 
-echo "=== .env.example 覆盖 config.validate 要求的三项 ==="
-# 少一项的话，用户照着模板填完仍然起不来，而错误信息出现在容器日志里 ——
-# 一个本该在模板里就避免的往返。
-for key in ENCRYPTION_KEY RELAY_KEYS ADMIN_PASSWORD; do
+echo "=== .env.example 不再把三项凭据标成必填 ==="
+# 三项可注释留空；首次启动 bootstrap。不应再要求域名/白名单。
+if grep -qE '^ENCRYPTION_KEY=$' "$envexample" || grep -qE '^# ENCRYPTION_KEY=' "$envexample"; then
+    pass '.env.example 允许 ENCRYPTION_KEY 缺省（首次自动生成）'
+else
+    fail '.env.example 对 ENCRYPTION_KEY 的缺省约定不清晰'
+fi
+for key in RELAY_DOMAIN RELAY_ACME_EMAIL RELAY_ALLOW_IPS; do
     if grep -qE "^${key}=" "$envexample"; then
-        pass ".env.example 有 $key"
-    else
-        fail ".env.example 缺 $key —— 照模板填完仍然起不来"
+        fail ".env.example 仍含 $key"
     fi
 done
+pass '.env.example 无域名 / ACME / 登录 IP 白名单键'
 
 echo "=== 送进容器 shell 的 here-string 必须先转成 LF ==="
-# *.ps1 是 CRLF 的（.gitattributes 强制），而运行镜像是 alpine ——
-# 它的 /bin/sh 是 busybox ash，**不容忍任何 \r**：`then\r` 不是关键字 `then`，
-# 整段脚本报 `syntax error: unexpected end of file (expecting "then")` 后
-# 一行都不执行。
-#
-# 症状是**冒烟脚本少跑了一整段却依然显示通过**，这比断言失败更糟。
-# 而开发机上的 MSYS sh 恰好容忍行尾 \r，所以这个问题本地复现不出来 ——
-# 只在 CI 的 Linux runner + alpine 容器里才现形。（实测：CI 抓到的。）
-#
-# 判据：凡是把 here-string 交给 `sh -ec` 的地方，都必须经过 ShLF 去掉 \r。
-# 也就是 `/bin/sh -ec` 后面只能跟变量，不能直接跟 @' 开头的 here-string。
 for ps1 in "$root"/scripts/*.ps1; do
     [ -e "$ps1" ] || continue
-    # `sh -ec @'` ：here-string 直接喂给容器 shell，没有过 ShLF
     raw=$(grep -cE "sh +-ec +@'" "$ps1" || true)
     if [ "$raw" -gt 0 ]; then
-        fail "$(basename "$ps1") 有 $raw 处把 here-string 直接交给 sh -ec —— "\
-"CRLF 会让 busybox ash 整段拒绝执行，断言恒不触发。应先过 ShLF 去掉 \\r"
+        fail "$(basename "$ps1") 有 $raw 处把 here-string 直接交给 sh -ec —— 应先过 ShLF"
     else
         pass "$(basename "$ps1") 的内嵌 shell 都经过 LF 转换"
     fi
 done
-
-echo "=== deploy-nginx.sh 的部署不变量（§13 场景）==="
-# 一条命令部署脚本是「已有 nginx + certbot」服务器的主路径，它的问题
-# 会在 curl | sh 后才暴露。这里盯住几条可以纯静态判定的不变量。
-deploy_nginx="$root/scripts/deploy-nginx.sh"
-if [ -f "$deploy_nginx" ]; then
-    # 1. 公网入口不能把网关直接暴露 —— 反代目标由形态决定且都指向网关：
-    #    容器 nginx → 服务名 relay-gate:18787（走 compose 网络，容器内
-    #    127.0.0.1 是 nginx 自己、不通宿主网关端口，写错 = 502）；
-    #    宿主机 nginx → 127.0.0.1:18787。两种都必须在脚本里，缺一不可。
-    if grep -qE 'NGINX_PROXY_TARGET=relay-gate:18787' "$deploy_nginx" &&
-        grep -qE 'NGINX_PROXY_TARGET=127\.0\.0\.1:18787' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 反代目标覆盖容器（relay-gate:18787）与宿主（127.0.0.1:18787）'
-    else
-        fail 'deploy-nginx.sh 的反代目标缺容器形态（relay-gate:18787）或宿主形态（127.0.0.1:18787）—— 容器 nginx 会 502，宿主 nginx 会直连公网'
-    fi
-
-    # 1b. 容器 nginx 必须把 nginx 容器接入网关网络，否则服务名解析不了。
-    if grep -qE 'docker network connect' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 有 docker network connect（容器 nginx 接入网关网络）'
-    else
-        fail 'deploy-nginx.sh 缺 docker network connect —— 容器 nginx 解析不到 relay-gate 服务名'
-    fi
-
-    # 2. 管理面默认拒绝而不是放行：白名单为空时必须 deny all。
-    if grep -qE 'ALLOW_LINES=.*deny all' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 白名单为空时管理面 deny all'
-    else
-        fail 'deploy-nginx.sh 缺「白名单为空时 deny all」的兜底 —— 忘了配 IP 就是全开放'
-    fi
-
-    # 3. 长思考不能被掐断：SSE 不缓冲 + 超时放宽。
-    if grep -qE 'proxy_buffering[[:space:]]+off' "$deploy_nginx" &&
-        grep -qE 'proxy_read_timeout[[:space:]]+35m' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 有 proxy_buffering off 与 proxy_read_timeout 35m'
-    else
-        fail 'deploy-nginx.sh 缺 proxy_buffering off 或 proxy_read_timeout —— 长思考会被 60s 默认超时掐断'
-    fi
-
-    # 4. 80 必须留 ACME 验证口（证书续期依赖它）。
-    if grep -qE 'acme-challenge' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 的 80 端口留了 /.well-known/acme-challenge/'
-    else
-        fail 'deploy-nginx.sh 的 80 端口没有 ACME 验证口 —— 续期会失败'
-    fi
-
-    # 5. 证书扩展必须保住老域名：--cert-name 固定证书名 + --expand。
-    # 用 -e 显式指定模式（模式本身以 -- 开头，直接当参数会被 grep
-    # 当成选项吞掉）。
-    if grep -qE -e '--cert-name' "$deploy_nginx" &&
-        grep -qE -e '--expand' "$deploy_nginx"; then
-        pass 'deploy-nginx.sh 的 certbot 用 --cert-name + --expand（老域名不丢）'
-    else
-        fail 'deploy-nginx.sh 的 certbot 缺 --cert-name 或 --expand —— 可能把证书换成只有新域名的'
-    fi
-else
-    fail '缺少 scripts/deploy-nginx.sh —— §13 场景的一键部署入口没了'
-fi
 
 echo
 if [ "$fails" -gt 0 ]; then
