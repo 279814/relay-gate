@@ -279,6 +279,37 @@ func TestPrepareOutboundHeaders_ForwardsAcceptEncoding(t *testing.T) {
 	}
 }
 
+// 管理会话 Cookie 绝不能随 /v1/messages 透传到上游；其它 Cookie 与业务头照常转发。
+func TestPrepareOutboundHeaders_StripsGatewaySessionCookie(t *testing.T) {
+	const sessionTok = "admin-session-token-must-not-leak"
+	in := claudeCodeHeaders()
+	in.Set("Cookie", gatewaySessionCookie+"="+sessionTok+"; unrelated=keep-me")
+
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
+
+	cookie := out.Get("Cookie")
+	if strings.Contains(cookie, gatewaySessionCookie) {
+		t.Errorf("出站 Cookie 仍含会话名 %q", gatewaySessionCookie)
+	}
+	if strings.Contains(cookie, sessionTok) {
+		t.Error("出站 Cookie 仍含会话令牌")
+	}
+	if !strings.Contains(cookie, "unrelated=keep-me") {
+		t.Errorf("无关 Cookie 应保留，得到 %q", cookie)
+	}
+	if out.Get("Anthropic-Version") != "2023-06-01" {
+		t.Errorf("Anthropic-Version 应原样转发，得到 %q", out.Get("Anthropic-Version"))
+	}
+
+	// 仅有会话 Cookie 时整头删掉。
+	only := http.Header{}
+	only.Set("Cookie", gatewaySessionCookie+"="+sessionTok)
+	onlyOut := PrepareOutboundHeaders(only, model.ProtoAnthropic)
+	if _, ok := onlyOut["Cookie"]; ok {
+		t.Errorf("仅含会话 Cookie 时应删除 Cookie 头，得到 %q", onlyOut.Get("Cookie"))
+	}
+}
+
 func TestStripHopByHopResponse(t *testing.T) {
 	h := http.Header{}
 	h.Set("Content-Type", "text/event-stream")
