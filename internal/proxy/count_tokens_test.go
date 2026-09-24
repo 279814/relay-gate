@@ -9,11 +9,148 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
 )
+
+// §10.3：404/405 标记该 Route 的 count_tokens unsupported，下次选路跳过；
+// /v1/messages 仍可选中；500 不写 unsupported；不改 Route 模型健康。
+func TestCountTokens_404MarksUnsupportedSkipsNextSelect(t *testing.T) {
+	var countHits, messagesHits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages/count_tokens":
+			countHits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"message":"no count_tokens"}}`))
+		default:
+			messagesHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+		}
+	})
+	caps := &memoryCountCaps{}
+	hs.h.WithCountTokensCapability(caps)
+
+	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+	rec1 := hs.serve(hs.countTokensRequest(body))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first count_tokens status = %d, want 200", rec1.Code)
+	}
+	if rec1.Header().Get("X-Relay-Count-Tokens") != "estimated" {
+		t.Fatalf("first response missing estimated marker")
+	}
+	if n := countHits.Load(); n != 1 {
+		t.Fatalf("first call upstream count_tokens hits = %d, want 1", n)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("after 404 capability = %s, want unsupported", got)
+	}
+
+	rec2 := hs.serve(hs.countTokensRequest(body))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second count_tokens status = %d, want 200", rec2.Code)
+	}
+	if n := countHits.Load(); n != 1 {
+		t.Fatalf("second call re-hit count_tokens: hits = %d, want 1 (unsupported must skip)", n)
+	}
+
+	msg := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`))
+	if msg.Code != http.StatusOK {
+		t.Fatalf("/v1/messages status = %d, want 200 (unsupported is count_tokens-only)", msg.Code)
+	}
+	if n := messagesHits.Load(); n != 1 {
+		t.Fatalf("/v1/messages upstream hits = %d, want 1", n)
+	}
+}
+
+// §10.3：405 与 404 同口径写 unsupported。
+func TestCountTokens_405MarksUnsupported(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	caps := &memoryCountCaps{}
+	hs.h.WithCountTokensCapability(caps)
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("after 405 capability = %s, want unsupported", got)
+	}
+}
+
+// §10.3：500 是临时失败，不得标记 count_tokens unsupported。
+func TestCountTokens_500DoesNotMarkUnsupported(t *testing.T) {
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	caps := &memoryCountCaps{}
+	hs.h.WithCountTokensCapability(caps)
+
+	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+	hs.serve(hs.countTokensRequest(body))
+	hs.serve(hs.countTokensRequest(body))
+	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("after 500 capability = %s, want unknown (not unsupported)", got)
+	}
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("500 must not skip route: hits = %d, want 2", n)
+	}
+}
+
+// 200 成功不得写 unsupported。
+func TestCountTokens_200DoesNotMarkUnsupported(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"input_tokens":9}`))
+	})
+	caps := &memoryCountCaps{}
+	hs.h.WithCountTokensCapability(caps)
+
+	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("after 200 capability = %s, want unknown", got)
+	}
+	if caps.marked != 0 {
+		t.Fatalf("MarkCountTokensUnsupported called %d times, want 0", caps.marked)
+	}
+}
+
+// memoryCountCaps is an in-memory CountTokensCapability for §10.3 tests.
+type memoryCountCaps struct {
+	mu     sync.Mutex
+	states map[int64]model.CapabilityState
+	marked int
+}
+
+func (m *memoryCountCaps) Effective(_ model.RecipeScope, scopeID int64,
+	endpoint model.EndpointKind, _ string) model.CapabilityState {
+	if endpoint != model.EndpointCountTokens {
+		return model.CapabilityUnknown
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.states == nil {
+		return model.CapabilityUnknown
+	}
+	return m.states[scopeID]
+}
+
+func (m *memoryCountCaps) MarkCountTokensUnsupported(routeID int64, statusCode int) {
+	if statusCode != http.StatusNotFound && statusCode != http.StatusMethodNotAllowed {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.states == nil {
+		m.states = map[int64]model.CapabilityState{}
+	}
+	m.states[routeID] = model.CapabilityUnsupported
+	m.marked++
+}
 
 // recordingReporter 数健康回写的次数。
 //

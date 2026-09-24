@@ -72,6 +72,43 @@ func TestCapabilityRegistry_CountTokensDoesNotChangeMessages(t *testing.T) {
 	}
 }
 
+func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	now := time.UnixMilli(1_700_000_000_000)
+	reg.now = func() time.Time { return now }
+
+	reg.MarkCountTokensUnsupported(7, 500)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("500 marked unsupported: %s", got)
+	}
+
+	reg.MarkCountTokensUnsupported(7, 404)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("404 effective=%s, want unsupported", got)
+	}
+	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
+	if row == nil || row.StatusCode != 404 {
+		t.Fatalf("snapshot=%+v", row)
+	}
+	if row.Endpoint != model.EndpointCountTokens {
+		t.Fatalf("endpoint=%s", row.Endpoint)
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, model.EvidencePolicySelector{
+		Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExp := now.UnixMilli() + policy.State.UnsupportedTTL.Milliseconds()
+	if row.ExpiresAt != wantExp {
+		t.Fatalf("ExpiresAt=%d want=%d (existing UnsupportedTTL)", row.ExpiresAt, wantExp)
+	}
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages capability leaked: %s", got)
+	}
+}
+
 func TestCapabilityRegistry_CASKeepsHigherOrder(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
