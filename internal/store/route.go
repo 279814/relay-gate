@@ -286,40 +286,11 @@ func (s *Store) DeleteRoute(id int64) (err error) {
 		return err
 	}
 
-	rows, err := tx.Query(`SELECT id FROM probe_recipe WHERE route_id=?`, id)
-	if err != nil {
+	// CHECK requires exactly one of upstream_id/route_id. Re-home archived rows
+	// onto the Route's Upstream so route_id can be cleared; archived status
+	// keeps them out of publishedBinding for both scopes.
+	if err = detachProbeRecipesRehomeTx(tx, upstreamID, `route_id=?`, id); err != nil {
 		return err
-	}
-	recipeIDs := make([]int64, 0, 4)
-	for rows.Next() {
-		var recipeID int64
-		if err = rows.Scan(&recipeID); err != nil {
-			rows.Close()
-			return err
-		}
-		recipeIDs = append(recipeIDs, recipeID)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-
-	if len(recipeIDs) > 0 {
-		// CHECK requires exactly one of upstream_id/route_id. Re-home archived
-		// rows onto the Route's Upstream so route_id can be cleared; archived
-		// status keeps them out of publishedBinding for both scopes.
-		updatedAt := nowMS()
-		if _, err = tx.Exec(`UPDATE probe_recipe SET status='archived',upstream_id=?,route_id=NULL,
-			revision=revision+1,active_binding_revision=active_binding_revision+1,updated_at=?
-			WHERE route_id=?`, upstreamID, updatedAt, id); err != nil {
-			return err
-		}
-		for _, recipeID := range recipeIDs {
-			if _, err = tx.Exec(`DELETE FROM recipe_active_secret_ref WHERE recipe_id=?`, recipeID); err != nil {
-				return err
-			}
-		}
 	}
 
 	if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, id); err != nil {

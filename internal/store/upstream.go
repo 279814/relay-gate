@@ -46,7 +46,8 @@ func (s *Store) scanUpstream(sc interface{ Scan(...any) error }) (*model.Upstrea
 }
 
 func (s *Store) ListUpstreams() ([]*model.Upstream, error) {
-	rows, err := s.db.Query(`SELECT ` + upstreamCols + ` FROM upstream ORDER BY id`)
+	// id<=0 is the internal recipe-archive holder, not an operator-facing site.
+	rows, err := s.db.Query(`SELECT ` + upstreamCols + ` FROM upstream WHERE id>0 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +75,7 @@ func (s *Store) ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilt
 	if err != nil {
 		return model.Page[*model.Upstream]{}, err
 	}
-	conditions := []string{"1=1"}
+	conditions := []string{"id>0"}
 	args := make([]any, 0, 4)
 	if filter.Enabled != nil {
 		conditions = append(conditions, "enabled=?")
@@ -288,12 +289,85 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	return nil
 }
 
-func (s *Store) DeleteUpstream(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM upstream WHERE id = ?`, id)
+// DeleteUpstream removes an Upstream and detaches its probe-recipe bindings.
+//
+// probe_recipe.upstream_id / route_id are ON DELETE RESTRICT and publishedBinding
+// looks up by numeric id alone. Child Routes CASCADE without going through
+// DeleteRoute, so route-scoped recipes must be detached here too. Archive and
+// re-home onto the internal holder in the same transaction as the delete so a
+// rollback cannot leave recipes detached from a still-living Upstream, and so a
+// later row that reuses the id cannot inherit the old published body.
+func (s *Store) DeleteUpstream(id int64) (err error) {
+	if id < 1 {
+		return ErrNotFound
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var exists int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM upstream WHERE id=?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+
+	if err = ensureRecipeArchiveHolderTx(tx); err != nil {
+		return err
+	}
+	// Upstream-scoped and child route-scoped recipes (CASCADE skips DeleteRoute).
+	if err = detachProbeRecipesRehomeTx(tx, recipeArchiveHolderID,
+		`upstream_id=? OR route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id, id); err != nil {
+		return err
+	}
+
+	// Executions / profiles / SQL reachability+capability rows also RESTRICT.
+	// Drop them with the Upstream; in-memory invalidation is handled by the API.
+	if _, err = tx.Exec(`DELETE FROM calibration_candidate WHERE run_id IN (
+		SELECT id FROM calibration_run WHERE route_id IN (SELECT id FROM route WHERE upstream_id=?))`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM calibration_run WHERE route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM probe_execution WHERE upstream_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM client_profile_active_secret_ref WHERE client_profile_id IN (
+		SELECT id FROM client_probe_profile WHERE upstream_id=?)`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM client_profile_required_secret WHERE client_profile_id IN (
+		SELECT id FROM client_probe_profile WHERE upstream_id=?)`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM client_probe_profile WHERE upstream_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM upstream_reachability WHERE upstream_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_upstream_id=?
+		OR scope_route_id IN (SELECT id FROM route WHERE upstream_id=?)
+		OR endpoint_id IN (SELECT id FROM upstream_endpoint WHERE upstream_id=?)`, id, id, id); err != nil {
+		return err
+	}
+
+	res, err := tx.Exec(`DELETE FROM upstream WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if err = checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func marshalHeaders(h map[string]string) (string, error) {

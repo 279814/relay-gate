@@ -512,3 +512,160 @@ func TestRecipeResolution_DeleteRouteDetachesRecipeForReusedID(t *testing.T) {
 		t.Error("reused id must not send the deleted route's published recipe")
 	}
 }
+
+// DeleteUpstream must detach published (and draft) upstream-scoped recipes, and
+// child route-scoped recipes (CASCADE skips DeleteRoute). After delete + SQLite
+// rowid reuse, the reincarnated id must fall through to builtin — not the
+// deleted upstream's body. A live sibling upstream must keep its published recipe.
+func TestRecipeResolution_DeleteUpstreamDetachesRecipeForReusedID(t *testing.T) {
+	fixture := newRecipeStoreFixture(t)
+	ctx := context.Background()
+
+	sibling := &model.Upstream{
+		Name: "recipe-sibling-up", BaseURL: "https://sibling-up.invalid",
+		APIKey: "sk-sibling-up-value", AuthStyle: model.AuthXAPIKey, Enabled: true,
+	}
+	if err := fixture.store.CreateUpstream(sibling); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRecipeID, oldVersionID := fixture.publishRecipe(t, model.RecipeScopeUpstream,
+		fixture.upstream.ID, []model.HeaderTemplate{{Name: "X-Layer", Values: []string{"upstream-old"}}})
+	_, siblingVersionID := publishUpstreamRecipe(t, fixture.store, sibling,
+		[]model.HeaderTemplate{{Name: "X-Layer", Values: []string{"sibling-up"}}})
+	routeRecipeID, routeVersionID := fixture.publishRecipe(t, model.RecipeScopeRoute,
+		fixture.routeID, []model.HeaderTemplate{{Name: "X-Layer", Values: []string{"route-child"}}})
+
+	draftID, err := fixture.store.CreateRecipe(model.RecipeScopeUpstream, fixture.upstream.ID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldID := fixture.upstream.ID
+	oldRouteID := fixture.routeID
+	if err := fixture.store.DeleteUpstream(oldID); err != nil {
+		t.Fatalf("DeleteUpstream: %v", err)
+	}
+	if _, err := fixture.store.PublishedUpstreamRecipe(ctx, oldID, model.EndpointModels); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted upstream published recipe must be gone: err=%v", err)
+	}
+	if _, err := fixture.store.PublishedRouteRecipe(ctx, oldRouteID, model.EndpointModels); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cascaded route published recipe must be gone: err=%v", err)
+	}
+	for _, recipeID := range []int64{oldRecipeID, draftID, routeRecipeID} {
+		recipe, err := fixture.store.GetRecipe(ctx, recipeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recipe.Status != model.RecipeArchived {
+			t.Fatalf("recipe %d must be archived, status=%s", recipeID, recipe.Status)
+		}
+	}
+
+	siblingResolved, err := fixture.resolver().Resolve(ctx, probe.RecipeQuery{
+		UpstreamID: sibling.ID, Endpoint: model.EndpointModels,
+	})
+	if err != nil {
+		t.Fatalf("sibling resolve: %v", err)
+	}
+	if siblingResolved.Layer != model.ResolvedUpstream || siblingResolved.Identity.DBVersionID != siblingVersionID {
+		t.Fatalf("sibling recipe must remain: layer=%s version=%d want %d",
+			siblingResolved.Layer, siblingResolved.Identity.DBVersionID, siblingVersionID)
+	}
+
+	if err := fixture.store.DeleteUpstream(sibling.ID); err != nil {
+		t.Fatalf("delete sibling: %v", err)
+	}
+	if _, err := fixture.store.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='upstream'`); err != nil {
+		t.Fatalf("reset upstream sequence: %v", err)
+	}
+	if _, err := fixture.store.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='upstream_endpoint'`); err != nil {
+		t.Fatalf("reset endpoint sequence: %v", err)
+	}
+	if _, err := fixture.store.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='route'`); err != nil {
+		t.Fatalf("reset route sequence: %v", err)
+	}
+
+	neu := &model.Upstream{
+		Name: "recipe-reused-up", BaseURL: "https://reused-up.invalid",
+		APIKey: "sk-reused-up-value", AuthStyle: model.AuthXAPIKey, Enabled: true,
+	}
+	if err := fixture.store.CreateUpstream(neu); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if neu.ID != oldID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", neu.ID, oldID)
+	}
+
+	resolved, err := fixture.resolver().Resolve(ctx, probe.RecipeQuery{
+		UpstreamID: neu.ID, Endpoint: model.EndpointModels,
+	})
+	if err != nil {
+		t.Fatalf("reused id resolve: %v", err)
+	}
+	if resolved.Layer == model.ResolvedUpstream && resolved.Identity.DBVersionID == oldVersionID {
+		t.Fatal("reused id must not send the deleted upstream's published recipe")
+	}
+	if resolved.Identity.DBVersionID == oldVersionID || resolved.Identity.DBVersionID == routeVersionID {
+		t.Fatalf("reused id must not send deleted recipe versions (upstream=%d route=%d got=%d)",
+			oldVersionID, routeVersionID, resolved.Identity.DBVersionID)
+	}
+	if resolved.Layer != model.ResolvedEmbedded && resolved.Layer != model.ResolvedProfile {
+		t.Fatalf("reused id without own recipe want embedded/profile, got layer=%s", resolved.Layer)
+	}
+}
+
+// publishUpstreamRecipe publishes an upstream-scoped recipe against the given
+// upstream (fixture.publishRecipe always pins the test execution to fixture.upstream).
+func publishUpstreamRecipe(t *testing.T, st *store.Store, upstream *model.Upstream,
+	headers []model.HeaderTemplate) (recipeID, versionID int64) {
+
+	t.Helper()
+	ctx := context.Background()
+	recipeID, err := st.CreateRecipe(model.RecipeScopeUpstream, upstream.ID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := &model.ProbeRecipeVersion{
+		RecipeID: recipeID, Origin: model.RecipeManual, Method: "GET",
+		Headers: headers, TimeoutProfile: model.TimeoutL1,
+	}
+	if err := st.AddRecipeVersion(version, 1); err != nil {
+		t.Fatal(err)
+	}
+	recipe, err := st.GetRecipe(ctx, recipeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := st.ListEndpointsPage(ctx, model.EndpointFilter{
+		UpstreamID: upstream.ID, Endpoint: model.EndpointModels,
+	})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("models endpoint = %+v err=%v", page, err)
+	}
+	endpoint := page.Items[0]
+	start, _, err := st.ReserveObservationOrders(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := model.ProbeExecution{
+		ID: "exec-up-" + itoa(version.ID) + "-" + itoa(upstream.ID),
+		Trigger: model.TriggerManual, UpstreamID: upstream.ID,
+		UpstreamNetworkRevision: upstream.NetworkRevision, UpstreamCredentialRevision: upstream.CredentialRevision,
+		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
+		AuthProfileRevision: endpoint.AuthProfile.Revision, Endpoint: model.EndpointModels,
+		RecipeBindingUse: model.BindingExplicitTest, RecipeStorage: model.RecipeStorageDB,
+		RecipeOrigin: model.RecipeManual, RecipeID: recipeID, RecipeVersionID: version.ID,
+		EvidenceHash: "evidence-up-" + itoa(version.ID), ErrorClass: model.ErrorNone,
+		Capability: model.CapabilityUnknown, Scope: model.ScopeUpstreamEndpoint,
+		Reachable: true, Final: true, Success: true,
+		ObservationOrder: start, SentAtMS: start, DoneAtMS: start + 1,
+	}
+	if err := st.InsertProbeExecution(ctx, &execution); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishRecipeVersion(recipeID, version.ID, execution.ID, recipe.Revision, false); err != nil {
+		t.Fatal(err)
+	}
+	return recipeID, version.ID
+}

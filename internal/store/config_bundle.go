@@ -117,7 +117,7 @@ func loadBundleModelNames(ctx context.Context, tx *sql.Tx) ([]*model.ModelName, 
 }
 
 func (store *Store) loadBundleUpstreams(ctx context.Context, tx *sql.Tx) ([]*model.Upstream, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT `+upstreamCols+` FROM upstream ORDER BY id`)
+	rows, err := tx.QueryContext(ctx, `SELECT `+upstreamCols+` FROM upstream WHERE id>0 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
