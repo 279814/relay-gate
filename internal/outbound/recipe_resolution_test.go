@@ -649,7 +649,7 @@ func publishUpstreamRecipe(t *testing.T, st *store.Store, upstream *model.Upstre
 		t.Fatal(err)
 	}
 	execution := model.ProbeExecution{
-		ID: "exec-up-" + itoa(version.ID) + "-" + itoa(upstream.ID),
+		ID:      "exec-up-" + itoa(version.ID) + "-" + itoa(upstream.ID),
 		Trigger: model.TriggerManual, UpstreamID: upstream.ID,
 		UpstreamNetworkRevision: upstream.NetworkRevision, UpstreamCredentialRevision: upstream.CredentialRevision,
 		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
