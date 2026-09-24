@@ -109,6 +109,52 @@ func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
 	}
 }
 
+func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	now := time.UnixMilli(1_700_000_000_000)
+	reg.now = func() time.Time { return now }
+
+	reg.MarkCountTokensConfigError(7, 500)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("500 marked config_error: %s", got)
+	}
+	reg.MarkCountTokensConfigError(7, 404)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("404 marked config_error: %s", got)
+	}
+
+	reg.MarkCountTokensConfigError(7, 401)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
+		t.Fatalf("401 effective=%s, want config_error", got)
+	}
+	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
+	if row == nil || row.StatusCode != 401 {
+		t.Fatalf("snapshot=%+v", row)
+	}
+	if row.State != model.CapabilityConfigError || row.ErrorClass != model.ErrorAuthRejected {
+		t.Fatalf("state=%s class=%s", row.State, row.ErrorClass)
+	}
+	if row.ExpiresAt != 0 {
+		t.Fatalf("ExpiresAt=%d want 0 (config_error does not TTL)", row.ExpiresAt)
+	}
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages capability leaked: %s", got)
+	}
+
+	// 404 remains unsupported, not overwritten by a later mis-mark as config_error path.
+	reg2 := NewCapabilityRegistry(capSettings{settings})
+	reg2.now = func() time.Time { return now }
+	reg2.MarkCountTokensUnsupported(8, 404)
+	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("404 effective=%s, want unsupported", got)
+	}
+	reg2.MarkCountTokensConfigError(8, 500)
+	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("500 must not change unsupported to %s", got)
+	}
+}
+
 func TestCapabilityRegistry_CASKeepsHigherOrder(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})

@@ -230,8 +230,8 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 4xx/5xx 对客户端一律降级到本地估算（拿不到准确值）。Capability 写回
-	// 按 §10.3 / §8.12 收窄：仅 404/405 标记该 Route 的 count_tokens
-	// unsupported，让下次选路跳过；400/401/500 等不写 unsupported。
+	// 按 §10.3：404/405 → count_tokens unsupported；401/403 → 端点配置错误
+	// （config_error）；临时失败（如 500）不写 unsupported/config_error。
 	// 失败**不回写** Route 模型健康，也不触发模型 L2。
 	//
 	// 原文进日志前**必须**脱敏：上游的鉴权错误经常把收到的 key 回显在消息里
@@ -239,10 +239,13 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
-		if (resp.StatusCode == http.StatusNotFound ||
-			resp.StatusCode == http.StatusMethodNotAllowed) &&
-			h.countCaps != nil && cand.Route != nil {
-			h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, resp.StatusCode)
+		if h.countCaps != nil && cand.Route != nil {
+			switch resp.StatusCode {
+			case http.StatusNotFound, http.StatusMethodNotAllowed:
+				h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, resp.StatusCode)
+			case http.StatusUnauthorized, http.StatusForbidden:
+				h.countCaps.MarkCountTokensConfigError(cand.Route.ID, resp.StatusCode)
+			}
 		}
 		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
