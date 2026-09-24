@@ -175,14 +175,16 @@ func respondOK(text string) http.HandlerFunc {
 }
 
 // §3.5 的可重试清单，逐条验证：换站之后客户端拿到的是好站的响应。
+// 默认 Balanced：仅 §11.2 点名的 429/502/503/504（及载荷侧临时错误）。
+// 通用 5xx（如 500）见 TestRetry_General5xxFailoverOnlyAggressive。
 func TestRetry_RetryableConditionsSwitchStation(t *testing.T) {
 	cases := []struct {
 		name string
 		bad  http.HandlerFunc
 	}{
-		{"500", respondStatus(500, `{"error":"internal"}`)},
 		{"502", respondStatus(502, `bad gateway`)},
 		{"503", respondStatus(503, `unavailable`)},
+		{"504", respondStatus(504, `gateway timeout`)},
 		{"429 限流", respondStatus(429, `{"error":{"type":"rate_limit_error"}}`)},
 		{
 			// 200 但流里第一个事件就是 error（§3.5 明确列为可重试）
@@ -335,24 +337,24 @@ func TestRetry_ModelMappingIsPerStation(t *testing.T) {
 // 然后把最后一次的响应交给客户端。
 func TestRetry_StopsAtMaxAttempts(t *testing.T) {
 	hs := newMultiHarness(t,
-		respondStatus(500, `s0 down`),
-		respondStatus(500, `s1 down`),
-		respondStatus(500, `s2 down`),
-		respondStatus(500, `s3 down`))
+		respondStatus(502, `s0 down`),
+		respondStatus(502, `s1 down`),
+		respondStatus(502, `s2 down`),
+		respondStatus(502, `s3 down`))
 	hs.cfg.settings.RetryMaxAttempts = 3
 	hs.cfg.settings.RealTotalSec = 30
 
 	rec := hs.serve(hs.req())
 
 	// 最后一次的上游响应原样透传（§3.3：响应方向不碰）
-	if rec.Code != 500 {
-		t.Errorf("应透传最后一次的 500，得到 %d", rec.Code)
+	if rec.Code != 502 {
+		t.Errorf("应透传最后一次的 502，得到 %d", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "s2 down") {
 		t.Errorf("应是第 3 个站的响应体，得到 %q", rec.Body.String())
 	}
 	hs.assertHits(t, 1, 1, 1, 0)
-	// §2.3: 透传的上游 500 不是网关自生成错误，不得带 X-Relay-Attempts。
+	// §2.3: 透传的上游 502 不是网关自生成错误，不得带 X-Relay-Attempts。
 	if got := rec.Header().Get("X-Relay-Attempts"); got != "" {
 		t.Errorf("透传上游响应不该带 X-Relay-Attempts，得到 %q", got)
 	}
@@ -361,14 +363,14 @@ func TestRetry_StopsAtMaxAttempts(t *testing.T) {
 // retry_max_attempts=1 表示不重试。这是 M5 的行为，必须能退回去。
 func TestRetry_DisabledWithOneAttempt(t *testing.T) {
 	hs := newMultiHarness(t,
-		respondStatus(500, `s0 down`),
+		respondStatus(502, `s0 down`),
 		respondOK(`{"id":"never"}`))
 	hs.cfg.settings.RetryMaxAttempts = 1
 
 	rec := hs.serve(hs.req())
 
-	if rec.Code != 500 {
-		t.Errorf("不重试时应直接透传 500，得到 %d", rec.Code)
+	if rec.Code != 502 {
+		t.Errorf("不重试时应直接透传 502，得到 %d", rec.Code)
 	}
 	hs.assertHits(t, 1, 0)
 	if got := rec.Header().Get("X-Relay-Attempts"); got != "" {
@@ -378,15 +380,15 @@ func TestRetry_DisabledWithOneAttempt(t *testing.T) {
 
 // 站不够时按站数收敛,不能死循环也不能重复打同一个站。
 func TestRetry_NeverRepeatsSameStation(t *testing.T) {
-	hs := newMultiHarness(t, respondStatus(500, `only station down`))
+	hs := newMultiHarness(t, respondStatus(502, `only station down`))
 	hs.cfg.settings.RetryMaxAttempts = 5
 	hs.cfg.settings.RealTotalSec = 30
 
 	rec := hs.serve(hs.req())
 
 	// 只有一个站,且它已经试过 —— 不该再试它,而是把它的响应交给客户端
-	if rec.Code != 500 {
-		t.Errorf("应透传那个站的 500，得到 %d", rec.Code)
+	if rec.Code != 502 {
+		t.Errorf("应透传那个站的 502，得到 %d", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "only station down") {
 		t.Errorf("上游错误体应原样透传，得到 %q", rec.Body.String())
@@ -498,7 +500,7 @@ func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 // 回写列为「最快的故障发现路径」，漏了它就等于放弃了这条路径。
 func TestRetry_ReportsHealthForEveryAttempt(t *testing.T) {
 	hs := newMultiHarness(t,
-		respondStatus(500, `s0 down`),
+		respondStatus(502, `s0 down`),
 		respondOK(`{"id":"ok"}`))
 	spy := &multiReporter{}
 	hs.h.WithHealthReporter(spy)
@@ -511,9 +513,9 @@ func TestRetry_ReportsHealthForEveryAttempt(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("两次尝试都该回写，得到 %d 次：%+v", len(got), got)
 	}
-	// 失败的那次：Route 100，状态 500
-	if got[0].routeID != 100 || got[0].status != 500 {
-		t.Errorf("第一条应是 Route 100 的 500，得到 route=%d status=%d",
+	// 失败的那次：Route 100，状态 502
+	if got[0].routeID != 100 || got[0].status != 502 {
+		t.Errorf("第一条应是 Route 100 的 502，得到 route=%d status=%d",
 			got[0].routeID, got[0].status)
 	}
 	// 成功的那次：Route 200，状态 200
@@ -529,8 +531,9 @@ func TestRetry_ReportsHealthForEveryAttempt(t *testing.T) {
 // （Anthropic 的 529 overloaded 就是这个形态）会因此被判成 Unavailable 而
 // 累计判死,本该只是冷却。一个热门的好站会就这样被踢出池子。
 func TestRetry_DiscardedAttemptCarriesErrBody(t *testing.T) {
+	// 502 is in the Balanced named set (§11.2); body still reaches health classify.
 	hs := newMultiHarness(t,
-		respondStatus(529, `{"error":{"type":"overloaded_error","message":"rate limit"}}`),
+		respondStatus(502, `{"error":{"type":"overloaded_error","message":"rate limit"}}`),
 		respondOK(`{"id":"ok"}`))
 	spy := &multiReporter{}
 	hs.h.WithHealthReporter(spy)
@@ -580,8 +583,9 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 // route_health.last_error 并显示在管理界面上（§3.6.3b 的要求是无条件的）。
 func TestRetry_RedactsEachAttemptWithItsOwnKey(t *testing.T) {
 	// 两个站都把自己收到的 key 回显在错误信息里（真实中转站的常见格式）
+	// 用 Balanced 点名的 502，以便换站并覆盖两次回写脱敏。
 	echoKey := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
+		w.WriteHeader(502)
 		fmt.Fprintf(w, `{"error":"Invalid API key: %s"}`, r.Header.Get("X-Api-Key"))
 	}
 	hs := newMultiHarness(t, echoKey, echoKey)
@@ -652,8 +656,8 @@ func (m *multiReporter) all() []reportedView {
 // 而配 max_concurrency 的通常是「多开一路就限流甚至封号」的公益站。
 func TestRetry_ReleasesConcurrencyPerAttempt(t *testing.T) {
 	hs := newMultiHarness(t,
-		respondStatus(500, `down`),
-		respondStatus(500, `down`),
+		respondStatus(502, `down`),
+		respondStatus(502, `down`),
 		respondOK(`{"id":"ok"}`))
 	hs.cfg.settings.RetryMaxAttempts = 3
 	hs.cfg.settings.RealTotalSec = 30
@@ -943,6 +947,92 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 	})
 }
 
+// §11.2: Balanced 仅点名 429/502/503/504；通用 5xx（500/501/…）仅 Aggressive 换站。
+// 不换站时透传该上游状态，不得换成网关笼统 502。
+func TestRetry_General5xxFailoverOnlyAggressive(t *testing.T) {
+	t.Run("balanced 500 stays on one upstream and passthrough", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondStatus(500, `{"error":"internal from station-a"}`),
+			respondOK(`{"id":"must-not-reach"}`))
+		hs.cfg.settings.RealTotalSec = 30
+		if hs.cfg.settings.RetryPolicy.Normalize() != model.RetryPolicyBalanced {
+			t.Fatalf("测试默认应为 Balanced，得到 %q", hs.cfg.settings.RetryPolicy)
+		}
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 500 {
+			t.Fatalf("应透传上游 500，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "internal from station-a") {
+			t.Errorf("上游错误体应原样透传，得到 %q", rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "must-not-reach") {
+			t.Error("Balanced 不应因通用 500 换站")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("balanced 501 stays on one upstream and passthrough", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondStatus(501, `{"error":"not implemented"}`),
+			respondOK(`{"id":"must-not-reach"}`))
+		hs.cfg.settings.RealTotalSec = 30
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 501 {
+			t.Fatalf("应透传上游 501，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("safe 500 stays on one upstream", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondStatus(500, `{"error":"internal"}`),
+			respondOK(`{"id":"must-not-reach"}`))
+		hs.cfg.settings.RealTotalSec = 30
+		hs.cfg.settings.RetryPolicy = model.RetryPolicySafe
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 500 {
+			t.Fatalf("应透传上游 500，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("balanced 502 switches before commit", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondStatus(502, `bad gateway`),
+			respondOK(`{"id":"from-good-station"}`))
+		hs.cfg.settings.RealTotalSec = 30
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 200 {
+			t.Fatalf("Balanced 应对 502 换站成功，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "from-good-station") {
+			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
+		}
+		hs.assertHits(t, 1, 1)
+	})
+
+	t.Run("aggressive 500 switches before commit", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondStatus(500, `{"error":"internal"}`),
+			respondOK(`{"id":"from-good-station"}`))
+		hs.cfg.settings.RealTotalSec = 30
+		hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 200 {
+			t.Fatalf("Aggressive 应对通用 500 换站成功，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "from-good-station") {
+			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
+		}
+		hs.assertHits(t, 1, 1)
+	})
+}
+
 // ── 样本：客户端的一次请求 = 一条样本 ─────────────────────
 
 // 重试不该让一次客户端请求变成多条样本。
@@ -951,7 +1041,7 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 // 客户端发了 N 次。逐次尝试的留档归 request_log（M6 PR-B）。
 func TestRetry_RecordsOneSamplePerClientRequest(t *testing.T) {
 	hs := newMultiHarness(t,
-		respondStatus(500, `down`),
+		respondStatus(502, `down`),
 		respondOK(`{"id":"ok"}`))
 	hs.cfg.settings.RealTotalSec = 30
 
