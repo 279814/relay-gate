@@ -7,6 +7,7 @@ package probe
 // 本 Registry **永不**写 RouteHealth（§P0-10 验收第 19 条）。
 
 import (
+	"net/http"
 	"sync"
 	"time"
 
@@ -148,6 +149,49 @@ func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, st
 		ObservedAt:               nowMS,
 		ExpiresAt:                expiresAt,
 		RedactedDetail:           string(model.ErrorUnsupported),
+	})
+}
+
+// MarkCountTokensConfigError records §10.3: upstream 401/403 on count_tokens
+// → that Route's count_tokens Capability is config_error (端点配置错误).
+// Does not touch RouteHealth or other endpoints; ExpiresAt stays 0 (§8.13).
+func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, statusCode int) {
+	if registry == nil || routeID <= 0 {
+		return
+	}
+	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		return
+	}
+	selector := model.EvidencePolicySelector{
+		Kind:     model.EvidenceCountTokens,
+		Endpoint: model.EndpointCountTokens,
+	}
+	settings := model.DefaultSettings()
+	if registry.settings != nil {
+		if s, err := registry.settings.Settings(); err == nil {
+			settings = s
+		}
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		return
+	}
+	fp := revisioncodec.ProbeSettingsFingerprint(policy)
+	nowMS := registry.now().UnixMilli()
+	registry.ApplyCommitted(&model.EndpointCapability{
+		ScopeType:                model.RecipeScopeRoute,
+		ScopeID:                  routeID,
+		Endpoint:                 model.EndpointCountTokens,
+		PolicySelector:           selector,
+		State:                    model.CapabilityConfigError,
+		ErrorClass:               model.ErrorAuthRejected,
+		StatusCode:               statusCode,
+		ObservationToken:         "",
+		ProbeSettingsFingerprint: fp,
+		LastObservationOrder:     nowMS,
+		ObservedAt:               nowMS,
+		ExpiresAt:                0, // §8.13: config_error 不自动过期
+		RedactedDetail:           string(model.ErrorAuthRejected),
 	})
 }
 
