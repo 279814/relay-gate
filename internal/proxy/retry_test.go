@@ -194,24 +194,8 @@ func TestRetry_RetryableConditionsSwitchStation(t *testing.T) {
 				w.(http.Flusher).Flush()
 			},
 		},
-		{
-			// 响应头都不回。首 Token 超时（Send 阶段的 headerTimer）
-			name: "响应头阶段卡死",
-			bad: func(w http.ResponseWriter, r *http.Request) {
-				time.Sleep(3 * time.Second) // > RealFirstTokenSec(2)
-			},
-		},
-		{
-			// 头回了、flush 了，但 body 一个字节都不吐。
-			// 这条走的是 Peek 里的首 Token 计时器,与上一条是不同的代码路径。
-			name: "响应头已回但 body 卡死",
-			bad: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.WriteHeader(200)
-				w.(http.Flusher).Flush()
-				time.Sleep(3 * time.Second)
-			},
-		},
+		// 首 Token / Peek 超时不在 Balanced 可重试清单（§11.2 仅 Aggressive）；
+		// 见 TestRetry_FirstTokenTimeoutFailoverOnlyAggressive。
 	}
 
 	for _, c := range cases {
@@ -437,11 +421,13 @@ func TestRetry_NoNextStationStillCommitsCurrentResponse(t *testing.T) {
 // 不共享的话每次尝试各拿一份完整的 30 分钟，3 次重试 = 客户端最坏等 90 分钟,
 // 而配置里写的明明是 30 分钟。
 func TestRetry_SharesTotalTimeBudget(t *testing.T) {
-	// 每个站都卡住不回响应头,各吃掉一次首 Token 超时
+	// 每个站都卡住不回响应头,各吃掉一次首 Token 超时。
+	// §11.2: 提交前首 Token 超时换站仅 Aggressive；本用例要多站消耗共享预算。
 	stall := func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
 	}
 	hs := newMultiHarness(t, stall, stall, stall)
+	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
 	hs.cfg.settings.RetryMaxAttempts = 3
 	// All stage budgets must match: TimeoutsFrom takes min(ResponseHead,
 	// FirstByte, …, Total). Leaving ResponseHeaderSec at testSettings' 2s
@@ -478,11 +464,14 @@ func TestRetry_SharesTotalTimeBudget(t *testing.T) {
 
 // §2.3: 网关自生成的错误响应（无上游头可透传）在真重试过时必须带
 // X-Relay-Attempts；成功/透传上游响应不得带（见上方换站成功用例）。
+//
+// 首 Token 超时换站仅 Aggressive（§11.2）；用它制造「无上游头可透传」的网关 504。
 func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 	stall := func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
 	}
 	hs := newMultiHarness(t, stall, stall)
+	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
 	hs.cfg.settings.RetryMaxAttempts = 2
 	hs.cfg.settings.RealFirstTokenSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
@@ -855,6 +844,102 @@ func TestRetry_PostWriteConnectDoesNotFailover_PreWriteDialStillDoes(t *testing.
 			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
 		}
 		hs.assertHits(t, 0, 1)
+	})
+}
+
+// §11.2: 提交前首响应体字节超时 (ErrFirstTokenTimeout) 仅 Aggressive 换站。
+// 默认 Balanced：一站、网关 504、无第二次 RoundTrip。
+func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
+	stallHeader := func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}
+	stallBody := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		time.Sleep(5 * time.Second)
+	}
+	shortStages := func(hs *multiHarness) {
+		hs.cfg.settings.RealFirstTokenSec = 1
+		hs.cfg.settings.RealResponseHeaderSec = 1
+		hs.cfg.settings.RealFirstByteSec = 1
+		hs.cfg.settings.RealFirstSemanticSec = 1
+		hs.cfg.settings.RealConnectSec = 1
+		hs.cfg.settings.RealTotalSec = 30
+		hs.cfg.settings.RetryMaxAttempts = 3
+	}
+
+	t.Run("balanced header stall stays on one upstream", func(t *testing.T) {
+		hs := newMultiHarness(t, stallHeader, respondOK(`{"id":"must-not-reach"}`))
+		shortStages(hs)
+		if hs.cfg.settings.RetryPolicy.Normalize() != model.RetryPolicyBalanced {
+			t.Fatalf("测试默认应为 Balanced，得到 %q", hs.cfg.settings.RetryPolicy)
+		}
+
+		rec := hs.serve(hs.req())
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "must-not-reach") {
+			t.Error("Balanced 不应因首 Token 超时换站")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("balanced body stall stays on one upstream", func(t *testing.T) {
+		hs := newMultiHarness(t, stallBody, respondOK(`{"id":"must-not-reach"}`))
+		shortStages(hs)
+
+		rec := hs.serve(hs.req())
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "must-not-reach") {
+			t.Error("Balanced 不应因 Peek 首字节超时换站")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("safe header stall stays on one upstream", func(t *testing.T) {
+		hs := newMultiHarness(t, stallHeader, respondOK(`{"id":"must-not-reach"}`))
+		shortStages(hs)
+		hs.cfg.settings.RetryPolicy = model.RetryPolicySafe
+
+		rec := hs.serve(hs.req())
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("aggressive header stall switches before commit", func(t *testing.T) {
+		hs := newMultiHarness(t, stallHeader, respondOK(`{"id":"from-good-station"}`))
+		shortStages(hs)
+		hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 200 {
+			t.Fatalf("Aggressive 应换站成功，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "from-good-station") {
+			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
+		}
+		hs.assertHits(t, 1, 1)
+	})
+
+	t.Run("aggressive body stall switches before commit", func(t *testing.T) {
+		hs := newMultiHarness(t, stallBody, respondOK(`{"id":"from-good-station"}`))
+		shortStages(hs)
+		hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
+
+		rec := hs.serve(hs.req())
+		if rec.Code != 200 {
+			t.Fatalf("Aggressive 应换站成功，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "from-good-station") {
+			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
+		}
+		hs.assertHits(t, 1, 1)
 	})
 }
 
