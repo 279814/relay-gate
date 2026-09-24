@@ -558,7 +558,7 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 // 再往流里写错误结构只会破坏客户端的 SSE 解析。
 //
 // redactKeys 是本次请求涉及的凭据。**必须脱敏**：err 的文本里可能带出站
-// URL，而 full_url_mode 的 base_url 允许把 key 放在 query 里（§3.2）。
+// URL，而 FixedQueryTemplate / legacy_exact 可能把 key 放在 query 里（§7.1）。
 // 客户端是外部的 —— 持有 relay key 不等于有资格看到上游 key。
 //
 // 当前标准库恰好不会把 URL 放进错误里（forward.go 直接调 Transport.RoundTrip，
@@ -668,8 +668,8 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 
 		InMethod: r.Method,
 		InPath:   r.URL.Path,
-		// query 与 URL 也要脱敏：§3.2 提到少数站接受 ?key=<key>，
-		// 而 full_url_mode 的 base_url 会被整段存进 out_url。
+		// query 与 URL 也要脱敏：少数站接受 ?key=<key>（由 FixedQueryTemplate
+		// 表达，§7.1），出站 URL 会被整段存进 out_url。
 		// 只清头和 body 满足不了 §9.4 的「真 key 全表 grep 零命中」。
 		InQuery:   sample.RedactText(r.URL.RawQuery, keys),
 		InHeaders: sample.RedactHeaders(r.Header, keys),

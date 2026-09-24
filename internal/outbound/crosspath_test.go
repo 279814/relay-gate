@@ -47,6 +47,9 @@ type crossPathCase struct {
 	name string
 	// basePath 追加在测试服务器地址之后，模拟带公共路径前缀的网关。
 	basePath string
+	// fullURLMode 为 true 时 base_url 即完整端点，不再拼 messages 路径；
+	// L1 接到 origin，不得叠到完整端点路径后面。
+	fullURLMode bool
 	// l1Path 为空表示只探连接层（HEAD base_url）。
 	l1Path     string
 	fixedQuery string
@@ -111,7 +114,7 @@ func crossPathCases() []crossPathCase {
 			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
-			// key 放在 query 里的站（§3.2）。三条路径都必须带上它，
+			// key 放在 query 里的站（§7.1 FixedQueryTemplate）。三条路径都必须带上它，
 			// 漏掉任何一条的症状都是「配了 key 却一直 401」。
 			name:           "固定 query 带 key",
 			l1Path:         "/v1/models",
@@ -146,6 +149,20 @@ func crossPathCases() []crossPathCase {
 			wantPath:         "/v1/messages",
 			wantCountPath:    "/v1/messages/count_tokens",
 			wantModelsPath:   "/status",
+			wantRealQuery:    "beta=true",
+			wantProbeL2Query: probeRecipeQuery,
+		},
+		{
+			// full_url_mode：messages 用 base 本身；L1 接到 origin，
+			// 不得变成 /custom/entry/v1/models 或 /custom/entry/status。
+			name:             "full_url_mode 不叠 L1 路径",
+			basePath:         "/custom/entry",
+			fullURLMode:      true,
+			l1Path:           "/v1/models",
+			incomingQuery:    "beta=true",
+			wantPath:         "/custom/entry",
+			wantCountPath:    "/custom/entry",
+			wantModelsPath:   "/v1/models",
 			wantRealQuery:    "beta=true",
 			wantProbeL2Query: probeRecipeQuery,
 		},
@@ -328,7 +345,8 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 	fixture.upstream = &model.Upstream{
 		ID: 10, Name: "mock", BaseURL: fixture.server.URL + testCase.basePath,
 		APIKey: crossUpstreamKey, AuthStyle: model.AuthXAPIKey,
-		L1Path: testCase.l1Path, Enabled: true, CredentialRevision: 1,
+		FullURLMode: testCase.fullURLMode,
+		L1Path:      testCase.l1Path, Enabled: true, CredentialRevision: 1,
 	}
 	modelName := &model.ModelName{ID: 1, Name: "claude-opus-5",
 		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}

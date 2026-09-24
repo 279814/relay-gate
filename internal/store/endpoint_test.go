@@ -118,8 +118,8 @@ func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 		model.EndpointCountTokens:     "https://a.com/custom/entry",
 		model.EndpointResponses:       "https://a.com/custom/entry",
 		model.EndpointChatCompletions: "https://a.com/custom/entry",
-		// 自定义 l1_path 只影响 models
-		model.EndpointModels: "https://a.com/custom/entry/status",
+		// 自定义 l1_path 接到 origin，不叠到完整端点路径后面
+		model.EndpointModels: "https://a.com/status",
 	}
 	for kind, want := range cases {
 		endpoint, err := store.Endpoint(context.Background(), upstream.ID, kind)

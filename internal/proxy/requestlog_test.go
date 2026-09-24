@@ -322,7 +322,7 @@ func TestRequestLog_IndependentFromSampleSwitch(t *testing.T) {
 // 日志的 error 字段必须脱敏。
 //
 // 它会显示在管理界面上，而错误文本里可能带出站 URL ——
-// full_url_mode 的 base_url 允许把 key 放在 query 里（§3.2）。
+// FixedQueryTemplate / legacy_exact 可能把 key 放在 query 里（§7.1）。
 func TestRequestLog_RedactsKeysInError(t *testing.T) {
 	const upKey = "sk-station-0-secret"
 	hs := newMultiHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -332,7 +332,8 @@ func TestRequestLog_RedactsKeysInError(t *testing.T) {
 	up := hs.cfg.snap.Upstreams[10]
 	up.APIKey = upKey
 	up.FullURLMode = true
-	up.BaseURL = "http://127.0.0.1:1/v1/messages?key=" + upKey
+	up.BaseURL = "http://127.0.0.1:1/v1/messages"
+	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 	sink := hs.withLogs()
 
 	hs.serve(hs.req())
