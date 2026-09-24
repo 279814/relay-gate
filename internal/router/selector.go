@@ -4,6 +4,7 @@ package router
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"strings"
@@ -343,25 +344,56 @@ func DeadRoutesFor(snap *Snapshot, hv HealthView, mn *model.ModelName) []*model.
 // weightedPick 按 weight 加权随机，返回**下标**。
 // 返回下标而不是元素，是为了让调用方能在占额度失败后把它剔出候选池重挑。
 // weight 已由 Validate 保证 ≥ 1。
+//
+// 累加用 int64，避免多个接近 MaxInt 的 weight 在 int 上绕回成
+// 负/零 total，从而总是返回下标 0 或让 IntN panic。若 int64 仍放不下，
+// 按比例右移后再抽，保证正权重路由仍有机会被选中。
 func weightedPick(rs []*model.Route) int {
 	if len(rs) == 1 {
 		return 0
 	}
-	total := 0
-	for _, r := range rs {
-		total += r.Weight
-	}
-	if total <= 0 {
+	total, shift, ok := weightTotal(rs)
+	if !ok || total <= 0 {
 		return 0 // 理论不可达（Validate 保证 weight ≥ 1），兜底防除零
 	}
-	n := rand.IntN(total)
+	n := rand.Int64N(total)
 	for i, r := range rs {
-		n -= r.Weight
+		n -= scaledWeight(r.Weight, shift)
 		if n < 0 {
 			return i
 		}
 	}
 	return len(rs) - 1
+}
+
+// weightTotal 在 int64 上求权重和。若直接相加会溢出，则统一右移
+// 直到和能放入 int64；返回的 shift 须用于抽签时的权重缩放。
+func weightTotal(rs []*model.Route) (total int64, shift uint, ok bool) {
+	for shift = 0; shift < 63; shift++ {
+		total = 0
+		overflow := false
+		for _, r := range rs {
+			w := scaledWeight(r.Weight, shift)
+			if w > 0 && total > math.MaxInt64-w {
+				overflow = true
+				break
+			}
+			total += w
+		}
+		if !overflow {
+			return total, shift, true
+		}
+	}
+	return 0, 0, false
+}
+
+func scaledWeight(weight int, shift uint) int64 {
+	w := int64(weight) >> shift
+	// 右移后不要把正权重抹成 0，否则小权重路由会从抽签中消失。
+	if weight > 0 && w == 0 {
+		return 1
+	}
+	return w
 }
 
 func sortedKeys(m map[int][]*model.Route) []int {
