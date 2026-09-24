@@ -333,3 +333,49 @@ func TestStripHopByHopResponse(t *testing.T) {
 		t.Error("普通响应头应保留")
 	}
 }
+
+// 上游 Set-Cookie 不能覆盖管理会话；其它 Set-Cookie 继续透传。
+// 匹配与出站 Cookie 剥离相同：cookie 名大小写敏感全等，不看 value。
+func TestFinalizeClientResponseHeaders_DropsGatewaySessionSetCookie(t *testing.T) {
+	h := http.Header{}
+	h.Add("Set-Cookie", gatewaySessionCookie+"=evil-from-upstream; Path=/; HttpOnly")
+	h.Add("Set-Cookie", "other=1")
+	h.Add("Set-Cookie", "Relay_Session=case-differs") // 大小写不同，应保留
+	h.Add("Set-Cookie", "prefix_"+gatewaySessionCookie+"=not-exact")
+	h.Add("Set-Cookie", "keep=has-"+gatewaySessionCookie+"-in-value")
+	h.Set("Connection", "close")
+	h.Set("X-Request-Id", "req-keep")
+
+	FinalizeClientResponseHeaders(h)
+
+	got := h.Values("Set-Cookie")
+	for _, line := range got {
+		first, _, _ := strings.Cut(line, ";")
+		name, _, _ := strings.Cut(first, "=")
+		if strings.TrimSpace(name) == gatewaySessionCookie {
+			t.Fatalf("客户端响应仍含会话 Set-Cookie: %q", line)
+		}
+	}
+	wantKeep := map[string]bool{
+		"other=1":                    false,
+		"Relay_Session=case-differs": false,
+		"prefix_" + gatewaySessionCookie + "=not-exact":  false,
+		"keep=has-" + gatewaySessionCookie + "-in-value": false,
+	}
+	for _, line := range got {
+		if _, ok := wantKeep[line]; ok {
+			wantKeep[line] = true
+		}
+	}
+	for line, ok := range wantKeep {
+		if !ok {
+			t.Errorf("应保留的 Set-Cookie 丢失: %q；得到 %v", line, got)
+		}
+	}
+	if h.Get("Connection") != "" {
+		t.Error("逐跳头仍应被清理")
+	}
+	if h.Get("X-Request-Id") != "req-keep" {
+		t.Error("普通响应头应保留")
+	}
+}
