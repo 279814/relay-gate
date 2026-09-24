@@ -102,6 +102,55 @@ func (registry *CapabilityRegistry) Snapshot(scope model.RecipeScope, scopeID in
 	return &copyValue
 }
 
+// MarkCountTokensUnsupported records §10.3 / §8.12: upstream 404/405 on
+// count_tokens → that Route's count_tokens Capability is unsupported.
+// Does not touch RouteHealth or other endpoints (messages stays selectable).
+// TTL comes from the existing CapabilityReductionPolicy; config changes still
+// clear via fingerprint / Invalidate — no new invalidation trigger.
+func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, statusCode int) {
+	if registry == nil || routeID <= 0 {
+		return
+	}
+	if statusCode != 404 && statusCode != 405 {
+		return
+	}
+	selector := model.EvidencePolicySelector{
+		Kind:     model.EvidenceCountTokens,
+		Endpoint: model.EndpointCountTokens,
+	}
+	settings := model.DefaultSettings()
+	if registry.settings != nil {
+		if s, err := registry.settings.Settings(); err == nil {
+			settings = s
+		}
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		return
+	}
+	fp := revisioncodec.ProbeSettingsFingerprint(policy)
+	nowMS := registry.now().UnixMilli()
+	expiresAt := int64(0)
+	if policy.State.UnsupportedTTL > 0 {
+		expiresAt = nowMS + policy.State.UnsupportedTTL.Milliseconds()
+	}
+	registry.ApplyCommitted(&model.EndpointCapability{
+		ScopeType:                model.RecipeScopeRoute,
+		ScopeID:                  routeID,
+		Endpoint:                 model.EndpointCountTokens,
+		PolicySelector:           selector,
+		State:                    model.CapabilityUnsupported,
+		ErrorClass:               model.ErrorUnsupported,
+		StatusCode:               statusCode,
+		ObservationToken:         "",
+		ProbeSettingsFingerprint: fp,
+		LastObservationOrder:     nowMS,
+		ObservedAt:               nowMS,
+		ExpiresAt:                expiresAt,
+		RedactedDetail:           string(model.ErrorUnsupported),
+	})
+}
+
 // Invalidate 丢弃一行（配置变更后立即 effective unknown）。
 func (registry *CapabilityRegistry) Invalidate(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) {
 	if registry == nil {

@@ -229,16 +229,21 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		return fmt.Sprintf("读响应失败: %v", err)
 	}
 
-	// 4xx/5xx 一律视为「这个站不支持」并降级。不区分类别是刻意的：
-	// 404（没这个端点）、400（参数要求不同）、401（这个端点单独鉴权）
-	// 对客户端而言结果相同 —— 拿不到准确值，用估算值。
-	// 而这些失败**不回写健康状态**，所以也不需要按 §4.3 分类。
+	// 4xx/5xx 对客户端一律降级到本地估算（拿不到准确值）。Capability 写回
+	// 按 §10.3 / §8.12 收窄：仅 404/405 标记该 Route 的 count_tokens
+	// unsupported，让下次选路跳过；400/401/500 等不写 unsupported。
+	// 失败**不回写** Route 模型健康，也不触发模型 L2。
 	//
 	// 原文进日志前**必须**脱敏：上游的鉴权错误经常把收到的 key 回显在消息里
 	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），而 401 恰好是这里
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
+		if (resp.StatusCode == http.StatusNotFound ||
+			resp.StatusCode == http.StatusMethodNotAllowed) &&
+			h.countCaps != nil && cand.Route != nil {
+			h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, resp.StatusCode)
+		}
 		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
 			collapseSpaces(string(safe), maxCountTokensLogBody))
