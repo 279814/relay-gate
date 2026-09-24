@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/sample"
 )
 
@@ -41,6 +42,9 @@ type ResultView struct {
 	Err     error
 	ErrBody []byte
 	Header  http.Header
+	// Endpoint 是本次 Attempt 的协议端点（messages / chat_completions / …）。
+	// §8.12 model_not_found 写 Route+Endpoint Capability 时需要它。
+	Endpoint model.EndpointKind
 	// TTFT 首 Token 延迟，0 表示未测到。
 	TTFT time.Duration
 	// BytesWritten 用于识别假活：200 但一个字节都没吐（§4.3）。
@@ -62,12 +66,13 @@ type ResultView struct {
 //
 // 放在 viewOf 而不是各调用点：这是 ErrBody 进入健康判定的唯一入口，
 // 在这里拦一次就覆盖全部路径；散到调用点则漏一处就是漏一个泄露口。
-func viewOf(res *Result, redactKeys []string) *ResultView {
+func viewOf(res *Result, redactKeys []string, endpoint model.EndpointKind) *ResultView {
 	return &ResultView{
 		Status:       res.Status,
 		Err:          res.Err,
 		ErrBody:      sample.RedactDiagnostic(res.ErrBody, redactKeys),
 		Header:       res.RespHeaders,
+		Endpoint:     endpoint,
 		TTFT:         res.TTFT(),
 		BytesWritten: res.BytesWritten,
 		SemanticSeen: res.SemanticSeen,

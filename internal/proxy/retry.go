@@ -263,7 +263,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
 		if h.reporter != nil {
-			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, viewOf(la.at.Result(), la.keys))
+			ep, _ := proto.Endpoint()
+			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, viewOf(la.at.Result(), la.keys, ep))
 		}
 		la.cand.Release()
 		cand = next
@@ -284,9 +285,15 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 	if exclude == nil {
 		exclude = map[int64]bool{}
 	}
+	ep, _ := proto.Endpoint()
 	for {
 		cand, err := router.SelectExcluding(pre.snapshot, h.health, pre.inModel, proto, exclude)
 		if err == nil {
+			if h.capabilityExcludes(cand.Route.ID, ep) {
+				exclude[cand.Route.ID] = true
+				cand.Release()
+				continue
+			}
 			wrapped, ok := h.wrapRecoveryIfNeeded(cand)
 			if ok {
 				return wrapped, false, nil

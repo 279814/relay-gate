@@ -182,7 +182,7 @@ func runServer() error {
 		WithRelayKeyValidator(credSvc).
 		WithTargets(targets, st).
 		WithTransports(transports).
-		WithHealthReporter(probe.NewReporter(tracker)).
+		WithHealthReporter(probe.NewReporter(tracker).WithCapabilityRegistry(capRegistry)).
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
