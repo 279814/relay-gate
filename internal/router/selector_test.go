@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -855,4 +856,72 @@ func TestSelectExcluding_DoesNotPersistAcrossCalls(t *testing.T) {
 		t.Errorf("排除集不该跨请求残留，新请求应重新选到 100，得到 %d", c.Route.ID)
 	}
 	c.Release()
+}
+
+// 两个接近 int 上限的 weight 若用 int 累加会绕回成负/零 total，
+// 旧实现会总是返回下标 0（或 IntN panic）。这里确认不再如此。
+func TestWeightedPick_MaxIntWeightsDoNotCollapseToFirst(t *testing.T) {
+	rs := []*model.Route{
+		{ID: 1, Weight: math.MaxInt},
+		{ID: 2, Weight: math.MaxInt},
+	}
+	counts := [2]int{}
+	const n = 200
+	for i := 0; i < n; i++ {
+		idx := weightedPick(rs)
+		if idx < 0 || idx > 1 {
+			t.Fatalf("下标越界: %d", idx)
+		}
+		counts[idx]++
+	}
+	if counts[0] == 0 || counts[1] == 0 {
+		t.Fatalf("MaxInt 权重不应塌缩到总选第一路；counts=%v", counts)
+	}
+}
+
+// 小权重求和与缩放不依赖全局 RNG：300:100 在 int64 上应原样累加且无需右移。
+func TestWeightTotal_SmallWeightsUnscaled(t *testing.T) {
+	rs := []*model.Route{
+		{Weight: 300},
+		{Weight: 100},
+	}
+	total, shift, ok := weightTotal(rs)
+	if !ok {
+		t.Fatal("小权重求和不应失败")
+	}
+	if shift != 0 {
+		t.Errorf("小权重不应右移，shift=%d", shift)
+	}
+	if total != 400 {
+		t.Errorf("total 应为 400，得到 %d", total)
+	}
+	if scaledWeight(300, 0) != 300 || scaledWeight(100, 0) != 100 {
+		t.Errorf("未缩放时权重应保持原值")
+	}
+}
+
+// MaxInt+MaxInt 在 int64 上也会溢出；缩放后两边仍为正且相等，比例可保留。
+func TestWeightTotal_MaxIntPairScales(t *testing.T) {
+	rs := []*model.Route{
+		{Weight: math.MaxInt},
+		{Weight: math.MaxInt},
+	}
+	total, shift, ok := weightTotal(rs)
+	if !ok {
+		t.Fatal("MaxInt 对应能通过缩放求和")
+	}
+	if shift == 0 && total <= 0 {
+		t.Fatal("未缩放时 total 不应为负/零（若平台 int 已是 64 位则必须右移）")
+	}
+	w0 := scaledWeight(math.MaxInt, shift)
+	w1 := scaledWeight(math.MaxInt, shift)
+	if w0 <= 0 || w1 <= 0 {
+		t.Fatalf("缩放后权重须为正: %d, %d (shift=%d)", w0, w1, shift)
+	}
+	if w0 != w1 {
+		t.Fatalf("两路 MaxInt 缩放后应相等: %d vs %d", w0, w1)
+	}
+	if total != w0+w1 {
+		t.Fatalf("total=%d 应等于 %d+%d", total, w0, w1)
+	}
 }
