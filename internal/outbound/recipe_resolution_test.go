@@ -398,3 +398,117 @@ func TestRecipeResolutionRejectsRecreatedSecretByName(t *testing.T) {
 		t.Error("同名但 secret_id 不同必须拒绝：那份凭据没有被这个 recipe 审核过")
 	}
 }
+
+// DeleteRoute must detach published (and draft) route-scoped recipes. After
+// delete + SQLite rowid reuse, the reincarnated id must fall through to the
+// upstream published recipe — not the deleted route's body. A live sibling
+// route must keep its published recipe; an upstream-level published recipe
+// must remain when only a route is deleted.
+func TestRecipeResolution_DeleteRouteDetachesRecipeForReusedID(t *testing.T) {
+	fixture := newRecipeStoreFixture(t)
+	ctx := context.Background()
+
+	oldRoute, err := fixture.store.GetRoute(fixture.routeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	siblingUpstream := &model.Upstream{
+		Name: "recipe-sibling-site", BaseURL: "https://sibling.invalid",
+		APIKey: "sk-sibling-value", AuthStyle: model.AuthXAPIKey, Enabled: true,
+	}
+	if err := fixture.store.CreateUpstream(siblingUpstream); err != nil {
+		t.Fatal(err)
+	}
+	sibling := &model.Route{
+		ModelNameID: oldRoute.ModelNameID, UpstreamID: siblingUpstream.ID,
+		Priority: 2, Weight: 100, Enabled: true,
+	}
+	if err := fixture.store.CreateRoute(sibling); err != nil {
+		t.Fatal(err)
+	}
+
+	_, upstreamVersionID := fixture.publishRecipe(t, model.RecipeScopeUpstream,
+		fixture.upstream.ID, []model.HeaderTemplate{{Name: "X-Layer", Values: []string{"upstream"}}})
+	_, siblingVersionID := fixture.publishRecipe(t, model.RecipeScopeRoute,
+		sibling.ID, []model.HeaderTemplate{{Name: "X-Layer", Values: []string{"sibling"}}})
+	oldRecipeID, oldVersionID := fixture.publishRecipe(t, model.RecipeScopeRoute,
+		fixture.routeID, []model.HeaderTemplate{{Name: "X-Layer", Values: []string{"route-old"}}})
+
+	// Draft on another endpoint must also be detached (not left for id reuse).
+	draftID, err := fixture.store.CreateRecipe(model.RecipeScopeRoute, fixture.routeID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldID := fixture.routeID
+	if err := fixture.store.DeleteRoute(oldID); err != nil {
+		t.Fatalf("DeleteRoute: %v", err)
+	}
+	if _, err := fixture.store.PublishedRouteRecipe(ctx, oldID, model.EndpointModels); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted route published recipe must be gone: err=%v", err)
+	}
+	if recipe, err := fixture.store.GetRecipe(ctx, oldRecipeID); err != nil {
+		t.Fatal(err)
+	} else if recipe.Status != model.RecipeArchived || recipe.ScopeType != model.RecipeScopeUpstream || recipe.ScopeID != fixture.upstream.ID {
+		t.Fatalf("old recipe must be archived and re-homed off the route: status=%s scope=%s/%d",
+			recipe.Status, recipe.ScopeType, recipe.ScopeID)
+	}
+	if recipe, err := fixture.store.GetRecipe(ctx, draftID); err != nil {
+		t.Fatal(err)
+	} else if recipe.Status != model.RecipeArchived || recipe.ScopeType != model.RecipeScopeUpstream || recipe.ScopeID != fixture.upstream.ID {
+		t.Fatalf("draft recipe must be archived and re-homed off the route: status=%s scope=%s/%d",
+			recipe.Status, recipe.ScopeType, recipe.ScopeID)
+	}
+
+	siblingResolved, err := fixture.resolver().Resolve(ctx, probe.RecipeQuery{
+		UpstreamID: siblingUpstream.ID, RouteID: sibling.ID, Endpoint: model.EndpointModels,
+	})
+	if err != nil {
+		t.Fatalf("sibling resolve: %v", err)
+	}
+	if siblingResolved.Layer != model.ResolvedRoute || siblingResolved.Identity.DBVersionID != siblingVersionID {
+		t.Fatalf("sibling recipe must remain: layer=%s version=%d want %d",
+			siblingResolved.Layer, siblingResolved.Identity.DBVersionID, siblingVersionID)
+	}
+	upstreamBinding, err := fixture.store.PublishedUpstreamRecipe(ctx, fixture.upstream.ID, model.EndpointModels)
+	if err != nil || upstreamBinding.Version.ID != upstreamVersionID {
+		t.Fatalf("upstream published recipe must remain: err=%v binding=%v", err, upstreamBinding != nil)
+	}
+
+	// Empty the route table so AUTOINCREMENT can reuse the deleted id after
+	// sqlite_sequence reset (a surviving higher id would force max+1).
+	if err := fixture.store.DeleteRoute(sibling.ID); err != nil {
+		t.Fatalf("delete sibling: %v", err)
+	}
+	if _, err := fixture.store.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='route'`); err != nil {
+		t.Fatalf("reset route sequence: %v", err)
+	}
+	neu := &model.Route{
+		ModelNameID: oldRoute.ModelNameID, UpstreamID: fixture.upstream.ID,
+		Priority: 1, Weight: 100, Enabled: true,
+	}
+	if err := fixture.store.CreateRoute(neu); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	if neu.ID != oldID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", neu.ID, oldID)
+	}
+
+	resolved, err := fixture.resolver().Resolve(ctx, probe.RecipeQuery{
+		UpstreamID: fixture.upstream.ID, RouteID: neu.ID, Endpoint: model.EndpointModels,
+	})
+	if err != nil {
+		t.Fatalf("reused id resolve: %v", err)
+	}
+	if resolved.Layer != model.ResolvedUpstream {
+		t.Errorf("reused id layer want upstream got %q", resolved.Layer)
+	}
+	if resolved.Identity.DBVersionID != upstreamVersionID {
+		t.Errorf("reused id must send upstream version %d, got %d (old route version was %d)",
+			upstreamVersionID, resolved.Identity.DBVersionID, oldVersionID)
+	}
+	if resolved.Identity.DBVersionID == oldVersionID {
+		t.Error("reused id must not send the deleted route's published recipe")
+	}
+}

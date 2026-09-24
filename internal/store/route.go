@@ -259,10 +259,79 @@ func validateRouteEndpointCompleteness(query interface {
 	return nil
 }
 
-func (s *Store) DeleteRoute(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM route WHERE id = ?`, id)
+// DeleteRoute removes a Route and detaches its probe-recipe bindings.
+//
+// probe_recipe.route_id is ON DELETE RESTRICT and publishedBinding looks up by
+// numeric route id alone. Leaving rows behind would either block the delete or
+// — after id reuse — make a new Route send the previous Route's published body.
+// Versions stay (immutable); archive + clear route_id so the resolver ignores
+// them. Executions keep history but drop the route pin (also RESTRICT).
+func (s *Store) DeleteRoute(id int64) (err error) {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var upstreamID int64
+	err = tx.QueryRow(`SELECT upstream_id FROM route WHERE id=?`, id).Scan(&upstreamID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	rows, err := tx.Query(`SELECT id FROM probe_recipe WHERE route_id=?`, id)
+	if err != nil {
+		return err
+	}
+	recipeIDs := make([]int64, 0, 4)
+	for rows.Next() {
+		var recipeID int64
+		if err = rows.Scan(&recipeID); err != nil {
+			rows.Close()
+			return err
+		}
+		recipeIDs = append(recipeIDs, recipeID)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if len(recipeIDs) > 0 {
+		// CHECK requires exactly one of upstream_id/route_id. Re-home archived
+		// rows onto the Route's Upstream so route_id can be cleared; archived
+		// status keeps them out of publishedBinding for both scopes.
+		updatedAt := nowMS()
+		if _, err = tx.Exec(`UPDATE probe_recipe SET status='archived',upstream_id=?,route_id=NULL,
+			revision=revision+1,active_binding_revision=active_binding_revision+1,updated_at=?
+			WHERE route_id=?`, upstreamID, updatedAt, id); err != nil {
+			return err
+		}
+		for _, recipeID := range recipeIDs {
+			if _, err = tx.Exec(`DELETE FROM recipe_active_secret_ref WHERE recipe_id=?`, recipeID); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, id); err != nil {
+		return err
+	}
+
+	res, err := tx.Exec(`DELETE FROM route WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if err = checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
