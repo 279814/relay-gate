@@ -17,6 +17,8 @@ type captureLearnerStore struct {
 func (c *captureLearnerStore) UpsertClientProbeProfile(_ context.Context, profile *model.ClientProbeProfile) error {
 	cp := *profile
 	cp.SafeHeaders = append([]model.HeaderTemplate(nil), profile.SafeHeaders...)
+	cp.BodyTemplate = append([]byte(nil), profile.BodyTemplate...)
+	cp.BodyShapeJSON = append([]byte(nil), profile.BodyShapeJSON...)
 	c.profile = &cp
 	return nil
 }
@@ -107,6 +109,96 @@ func TestLearner_ProfileProbeOmitsSecretsKeepsAnthropicBeta(t *testing.T) {
 	}
 	if strings.Contains(rendered.RawQuery, "sk-upstream") {
 		t.Fatalf("学到的形状不得经 query 带出上游 key，得到 %q", rendered.RawQuery)
+	}
+}
+
+// §8.4：不得保存 messages / system / tools 内容与认证值。
+// 即便入站 BodyTemplate 是整份客户端 JSON，入库与探活 body 也必须是紧凑探活体。
+func TestLearner_ProbeBodyOmitsClientMessagesSystemToolsAndCredentials(t *testing.T) {
+	const uniqueMessage = "UNIQUE_CLIENT_SENTENCE_zephyr-orchid-918273"
+	const uniqueSystem = "UNIQUE_SYSTEM_PROMPT_maple-quartz-445566"
+	const uniqueTool = "UNIQUE_TOOL_SCHEMA_cobalt-ember-778899"
+	const bodyCredential = "sk-ant-body-only-credential-ABCDEFGHijklmnop"
+
+	clientBody := []byte(`{` +
+		`"model":"claude-opus-5",` +
+		`"system":"` + uniqueSystem + `",` +
+		`"tools":[{"name":"` + uniqueTool + `","description":"leak","input_schema":{"type":"object"}}],` +
+		`"api_key":"` + bodyCredential + `",` +
+		`"stream":true,` +
+		`"messages":[{"role":"user","content":"` + uniqueMessage + `"}]` +
+		`}`)
+
+	store := &captureLearnerStore{}
+	learner := NewLearner(store)
+	shape := model.ClientRequestShape{
+		BodyTemplate:  append([]byte(nil), clientBody...),
+		BodyShapeJSON: []byte(`{"stream":"bool","model":"string","messages":"array"}`),
+	}
+	if err := learner.ObserveSuccessful(context.Background(), 7, model.EndpointMessages, shape); err != nil {
+		t.Fatalf("ObserveSuccessful: %v", err)
+	}
+	if store.profile == nil {
+		t.Fatal("应持久化 candidate profile")
+	}
+	assertLearnedBodyOmitsPrivateContent(t, store.profile.BodyTemplate,
+		uniqueMessage, uniqueSystem, uniqueTool, bodyCredential)
+	if !strings.Contains(string(store.profile.BodyTemplate), "{{PROBE_PROMPT}}") {
+		t.Fatalf("探活 body 应使用 PROBE_PROMPT 占位符，得到 %s", store.profile.BodyTemplate)
+	}
+	if !strings.Contains(string(store.profile.BodyTemplate), "{{UPSTREAM_MODEL}}") {
+		t.Fatalf("探活 body 应使用 UPSTREAM_MODEL 占位符，得到 %s", store.profile.BodyTemplate)
+	}
+
+	// 旧 profile 行即使仍存着整份客户端 body，解析探活时也不得回放私密内容。
+	source := &fakeRecipeSource{
+		profile: &model.ClientProbeProfile{
+			ID: 11, Revision: 2, Status: model.ProfileTested,
+			Endpoint:      model.EndpointMessages,
+			BodyTemplate:  append([]byte(nil), clientBody...),
+			BodyShapeJSON: []byte(`{"stream":"bool"}`),
+			SafeHeaders:   []model.HeaderTemplate{{Name: "anthropic-beta", Values: []string{"prompt-caching-2024-07-31"}}},
+		},
+	}
+	resolved, err := testResolver(source).Resolve(context.Background(), RecipeQuery{
+		UpstreamID: 1, Endpoint: model.EndpointMessages,
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	rendered, err := resolved.Compiled.Render(context.Background(), TemplateValues{
+		UpstreamAPIKey: probetemplate.ResolvedValue{Plain: []byte("sk-upstream")},
+		UpstreamModel:  probetemplate.ResolvedValue{Plain: []byte("mapped-model")},
+		ModelName:      probetemplate.ResolvedValue{Plain: []byte("alias")},
+		ProbePrompt:    probetemplate.ResolvedValue{Plain: []byte("1+1=?")},
+		SessionID:      probetemplate.ResolvedValue{Plain: []byte("probe-test")},
+		Timestamp:      time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	assertLearnedBodyOmitsPrivateContent(t, rendered.Body,
+		uniqueMessage, uniqueSystem, uniqueTool, bodyCredential)
+	if !strings.Contains(string(rendered.Body), "1+1=?") {
+		t.Fatalf("探活应渲染 PROBE_PROMPT，得到 %s", rendered.Body)
+	}
+	if !strings.Contains(string(rendered.Body), "mapped-model") {
+		t.Fatalf("探活应渲染 UPSTREAM_MODEL，得到 %s", rendered.Body)
+	}
+}
+
+func assertLearnedBodyOmitsPrivateContent(t *testing.T, body []byte, forbidden ...string) {
+	t.Helper()
+	text := string(body)
+	for _, item := range forbidden {
+		if item != "" && strings.Contains(text, item) {
+			t.Fatalf("learned/probe body 不得含私密片段 %q，得到 %s", item, body)
+		}
+	}
+	for _, key := range []string{`"system"`, `"tools"`, `"metadata"`, `"api_key"`} {
+		if strings.Contains(text, key) {
+			t.Fatalf("紧凑探活 body 不得含字段 %s，得到 %s", key, body)
+		}
 	}
 }
 
