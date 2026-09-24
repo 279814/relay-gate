@@ -252,6 +252,56 @@ func TestReportResult_ModelNotFoundRecordsRouteConfigError(t *testing.T) {
 	}
 }
 
+// Delete + recreate can reuse a SQLite route rowid. Semantic InvalidateRoute
+// clears Capability, but a late real-traffic ApplyCommitted that skips the
+// RouteHealth generation check would re-poison the new incarnation — the same
+// hole CommitProbeObservation closes with RouteCreatedAt.
+func TestReportResult_ModelNotFound_LateAfterReuseDoesNotPoison(t *testing.T) {
+	const routeID int64 = 42
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+	tr := health.NewTracker(nil)
+	rep := NewReporter(tr).WithCapabilityRegistry(caps)
+	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
+
+	oldGen := tr.EnsureGeneration(routeID)
+	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
+	view := &proxy.ResultView{
+		Status: 404, ErrBody: body, Endpoint: model.EndpointMessages,
+		BytesWritten: int64(len(body)),
+	}
+	rep.ReportResult(routeID, oldGen, view)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("live route capability=%s want config_error", got)
+	}
+
+	// §9.2 delete: clear Capability + Forget RouteHealth (generation bump on reuse).
+	sem.InvalidateRoute(routeID)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatal("InvalidateRoute must clear config_error")
+	}
+
+	newGen := tr.EnsureGeneration(routeID)
+	if newGen == 0 || newGen == oldGen {
+		t.Fatalf("reused id must get a new generation: old=%d new=%d", oldGen, newGen)
+	}
+
+	// Late observation from the deleted incarnation must not restore config_error.
+	rep.ReportResult(routeID, oldGen, view)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatalf("stale generation must not leave reused id config_error, got %s", got)
+	}
+	// New route remains selectable (Capability does not exclude).
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("reused route Effective=%s want unknown (selectable)", got)
+	}
+
+	// Matching generation on the live reuse still sticks until invalidate.
+	rep.ReportResult(routeID, newGen, view)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("live reused route capability=%s want config_error", got)
+	}
+}
+
 func TestReportResult_ModelNotFoundCodeVariants(t *testing.T) {
 	for _, code := range []string{"model_not_found", "model_not_available", "invalid_model", "unknown_model"} {
 		t.Run(code, func(t *testing.T) {
