@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"net/http"
 	"strings"
 	"testing"
@@ -139,5 +140,149 @@ func TestSSETransform_AppliesEventsAndSyntheticEnd(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("missing synthetic end: %s", body)
+	}
+}
+
+// §15: exact MaxBodyBuffer is still transformable; one byte over must follow the
+// pre-Commit fail policy and must not return a truncated success body.
+func TestResponseTransform_BodyAtMaxBufferSucceeds(t *testing.T) {
+	const marker = `"note":"upstream"`
+	const replaced = `"note":"gateways"` // same length so body stays at MaxBodyBuffer
+	full := make([]byte, transform.MaxBodyBuffer)
+	copy(full, []byte(`{"ok":true,`+marker+`}`))
+	for i := len(`{"ok":true,` + marker + `}`); i < len(full); i++ {
+		full[i] = 'x'
+	}
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(full)
+	})
+	reg := transform.NewRegistry(4)
+	set, err := reg.CreateSet("cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{
+		{Kind: transform.KindReplaceBytes, From: marker, To: replaced},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		preview := rec.Body.String()
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		t.Fatalf("status=%d body=%s", rec.Code, preview)
+	}
+	if rec.Body.Len() != transform.MaxBodyBuffer {
+		t.Fatalf("len=%d want %d", rec.Body.Len(), transform.MaxBodyBuffer)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(replaced)) {
+		t.Fatal("exact-cap body must still be transformed")
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(marker)) {
+		t.Fatal("marker should have been replaced")
+	}
+}
+
+func TestResponseTransform_BodyOverMaxBufferFailClosed(t *testing.T) {
+	// Cap+1: large enough that a truncated success body would be visible, and
+	// larger than limit+1 read so a buggy fail_open path would drop the tail.
+	full := bytes.Repeat([]byte("a"), transform.MaxBodyBuffer+2)
+	copy(full, []byte(`{"note":"upstream"}`))
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream", "raw")
+		w.WriteHeader(200)
+		w.Write(full)
+	})
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("over-closed")
+	rules := []transform.Rule{
+		{Kind: transform.KindSetHeader, Name: "X-Transformed", Value: "1"},
+		{Kind: transform.KindReplaceBytes, From: `"note":"upstream"`, To: `"note":"gateway"`},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502 fail_closed, got %d len=%d", rec.Code, rec.Body.Len())
+	}
+	if rec.Header().Get("X-Transformed") != "" {
+		t.Fatal("transform header must not reach client on over-limit fail_closed")
+	}
+	if rec.Header().Get("X-Upstream") != "" {
+		t.Fatal("upstream header must not leak on fail_closed over-limit")
+	}
+	// Must not be a truncated success body of a's / partial JSON.
+	if rec.Body.Len() > 512 && bytes.Count(rec.Body.Bytes(), []byte("a")) > 100 {
+		t.Fatalf("client received truncated upstream body as response: len=%d", rec.Body.Len())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"note":"gateway"`)) {
+		t.Fatal("must not commit a transformed truncated body")
+	}
+}
+
+func TestResponseTransform_BodyOverMaxBufferFailOpenPassthrough(t *testing.T) {
+	// Body larger than MaxBodyBuffer+1 so a truncated commit would drop the tail.
+	full := bytes.Repeat([]byte("b"), transform.MaxBodyBuffer+4096)
+	copy(full, []byte(`{"note":"upstream","pad":"`))
+	copy(full[len(full)-2:], []byte(`"}`))
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream", "keep")
+		w.WriteHeader(200)
+		w.Write(full)
+	})
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("over-open")
+	rules := []transform.Rule{
+		{Kind: transform.KindSetHeader, Name: "X-Transformed", Value: "1"},
+		{Kind: transform.KindReplaceBytes, From: `"note":"upstream"`, To: `"note":"gateway"`},
+	}
+	// req fail_closed, res fail_open (doc default for response).
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("fail_open over-limit want 200 original, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Transformed") != "" {
+		t.Fatal("over-limit fail_open must not apply transform headers")
+	}
+	if rec.Header().Get("X-Upstream") != "keep" {
+		t.Fatalf("original header lost: %q", rec.Header().Get("X-Upstream"))
+	}
+	if rec.Body.Len() != len(full) {
+		t.Fatalf("truncated success body: got %d want %d", rec.Body.Len(), len(full))
+	}
+	if !bytes.Equal(rec.Body.Bytes(), full) {
+		t.Fatal("fail_open over-limit must pass through the original full body")
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"note":"gateway"`)) {
+		t.Fatal("transform must not apply when body exceeds buffer")
 	}
 }

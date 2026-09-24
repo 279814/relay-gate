@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -76,6 +77,13 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		body = nil
 	}
 
+	// §15: non-stream body transform requires a complete read within MaxBodyBuffer.
+	// Over-limit follows the pre-Commit fail policy — never commit a truncated
+	// prefix as a successful transformed body.
+	if len(body) > transform.MaxBodyBuffer {
+		return at.commitBodyOverLimit(w, compiled, record, f, body)
+	}
+
 	in := transform.ResponseInput{
 		Status: at.resp.StatusCode,
 		Header: at.resp.Header.Clone(),
@@ -144,6 +152,57 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		res.Err = werr
 	}
 	res.DoneAt = now
+	return res
+}
+
+// commitBodyOverLimit handles a non-stream upstream body larger than MaxBodyBuffer.
+// §15 / §15.7: over-limit follows the pre-Commit fail policy. fail_closed returns
+// before any client byte; fail_open submits the original status/headers/full body
+// (buffered prefix + remaining upstream bytes) without applying transform rules.
+func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transform.Compiled,
+	record func(transform.ExecutionRecord), f *Forwarder, prefix []byte) *Result {
+
+	res := at.res
+	policy := compiled.Version.ResFailPolicy
+	if policy == "" {
+		policy = transform.FailOpen
+	}
+	err := fmt.Errorf("response body exceeds %d byte buffer", transform.MaxBodyBuffer)
+	if record != nil {
+		record(transform.ExecutionRecord{
+			Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
+			InputHash: transform.HashBytes(nil),
+		})
+	}
+	if policy == transform.FailClosed {
+		res.Err = err
+		if res.DoneAt.IsZero() {
+			res.DoneAt = time.Now()
+		}
+		return res
+	}
+
+	// fail_open: original status/headers/body, no transform (§15.7).
+	dst := w.Header()
+	for k, vs := range at.resp.Header {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	StripHopByHopResponse(dst)
+	w.WriteHeader(at.resp.StatusCode)
+	res.HeadersSent = true
+	res.Status = at.resp.StatusCode
+	res.RespHeaders = at.resp.Header.Clone()
+
+	// prefix already includes peeked bytes from readResponseBody; do not replay peeked.
+	src := io.MultiReader(bytes.NewReader(prefix), at.resp.Body)
+	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	res.BytesWritten = n
+	res.DoneAt = time.Now()
+	if werr != nil && res.Err == nil {
+		res.Err = werr
+	}
 	return res
 }
 
