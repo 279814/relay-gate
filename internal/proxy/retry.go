@@ -596,6 +596,14 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 		errors.Is(res.Err, ErrConnect) && !safeRetryEvidence(la) {
 		return false
 	}
+	// §11.2 Aggressive only: 提交前首响应体字节超时 (ErrFirstTokenTimeout).
+	// Default Balanced must not switch stations — client gets the gateway
+	// timeout from this upstream, no second RoundTrip.
+	if res := la.at.Result(); res != nil && res.Err != nil &&
+		errors.Is(res.Err, ErrFirstTokenTimeout) &&
+		policy != model.RetryPolicyAggressive {
+		return false
+	}
 	if la.instr.Retry == nil {
 		return true
 	}
@@ -640,8 +648,11 @@ func safeRetryEvidence(la *liveAttempt) bool {
 
 // retryable 判断一次**尚未提交**的尝试是否值得换站重来（§3.5）。
 //
-// 可重试：连接失败、TLS 失败、首 Token 超时、5xx、429、200 但载荷是错误。
-// 不可重试：4xx（除 429）、客户端自己断开。
+// 可重试（base）：连接失败、TLS 失败、首 Token 超时、5xx、429、200 但载荷是错误。
+// 不可重试：4xx（除 429）、客户端自己断开、ErrUpstreamBroke。
+//
+// 策略收窄在 retryableAttempt：§11.2 规定 ErrFirstTokenTimeout 仅 Aggressive
+// 换站；Balanced/Safe 的 base 仍为 true（健康回写仍算上游账），但不 failover。
 //
 // 「已写出字节后不得重试」这条不在这里判 —— 结构上到不了：判定发生在
 // Commit 之前，而 Commit 是唯一会写字节给客户端的地方。
