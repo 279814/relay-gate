@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -32,13 +33,18 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// §7.4：一次客户端请求的多次上游尝试共享同一份 count_tokens_total_sec。
+	// 不夹剩余预算的话，每个 Route 各拿一份完整 total，客户端最坏等 N 倍时长。
+	deadline := time.Now().Add(time.Duration(pre.settings.CountTokensTotalSec) * time.Second)
+	connectCost := time.Duration(pre.settings.CountTokensConnectSec) * time.Second
+
 	// 选路与模型流量共用 SelectExcluding 的精确→最长前缀 walk（§6.4 / PR #145）：
 	// 精确 Route 因 count_tokens unsupported / config_error 不合格时，仍可选健康前缀。
 	tried := map[int64]bool{}
-	if h.tryCountTokensPass(w, r, pre, tried, preferSupported) {
+	if h.tryCountTokensPass(w, r, pre, tried, preferSupported, deadline, connectCost) {
 		return
 	}
-	if h.tryCountTokensPass(w, r, pre, tried, preferUnknown) {
+	if h.tryCountTokensPass(w, r, pre, tried, preferUnknown, deadline, connectCost) {
 		return
 	}
 
@@ -54,9 +60,14 @@ const (
 )
 
 func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
-	pre *preambleResult, tried map[int64]bool, prefer countTokensPrefer) bool {
+	pre *preambleResult, tried map[int64]bool, prefer countTokensPrefer,
+	deadline time.Time, connectCost time.Duration) bool {
 
 	for {
+		// 剩余预算不足一次 connect 时停止换站，交给本地估算（§7.4 / §10.3）。
+		if time.Until(deadline) < connectCost {
+			return false
+		}
 		cand, err := h.selectCountTokensCandidate(pre.snapshot, pre.inModel, tried, prefer)
 		if err != nil || cand == nil {
 			return false
@@ -74,7 +85,7 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		// do not recover here — panic must not start another upstream attempt).
 		reason := func() string {
 			defer cand.Release()
-			return h.proxyCountTokens(w, r, pre, cand)
+			return h.proxyCountTokens(w, r, pre, cand, time.Until(deadline))
 		}()
 		if reason == "" {
 			return true
@@ -146,7 +157,7 @@ func (h *Handler) countTokensPreferOK(routeID int64, prefer countTokensPrefer) b
 // **不得**在写出响应后再返回非空原因 —— 那会让调用方把兜底结果追加到
 // 已经写出的响应后面，客户端拿到两个拼在一起的 JSON。
 func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
-	pre *preambleResult, cand *router.Candidate) string {
+	pre *preambleResult, cand *router.Candidate, remaining time.Duration) string {
 
 	outBody, err := ReplaceModel(pre.body, cand.Route.UpstreamModel)
 	if err != nil {
@@ -168,7 +179,8 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
 	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，
 	// 而本地粗算本来就能立刻作答。
-	budget := outbound.CountTokensBudget(pre.settings)
+	// CapTotal 只夹 Total，connect 不变 —— 各 Route 尝试共享同一份 total。
+	budget := outbound.CountTokensBudget(pre.settings).CapTotal(remaining)
 	tr, err := h.TransportFor(cand.Upstream, budget)
 	if err != nil {
 		return fmt.Sprintf("取连接池失败: %v", err)
