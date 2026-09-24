@@ -144,18 +144,22 @@ func (s *Store) ListRequestLogs(f RequestLogFilter) ([]*model.RequestLog, error)
 	return out, rows.Err()
 }
 
-// PruneRequestLogs 按条数与天数清理，两者取**先到者**。
+// PruneRequestLogs 按条数与天数清理**无对应 sample 的孤儿日志**，两者取**先到者**。
 //
 // keepCount / keepDays <= 0 表示该维度不限。
 //
-// 与样本不同，日志没有 pinned：单行日志离开它那一组就没什么意义，
-// 而按组置顶会让「保留 N 条」变成一个无法预估的数字。要留证据就置顶样本。
+// §5.4：request_log 属于 Sample Group，文档未给日志单独更短寿命；
+// 仍有 sample 行的 req_id 不得在这里删掉（置顶样本同理）。无样本的独立
+// 日志才按 keep 滚动。与样本不同，孤儿日志没有 pinned：单行离开整组就
+// 没什么意义，要留证据就置顶样本。
 func (s *Store) PruneRequestLogs(keepCount, keepDays int) (int64, error) {
 	var total int64
+	const orphanOnly = `NOT EXISTS (SELECT 1 FROM sample WHERE sample.req_id = request_log.req_id)`
 
 	if keepDays > 0 {
 		cutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
-		res, err := s.db.Exec(`DELETE FROM request_log WHERE ts_recv < ?`, cutoff)
+		res, err := s.db.Exec(
+			`DELETE FROM request_log WHERE ts_recv < ? AND `+orphanOnly, cutoff)
 		if err != nil {
 			return total, fmt.Errorf("按天数清理请求日志: %w", err)
 		}
@@ -164,13 +168,14 @@ func (s *Store) PruneRequestLogs(keepCount, keepDays int) (int64, error) {
 	}
 
 	if keepCount > 0 {
-		// 按 req_id 整组保留，而不是按行 —— 按行截会把一次重试的
-		// 后半截切掉，于是详情页显示「第 2、3 次尝试」而没有第 1 次，
-		// 看起来像数据坏了。
-		res, err := s.db.Exec(`DELETE FROM request_log WHERE req_id NOT IN (
+		// 只对孤儿按 req_id 整组保留 —— 按行截会把一次重试的后半截切掉；
+		// 有 sample 的组一律不动。
+		res, err := s.db.Exec(`DELETE FROM request_log WHERE `+orphanOnly+` AND req_id NOT IN (
 			SELECT req_id FROM (
-				SELECT req_id, MAX(id) AS mx FROM request_log
-				GROUP BY req_id ORDER BY mx DESC LIMIT ?))`, keepCount)
+				SELECT request_log.req_id AS req_id, MAX(request_log.id) AS mx
+				FROM request_log
+				WHERE `+orphanOnly+`
+				GROUP BY request_log.req_id ORDER BY mx DESC LIMIT ?))`, keepCount)
 		if err != nil {
 			return total, fmt.Errorf("按条数清理请求日志: %w", err)
 		}
