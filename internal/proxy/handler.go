@@ -120,6 +120,16 @@ func (h *Handler) WithCountTokensCapability(c CountTokensCapability) *Handler {
 	return h
 }
 
+// capabilityExcludes reports whether §6.4 / §8.12 should skip this Route:
+// Endpoint Capability is unsupported or config_error.
+func (h *Handler) capabilityExcludes(routeID int64, endpoint model.EndpointKind) bool {
+	if h.countCaps == nil || routeID <= 0 || !endpoint.Valid() {
+		return false
+	}
+	state := h.countCaps.Effective(model.RecipeScopeRoute, routeID, endpoint, "")
+	return state == model.CapabilityUnsupported || state == model.CapabilityConfigError
+}
+
 // WithRelayKeyValidator wires live relay-key auth (rotate / grace / revoke).
 // When set, authOK consults the validator and ignores the static relayKeys map.
 func (h *Handler) WithRelayKeyValidator(v RelayKeyValidator) *Handler {
@@ -445,7 +455,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
 	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
-		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, viewOf(res, keys))
+		ep, _ := proto.Endpoint()
+		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, viewOf(res, keys, ep))
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。

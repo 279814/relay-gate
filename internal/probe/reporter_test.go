@@ -9,6 +9,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/proxy"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 // §6.8 / §8.12：HTTP 200 结构化 error 不得按 200 判活，也不得 piggyback。
@@ -200,6 +201,104 @@ type recordingSched struct {
 }
 
 func (r *recordingSched) ObserveRealSuccess(ScheduleKey, time.Time) { r.n++ }
+
+func TestReportResult_ModelNotFoundRecordsRouteConfigError(t *testing.T) {
+	settings := model.DefaultSettings()
+	caps := NewCapabilityRegistry(capSettings{settings})
+	reach := health.NewReachabilityTracker(capSettings{settings})
+	reachSel := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	reachPol, err := revisioncodec.BuildReachabilityEvidencePolicy(settings, reachSel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reachFP := revisioncodec.ReachabilitySettingsFingerprint(reachPol)
+	reachTok := revisioncodec.NewReachabilityToken(model.ReachabilityRevision{
+		NetworkRevision: 1, SettingsFingerprint: reachFP,
+	})
+	reach.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 1, PolicySelector: reachSel, State: model.ReachabilityReachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: reachFP,
+		ObservationToken: reachTok, LastObservationOrder: 1, ConsecutiveOK: 2,
+	})
+
+	tr := health.NewTracker(nil)
+	rep := NewReporter(tr).WithCapabilityRegistry(caps)
+
+	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
+	rep.ReportResult(9, 0, &proxy.ResultView{
+		Status:       404,
+		ErrBody:      body,
+		Endpoint:     model.EndpointMessages,
+		BytesWritten: int64(len(body)),
+	})
+
+	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("route capability=%s want config_error", got)
+	}
+	row := caps.Snapshot(model.RecipeScopeRoute, 9, model.EndpointMessages)
+	if row == nil || row.ErrorClass != model.ErrorModelNotFound || row.ExpiresAt != 0 {
+		t.Fatalf("config_error row = %+v", row)
+	}
+	// §9.1：config_error 由 Capability 排除，不伪装成 dead。
+	if tr.State(9) == model.StateDead {
+		t.Fatal("model_not_found must not mark RouteHealth dead")
+	}
+	if reach.Effective(1, 1) != model.ReachabilityReachable {
+		t.Fatalf("upstream reachability=%s want reachable", reach.Effective(1, 1))
+	}
+	// Sibling route on the same upstream stays selectable (no config_error).
+	if got := caps.Effective(model.RecipeScopeRoute, 10, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatalf("sibling route must not inherit config_error, got %s", got)
+	}
+}
+
+func TestReportResult_ModelNotFoundCodeVariants(t *testing.T) {
+	for _, code := range []string{"model_not_found", "model_not_available", "invalid_model", "unknown_model"} {
+		t.Run(code, func(t *testing.T) {
+			caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+			rep := NewReporter(health.NewTracker(nil)).WithCapabilityRegistry(caps)
+			body := []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"` + code + `"}}`)
+			rep.ReportResult(3, 0, &proxy.ResultView{
+				Status: 400, ErrBody: body, Endpoint: model.EndpointChatCompletions,
+				BytesWritten: int64(len(body)),
+			})
+			if got := caps.Effective(model.RecipeScopeRoute, 3, model.EndpointChatCompletions, ""); got != model.CapabilityConfigError {
+				t.Fatalf("capability=%s want config_error for code %s", got, code)
+			}
+		})
+	}
+}
+
+func TestReportResult_AssistantTextModelNotFoundDoesNotConfigError(t *testing.T) {
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+	tr := health.NewTracker(nil)
+	rep := NewReporter(tr).WithCapabilityRegistry(caps)
+
+	// Normal 200 with the words inside assistant text — no structured error payload.
+	rep.ReportResult(9, 0, &proxy.ResultView{
+		Status:       200,
+		ErrBody:      nil,
+		Endpoint:     model.EndpointMessages,
+		BytesWritten: 120,
+		SemanticSeen: true,
+	})
+	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatal("assistant text must not write config_error")
+	}
+	if tr.Status(9).ConsecutiveFail != 0 {
+		t.Fatalf("semantic 200 should be OK, fail=%d", tr.Status(9).ConsecutiveFail)
+	}
+
+	// Structured-looking message field alone is not enough without a whitelist code.
+	body := []byte(`{"error":{"type":"server_error","message":"model_not_found in prose"}}`)
+	rep.ReportResult(9, 0, &proxy.ResultView{
+		Status: 200, ErrBody: body, Endpoint: model.EndpointMessages,
+		BytesWritten: int64(len(body)),
+	})
+	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatal("message prose must not write config_error without structured code")
+	}
+}
 
 func TestTrafficFinish_DoesNotPiggybackOnStatusAlone(t *testing.T) {
 	sched := &recordingSched{}

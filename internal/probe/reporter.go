@@ -15,17 +15,37 @@ import (
 // 本 Reporter 仍是临时 adapter，只把真实流量结果喂给旧 RouteHealth Tracker
 // （完整真实观察与 RecoveryGate 属 P0-13 / P1）。与探活共用分类器，避免
 // 「429 / 客户端断开」规则在两边分叉。
+//
+// §8.12 model_not_found：结构化 code 命中 modelNotFoundCodes 时，写 Route
+// Capability config_error（与 ResponseClassifier.applyRemoteError 同集），
+// 不经 RouteHealth dead 伪装。
 type Reporter struct {
 	track Tracker
+	caps  *CapabilityRegistry
 }
 
 func NewReporter(track Tracker) *Reporter { return &Reporter{track: track} }
+
+// WithCapabilityRegistry 注入 Endpoint Capability 热路径，供真实流量
+// model_not_found 写 Route config_error（§8.12）。
+func (r *Reporter) WithCapabilityRegistry(caps *CapabilityRegistry) *Reporter {
+	if r != nil {
+		r.caps = caps
+	}
+	return r
+}
 
 // ReportResult 上报一次真实转发的结果（§3.5）。
 //
 // 非阻塞：全程只做内存里的状态更新，没有 I/O。
 // generation 来自选路占位；与当前 RouteHealth 世代不一致则丢弃。
 func (r *Reporter) ReportResult(routeID int64, generation uint64, res *proxy.ResultView) {
+	// §8.12：结构化 model_not_found 与探活同口径 — Route config_error，
+	// 排除该 Route；不改 Upstream Reachability，不伪装成 dead。
+	if r.recordRealModelNotFound(routeID, res) {
+		return
+	}
+
 	out := classifyReal(res)
 	if out.Verdict == health.VerdictIgnore {
 		return
