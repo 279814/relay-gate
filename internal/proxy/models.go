@@ -50,8 +50,9 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 只返回启用的 ModelName。禁用的不该出现在列表里，
-	// 否则客户端会选中它、请求却 404。
+	// §8.7：返回本地已配置的逻辑 ModelName 列表（含 disabled）。
+	// enabled 只约束真实转发选路，不决定清单是否暴露；禁用名仍应出现，
+	// 否则客户端无法对照「配了哪些模型」做配置同步。
 	//
 	// 不按健康状态过滤（§10.3 留的问题）：一个暂时 dead 的模型在列表里
 	// 消失，客户端可能把它从自己的配置里也去掉，而它几十秒后就恢复了。
@@ -59,9 +60,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	// 一次短暂故障变成一次配置丢失。
 	names := make([]string, 0, len(snap.ModelNames))
 	for _, mn := range snap.ModelNames {
-		if mn.Enabled {
-			names = append(names, mn.Name)
-		}
+		names = append(names, mn.Name)
 	}
 	// 定序输出。snap.ModelNames 的顺序来自库里的查询，稳定的列表
 	// 让客户端侧的 diff 与人工比对都不会因为顺序抖动而产生噪声。
