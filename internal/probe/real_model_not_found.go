@@ -14,9 +14,13 @@ import (
 // recordRealModelNotFound applies the same §8.12 Route config_error observation
 // probes record when ErrBody carries a structured code in modelNotFoundCodes.
 //
-// Returns true when the observation was recorded (caller must not also feed
-// RouteHealth Tracker — config_error excludes via Capability, not dead).
-func (r *Reporter) recordRealModelNotFound(routeID int64, res *proxy.ResultView) bool {
+// Returns true when the observation was handled as model_not_found (caller must
+// not also feed RouteHealth Tracker — config_error excludes via Capability, not
+// dead). generation mirrors Tracker.Report: after Semantic InvalidateRoute /
+// Forget, a late in-flight result must not ApplyCommitted onto a new Route that
+// reused the same numeric id (probe CommitProbeObservation uses RouteCreatedAt
+// for the same incarnation hole).
+func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res *proxy.ResultView) bool {
 	if r == nil || r.caps == nil || res == nil || routeID <= 0 {
 		return false
 	}
@@ -35,8 +39,29 @@ func (r *Reporter) recordRealModelNotFound(routeID int64, res *proxy.ResultView)
 	if !isModelNotFound(event) {
 		return false
 	}
+	if !r.routeGenerationCurrent(routeID, generation) {
+		// Stale incarnation: drop ApplyCommitted, still suppress RouteHealth.
+		return true
+	}
 	r.applyRouteModelNotFound(routeID, res.Endpoint, res.Status)
 	return true
+}
+
+// routeGenerationCurrent is the real-traffic analogue of CommitProbeObservation's
+// RouteCreatedAt incarnation check. generation == 0 means unbound (tests /
+// legacy callers) and still applies; generation > 0 must match the current
+// RouteHealth entry after Claim / EnsureGeneration.
+func (r *Reporter) routeGenerationCurrent(routeID int64, generation uint64) bool {
+	if generation == 0 {
+		return true
+	}
+	viewer, ok := r.track.(interface {
+		GenerationOf(routeID int64) uint64
+	})
+	if !ok {
+		return true
+	}
+	return viewer.GenerationOf(routeID) == generation
 }
 
 func (r *Reporter) applyRouteModelNotFound(routeID int64, endpoint model.EndpointKind, status int) {

@@ -38,11 +38,12 @@ func (r *Reporter) WithCapabilityRegistry(caps *CapabilityRegistry) *Reporter {
 // ReportResult 上报一次真实转发的结果（§3.5）。
 //
 // 非阻塞：全程只做内存里的状态更新，没有 I/O。
-// generation 来自选路占位；与当前 RouteHealth 世代不一致则丢弃。
+// generation 来自选路占位；与当前 RouteHealth 世代不一致则丢弃
+//（含 §8.12 真实流量 config_error，避免 Forget 后同 id 新 Route 被污染）。
 func (r *Reporter) ReportResult(routeID int64, generation uint64, res *proxy.ResultView) {
 	// §8.12：结构化 model_not_found 与探活同口径 — Route config_error，
 	// 排除该 Route；不改 Upstream Reachability，不伪装成 dead。
-	if r.recordRealModelNotFound(routeID, res) {
+	if r.recordRealModelNotFound(routeID, generation, res) {
 		return
 	}
 
