@@ -187,7 +187,8 @@ func runServer() error {
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
 		WithSecurityObserver(secObs).
-		WithTransforms(xform)
+		WithTransforms(xform).
+		WithSampleDiskStat(st)
 	// 关掉缓存的出站连接。放在 Shutdown 之后：在途的流式请求还要用它们。
 	defer transports.CloseIdleConnections()
 

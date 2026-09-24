@@ -43,6 +43,12 @@ type SampleSink interface {
 	Record(*model.Sample)
 }
 
+// SampleDiskStat 报告样本正文 BLOB 当前占用的磁盘字节（§5.4）。
+// 由 store.Store 实现；采集路径用它计算剩余配额，避免整段响应先攒进内存。
+type SampleDiskStat interface {
+	SampleDiskBytes() (int64, error)
+}
+
 // Handler 处理三个透传端点。
 type Handler struct {
 	cfg     ConfigSource
@@ -68,6 +74,10 @@ type Handler struct {
 
 	// transforms provides published declarative transforms (§15). Optional.
 	transforms *transform.Registry
+
+	// sampleDisk 提供当前样本 BLOB 磁盘占用，供 §5.4 剩余配额在采集时生效。
+	// 可为 nil：此时不按配额切头尾（仍靠事后 PruneSamples）。
+	sampleDisk SampleDiskStat
 
 	// relayKeys 是入站合法凭据集合（静态；测试与未装配热更新时使用）。
 	relayKeys map[string]bool
@@ -149,6 +159,12 @@ func (h *Handler) WithSecurityObserver(o *security.Observer) *Handler {
 // WithTransforms injects the P4 declarative transform registry (optional).
 func (h *Handler) WithTransforms(reg *transform.Registry) *Handler {
 	h.transforms = reg
+	return h
+}
+
+// WithSampleDiskStat injects sample disk usage for §5.4 remaining-quota capture.
+func (h *Handler) WithSampleDiskStat(s SampleDiskStat) *Handler {
+	h.sampleDisk = s
 	return h
 }
 
@@ -601,6 +617,14 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	}
 	if oc.respTee.Truncated() {
 		flags |= model.TruncRespBody
+	}
+	if oc.respTee.QuotaOverflow() {
+		// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。
+		// 采集是旁路，只记日志，绝不回写或中断已完成的转发。
+		h.log.Warn("样本响应超过剩余磁盘配额，已改留头尾",
+			"route", cand.Route.ID,
+			"resp_total", oc.respTee.Total(),
+			"resp_kept", len(respSafe))
 	}
 
 	modelOut := inModel

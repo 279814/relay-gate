@@ -450,6 +450,20 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	var tee *sample.HeadTail
 	if h.samples != nil && settings.SampleEnabled {
 		tee = sample.NewHeadTail(settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
+		// §5.4：完整模式下若本条响应会撑破剩余磁盘配额，采集当场切头尾，
+		// 不能等 PruneSamples —— 全量已进 RAM 再删救不了峰值。
+		if settings.SampleDiskQuotaBytes > 0 {
+			remaining := settings.SampleDiskQuotaBytes
+			if h.sampleDisk != nil {
+				if used, err := h.sampleDisk.SampleDiskBytes(); err == nil {
+					remaining -= used
+				}
+			}
+			// 本条 in/out 与 resp 共享配额；先扣掉已知的请求体，剩余才给响应。
+			remaining -= int64(len(pre.body) + len(outBody))
+			tee.LimitToRemaining(remaining,
+				settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
+		}
 	}
 	// 被动扫描副本与样本开关无关（§14.3：样本关闭时仍可扫描）。
 	var secTee *sample.HeadTail
