@@ -38,8 +38,11 @@ func TestREADMEReferencedScriptsExist(t *testing.T) {
 	if !strings.Contains(text, "scripts/check-p5.sh") {
 		t.Fatal("README must document scripts/check-p5.sh (CI P5 offline gate)")
 	}
-	if !strings.Contains(text, "deploy.ps1 -Local") || !strings.Contains(text, "./deploy.sh --local") {
-		t.Fatal("README must document local one-line deploy commands")
+	if !strings.Contains(text, "deploy.ps1") || !strings.Contains(text, "./deploy.sh") {
+		t.Fatal("README must document one-line deploy commands")
+	}
+	if !strings.Contains(text, "docker compose up") {
+		t.Fatal("README must document docker compose one-liner")
 	}
 
 	re := regexp.MustCompile(`(?:scripts/[A-Za-z0-9._/-]+\.(?:sh|ps1)|deploy\.(?:ps1|sh))`)

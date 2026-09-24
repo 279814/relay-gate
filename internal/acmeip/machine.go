@@ -32,8 +32,8 @@ type Certbot interface {
 // Machine is the fail-closed public IP HTTPS bootstrap (§12.2).
 //
 // It never claims a public certificate was issued unless Certbot.IssueIP
-// succeeds and Validate passes. Deploy scripts must not delete docs/03 until
-// a real public smoke has completed outside this package.
+// succeeds and Validate passes. Documented install is HTTP IP:port (README);
+// this machine is not required to install or log in.
 type Machine struct {
 	mu     sync.Mutex
 	phase  Phase

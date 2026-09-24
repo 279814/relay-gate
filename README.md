@@ -17,86 +17,9 @@ Claude Code ──▶ relay-gate ──▶ 站 A（优先级 1，健康）✅
                     └── 探活中：站 C（优先级 3，已判死，不投递）
 ```
 
-## 为什么不是"重试就行了"
+## 它代理什么
 
-被动 failover（请求失败再换下一个）在长思考场景下代价很高：一次首 Token 超时可能是
-20 分钟，而用户看到的是 20 分钟的空白。主动探活把这个代价挪到了请求之外。
-
-| | 被动 failover | relay-gate |
-|---|---|---|
-| 何时发现站挂了 | 用户的请求撞上去时 | 探活周期内（实测 1.5–2.0s） |
-| 用户感知 | 白等一次超时 | 无感，直接投到健康站 |
-| 假活（HTTP 200 但不出内容） | 认为可用 | 判死 —— 必须收到首个**非空内容 delta** 才算活 |
-
-## 三条主线
-
-1. **主动探活** —— 两级探测（传输层零 token + 模型层真实调用），状态在请求到达前已知
-2. **严格透传** —— 除鉴权 key 与 `model` 外，请求一个字节都不改；响应完全不碰
-3. **样本留档** —— 每次转发的入站请求、出站请求、上游响应全部存下来，
-   既验证第 2 条真做到了，也让探活请求长得和真实请求一样
-
-## 快速开始
-
-需要 Docker 与 Docker Compose。
-
-```bash
-git clone https://github.com/279814/relay-gate.git
-cd relay-gate
-cp .env.example .env
-```
-
-填 `.env` 里的三项必填（缺任何一项都会**拒绝启动**，而不是带着空 key 跑起来）：
-
-```bash
-ENCRYPTION_KEY=$(openssl rand -hex 32)    # 加密上游 key。丢了 = 已存的 key 全部解不开
-RELAY_KEYS=rk-$(openssl rand -hex 24)     # 发给客户端的 key，不是上游站的
-ADMIN_PASSWORD=$(openssl rand -base64 24) # 管理界面口令
-```
-
-```bash
-docker compose up -d
-```
-
-端口只绑 `127.0.0.1:18787`，管理界面在 <http://127.0.0.1:18787/admin/>。
-在界面里配上游站、逻辑模型、路由优先级。
-
-需要**服务器公网访问 + 多中转站 + Claude Code 接入 + 运维**的逐步示例，
-请直接看 [服务器部署与配置](docs/03-部署与配置.md)。
-服务器上**已有 nginx + 证书**（80/443 被占用）的话，用其中
-[第 14 章的一键脚本](docs/03-部署与配置.md#14-已有-nginx--证书的服务器一键脚本)：
-```bash
-curl -sSL https://raw.githubusercontent.com/279814/relay-gate/main/scripts/deploy-nginx.sh | sh
-```
-脚本自动生成凭据与 nginx 反代、扩证书 SAN，全程无需编辑文件，
-中转站配置走网页管理界面。
-
-### 接上 Claude Code
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18787
-export ANTHROPIC_AUTH_TOKEN=rk-你生成的那个
-```
-
-网关三个位置都认凭据（`x-api-key` / `Authorization: Bearer` / `Api-Key`），
-所以 `ANTHROPIC_API_KEY` 同样可用。
-
-### 对公网提供服务
-
-```bash
-# .env 里再填 RELAY_DOMAIN、RELAY_ALLOW_IPS（留空 = 管理面全部 403，刻意如此）
-docker compose --profile public up -d
-```
-
-Caddy 负责 TLS 与证书自动续期，并对管理面做 IP 白名单。转发端点不限 IP，靠 relay key 鉴权。
-
-> [!WARNING]
-> **把这个服务裸奔到公网 = 一个无鉴权的免费 API 池。** 必须设置 relay key。
-> 端口刻意只绑 `127.0.0.1` —— 写成 `18787:18787` 的话 Docker 会插一条 iptables 规则
-> 把它**直接暴露到公网，且绕过 ufw/firewalld**（你在防火墙里看不到）。
-
-## 支持的端点
-
-入站路径 = 出站路径，**不做协议转换**。
+入站路径 = 出站路径，**不做协议转换**。支持：
 
 | 端点 | 说明 |
 |---|---|
@@ -105,131 +28,125 @@ Caddy 负责 TLS 与证书自动续期，并对管理面做 IP 白名单。转�
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/messages/count_tokens` | 上游优先，不支持时本地估算兜底 |
 | `GET /v1/models` | 本地应答，返回已配置的逻辑模型 |
-| `GET /healthz` | 进程存活 + 版本 + 总闸状态（不代表有可用上游） |
+| `GET /healthz` | 进程存活 + 版本 + 总闸状态 |
+
+鉴权：客户端使用本服务发放的 **relay key**（不是上游站的 key）。管理界面用管理员口令。
+
+## 一行安装（HTTP `IP:port`）
+
+需要 **Docker** 与 **Docker Compose**。访问形态是 `http://<主机IP>:18787`，
+**不需要域名、证书、ACME 邮箱、SMTP，也没有登录 IP 白名单**。
+
+### 本机（Windows / macOS / Linux）
+
+```powershell
+git clone https://github.com/279814/relay-gate.git
+cd relay-gate
+.\deploy.ps1
+```
+
+或（任意已装 Docker 的系统）：
+
+```bash
+git clone https://github.com/279814/relay-gate.git
+cd relay-gate
+docker compose up -d --build
+```
+
+### Linux 服务器
+
+```bash
+git clone https://github.com/279814/relay-gate.git
+cd relay-gate
+./deploy.sh
+```
+
+默认端口 **18787**（可用 `.env` 里的 `RELAY_PORT` 覆盖）。打开：
+
+```text
+http://<这台机器的IP>:18787/admin/
+```
+
+### 首次启动的三项密钥
+
+若未在环境变量里设置凭据，**第一次启动**会生成并**只打印一次**到控制台 / 容器日志：
+
+| 打印行 | 含义 |
+|---|---|
+| `ADMIN_PASSWORD=` | 管理界面口令 |
+| `RELAY_KEYS=` | 发给客户端的 relay key |
+| `ENCRYPTION_KEY=` | 上游 key 的加密主密钥（Master Key） |
+
+查看（Compose）：
+
+```bash
+docker compose logs --no-color 2>&1 | grep -E '^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)='
+```
+
+之后重启**不会再打印**。若操作员已设置 `ENCRYPTION_KEY` / `RELAY_KEYS` / `ADMIN_PASSWORD`，环境变量优先，不会另造一套。凭据落在 `data/secrets/`（已 gitignore），不要提交进仓库。
+
+### 接上 Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=http://<主机IP>:18787
+export ANTHROPIC_AUTH_TOKEN=<RELAY_KEYS 打印出的值>
+```
+
+网关三个位置都认凭据（`x-api-key` / `Authorization: Bearer` / `Api-Key`）。
+
+## 为什么不是「重试就行了」
+
+被动 failover（请求失败再换下一个）在长思考场景下代价很高：一次首 Token 超时可能是
+20 分钟。主动探活把发现故障的代价挪到请求之外。
 
 ## 设计要点
 
 | 主题 | 结论 |
 |---|---|
-| 改写范围 | 仅鉴权头（必改）+ body 顶层 `model`（配了映射才改）。字节级切片替换，不做 JSON round-trip |
-| 数据模型 | 三层：Upstream（站）/ ModelName（逻辑模型）/ Route（绑定，含优先级与映射）。Route 是健康状态的最小单位 |
-| 首 Token 超时 | 默认 20 分钟，**硬下限 5 分钟**。探活超时独立配置，因此「容忍长思考」与「快速判死」可以同时成立 |
-| 死站恢复 | 固定短周期（L1 20s / L2 30s）+ L1 转通即触发 L2 + 半开放行，不用指数退避 |
-| 假活检测 | HTTP 200 不算活。必须收到首个**非空内容 delta** 才算 |
-| 请求内重试 | 未写出字节前可换站重试，逐次尝试都留档 |
-| 存储 | 单副本 SQLite（`modernc.org/sqlite`，无 CGO），库文件权限 0600 |
+| 改写范围 | 仅鉴权头（必改）+ body 顶层 `model`（配了映射才改） |
+| 数据模型 | Upstream / ModelName / Route（优先级与健康状态最小单位） |
+| 存储 | 单副本 SQLite（`modernc.org/sqlite`，无 CGO），库权限 0600 |
+| 登录保护 | 失败退避（按来源 IP + 全局）；**无**登录 IP 白名单 |
 
-v1.0.0 要做成什么样见 [需求与设计](docs/01-需求与设计.md)。做到哪一步见 [P0 实施计划](docs/04-P0-探活基础门禁实施计划.md)。
+需求基线：[docs/01-需求与设计.md](docs/01-需求与设计.md)。阶段记录见 docs/04–09。
 
-部署到公网、配置多个中转站、验证故障切换、接入 Claude Code、备份与排障：
-见 [服务器部署与配置](docs/03-部署与配置.md)。
-
-## 项目状态
-
-分两层看，不要混在一起。
-
-**今天能部署的**是 `main` 上的网关：主动探活、优先级路由、严格透传、样本留档，以及已合入的 P1–P5 离线能力（懒探活、三凭据/Keyring、内容安全、声明式转换、发布门禁等）。本地一行部署：`deploy.ps1 -Local` / `./deploy.sh --local`（拒绝未验证的公网 IP 模式）。公网域名 / 已有 nginx 仍看 [服务器部署与配置](docs/03-部署与配置.md)。阶段记录见 docs/05–09。
-
-**尚未冒充完成的**见 [发布说明](docs/RELEASE-NOTES-v1.0.0.md) Deferred：真实公网 IP 证书与容器 smoke、多日 soak、确认后的旧 sample 明文 dual-read 清理。公网 IP HTTPS 验证前不得删除 docs/03 / Caddyfile / `scripts/deploy-nginx.sh`。
-
-当前仍待真实流量验证的三项（都需要接上 Claude Code 才能做）：
-`/v1/responses` 的上游支持性复测、`count_tokens` 本地估算的精度校准、
-公网模式下长思考不被 Caddy 中途掐断（配置已通过 `caddy validate`，
-但「解析器接受」不等于「运行时按预期生效」）。
-
-### 离线备份检查与恢复（P0-17）
-
-升级前会在 `data/backups/` 写下带 manifest 的 schema 边界备份。恢复必须停服务，并显式授权：
+## 构建与开发
 
 ```bash
-# 只读校验（不移动文件）；确认输出的 ReaderContract / PairedBuildID
+go build ./...
+go test ./...
+go vet ./...
+sh scripts/check-p0.sh
+sh scripts/check-p5.sh
+sh scripts/check-deploy.sh
+sh scripts/check-entrypoint.sh
+```
+
+Windows 本地不要用 `-race`（无 CGO）。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
+
+### 离线备份检查与恢复
+
+```bash
 relay-gate db check-backup --database /abs/path/data/relay.db \
   --manifest /abs/path/data/backups/<backup>/manifest.json
 
-# 破坏性恢复：先隔离当前 db/-wal/-shm，再装回 backup
 relay-gate db restore --database /abs/path/data/relay.db \
   --manifest /abs/path/data/backups/<backup>/manifest.json \
   --execute --accept-data-replacement \
   --accept-reader-contract '<exact-ReaderContract-from-check>'
 ```
 
-恢复后按输出的 `PairedBuildID` 启动配对 binary，再做健康检查。schema2 cutover backup 回到 schema2 兼容 reader；更早的 schema1 backup 会丢掉此后全部 P0 配置。`docs/03` 仍是域名/nginx 公网部署指南，不被本命令替换。
-
-## 目录结构
-
-```
-cmd/relay-gate/   入口：启动、优雅关闭、依赖装配
-internal/         proxy 透传 / probe 探活 / health 状态机 / router 选路 /
-                  store SQLite / api 管理端 / web 内嵌界面
-deploy/           Caddyfile 与容器 entrypoint
-docs/             需求与设计文档
-scripts/          能力探测、各阶段冒烟、部署静态检查
-```
-
-## 开发
-
-```bash
-go build ./...
-go test ./...
-go vet ./...
-sh scripts/check-p0.sh          # P0 离线 gate（CI 已接入）
-sh scripts/check-p5.sh          # P5 离线 release gate（CI 已接入）
-```
-
-前端是单页 HTML + Alpine.js，通过 `go:embed` 打进二进制 —— 没有构建链，
-改完直接 `go build`。
-
-验证部署改动：
-
-```bash
-sh scripts/check-entrypoint.sh   # entrypoint 的静态不变量，无需 Docker
-sh scripts/check-deploy.sh       # 部署清单的静态不变量，无需 Docker
-pwsh -File scripts/smoke-m7.ps1  # 容器端到端，需要 Docker 引擎
-```
-
-三项都在 CI 里跑（前两个在 `test` job，第三个在独立的 `container` job）。
-容器那一项验的每一条（0600 库权限、PID 1 是谁、SIGTERM 直达、端口只绑
-`127.0.0.1`、空 ACME 邮箱、空 IP 白名单）都**只在容器里**才成立或才会坏，
-本地 `go test` 全绿证明不了其中任何一条。
-
-### 探测上游能力（可选）
-
-写代码前先实测各站到底支持什么：
-
-```bash
-cp scripts/upstreams.example.tsv scripts/upstreams.tsv
-# 编辑 upstreams.tsv（Tab 分隔，含真实 key，已在 .gitignore 中）
-bash scripts/probe-all.sh scripts/upstreams.tsv
-```
-
-输出能力矩阵到 `docs/02-上游能力矩阵.md`（同样已 gitignore，含站点地址）。
-单站约消耗 100 token。探测项包括鉴权头风格、模型名原名是否可用、
-流式真活/假活、首 Token 延迟、`count_tokens` 与 `/v1/responses` 支持情况。
-
-## 版本状态（v1.0.0）
-
-实现进度与 Deferred 以 [发布说明](docs/RELEASE-NOTES-v1.0.0.md) 和 docs/05–09 为准。
-公网域名部署仍看 [docs/03](docs/03-部署与配置.md)；公网 IP HTTPS 一行部署尚未验证，因此 docs/03 保留。
-
-离线发布门禁：`bash scripts/check-p5.sh`（CI 已接入）。
-
 ## 安全
 
-- 上游 key 在数据库中 **AES-GCM 加密**存储；样本里的凭据脱敏
-- 库文件与 WAL 权限收到 **0600** —— 样本里有**明文的**对话原文，加密只保护了上游 key
-- `.env`、`data/`、`scripts/upstreams.tsv`、`docs/02-上游能力矩阵.md` 已全部 gitignore
-- 备份只需 `data/` 目录：上游配置、样本、请求日志、健康历史全在里面
+- 上游 key 在库中 AES-GCM 加密；样本凭据脱敏
+- `.env`、`data/`、`scripts/upstreams.tsv`、`docs/02-上游能力矩阵.md` 已 gitignore
+- 备份单位是整个 `data/`（含 Keyring）
 
 发现安全问题请看 [SECURITY.md](SECURITY.md)。
 
 ## 贡献
 
 欢迎 issue 与 PR，请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 技术栈
-
-Go 1.26 / `net/http` + `httputil.ReverseProxy` / SQLite（`modernc.org/sqlite`，无 CGO）/
-单页 HTML + Alpine.js（`go:embed`）/ Docker Compose 单容器部署。
 
 ## License
 

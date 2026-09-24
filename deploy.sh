@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# Local one-line deploy (P2 §12.1). Does NOT replace docs/03 public nginx guide.
+# One-command install: local or Linux server with Docker.
+# Access: http://<host-IP>:${RELAY_PORT:-18787}/admin/
+# First start prints ADMIN_PASSWORD / RELAY_KEYS / ENCRYPTION_KEY once (container logs).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-MODE="${1:-}"
-if [[ "$MODE" != "--local" ]]; then
-  echo "Usage: ./deploy.sh --local"
-  echo "Public IP mode is not verified in this PR; keep using docs/03 for domain/nginx deploys."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required. Install Docker, then re-run ./deploy.sh" >&2
   exit 2
 fi
 
-rand_hex() { openssl rand -hex "$1"; }
+mkdir -p data
+chmod 700 data 2>/dev/null || true
 
-if [[ ! -f .env ]]; then
-  ENC="$(rand_hex 32)"
-  RELAY="rk-$(rand_hex 24)"
-  ADMIN="$(rand_hex 24)"
-  cat > .env <<EOF
-ENCRYPTION_KEY=$ENC
-RELAY_KEYS=$RELAY
-ADMIN_PASSWORD=$ADMIN
-EOF
-  chmod 600 .env
-  echo "Wrote .env with one-time credentials (shown once below):"
-  echo "ADMIN_PASSWORD=$ADMIN"
-  echo "RELAY_KEYS=$RELAY"
-  echo "ENCRYPTION_KEY=$ENC"
-else
-  echo ".env already exists; not regenerating credentials."
+echo "Building and starting relay-gate (http://0.0.0.0:${RELAY_PORT:-18787})..."
+docker compose up -d --build
+
+echo
+echo "Waiting for healthz..."
+ok=0
+for i in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${RELAY_PORT:-18787}/healthz" >/dev/null 2>&1; then
+    ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$ok" -ne 1 ]]; then
+  echo "Service did not become healthy. Recent logs:" >&2
+  docker compose logs --tail=80
+  exit 1
 fi
 
-mkdir -p data/secrets
-chmod 700 data data/secrets || true
-
-echo "Building relay-gate..."
-go build -o relay-gate ./cmd/relay-gate
-echo "Start with: ./relay-gate"
-echo "Admin UI: http://127.0.0.1:18787/admin/"
+echo
+echo "Open http://<this-host-IP>:${RELAY_PORT:-18787}/admin/"
+echo "On first start, three secrets are printed once in the container log:"
+echo "  docker compose logs --no-color 2>&1 | sed -n '/ADMIN_PASSWORD=/p;/RELAY_KEYS=/p;/ENCRYPTION_KEY=/p'"
+echo "Later restarts do not reprint them. Env still wins if you set ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD."

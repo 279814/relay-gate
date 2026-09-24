@@ -5,40 +5,39 @@
 ## 范围声明
 
 本版本按 `docs/01` 分阶段交付。下列「已交付」来自已合并 PR 与各阶段实施记录；
-「Deferred」仍属 v1.0.0 目标但**尚未**在本仓库冒充完成。`docs/03-部署与配置.md`
-仍是公网域名部署指南，直到公网 IP HTTPS **真实证书签发与容器 smoke** 完成前不得删除。
+「Deferred」仍属 v1.0.0 目标但**尚未**在本仓库冒充完成。支持的安装形态是 README 中的
+HTTP `IP:port` 一行部署（无域名 / ACME / 登录 IP 白名单）。
 
 ## 已交付（按阶段）
 
 | 阶段 | 记录 | 合并要点 |
 |---|---|---|
-| P0 | docs/04 | 探活基础门禁至 P0-17 schema3 cutover / 离线 restore（PR #57） |
-| P1 | docs/05 | RecoveryGate、RetryPolicy、duplicate_risk DB 列、重复 model、语义失效、count_tokens 多 Route、Lazy 恢复（PR #58 / #64） |
-| P2 | docs/06 | Keyring、凭据 UI/轮换、最近错误、本地一行部署、公网 IP HTTPS **状态机 + 本地 fake Certbot**（PR #59 / #65）；**续期可观测** `RenewWatch`（成功/失败/reload 保留旧证/剩余有效期告警，本地 fake）；Runtime Controller **maintenance 叠加态 + 暖机进度**；首次凭据 **bootstrap journal**；旧环境变量 **migration journal**、**reset-admin**、登录/Bearer **Argon2id**（仍兼容 env 明文）；启动时可从 **keyring / bootstrap-credentials** 加载 ENCRYPTION_KEY / RELAY_KEYS（env 优先；未完成 journal 拒绝启动）；**未**签发真实公网证书 |
-| P3 | docs/07 | 被动扫描旁路、SMTP 假服务器、Active 手动 canary、finding 持久化、Security Center 模块（PR #60 / #66） |
-| P4 | docs/08 | 声明式编译器/API（PR #61）；schema 6 持久化 + proxy 请求/响应/SSE（PR #67 / #68 / #71）；UI（PR #73）；JSON Patch；body_template；Secret 污点；执行预算二次确认审计 |
-| P5 | docs/09 | 离线发布门禁 `check-p5` + 本说明；旧 sample 信封迁移（PR #69 / #72） |
+| P0 | docs/04 | 探活基础门禁至 P0-17 schema3 cutover / 离线 restore |
+| P1 | docs/05 | RecoveryGate、RetryPolicy、duplicate_risk、语义失效、count_tokens 多 Route、Lazy 恢复 |
+| P2 | docs/06 | Keyring、凭据 UI/轮换、bootstrap/migrate、HTTP IP:port 一行部署；`acmeip` 状态机与 fake 续期（**未**作安装路径）；登录无 IP 白名单 |
+| P3 | docs/07 | 被动扫描旁路、SMTP 假服务器、Active 手动 canary、Security Center |
+| P4 | docs/08 | 声明式转换编译器/API/持久化/proxy/UI |
+| P5 | docs/09 | 离线发布门禁 `check-p5` + 本说明；旧 sample 信封迁移 |
 
 ## 部署入口
 
-- 本地 / Docker：见根目录 README。
-- 公网域名 + 已有 nginx：见 `docs/03-部署与配置.md`。
-- 本地一行脚本：`deploy.ps1 -Local` / `./deploy.sh --local`（拒绝未验证的 `--public`）。
+- 本机 / Linux 服务器：见根目录 README（`deploy.ps1` / `./deploy.sh` / `docker compose up -d --build`）。
+- 首次启动打印 `ADMIN_PASSWORD` / `RELAY_KEYS` / `ENCRYPTION_KEY` 各一次；之后不重复。
 
 ## 安全边界（发布时仍成立）
 
 - 默认严格透传；Transform 默认关闭且未绑定不进入转换路径。
 - 内容安全默认只告警、不自动改响应或禁用 Route。
 - 不提交 `.env`、Keyring、`upstreams.tsv`、`docs/02`、样本正文。
+- 管理登录保留失败退避；无登录 IP 白名单。
 
 ## 仍 Deferred（诚实清单）
 
-- 公网 IP HTTPS / Certbot **真实公网证书签发与容器 smoke**（本地签发状态机、续期可观测与 fake Certbot 已测；**不得**声称已签发公网证书；docs/03 / Caddyfile / deploy-nginx.sh 保留）
-- 多日生产 soak / 长流压测（本仓库与 CI 时长不允许伪称完成）
+- 需求 §12.2 公网 IP HTTPS / Certbot **真实公网证书签发**（本地状态机与 fake 续期已测；**不得**声称已签发公网证书；当前安装为明文 HTTP）
+- 多日生产验证 / 长流压测（本仓库与 CI 时长不允许伪称完成）
 - 确认后的旧 sample 明文 dual-read 清理（信封迁移已交付；去掉明文回退需运维确认）
-- README 替换 docs/03 后的删除清单（Caddyfile、deploy-nginx.sh；**真实公网证书验证前不得删**）
 
 ## 最终审查记录
 
-- 请求/响应转换 `fail_closed`：Apply 失败时回滚半截头/body；响应路径在写入客户端前失败可返回本地错误（PR #63 / #71）。
-- P1–P5 既有 Deferred 收口见 PR #64–#73；本说明与 docs/05–09 对齐事实，不冒充公网证书或多日 soak。
+- 请求/响应转换 `fail_closed`：Apply 失败时回滚半截头/body。
+- 本说明与 docs/05–09 对齐事实，不冒充公网证书或多日生产验证已完成。

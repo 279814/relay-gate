@@ -37,7 +37,7 @@ type Service struct {
 	// relayAlso holds digests of extra bootstrap keys (comma-separated
 	// RELAY_KEYS) that remain accepted alongside active/grace. Rotation moves
 	// only relayActive into grace; also-keys are unchanged (§12.6 single
-	// active + docs/03 multi).
+	// active + optional comma-separated extras from env).
 	relayAlso  map[string]struct{}
 	graceUntil time.Time
 	graceSec   int
