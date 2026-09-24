@@ -1164,7 +1164,7 @@ func TestSample_LargeSSEKeepsHeadAndTail(t *testing.T) {
 }
 
 // §5.4：剩余样本磁盘配额小于响应流时，样本不得保留全文；客户端仍收齐每一字节。
-// 配额充足的短响应仍完整落库（0/0 默认不被改成固定封顶）。
+// 默认 0/0 溢出不另造头尾长度，但仍标记 TruncRespBody；配额充足的短响应仍完整落库。
 func TestSample_RemainingDiskQuotaSwitchesCapture(t *testing.T) {
 	const chunks = 80
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1178,8 +1178,7 @@ func TestSample_RemainingDiskQuotaSwitchesCapture(t *testing.T) {
 		w.Write([]byte("event: message_stop\ndata: {\"usage\":{\"output_tokens\":7}}\n\n"))
 		fl.Flush()
 	})
-	// 默认 0/0 = 完整保留；人为把「剩余配额」压到远小于流长度，
-	// 但仍够头尾各留一点（usage 关键字要落在尾环里）。
+	// 默认 0/0 = 完整保留；人为把「剩余配额」压到远小于流长度。
 	hs.cfg.settings.SampleRespHeadBytes = 0
 	hs.cfg.settings.SampleRespTailBytes = 0
 	hs.cfg.settings.SampleDiskQuotaBytes = 5 << 30
@@ -1198,11 +1197,10 @@ func TestSample_RemainingDiskQuotaSwitchesCapture(t *testing.T) {
 	if !smp.Truncated.Has(model.TruncRespBody) {
 		t.Error("超剩余配额应标记 resp_body 截断")
 	}
-	if !bytes.Contains(smp.RespBody, []byte("message_start")) {
-		t.Error("应保留头部")
-	}
-	if !bytes.Contains(smp.RespBody, []byte("output_tokens")) {
-		t.Error("应保留尾部 usage")
+	// 0/0 不发明头尾：不得靠魔法长度仍留下 message_start / usage 正文
+	if bytes.Contains(smp.RespBody, []byte("message_start")) ||
+		bytes.Contains(smp.RespBody, []byte("output_tokens")) {
+		t.Errorf("0/0 溢出不应另造头尾保留正文，得到 %q", smp.RespBody)
 	}
 
 	// 配额充足时短响应仍全文落库

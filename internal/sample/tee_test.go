@@ -276,7 +276,8 @@ func TestHeadTail_FullModeAcrossChunks(t *testing.T) {
 	}
 }
 
-// §5.4：剩余配额不够装下整段流时，采集当场改留头尾，绝不先把全文攒进 RAM。
+// §5.4：剩余配额不够装下整段流时，采集当场停止全收，绝不先把全文攒进 RAM。
+// 溢出头尾为 0/0 时保持 0，不另造魔法长度；仍标记截断与 QuotaOverflow。
 func TestHeadTail_RemainingQuotaSwitchesToHeadTail(t *testing.T) {
 	const budget = 200
 	ht := NewHeadTail(0, 0).LimitToRemaining(budget, 0, 0)
@@ -308,18 +309,46 @@ func TestHeadTail_RemainingQuotaSwitchesToHeadTail(t *testing.T) {
 	if bytes.Equal(got, stream) {
 		t.Fatal("样本不得保留完整流 —— 那正是配额旁路要避免的峰值内存")
 	}
-	if len(got) > budget+64 { // 省略标记有少量开销
-		t.Fatalf("留存应落在剩余配额附近，got %d budget %d", len(got), budget)
+	// 0/0 不发明头尾：内部缓冲必须仍为 0
+	if len(ht.head)+ht.tailLen != 0 {
+		t.Fatalf("0/0 溢出不得另造头尾缓冲，got head=%d tail=%d", len(ht.head), ht.tailLen)
 	}
+	if ht.headMax != 0 || len(ht.tail) != 0 {
+		t.Fatalf("0/0 溢出后 headMax/tail 应保持 0，got headMax=%d tailCap=%d", ht.headMax, len(ht.tail))
+	}
+}
+
+// 溢出时头尾必须用调用方传入的配置值，不得改用 remaining 拆出的魔法长度。
+func TestHeadTail_RemainingQuotaUsesConfiguredOverflowSizes(t *testing.T) {
+	const budget = 200
+	const overflowHead, overflowTail = 40, 30
+	ht := NewHeadTail(0, 0).LimitToRemaining(budget, overflowHead, overflowTail)
+
+	stream := []byte("HEAD-" + strings.Repeat("m", 500) + "-TAIL-end")
+	for i := 0; i < len(stream); i += 37 {
+		end := i + 37
+		if end > len(stream) {
+			end = len(stream)
+		}
+		ht.Write(stream[i:end])
+	}
+
+	if !ht.QuotaOverflow() || !ht.Truncated() {
+		t.Fatal("超配额应溢出并截断")
+	}
+	if ht.headMax != overflowHead || len(ht.tail) != overflowTail {
+		t.Fatalf("应用配置头尾 %d/%d，得到 headMax=%d tailCap=%d",
+			overflowHead, overflowTail, ht.headMax, len(ht.tail))
+	}
+	got := ht.Bytes()
 	if !bytes.Contains(got, []byte("HEAD-")) {
-		t.Errorf("应保留头部，得到 %q", got)
+		t.Errorf("应保留配置长度的头部，得到 %q", got)
 	}
 	if !bytes.Contains(got, []byte("-end")) {
-		t.Errorf("应保留尾部，得到 %q", got)
+		t.Errorf("应保留配置长度的尾部，得到 %q", got)
 	}
-	// 内存中的 head+tail 缓冲不得超过 budget
-	if len(ht.head)+ht.tailLen > budget {
-		t.Fatalf("内部缓冲 %d 超过剩余配额 %d", len(ht.head)+ht.tailLen, budget)
+	if len(ht.head)+ht.tailLen > overflowHead+overflowTail {
+		t.Fatalf("内部缓冲 %d 超过配置头尾 %d", len(ht.head)+ht.tailLen, overflowHead+overflowTail)
 	}
 }
 

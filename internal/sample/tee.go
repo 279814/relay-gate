@@ -45,7 +45,7 @@ type HeadTail struct {
 	// 超限时切到有界头尾；切过后 budgetOn 清掉，后续走普通有界路径。
 	budgetOn      bool
 	budget        int64
-	overflowHead  int // 配置的头上限；0 表示按剩余配额拆分
+	overflowHead  int // 配置的头上限（SampleRespHeadBytes）；0 保持 0，不另造长度
 	overflowTail  int
 	quotaOverflow bool // 是否因配额从完整模式切到了头尾
 }
@@ -73,8 +73,8 @@ func NewHeadTail(headMax, tailMax int) *HeadTail {
 // 即将写入的 in/out body。负数按 0（已无空间）处理。
 //
 // overflowHead / overflowTail 是配置的 sample_resp_head/tail_bytes：
-// 超限时切到这对头尾；两者仍为 0 时，把头尾预算从 remaining 本身拆出
-// （不另造固定 KiB 上限），保证「超过剩余配额就不再全收」。
+// 超限时切到这对头尾。两者仍为 0 时保持 0 —— 不另造魔法长度；
+// 仍会标记截断并停止全收，只是头尾缓冲为空。
 //
 // 非完整模式（调用方已配置了正的头尾）原样返回 —— 内存本就有界。
 func (h *HeadTail) LimitToRemaining(remaining int64, overflowHead, overflowTail int) *HeadTail {
@@ -160,26 +160,14 @@ func (h *HeadTail) switchFromFull(already []byte) {
 	if h.budgetOn && int(h.budget) < budget {
 		budget = int(h.budget)
 	}
-	if headMax == 0 && tailMax == 0 {
-		// 配置仍是「尽量完整」：用剩余配额本身拆头尾，不另造固定封顶。
-		// 8:1 贴近历史上头大尾小的诊断比例，但字节数来自 remaining。
-		if budget <= 0 {
-			headMax, tailMax = 0, 0
-		} else if budget == 1 {
-			headMax, tailMax = 1, 0
-		} else {
-			headMax = budget * 8 / 9
+	// 0/0 保持 0：§5.4 要的是「可配置的头尾」，未配置时不发明长度。
+	if headMax > 0 || tailMax > 0 {
+		if budget > 0 && headMax+tailMax > budget {
+			// 配置头尾之和大于剩余配额时，按比例压进配额内。
+			total := headMax + tailMax
+			headMax = budget * headMax / total
 			tailMax = budget - headMax
-			if tailMax < 1 {
-				tailMax = 1
-				headMax = budget - 1
-			}
 		}
-	} else if budget > 0 && headMax+tailMax > budget {
-		// 配置头尾之和大于剩余配额时，按比例压进配额内。
-		total := headMax + tailMax
-		headMax = budget * headMax / total
-		tailMax = budget - headMax
 	}
 
 	h.quotaOverflow = true
