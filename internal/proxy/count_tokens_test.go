@@ -1060,9 +1060,10 @@ func TestEstimateTokens_NormalProseUnaffectedByLongWordRule(t *testing.T) {
 
 // ── /v1/models ────────────────────────────────────────────
 
-func TestModels_ListsEnabledModelNames(t *testing.T) {
+func TestModels_ListsConfiguredModelNames(t *testing.T) {
 	hs := newHarness(t, nil)
-	// 再加两个：一个启用、一个停用，验证过滤与定序。
+	// 再加两个：一个启用、一个停用。§8.7 要求返回本地已配置的逻辑名，
+	// 含 disabled；enabled 只约束转发选路，不决定清单是否暴露。
 	extra := []*model.ModelName{
 		{ID: 2, Name: "aaa-model", Protocol: model.ProtoOpenAIChat,
 			MatchMode: model.MatchExact, Enabled: true},
@@ -1100,8 +1101,8 @@ func TestModels_ListsEnabledModelNames(t *testing.T) {
 			t.Errorf("%s 的 object = %q, want model", d.ID, d.Object)
 		}
 	}
-	// 已定序，所以可以直接比对完整列表 —— 停用的那个必须不在里面。
-	want := []string{"aaa-model", "claude-opus-5"}
+	// 已定序；停用的名字仍必须出现（§8.7「已配置的逻辑 ModelName」）。
+	want := []string{"aaa-model", "claude-opus-5", "disabled-model"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Errorf("模型列表 = %v, want %v", ids, want)
 	}
