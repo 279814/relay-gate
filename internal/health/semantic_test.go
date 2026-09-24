@@ -7,12 +7,16 @@ import (
 )
 
 type memCaps struct {
-	cleared []int64
+	cleared         []int64
+	upstreamCleared []int64
 }
 
 func (m *memCaps) InvalidateScope(scope model.RecipeScope, scopeID int64) {
-	if scope == model.RecipeScopeRoute {
+	switch scope {
+	case model.RecipeScopeRoute:
 		m.cleared = append(m.cleared, scopeID)
+	case model.RecipeScopeUpstream:
+		m.upstreamCleared = append(m.upstreamCleared, scopeID)
 	}
 }
 
@@ -73,6 +77,29 @@ func TestSemanticInvalidatorInvalidateUpstreamClearsAliveRouteHealth(t *testing.
 	}
 	if tr.State(99) != model.StateAlive {
 		t.Fatalf("unrelated route must stay alive, got %s", tr.State(99))
+	}
+}
+
+// Delete / network-origin invalidate must drop RecipeScopeUpstream capability
+// keys for that upstream id (L1 unsupported / config_error), without touching
+// another upstream's upstream-scoped rows. Child route scopes still clear.
+func TestSemanticInvalidatorInvalidateUpstreamClearsUpstreamCapability(t *testing.T) {
+	caps := &memCaps{}
+	inv := NewSemanticInvalidator(nil, nil, caps, nil, nil)
+	inv.InvalidateUpstream(10, []int64{100, 101})
+	if len(caps.upstreamCleared) != 1 || caps.upstreamCleared[0] != 10 {
+		t.Fatalf("upstream capability scope=%v want [10]", caps.upstreamCleared)
+	}
+	if len(caps.cleared) != 2 || caps.cleared[0] != 100 || caps.cleared[1] != 101 {
+		t.Fatalf("child route capability scopes=%v want [100 101]", caps.cleared)
+	}
+	// Second upstream must not be cleared as a side effect.
+	inv.InvalidateUpstream(20, nil)
+	if len(caps.upstreamCleared) != 2 || caps.upstreamCleared[1] != 20 {
+		t.Fatalf("after second clear upstreamCleared=%v want [10 20]", caps.upstreamCleared)
+	}
+	if len(caps.cleared) != 2 {
+		t.Fatalf("nil routeIDs must not invent route clears, cleared=%v", caps.cleared)
 	}
 }
 
