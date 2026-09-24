@@ -50,3 +50,48 @@ func TestPublishedBindingApplyAndUnboundSkip(t *testing.T) {
 		t.Fatalf("unbound must skip: %v %v", cNil, err)
 	}
 }
+
+// Delete + recreate can reuse a SQLite route rowid. After the delete path
+// removes the binding, a request against the same numeric route+endpoint id
+// must forward the body unchanged (passthrough).
+func TestRequestTransform_ReusedRouteIDPassthroughAfterDetach(t *testing.T) {
+	hs := newHarness(t, nil)
+	reg := transform.NewRegistry(8)
+	set, err := reg.CreateSet("reuse-traffic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{
+		{Kind: transform.KindReplaceBytes, From: `"model":"claude-opus-5"`, To: `"model":"rewritten"`},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	// harness Route.ID=100, Endpoint.ID=1
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	body := `{"model":"claude-opus-5","max_tokens":1}`
+	rec := hs.serve(hs.anthropicRequest(body))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(string(hs.gotReq.body), `"model":"rewritten"`) {
+		t.Fatalf("setup: transform did not apply, upstream body=%s", hs.gotReq.body)
+	}
+
+	// Simulate Route delete detach, then the same numeric id reincarnated in cfg.
+	if err := reg.RemoveBindingsForRoute(100); err != nil {
+		t.Fatal(err)
+	}
+	hs.gotReq = &capturedRequest{}
+	rec = hs.serve(hs.anthropicRequest(body))
+	if rec.Code != 200 {
+		t.Fatalf("after detach status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if string(hs.gotReq.body) != body {
+		t.Fatalf("reused id must passthrough unchanged: got %s want %s", hs.gotReq.body, body)
+	}
+}

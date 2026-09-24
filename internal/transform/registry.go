@@ -247,6 +247,49 @@ func (r *Registry) ClearPublished(routeID, endpointID int64) (*Binding, error) {
 	return cloneBinding(b), nil
 }
 
+// RemoveBindingsForRoute drops every binding for routeID (published and shadow).
+// Call on Route delete so a later row that reuses the same numeric id cannot
+// inherit the old published transform (§15 binding lifetime / id reuse).
+func (r *Registry) RemoveBindingsForRoute(routeID int64) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := false
+	for key, b := range r.bindings {
+		if b != nil && b.RouteID == routeID {
+			delete(r.bindings, key)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil
+	}
+	return r.flushLocked()
+}
+
+// RemoveBindingsForEndpoint drops every binding for endpointID.
+// Call on Endpoint delete so a reused endpoint id cannot inherit an old binding.
+func (r *Registry) RemoveBindingsForEndpoint(endpointID int64) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := false
+	for key, b := range r.bindings {
+		if b != nil && b.EndpointID == endpointID {
+			delete(r.bindings, key)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil
+	}
+	return r.flushLocked()
+}
+
 // GetBinding returns the binding for route+endpoint.
 func (r *Registry) GetBinding(routeID, endpointID int64) (*Binding, bool) {
 	r.mu.RLock()

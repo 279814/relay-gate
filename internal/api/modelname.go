@@ -85,6 +85,19 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// Collect child Route ids before CASCADE so §15 transform bindings can be
+	// detached after a successful delete (SQL CASCADE does not touch
+	// transform_binding; those rows are keyed only by numeric ids).
+	var childRoutes []int64
+	if s.transforms != nil {
+		if routes, err := s.st.ListRoutes(id); err == nil {
+			for _, rt := range routes {
+				if rt != nil {
+					childRoutes = append(childRoutes, rt.ID)
+				}
+			}
+		}
+	}
 	// Invalidate before DELETE: RoutesOfModelName reads the live SQL table, and
 	// ON DELETE CASCADE removes child Routes with the ModelName. After delete,
 	// SemanticConfigInvalidator would see zero route IDs and leave their
@@ -94,7 +107,10 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	// route 表对 model_name 是 ON DELETE CASCADE，绑定会一并消失。
+	for _, rid := range childRoutes {
+		s.detachTransformBindingsForRoute(rid)
+	}
+	// route 表对 model_name 是 ON DELETE CASCADE；transform_binding 需显式卸绑。
 	s.log.Info("删除 model_name（其 route 已级联删除）", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }

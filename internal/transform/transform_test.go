@@ -97,6 +97,81 @@ func TestPassthrough_UnboundHashIdentity(t *testing.T) {
 	}
 }
 
+// Delete + recreate can reuse a SQLite route rowid. RemoveBindingsForRoute must
+// drop the published pointer so the reincarnated id stays passthrough unless
+// the new route publishes its own binding.
+func TestRemoveBindingsForRoute_ReusedIDIsPassthrough(t *testing.T) {
+	reg := NewRegistry(20)
+	set, err := reg.CreateSet("reuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []Rule{{Kind: KindReplaceBytes, From: "OLD", To: "NEW"}}
+	if _, err := reg.UpdateDraft(set.ID, rules, FailClosed, FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	const routeID, endpointID, otherRoute int64 = 5, 11, 6
+	if _, _, err := reg.PublishSnapshot(set.ID, routeID, endpointID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, otherRoute, endpointID); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := reg.PublishedCompiled(routeID, endpointID)
+	if err != nil || c == nil {
+		t.Fatalf("setup compiled=%v err=%v", c != nil, err)
+	}
+	if err := reg.RemoveBindingsForRoute(routeID); err != nil {
+		t.Fatal(err)
+	}
+	// Same numeric id after delete+recreate: must not see the old published binding.
+	c, vid, err := reg.PublishedCompiled(routeID, endpointID)
+	if err != nil || c != nil || vid != 0 {
+		t.Fatalf("reused id must be unbound: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+	if _, ok := reg.GetBinding(routeID, endpointID); ok {
+		t.Fatal("binding row must be removed, not merely cleared")
+	}
+	// Live sibling route must keep its binding.
+	cOther, _, err := reg.PublishedCompiled(otherRoute, endpointID)
+	if err != nil || cOther == nil {
+		t.Fatalf("sibling binding must remain: c=%v err=%v", cOther != nil, err)
+	}
+	body := []byte("OLD")
+	out := cOther.ApplyRequest(RequestInput{Header: http.Header{}, Body: body})
+	if out.Err != nil || !bytes.Equal(out.Body, []byte("NEW")) {
+		t.Fatalf("sibling apply body=%s err=%v", out.Body, out.Err)
+	}
+}
+
+func TestRemoveBindingsForEndpoint_DropsOnlyThatEndpoint(t *testing.T) {
+	reg := NewRegistry(10)
+	set, err := reg.CreateSet("ep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.UpdateDraft(set.ID, []Rule{{Kind: KindReplaceBytes, From: "a", To: "b"}}, FailClosed, FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 1, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RemoveBindingsForEndpoint(10); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := reg.PublishedCompiled(1, 10)
+	if err != nil || c != nil {
+		t.Fatalf("deleted endpoint binding must be gone: c=%v err=%v", c != nil, err)
+	}
+	cKeep, _, err := reg.PublishedCompiled(1, 20)
+	if err != nil || cKeep == nil {
+		t.Fatalf("other endpoint binding must remain: c=%v err=%v", cKeep != nil, err)
+	}
+}
+
 func TestPublishShadowRollback(t *testing.T) {
 	reg := NewRegistry(50)
 	set, err := reg.CreateSet("demo")

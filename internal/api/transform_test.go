@@ -155,6 +155,96 @@ func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
 	}
 }
 
+// DeleteRoute must detach published transform bindings. After delete + SQLite
+// rowid reuse, the reincarnated id must stay passthrough unless it publishes
+// anew. A live sibling route must keep its binding.
+func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
+	s, _ := newTestServer(t)
+	reg := transform.NewRegistry(20)
+	h := s.WithTransformRegistry(reg).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h, `{"name":"xform-reuse-u","base_url":"https://x.example.com","api_key":"sk-xxxxxxxxxxxx"}`)
+	upSibling := mkUpstreamViaAPI(t, h, `{"name":"xform-reuse-u2","base_url":"https://y.example.com","api_key":"sk-yyyyyyyyyyyy"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"xform-reuse-m","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("model-name: %d %s", rec.Code, rec.Body.String())
+	}
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("route: %d %s", rec.Code, rec.Body.String())
+	}
+	routeID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upSibling)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("sibling route: %d %s", rec.Code, rec.Body.String())
+	}
+	siblingID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	const endpointID int64 = 1
+	rec = do(t, h, "POST", "/admin/api/transforms", `{"name":"reuse-set"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("transform set: %d %s", rec.Code, rec.Body.String())
+	}
+	setID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "PUT", "/admin/api/transforms/"+itoa(setID)+"/draft",
+		`{"rules":[{"kind":"replace_bytes","from":"OLD","to":"NEW"}]}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draft: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(endpointID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(siblingID)+`,"endpoint_id":`+itoa(endpointID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sibling publish: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(routeID), "", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete route: %d %s", rec.Code, rec.Body.String())
+	}
+	c, vid, err := reg.PublishedCompiled(routeID, endpointID)
+	if err != nil || c != nil || vid != 0 {
+		t.Fatalf("deleted route binding must be gone: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+	cSibling, _, err := reg.PublishedCompiled(siblingID, endpointID)
+	if err != nil || cSibling == nil {
+		t.Fatalf("live sibling binding must remain: c=%v err=%v", cSibling != nil, err)
+	}
+
+	// Empty the route table so AUTOINCREMENT can reuse the deleted id after
+	// sqlite_sequence reset (a surviving higher id would force max+1).
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(siblingID), "", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete sibling: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.st.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='route'`); err != nil {
+		t.Fatalf("reset route sequence: %v", err)
+	}
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("recreate route: %d %s", rec.Code, rec.Body.String())
+	}
+	reusedID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	if reusedID != routeID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", reusedID, routeID)
+	}
+	c, vid, err = reg.PublishedCompiled(reusedID, endpointID)
+	if err != nil || c != nil || vid != 0 {
+		t.Fatalf("reused id must stay passthrough: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+}
+
 func itoa64(v int64) string {
 	return jsonNumber(v)
 }

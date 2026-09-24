@@ -15,6 +15,27 @@ func (s *Server) WithTransformRegistry(r *transform.Registry) *Server {
 	return s
 }
 
+// detachTransformBindingsForRoute removes published/shadow bindings for a
+// deleted Route. Persist errors are logged; the SQL row is already gone.
+func (s *Server) detachTransformBindingsForRoute(routeID int64) {
+	if s == nil || s.transforms == nil || routeID <= 0 {
+		return
+	}
+	if err := s.transforms.RemoveBindingsForRoute(routeID); err != nil && s.log != nil {
+		s.log.Error("detach transform bindings after route delete", "route_id", routeID, "err", err)
+	}
+}
+
+// detachTransformBindingsForEndpoint removes bindings for a deleted Endpoint.
+func (s *Server) detachTransformBindingsForEndpoint(endpointID int64) {
+	if s == nil || s.transforms == nil || endpointID <= 0 {
+		return
+	}
+	if err := s.transforms.RemoveBindingsForEndpoint(endpointID); err != nil && s.log != nil {
+		s.log.Error("detach transform bindings after endpoint delete", "endpoint_id", endpointID, "err", err)
+	}
+}
+
 func (s *Server) listTransformSets(w http.ResponseWriter, r *http.Request) {
 	if s.transforms == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"sets": []any{}})
