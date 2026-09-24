@@ -24,6 +24,10 @@ const ellipsisFmt = "\n/* …relay-gate: 省略 %d 字节… */\n"
 // 尾部有 message_stop 与 usage（真实 token 消耗）。只留头会丢掉「这次到底
 // 花了多少 token」，而那正是公益站配额排查最需要的。
 // 这个模式下内存占用恒为 head+tail，与流的实际长度无关。
+//
+// **磁盘配额**（§5.4）：完整模式下可经 LimitToRemaining 附上剩余配额。
+// 一旦继续全收会超过剩余配额，当场改成留头留尾，而不是先把整段流
+// 攒进内存再等 PruneSamples 事后删 —— 事后删救不了峰值 RAM。
 type HeadTail struct {
 	head    []byte
 	tail    []byte // 环形缓冲：只保留最后 tailMax 字节
@@ -36,6 +40,14 @@ type HeadTail struct {
 	// 与「不限」是两回事。混为一谈的话，「只留尾」会静默变成「全留」。
 	full  bool
 	total int64
+
+	// budgetOn / budget：完整模式下的剩余样本磁盘配额（§5.4）。
+	// 超限时切到有界头尾；切过后 budgetOn 清掉，后续走普通有界路径。
+	budgetOn      bool
+	budget        int64
+	overflowHead  int // 配置的头上限；0 表示按剩余配额拆分
+	overflowTail  int
+	quotaOverflow bool // 是否因配额从完整模式切到了头尾
 }
 
 // NewHeadTail 构造收集器。headMax 与 tailMax **同时为 0** 表示完整保留；
@@ -55,9 +67,51 @@ func NewHeadTail(headMax, tailMax int) *HeadTail {
 	}
 }
 
+// LimitToRemaining 给完整模式挂上 §5.4 剩余磁盘配额。
+//
+// remaining 是「本条响应体还能占用的字节」：总配额减去已用再减去本条
+// 即将写入的 in/out body。负数按 0（已无空间）处理。
+//
+// overflowHead / overflowTail 是配置的 sample_resp_head/tail_bytes：
+// 超限时切到这对头尾；两者仍为 0 时，把头尾预算从 remaining 本身拆出
+// （不另造固定 KiB 上限），保证「超过剩余配额就不再全收」。
+//
+// 非完整模式（调用方已配置了正的头尾）原样返回 —— 内存本就有界。
+func (h *HeadTail) LimitToRemaining(remaining int64, overflowHead, overflowTail int) *HeadTail {
+	if h == nil || !h.full {
+		return h
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	if overflowHead < 0 {
+		overflowHead = 0
+	}
+	if overflowTail < 0 {
+		overflowTail = 0
+	}
+	h.budgetOn = true
+	h.budget = remaining
+	h.overflowHead = overflowHead
+	h.overflowTail = overflowTail
+	if remaining == 0 {
+		h.switchFromFull(nil)
+	}
+	return h
+}
+
+// QuotaOverflow 表示是否因剩余磁盘配额从完整模式切到了头尾（§5.4）。
+func (h *HeadTail) QuotaOverflow() bool {
+	return h != nil && h.quotaOverflow
+}
+
 // Write 收下一段字节。永不返回错误 —— 采集是旁路，
 // 它的失败不该以任何形式传播到转发路径上。
 func (h *HeadTail) Write(p []byte) (int, error) {
+	if h.full && h.budgetOn && h.total+int64(len(p)) > h.budget {
+		return h.writeOverBudget(p)
+	}
+
 	h.total += int64(len(p))
 
 	// 完整模式：全部进 head，tail 不用。Bytes 与 Truncated 的既有公式
@@ -67,6 +121,82 @@ func (h *HeadTail) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 
+	h.writeBounded(p)
+	return len(p), nil
+}
+
+// writeOverBudget 在完整模式撞上剩余配额时切到头尾，再写入本段。
+// 绝不先把超配额的字节 append 进 head —— 那正是本不变量要消灭的峰值。
+func (h *HeadTail) writeOverBudget(p []byte) (int, error) {
+	room := h.budget - h.total
+	if room < 0 {
+		room = 0
+	}
+	var fit []byte
+	if room > 0 {
+		if int64(len(p)) > room {
+			fit = p[:room]
+		} else {
+			fit = p
+		}
+	}
+	already := make([]byte, 0, len(h.head)+len(fit))
+	already = append(already, h.head...)
+	already = append(already, fit...)
+	rest := p[len(fit):]
+
+	h.switchFromFull(already)
+	if len(rest) > 0 {
+		h.total += int64(len(rest))
+		h.writeBounded(rest)
+	}
+	return len(p), nil
+}
+
+// switchFromFull 丢掉完整缓冲，改成有界头尾并回放已收下的前缀。
+func (h *HeadTail) switchFromFull(already []byte) {
+	headMax, tailMax := h.overflowHead, h.overflowTail
+	budget := len(already)
+	if h.budgetOn && int(h.budget) < budget {
+		budget = int(h.budget)
+	}
+	if headMax == 0 && tailMax == 0 {
+		// 配置仍是「尽量完整」：用剩余配额本身拆头尾，不另造固定封顶。
+		// 8:1 贴近历史上头大尾小的诊断比例，但字节数来自 remaining。
+		if budget <= 0 {
+			headMax, tailMax = 0, 0
+		} else if budget == 1 {
+			headMax, tailMax = 1, 0
+		} else {
+			headMax = budget * 8 / 9
+			tailMax = budget - headMax
+			if tailMax < 1 {
+				tailMax = 1
+				headMax = budget - 1
+			}
+		}
+	} else if budget > 0 && headMax+tailMax > budget {
+		// 配置头尾之和大于剩余配额时，按比例压进配额内。
+		total := headMax + tailMax
+		headMax = budget * headMax / total
+		tailMax = budget - headMax
+	}
+
+	h.quotaOverflow = true
+	h.full = false
+	h.budgetOn = false
+	h.headMax = headMax
+	h.head = make([]byte, 0, headMax)
+	h.tail = make([]byte, tailMax)
+	h.tailPos, h.tailLen = 0, 0
+	h.total = 0
+	if len(already) > 0 {
+		h.total += int64(len(already))
+		h.writeBounded(already)
+	}
+}
+
+func (h *HeadTail) writeBounded(p []byte) {
 	if n := h.headMax - len(h.head); n > 0 {
 		if n > len(p) {
 			n = len(p)
@@ -93,7 +223,6 @@ func (h *HeadTail) Write(p []byte) (int, error) {
 			h.tailLen = len(h.tail)
 		}
 	}
-	return len(p), nil
 }
 
 // Total 返回流经的总字节数（不是保存的字节数）。

@@ -276,6 +276,82 @@ func TestHeadTail_FullModeAcrossChunks(t *testing.T) {
 	}
 }
 
+// §5.4：剩余配额不够装下整段流时，采集当场改留头尾，绝不先把全文攒进 RAM。
+func TestHeadTail_RemainingQuotaSwitchesToHeadTail(t *testing.T) {
+	const budget = 200
+	ht := NewHeadTail(0, 0).LimitToRemaining(budget, 0, 0)
+
+	head := []byte("HEAD-" + strings.Repeat("h", 40))
+	mid := []byte(strings.Repeat("m", 500))
+	tail := []byte("TAIL-" + strings.Repeat("t", 40) + "-end")
+	stream := append(append(append([]byte{}, head...), mid...), tail...)
+
+	// 分块写入，模拟 streamBody 的真实路径
+	for i := 0; i < len(stream); i += 37 {
+		end := i + 37
+		if end > len(stream) {
+			end = len(stream)
+		}
+		ht.Write(stream[i:end])
+	}
+
+	if ht.Total() != int64(len(stream)) {
+		t.Fatalf("Total 应记全部流经字节 %d，得到 %d", len(stream), ht.Total())
+	}
+	if !ht.QuotaOverflow() {
+		t.Fatal("超过剩余配额应标记 QuotaOverflow")
+	}
+	if !ht.Truncated() {
+		t.Fatal("超配额后样本应标记截断")
+	}
+	got := ht.Bytes()
+	if bytes.Equal(got, stream) {
+		t.Fatal("样本不得保留完整流 —— 那正是配额旁路要避免的峰值内存")
+	}
+	if len(got) > budget+64 { // 省略标记有少量开销
+		t.Fatalf("留存应落在剩余配额附近，got %d budget %d", len(got), budget)
+	}
+	if !bytes.Contains(got, []byte("HEAD-")) {
+		t.Errorf("应保留头部，得到 %q", got)
+	}
+	if !bytes.Contains(got, []byte("-end")) {
+		t.Errorf("应保留尾部，得到 %q", got)
+	}
+	// 内存中的 head+tail 缓冲不得超过 budget
+	if len(ht.head)+ht.tailLen > budget {
+		t.Fatalf("内部缓冲 %d 超过剩余配额 %d", len(ht.head)+ht.tailLen, budget)
+	}
+}
+
+// 剩余配额够用时，0/0 仍完整保留（不得误切头尾）。
+func TestHeadTail_RemainingQuotaAllowsFullWhenFits(t *testing.T) {
+	data := []byte("event: message_start\ndata: {\"ok\":true}\n\n")
+	ht := NewHeadTail(0, 0).LimitToRemaining(int64(len(data)+100), 0, 0)
+	ht.Write(data)
+
+	if ht.QuotaOverflow() {
+		t.Fatal("配额充足时不应切头尾")
+	}
+	if ht.Truncated() {
+		t.Fatal("配额充足时不应截断")
+	}
+	if !bytes.Equal(ht.Bytes(), data) {
+		t.Fatalf("应完整保留，got %q", ht.Bytes())
+	}
+}
+
+// 配置了正的头尾时 LimitToRemaining 是空操作：调用方已选择有界模式。
+func TestHeadTail_LimitToRemainingNoopWhenBounded(t *testing.T) {
+	ht := NewHeadTail(10, 10).LimitToRemaining(5, 10, 10)
+	ht.Write([]byte(strings.Repeat("x", 100)))
+	if ht.QuotaOverflow() {
+		t.Fatal("有界模式不应走配额切换路径")
+	}
+	if !ht.Truncated() {
+		t.Fatal("有界模式超长仍应截断")
+	}
+}
+
 // head=0 但 tail>0 仍是**有界**的「只留尾」，不能被当成不限。
 //
 // 这条钉的是 full 标志为什么不能写成 headMax==0：混为一谈的话，

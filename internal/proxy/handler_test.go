@@ -1163,6 +1163,68 @@ func TestSample_LargeSSEKeepsHeadAndTail(t *testing.T) {
 	}
 }
 
+// §5.4：剩余样本磁盘配额小于响应流时，样本不得保留全文；客户端仍收齐每一字节。
+// 配额充足的短响应仍完整落库（0/0 默认不被改成固定封顶）。
+func TestSample_RemainingDiskQuotaSwitchesCapture(t *testing.T) {
+	const chunks = 80
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		w.Write([]byte("event: message_start\ndata: {\"head\":true}\n\n"))
+		fl.Flush()
+		for i := 0; i < chunks; i++ {
+			w.Write([]byte("data: " + strings.Repeat("m", 200) + "\n\n"))
+		}
+		w.Write([]byte("event: message_stop\ndata: {\"usage\":{\"output_tokens\":7}}\n\n"))
+		fl.Flush()
+	})
+	// 默认 0/0 = 完整保留；人为把「剩余配额」压到远小于流长度，
+	// 但仍够头尾各留一点（usage 关键字要落在尾环里）。
+	hs.cfg.settings.SampleRespHeadBytes = 0
+	hs.cfg.settings.SampleRespTailBytes = 0
+	hs.cfg.settings.SampleDiskQuotaBytes = 5 << 30
+	hs.h.WithSampleDiskStat(fixedSampleDisk{used: 5<<30 - 800})
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+
+	if n := strings.Count(rec.Body.String(), "data: "); n != chunks+2 {
+		t.Errorf("客户端应收到全部 %d 个事件，得到 %d", chunks+2, n)
+	}
+
+	smp := hs.sink.one(t)
+	if len(smp.RespBody) >= 80*200 {
+		t.Fatalf("样本不得保留接近完整流（%d 字节）—— 剩余配额已不够", len(smp.RespBody))
+	}
+	if !smp.Truncated.Has(model.TruncRespBody) {
+		t.Error("超剩余配额应标记 resp_body 截断")
+	}
+	if !bytes.Contains(smp.RespBody, []byte("message_start")) {
+		t.Error("应保留头部")
+	}
+	if !bytes.Contains(smp.RespBody, []byte("output_tokens")) {
+		t.Error("应保留尾部 usage")
+	}
+
+	// 配额充足时短响应仍全文落库
+	hs2 := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"msg_small","ok":true}`))
+	})
+	hs2.cfg.settings.SampleDiskQuotaBytes = 5 << 30
+	hs2.h.WithSampleDiskStat(fixedSampleDisk{used: 0})
+	hs2.serve(hs2.anthropicRequest(`{"model":"claude-opus-5"}`))
+	small := hs2.sink.one(t)
+	if !bytes.Equal(small.RespBody, []byte(`{"id":"msg_small","ok":true}`)) {
+		t.Fatalf("配额充足时应完整保留，得到 %q", small.RespBody)
+	}
+	if small.Truncated.Has(model.TruncRespBody) {
+		t.Error("配额充足的短响应不应标记截断")
+	}
+}
+
+type fixedSampleDisk struct{ used int64 }
+
+func (f fixedSampleDisk) SampleDiskBytes() (int64, error) { return f.used, nil }
+
 // 上游 500 的样本必须完整落库。恰恰是失败的那次，
 // 才需要知道「我到底发了什么头过去」。
 func TestSample_RecordsUpstreamFailure(t *testing.T) {
