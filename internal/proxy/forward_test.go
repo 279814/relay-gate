@@ -266,13 +266,14 @@ func TestForward_FirstTokenTimeout(t *testing.T) {
 	}
 }
 
-// 流内静默超时：首字节来了，之后卡住。
-// 与首 Token 超时必须区分开 —— 两者对健康状态的含义不同。
+// 流内静默超时：首语义证据来了，之后卡住。
+// 与首 Token / 首语义超时必须区分开 —— 两者对健康状态的含义不同。
 func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	release := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Write([]byte("data: first\n\n"))
+		// 必须是 §8.8 语义证据：裸 "data: first" 不能结束 FirstToken。
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
 		w.(http.Flusher).Flush()
 		<-release // 之后再不吐东西
 	}))
@@ -292,11 +293,11 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 		t.Errorf("应在 Idle 超时（400ms）后中断，实际 %v", elapsed)
 	}
 	// 已收到的部分必须已经传给客户端
-	if !strings.Contains(rec.Body.String(), "data: first") {
-		t.Error("首字节应已写给客户端")
+	if !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Error("首语义应已写给客户端")
 	}
-	if res.FirstByteAt.IsZero() {
-		t.Error("应记录首字节时刻")
+	if !res.SemanticSeen || res.FirstSemanticAt.IsZero() {
+		t.Error("应记录首语义时刻")
 	}
 	// 不断言 TTFT > 0：环回连接上上游立刻回写，两次 time.Now() 可能
 	// 落在同一个时钟刻度里（Windows 单调时钟粒度约 0.5–1ms），
@@ -306,26 +307,26 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	}
 }
 
-// TTFT 的契约：两个时间戳都有才算得出来，缺任何一个返回 0。
+// TTFT 的契约：SentAt 与 FirstSemanticAt 都有才算得出来，缺任何一个返回 0。
 //
 // 返回 0 而不是负数或 panic 是刻意的：调用方（健康状态机、样本记录）
-// 用 0 表示「没测到」，而首 Token 超时的样本正是 FirstByteAt 为零的那种。
+// 用 0 表示「没测到」，而未见语义证据的样本正是 FirstSemanticAt 为零的那种。
 func TestResult_TTFT(t *testing.T) {
 	base := time.Now()
 	cases := []struct {
-		name        string
-		sent, first time.Time
-		want        time.Duration
+		name           string
+		sent, semantic time.Time
+		want           time.Duration
 	}{
 		{"正常", base, base.Add(3200 * time.Millisecond), 3200 * time.Millisecond},
 		{"同一刻度", base, base, 0},
-		{"没收到首字节", base, time.Time{}, 0},
+		{"没收到首语义", base, time.Time{}, 0},
 		{"没发出去", time.Time{}, base, 0},
 		{"两个都没有", time.Time{}, time.Time{}, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := &Result{SentAt: c.sent, FirstByteAt: c.first}
+			r := &Result{SentAt: c.sent, FirstSemanticAt: c.semantic}
 			if got := r.TTFT(); got != c.want {
 				t.Errorf("want %v got %v", c.want, got)
 			}
@@ -333,9 +334,10 @@ func TestResult_TTFT(t *testing.T) {
 	}
 }
 
-// 长思考场景：首字节来得很慢，但只要在 FirstToken 时限内就必须放过，
+// 长思考场景：首语义来得很慢，但只要在 FirstToken 时限内就必须放过，
 // 之后持续吐 delta 也不能被 Idle 超时打断。这是 5 分钟下限要保护的场景。
 func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
+	delta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n")
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -343,7 +345,7 @@ func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 		fl.Flush()
 		time.Sleep(350 * time.Millisecond) // 慢，但在 FirstToken(600ms) 内
 		for i := 0; i < 4; i++ {
-			w.Write([]byte("data: thinking\n\n"))
+			_, _ = w.Write(delta)
 			fl.Flush()
 			time.Sleep(200 * time.Millisecond) // 小于 Idle(400ms)
 		}
@@ -357,7 +359,7 @@ func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("慢首 Token + 稳定流不该超时，得到 %v", res.Err)
 	}
-	if n := strings.Count(rec.Body.String(), "data: thinking"); n != 4 {
+	if n := strings.Count(rec.Body.String(), `"text":"x"`); n != 4 {
 		t.Errorf("应收到 4 个 chunk，得到 %d", n)
 	}
 }
@@ -370,11 +372,12 @@ func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 // 单次运行可能碰巧通过，所以这里用 20 个 chunk 把概率压到可忽略。
 func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 	const chunks = 20
+	delta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"d\"}}\n\n")
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
 		for i := 0; i < chunks; i++ {
-			w.Write([]byte("data: delta\n\n"))
+			_, _ = w.Write(delta)
 			fl.Flush()
 			time.Sleep(15 * time.Millisecond) // 分时到达，逼出上述竞态
 		}
@@ -388,7 +391,7 @@ func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("稳定流不该出错，得到 %v", res.Err)
 	}
-	if n := strings.Count(rec.Body.String(), "data: delta"); n != chunks {
+	if n := strings.Count(rec.Body.String(), `"text":"d"`); n != chunks {
 		t.Errorf("应完整收到 %d 个 chunk，实际 %d —— 流被中途截断", chunks, n)
 	}
 }
@@ -399,6 +402,7 @@ func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 // 但请求是用那个 context 建的，cancel 会连带取消整个响应体读取，
 // 流当场断在第一块。真实的长思考正是这个形状：头秒回，body 慢慢吐。
 func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
+	delta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"c\"}}\n\n")
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200) // 头立刻回
@@ -406,7 +410,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 		// 之后每块都比 FirstToken(300ms) 晚，但都在 Idle(400ms) 之内
 		for i := 0; i < 6; i++ {
 			time.Sleep(200 * time.Millisecond)
-			w.Write([]byte("data: chunk\n\n"))
+			_, _ = w.Write(delta)
 			w.(http.Flusher).Flush()
 		}
 	}))
@@ -419,7 +423,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("头快 body 慢的流不该出错，得到 %v", res.Err)
 	}
-	if n := strings.Count(rec.Body.String(), "data: chunk"); n != 6 {
+	if n := strings.Count(rec.Body.String(), `"text":"c"`); n != 6 {
 		t.Errorf("应完整收到 6 块，实际 %d —— 响应头时限误伤了 body 读取", n)
 	}
 }

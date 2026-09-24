@@ -134,13 +134,11 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		!IsStructuredErrorPayload(out.Body, out.Header.Get("Content-Type")) &&
 		HasSemanticEvidence(out.Body, out.Header.Get("Content-Type")) {
 		res.SemanticSeen = true
+		res.stampFirstSemantic(f)
 	}
 	now := time.Now()
 	if n > 0 && res.FirstByteAt.IsZero() {
 		res.FirstByteAt = now
-		if f.OnFirstByte != nil {
-			f.OnFirstByte()
-		}
 	}
 	if werr != nil && res.Err == nil {
 		res.Err = werr
@@ -227,13 +225,11 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			semSniffer.Feed(ev.Raw[:wn], ct)
 			if semSniffer.Seen() {
 				res.SemanticSeen = true
+				res.stampFirstSemantic(f)
 			}
 		}
 		if res.FirstByteAt.IsZero() && wn > 0 {
 			res.FirstByteAt = time.Now()
-			if f.OnFirstByte != nil {
-				f.OnFirstByte()
-			}
 		}
 		return werr
 	}
