@@ -109,7 +109,6 @@ func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
 	}
 }
 
-
 func TestCapabilityRegistry_CASKeepsHigherOrder(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
