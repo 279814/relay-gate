@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/revisioncodec"
 )
@@ -78,12 +79,12 @@ func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	reg.now = func() time.Time { return now }
 
-	reg.MarkCountTokensUnsupported(7, 500)
+	reg.MarkCountTokensUnsupported(7, 0, 500)
 	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
 		t.Fatalf("500 marked unsupported: %s", got)
 	}
 
-	reg.MarkCountTokensUnsupported(7, 404)
+	reg.MarkCountTokensUnsupported(7, 0, 404)
 	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
 		t.Fatalf("404 effective=%s, want unsupported", got)
 	}
@@ -115,16 +116,16 @@ func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	reg.now = func() time.Time { return now }
 
-	reg.MarkCountTokensConfigError(7, 500)
+	reg.MarkCountTokensConfigError(7, 0, 500)
 	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
 		t.Fatalf("500 marked config_error: %s", got)
 	}
-	reg.MarkCountTokensConfigError(7, 404)
+	reg.MarkCountTokensConfigError(7, 0, 404)
 	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
 		t.Fatalf("404 marked config_error: %s", got)
 	}
 
-	reg.MarkCountTokensConfigError(7, 401)
+	reg.MarkCountTokensConfigError(7, 0, 401)
 	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
 		t.Fatalf("401 effective=%s, want config_error", got)
 	}
@@ -145,13 +146,77 @@ func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	// 404 remains unsupported, not overwritten by a later mis-mark as config_error path.
 	reg2 := NewCapabilityRegistry(capSettings{settings})
 	reg2.now = func() time.Time { return now }
-	reg2.MarkCountTokensUnsupported(8, 404)
+	reg2.MarkCountTokensUnsupported(8, 0, 404)
 	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
 		t.Fatalf("404 effective=%s, want unsupported", got)
 	}
-	reg2.MarkCountTokensConfigError(8, 500)
+	reg2.MarkCountTokensConfigError(8, 0, 500)
 	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
 		t.Fatalf("500 must not change unsupported to %s", got)
+	}
+}
+
+// Delete + recreate can reuse a SQLite route rowid. InvalidateRoute clears
+// Capability, but a late count_tokens Mark* that skips the RouteHealth
+// generation check would re-poison the new incarnation — same hole as
+// TestReportResult_ModelNotFound_LateAfterReuseDoesNotPoison.
+func TestCapabilityRegistry_MarkCountTokens_LateAfterReuseDoesNotPoison(t *testing.T) {
+	const routeID int64 = 42
+	settings := model.DefaultSettings()
+	caps := NewCapabilityRegistry(capSettings{settings})
+	tr := health.NewTracker(nil)
+	caps.WithRouteGeneration(tr)
+	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
+
+	oldGen := tr.EnsureGeneration(routeID)
+
+	caps.MarkCountTokensUnsupported(routeID, oldGen, 404)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("live 404 capability=%s want unsupported", got)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages leaked: %s", got)
+	}
+
+	sem.InvalidateRoute(routeID)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got == model.CapabilityUnsupported {
+		t.Fatal("InvalidateRoute must clear count_tokens unsupported")
+	}
+
+	newGen := tr.EnsureGeneration(routeID)
+	if newGen == 0 || newGen == oldGen {
+		t.Fatalf("reused id must get a new generation: old=%d new=%d", oldGen, newGen)
+	}
+
+	// Late 404 from the deleted incarnation must not mark the new route.
+	caps.MarkCountTokensUnsupported(routeID, oldGen, 404)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("stale 404 must not leave reused id unsupported, got %s", got)
+	}
+
+	// Late 401 must not mark config_error either.
+	caps.MarkCountTokensConfigError(routeID, oldGen, 401)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("stale 401 must not leave reused id config_error, got %s", got)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages must stay untouched, got %s", got)
+	}
+
+	// Matching generation on the live reuse still marks.
+	caps.MarkCountTokensUnsupported(routeID, newGen, 404)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("live reused 404 capability=%s want unsupported", got)
+	}
+
+	sem.InvalidateRoute(routeID)
+	newGen2 := tr.EnsureGeneration(routeID)
+	caps.MarkCountTokensConfigError(routeID, newGen2, 401)
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
+		t.Fatalf("live reused 401 capability=%s want config_error", got)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages must stay untouched after config_error mark, got %s", got)
 	}
 }
 

@@ -28,6 +28,11 @@ type CapabilityRegistry struct {
 	rows     map[capabilityKey]*model.EndpointCapability
 	now      func() time.Time
 	settings SettingsSource
+	// routeGen peeks RouteHealth generation for real-traffic count_tokens
+	// marks (same incarnation check as Reporter.routeGenerationCurrent).
+	routeGen interface {
+		GenerationOf(routeID int64) uint64
+	}
 }
 
 // SettingsSource 提供读侧失效所需的当前 Settings。
@@ -42,6 +47,17 @@ func NewCapabilityRegistry(settings SettingsSource) *CapabilityRegistry {
 		now:      time.Now,
 		settings: settings,
 	}
+}
+
+// WithRouteGeneration binds RouteHealth generation peeks so MarkCountTokens*
+// can drop stale writes after delete+reinsert reused a numeric route id.
+func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
+	GenerationOf(routeID int64) uint64
+}) *CapabilityRegistry {
+	if registry != nil {
+		registry.routeGen = viewer
+	}
+	return registry
 }
 
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
@@ -108,11 +124,18 @@ func (registry *CapabilityRegistry) Snapshot(scope model.RecipeScope, scopeID in
 // Does not touch RouteHealth or other endpoints (messages stays selectable).
 // TTL comes from the existing CapabilityReductionPolicy; config changes still
 // clear via fingerprint / Invalidate — no new invalidation trigger.
-func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, statusCode int) {
+//
+// generation is the RouteHealth generation captured at select/TryAcquire;
+// mismatched generations drop ApplyCommitted (same hole as real-traffic
+// model_not_found after delete+reinsert reused the numeric id).
+func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, generation uint64, statusCode int) {
 	if registry == nil || routeID <= 0 {
 		return
 	}
 	if statusCode != 404 && statusCode != 405 {
+		return
+	}
+	if !registry.routeGenerationCurrent(routeID, generation) {
 		return
 	}
 	selector := model.EvidencePolicySelector{
@@ -155,11 +178,15 @@ func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, st
 // MarkCountTokensConfigError records §10.3: upstream 401/403 on count_tokens
 // → that Route's count_tokens Capability is config_error (端点配置错误).
 // Does not touch RouteHealth or other endpoints; ExpiresAt stays 0 (§8.13).
-func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, statusCode int) {
+// generation mirrors MarkCountTokensUnsupported (drop stale after id reuse).
+func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, generation uint64, statusCode int) {
 	if registry == nil || routeID <= 0 {
 		return
 	}
 	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		return
+	}
+	if !registry.routeGenerationCurrent(routeID, generation) {
 		return
 	}
 	selector := model.EvidencePolicySelector{
@@ -193,6 +220,18 @@ func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, st
 		ExpiresAt:                0, // §8.13: config_error 不自动过期
 		RedactedDetail:           string(model.ErrorAuthRejected),
 	})
+}
+
+// routeGenerationCurrent mirrors Reporter.routeGenerationCurrent for count_tokens
+// marks: generation == 0 is unbound (tests / no viewer) and still applies.
+func (registry *CapabilityRegistry) routeGenerationCurrent(routeID int64, generation uint64) bool {
+	if generation == 0 {
+		return true
+	}
+	if registry == nil || registry.routeGen == nil {
+		return true
+	}
+	return registry.routeGen.GenerationOf(routeID) == generation
 }
 
 // Invalidate 丢弃一行（配置变更后立即 effective unknown）。
