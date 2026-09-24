@@ -30,6 +30,12 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnsafeLockPath, err)
 	}
+	// Fail closed like restore: a symlink/junction database path would take a
+	// different "<path>.lock" than the real file, so two Opens could migrate
+	// and serve the same SQLite file. Refuse before locking.
+	if err := rejectSymlinkDatabasePath(absolute); err != nil {
+		return nil, err
+	}
 	parent := filepath.Dir(absolute)
 	resolvedParent, err := filepath.EvalSymlinks(parent)
 	if err != nil {
@@ -41,7 +47,7 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 
 	lockPath := absolute + ".lock"
 	if info, statErr := os.Lstat(lockPath); statErr == nil {
-		if info.Mode()&os.ModeSymlink != 0 || pathInfoIsReparsePoint(info) {
+		if isSymlinkOrReparse(info) {
 			return nil, fmt.Errorf("%w: %s", ErrUnsafeLockPath, lockPath)
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -57,7 +63,7 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 		return nil, fmt.Errorf("收紧数据库锁文件权限: %w", err)
 	}
 	info, err := os.Lstat(lockPath)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || pathInfoIsReparsePoint(info) {
+	if err != nil || isSymlinkOrReparse(info) {
 		_ = file.Close()
 		return nil, fmt.Errorf("%w: 锁文件在打开时发生变化", ErrUnsafeLockPath)
 	}
@@ -66,6 +72,26 @@ func acquireInstanceLock(databasePath string) (*instanceLock, error) {
 		return nil, err
 	}
 	return &instanceLock{file: file}, nil
+}
+
+// rejectSymlinkDatabasePath refuses a configured DB path that is itself a
+// symlink or reparse point. A missing path is allowed (first Open creates it).
+func rejectSymlinkDatabasePath(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("检查数据库路径: %w", err)
+	}
+	if isSymlinkOrReparse(info) {
+		return fmt.Errorf("%w: %s 是 symlink/reparse point", ErrUnsafeLockPath, path)
+	}
+	return nil
+}
+
+func isSymlinkOrReparse(info os.FileInfo) bool {
+	return info.Mode()&os.ModeSymlink != 0 || pathInfoIsReparsePoint(info)
 }
 
 func sameFilesystemPath(left, right string) bool {
