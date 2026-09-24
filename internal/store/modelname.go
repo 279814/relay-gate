@@ -198,10 +198,72 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 	return tx.Commit()
 }
 
-func (s *Store) DeleteModelName(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM model_name WHERE id = ?`, id)
+// DeleteModelName removes a ModelName and detaches probe recipes on its child
+// Routes. Routes CASCADE without going through DeleteRoute, and probe_recipe
+// / probe_execution pin route_id with ON DELETE RESTRICT — so a bare DELETE
+// either fails when recipes exist, or (if those pins were cleared some other
+// way) would leave published rows keyed by the numeric route id for SQLite
+// reuse. Archive + re-home onto each Route's Upstream in the same transaction
+// as the delete; upstream-scoped recipes are untouched.
+func (s *Store) DeleteModelName(id int64) (err error) {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var exists int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM model_name WHERE id=?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+
+	rows, err := tx.Query(`SELECT id, upstream_id FROM route WHERE model_name_id=?`, id)
+	if err != nil {
+		return err
+	}
+	type childRoute struct {
+		id         int64
+		upstreamID int64
+	}
+	children := make([]childRoute, 0, 4)
+	for rows.Next() {
+		var child childRoute
+		if err = rows.Scan(&child.id, &child.upstreamID); err != nil {
+			rows.Close()
+			return err
+		}
+		children = append(children, child)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, child := range children {
+		// Same helper as DeleteRoute: archive and re-home onto the Route's
+		// Upstream so CHECK still holds while route_id is cleared.
+		if err = detachProbeRecipesRehomeTx(tx, child.upstreamID, `route_id=?`, child.id); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, child.id); err != nil {
+			return err
+		}
+	}
+
+	res, err := tx.Exec(`DELETE FROM model_name WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if err = checkAffected(res); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

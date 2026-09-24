@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
@@ -458,5 +459,61 @@ func TestDeleteModelNameCascadesRoutes(t *testing.T) {
 		if got.ID == r.ID {
 			t.Fatal("删除 ModelName 后它的 Route 仍在（ON DELETE CASCADE 未生效）")
 		}
+	}
+}
+
+// DeleteModelName archives child-route recipes in the same transaction as the
+// DELETE. A RESTRICT pin that blocks CASCADE must roll the archive back so a
+// still-living ModelName does not lose its published route recipe.
+func TestDeleteModelName_RollbackKeepsChildRouteRecipes(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	up := mkUpstream(t, st, "mn-rb-up")
+	mn := mkModelName(t, st, "mn-rb", model.ProtoAnthropic)
+	r := &model.Route{ModelNameID: mn.ID, UpstreamID: up.ID}
+	r.Defaults()
+	if err := st.CreateRoute(r); err != nil {
+		t.Fatal(err)
+	}
+	recipeID, err := st.CreateRecipe(model.RecipeScopeRoute, r.ID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := &model.ProbeRecipeVersion{
+		RecipeID: recipeID, Origin: model.RecipeManual, Method: "GET",
+		TimeoutProfile: model.TimeoutL1,
+	}
+	if err := st.AddRecipeVersion(version, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE probe_recipe SET status='published',published_version_id=?,
+		revision=revision+1,active_binding_revision=active_binding_revision+1,updated_at=? WHERE id=?`,
+		version.ID, nowMS(), recipeID); err != nil {
+		t.Fatal(err)
+	}
+	// calibration_run RESTRICT blocks Route CASCADE; DeleteModelName does not
+	// clear it, so the whole transaction (including recipe archive) must roll back.
+	if _, err := st.db.Exec(`INSERT INTO calibration_run (id,route_id,endpoint,state,created_at)
+		VALUES ('mn-rb-cal',?,'models','planned',?)`, r.ID, nowMS()); err != nil {
+		t.Fatal(err)
+	}
+
+	err = st.DeleteModelName(mn.ID)
+	if err == nil {
+		t.Fatal("DeleteModelName must fail while calibration_run pins the route")
+	}
+	if _, err := st.GetModelName(mn.ID); err != nil {
+		t.Fatalf("model name must still exist after rollback: %v", err)
+	}
+	recipe, err := st.GetRecipe(ctx, recipeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recipe.Status != model.RecipePublished || recipe.ScopeType != model.RecipeScopeRoute || recipe.ScopeID != r.ID {
+		t.Fatalf("rolled-back delete must not archive recipe: status=%s scope=%s/%d",
+			recipe.Status, recipe.ScopeType, recipe.ScopeID)
+	}
+	if _, err := st.PublishedRouteRecipe(ctx, r.ID, model.EndpointModels); err != nil {
+		t.Fatalf("published binding must remain: %v", err)
 	}
 }
