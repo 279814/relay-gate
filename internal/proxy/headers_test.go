@@ -357,9 +357,9 @@ func TestFinalizeClientResponseHeaders_DropsGatewaySessionSetCookie(t *testing.T
 		}
 	}
 	wantKeep := map[string]bool{
-		"other=1":                         false,
-		"Relay_Session=case-differs":      false,
-		"prefix_" + gatewaySessionCookie + "=not-exact": false,
+		"other=1":                    false,
+		"Relay_Session=case-differs": false,
+		"prefix_" + gatewaySessionCookie + "=not-exact":  false,
 		"keep=has-" + gatewaySessionCookie + "-in-value": false,
 	}
 	for _, line := range got {
