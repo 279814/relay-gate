@@ -4,6 +4,7 @@ import (
 	"net/smtp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/279814/relay-gate/internal/security"
 )
@@ -86,4 +87,106 @@ func atoiPort(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// §14.6: Critical may send immediately; medium/low aggregate; same finding
+// is deduped/rate-limited. Dedup key is category|upstream (no raw body/secrets).
+func TestAlertMailer_CriticalImmediate_NonCriticalDigestDedupe(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	var captured []string
+	m := security.NewAlertMailer().
+		WithNowForTest(func() time.Time { return now }).
+		WithSendForTest(func(a string, auth smtp.Auth, from string, to []string, msg []byte) error {
+			captured = append(captured, string(msg))
+			return nil
+		})
+	m.SetConfig(security.MailConfig{
+		Enabled:     true,
+		Host:        "smtp.test.local",
+		Port:        587,
+		From:        "relay@test.local",
+		Recipients:  []string{"ops@test.local"},
+		MinSeverity: security.SeverityInfo,
+	})
+
+	medium := security.Finding{
+		ID:       "m1",
+		Severity: security.SeverityMedium,
+		Category: "xss_pattern",
+		Summary:  "检测到 HTML 事件属性",
+		Detail:   "raw body with secret sk-SECRET must not be a dedupe key",
+		Upstream: "up-a",
+		RouteID:  7,
+		Source:   "passive",
+	}
+	if err := m.MaybeNotify(medium, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MaybeNotify(medium, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 0 {
+		t.Fatalf("non-critical must not send immediately; got %d mails", len(captured))
+	}
+
+	crit := security.Finding{
+		ID:       "c1",
+		Severity: security.SeverityCritical,
+		Category: "credential_leak",
+		Summary:  "known credential fragment",
+		Upstream: "up-b",
+		Source:   "passive",
+	}
+	if err := m.MaybeNotify(crit, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("critical must send immediately without waiting for digest; got %d", len(captured))
+	}
+	if !strings.Contains(captured[0], "severity: critical") {
+		t.Fatalf("expected immediate critical mail, got: %s", captured[0])
+	}
+	if strings.Contains(captured[0], "sk-SECRET") || strings.Contains(captured[0], "raw body") {
+		t.Fatal("secret/raw body leaked into critical mail")
+	}
+
+	// Second identical critical inside rate window must not send again.
+	if err := m.MaybeNotify(crit, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("identical critical inside window must be rate-limited; got %d", len(captured))
+	}
+
+	now = now.Add(5 * time.Minute)
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("want one digest after flush; got %d mails", len(captured))
+	}
+	digest := captured[1]
+	if !strings.Contains(digest, "security digest") {
+		t.Fatalf("expected digest subject/body, got: %s", digest)
+	}
+	if !strings.Contains(digest, "unique_findings: 1") {
+		t.Fatalf("two identical medium findings must dedupe to one digest item: %s", digest)
+	}
+	if !strings.Contains(digest, "count=2") {
+		t.Fatalf("digest should record duplicate count: %s", digest)
+	}
+	if strings.Contains(digest, "sk-SECRET") || strings.Contains(digest, "raw body with secret") {
+		t.Fatal("detail/secret must not appear in digest")
+	}
+
+	// Same medium identity still inside rate window after digest → no second digest.
+	if err := m.MaybeNotify(medium, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("rate-limited medium must not produce another digest; got %d", len(captured))
+	}
 }
