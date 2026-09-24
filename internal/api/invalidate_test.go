@@ -524,6 +524,9 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 	if !caps.has(rtID) {
 		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
 	}
+	if !caps.hasUpstream(upID) {
+		t.Fatalf("upstream-scoped Capability 必须清除，upstreamCleared=%v", caps.upstreamCleared)
+	}
 	_, ups, _ := inner.counts()
 	if ups < 1 {
 		t.Fatal("delete upstream 应调用 InvalidateUpstream")
@@ -599,18 +602,31 @@ func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 }
 
 type recordingCaps struct {
-	cleared []int64
+	cleared         []int64
+	upstreamCleared []int64
 }
 
 func (r *recordingCaps) InvalidateScope(scope model.RecipeScope, scopeID int64) {
-	if scope == model.RecipeScopeRoute {
+	switch scope {
+	case model.RecipeScopeRoute:
 		r.cleared = append(r.cleared, scopeID)
+	case model.RecipeScopeUpstream:
+		r.upstreamCleared = append(r.upstreamCleared, scopeID)
 	}
 }
 
 func (r *recordingCaps) has(routeID int64) bool {
 	for _, id := range r.cleared {
 		if id == routeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingCaps) hasUpstream(upstreamID int64) bool {
+	for _, id := range r.upstreamCleared {
+		if id == upstreamID {
 			return true
 		}
 	}

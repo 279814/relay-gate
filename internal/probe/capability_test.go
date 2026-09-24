@@ -156,6 +156,73 @@ func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	}
 }
 
+// Delete Upstream runs SemanticInvalidator.InvalidateUpstream before CASCADE.
+// Upstream-scoped L1 verdicts (unsupported / config_error) must be dropped so a
+// reused SQLite upstream id is unknown until a new observation — without
+// clearing another upstream's rows or regressing child route clears.
+func TestInvalidateUpstream_ClearsUpstreamScopedCapability(t *testing.T) {
+	const (
+		deletedUp  int64 = 10
+		otherUp    int64 = 20
+		childRoute int64 = 100
+		otherRoute int64 = 200
+	)
+	settings := model.DefaultSettings()
+	caps := NewCapabilityRegistry(capSettings{settings})
+	sem := health.NewSemanticInvalidator(nil, nil, caps, nil, nil)
+
+	l1 := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	l2 := model.EvidencePolicySelector{
+		Kind: model.EvidenceL2, Endpoint: model.EndpointMessages, TimeoutProfile: model.TimeoutL2Standard,
+	}
+	l1FP := mustCapFP(t, settings, l1)
+	l2FP := mustCapFP(t, settings, l2)
+
+	caps.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: deletedUp, Endpoint: model.EndpointModels,
+		PolicySelector: l1, State: model.CapabilityUnsupported,
+		ObservationToken: "tok-del", ProbeSettingsFingerprint: l1FP,
+		LastObservationOrder: 1, ErrorClass: model.ErrorUnsupported,
+	})
+	caps.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: otherUp, Endpoint: model.EndpointModels,
+		PolicySelector: l1, State: model.CapabilityConfigError,
+		ObservationToken: "tok-other", ProbeSettingsFingerprint: l1FP,
+		LastObservationOrder: 1, ErrorClass: model.ErrorAuthRejected, ExpiresAt: 0,
+	})
+	caps.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeRoute, ScopeID: childRoute, Endpoint: model.EndpointMessages,
+		PolicySelector: l2, State: model.CapabilityUnsupported,
+		ObservationToken: "tok-child", ProbeSettingsFingerprint: l2FP,
+		LastObservationOrder: 1, ErrorClass: model.ErrorUnsupported,
+	})
+	caps.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeRoute, ScopeID: otherRoute, Endpoint: model.EndpointMessages,
+		PolicySelector: l2, State: model.CapabilityUnsupported,
+		ObservationToken: "tok-keep", ProbeSettingsFingerprint: l2FP,
+		LastObservationOrder: 1, ErrorClass: model.ErrorUnsupported,
+	})
+
+	if got := caps.Effective(model.RecipeScopeUpstream, deletedUp, model.EndpointModels, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("setup deleted upstream capability=%s want unsupported", got)
+	}
+
+	sem.InvalidateUpstream(deletedUp, []int64{childRoute})
+
+	if got := caps.Effective(model.RecipeScopeUpstream, deletedUp, model.EndpointModels, ""); got != model.CapabilityUnknown {
+		t.Fatalf("deleted upstream capability=%s want unknown (reused id must not inherit)", got)
+	}
+	if got := caps.Effective(model.RecipeScopeUpstream, otherUp, model.EndpointModels, ""); got != model.CapabilityConfigError {
+		t.Fatalf("other upstream capability=%s want config_error retained", got)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, childRoute, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("child route capability=%s want unknown", got)
+	}
+	if got := caps.Effective(model.RecipeScopeRoute, otherRoute, model.EndpointMessages, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("unrelated route capability=%s want unsupported retained", got)
+	}
+}
+
 // Delete + recreate can reuse a SQLite route rowid. InvalidateRoute clears
 // Capability, but a late count_tokens Mark* that skips the RouteHealth
 // generation check would re-poison the new incarnation — same hole as

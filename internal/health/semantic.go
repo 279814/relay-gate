@@ -72,12 +72,19 @@ func (s *SemanticInvalidator) InvalidateRoute(routeID int64) {
 
 // InvalidateUpstream clears reachability-adjacent Route state for every known
 // Route under upstreamID when the caller also passes those route IDs.
+//
+// Also drops EndpointCapability rows keyed by RecipeScopeUpstream + upstreamID
+// (L1 /models unsupported / config_error). Without this, delete + SQLite rowid
+// reuse would inherit the old station verdict until a new observation.
 func (s *SemanticInvalidator) InvalidateUpstream(upstreamID int64, routeIDs []int64) {
 	if s == nil {
 		return
 	}
 	for _, id := range routeIDs {
 		s.InvalidateRoute(id)
+	}
+	if s.caps != nil && upstreamID > 0 {
+		s.caps.InvalidateScope(model.RecipeScopeUpstream, upstreamID)
 	}
 	if s.learner != nil && upstreamID > 0 {
 		s.learner.ForgetUpstream(upstreamID)
