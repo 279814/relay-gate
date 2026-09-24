@@ -347,6 +347,47 @@ func TestCountTokens_ProxiesToUpstreamWhenSupported(t *testing.T) {
 	}
 }
 
+// §10.4：上游 count_tokens 若带回 X-Relay-Count-Tokens，客户端不得见到；
+// body 与其它端到端头仍透传。本地估算路径仍必须打该头。
+func TestCountTokens_StripsUpstreamCountTokensHeader(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(headerRelayCountTokens, "estimated")
+		w.Header().Set("X-Request-Id", "up-ct-1")
+		w.Write([]byte(`{"input_tokens":99}`))
+	})
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := decodeInputTokens(t, rec.Body.String()); got != 99 {
+		t.Errorf("input_tokens = %d, want 99（上游 body 须透传）", got)
+	}
+	if v := rec.Header().Get(headerRelayCountTokens); v != "" {
+		t.Errorf("client saw X-Relay-Count-Tokens = %q, want stripped", v)
+	}
+	if rec.Header().Get("X-Request-Id") != "up-ct-1" {
+		t.Error("其它端到端头应保留")
+	}
+
+	// 对照：本地估算仍打该头（上游 404 触发兜底）。
+	hsFB := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":{"message":"no count_tokens"}}`))
+	})
+	fb := hsFB.serve(hsFB.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hello world"}]}`))
+	if fb.Code != http.StatusOK {
+		t.Fatalf("fallback status = %d, want 200", fb.Code)
+	}
+	if got := fb.Header().Get(headerRelayCountTokens); got != "estimated" {
+		t.Fatalf("local estimate X-Relay-Count-Tokens = %q, want estimated", got)
+	}
+}
+
 // 出站鉴权必须换成上游 key。漏了这一步就是把 relay key 发给公益站，
 // 结果是一个难以归因的 401。
 func TestCountTokens_ReplacesInboundCredentials(t *testing.T) {

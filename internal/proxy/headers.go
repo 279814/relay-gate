@@ -142,14 +142,22 @@ func StripHopByHopResponse(h http.Header) {
 	}
 }
 
+// headerRelayCountTokens 是本地 count_tokens 估算响应专用的诊断头（§10.4）。
+// 只允许网关在 localCountTokens 写出；上游若回同名头必须在抄给客户端前丢掉，
+// 否则客户端会把上游伪造的 estimated 当成网关本地估算。
+const headerRelayCountTokens = "X-Relay-Count-Tokens"
+
 // FinalizeClientResponseHeaders 在把上游响应头写给客户端之前做最后清理：
-// 逐跳头 + 本网关会话 Cookie 的 Set-Cookie。
+// 逐跳头 + 本网关会话 Cookie 的 Set-Cookie + 上游伪造的 X-Relay-Count-Tokens。
 //
 // 其它 Set-Cookie 照常透传；管理登录走 api 包自己的 SetCookie，不经此路径。
+// 其它 X-Relay-* 不在这里剥 —— 成功透传不得新增 Attempts/Half-Open，
+// 但也不该在此路径上批量抹掉；Count-Tokens 是文档明确「只出现在网关生成响应」的那一个。
 // 不记录 Cookie 值 —— 会话令牌进日志等于泄露。
 func FinalizeClientResponseHeaders(h http.Header) {
 	StripHopByHopResponse(h)
 	stripGatewaySessionSetCookie(h)
+	h.Del(headerRelayCountTokens)
 }
 
 // stripGatewaySessionSetCookie 丢掉 cookie-name 恰为 gatewaySessionCookie
