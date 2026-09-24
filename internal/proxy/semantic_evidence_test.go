@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHasSemanticEvidence_TextDeltaAndHTML(t *testing.T) {
@@ -167,6 +168,9 @@ func TestCommit_SetsSemanticSeenOnPositiveUsage(t *testing.T) {
 	if !res.SemanticSeen {
 		t.Fatal("Commit must set SemanticSeen on positive output_tokens alone")
 	}
+	if res.FirstSemanticAt.IsZero() {
+		t.Fatal("positive usage must stamp FirstSemanticAt")
+	}
 	if !strings.Contains(rec.Body.String(), `"output_tokens":3`) {
 		t.Fatalf("client bytes changed or lost: %q", rec.Body.String())
 	}
@@ -194,8 +198,102 @@ func TestCommit_SetsSemanticSeenOnTextDelta(t *testing.T) {
 	if !res.SemanticSeen {
 		t.Fatal("Commit must set SemanticSeen on non-empty text delta")
 	}
+	if res.FirstSemanticAt.IsZero() || res.TTFT() < 0 {
+		t.Fatal("text delta must stamp FirstSemanticAt / TTFT")
+	}
 	if !strings.Contains(rec.Body.String(), `"text":"hi"`) {
 		t.Fatalf("client bytes changed or lost delta: %q", rec.Body.String())
+	}
+}
+
+// message_start / ping  alone must not stamp TTFT; the following text delta must.
+// Measurement is after client flush (same path as SemanticSeen), not by delaying flush.
+func TestForward_TTFTStampsOnSemanticNotMessageStart(t *testing.T) {
+	startGate := make(chan struct{})
+	deltaGate := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl := w.(http.Flusher)
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"))
+		fl.Flush()
+		close(startGate)
+		<-deltaGate
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
+		fl.Flush()
+	}))
+	defer up.Close()
+
+	f := testForwarder(t, Timeouts{
+		Connect: 2 * time.Second, FirstToken: 2 * time.Second,
+		Idle: 2 * time.Second, Total: 5 * time.Second,
+	})
+	rec := httptest.NewRecorder()
+	done := make(chan *Result, 1)
+	go func() {
+		done <- f.Forward(context.Background(), rec, "POST", up.URL, http.Header{}, []byte("{}"))
+	}()
+
+	select {
+	case <-startGate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not send message_start")
+	}
+	// Give streamBody time to flush message_start and sniff it.
+	time.Sleep(50 * time.Millisecond)
+	close(deltaGate)
+
+	res := <-done
+	if res.Err != nil {
+		t.Fatalf("forward: %v", res.Err)
+	}
+	if res.FirstByteAt.IsZero() {
+		t.Fatal("message_start is a body byte; FirstByteAt should be set")
+	}
+	if !res.SemanticSeen || res.FirstSemanticAt.IsZero() {
+		t.Fatal("text delta must set SemanticSeen and FirstSemanticAt")
+	}
+	if !res.FirstSemanticAt.After(res.FirstByteAt) && !res.FirstSemanticAt.Equal(res.FirstByteAt) {
+		// On coarse clocks they may tie if both land in one tick; require not before.
+		if res.FirstSemanticAt.Before(res.FirstByteAt) {
+			t.Fatalf("FirstSemanticAt %v before FirstByteAt %v", res.FirstSemanticAt, res.FirstByteAt)
+		}
+	}
+	if res.TTFT() < 0 {
+		t.Fatalf("TTFT negative: %v", res.TTFT())
+	}
+	if !strings.Contains(rec.Body.String(), "message_start") || !strings.Contains(rec.Body.String(), `"text":"hi"`) {
+		t.Fatalf("client must see both events: %q", rec.Body.String())
+	}
+}
+
+func TestCommit_MessageStartAloneLeavesTTFTUnset(t *testing.T) {
+	body := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: ping\ndata: {}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer up.Close()
+
+	f := testForwarder(t, fastTimeouts())
+	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, []byte("{}"))
+	if at.Failed() {
+		t.Fatalf("Send: %v", at.Result().Err)
+	}
+	_ = at.Peek()
+	res := at.Commit(httptest.NewRecorder())
+	if res.BytesWritten == 0 {
+		t.Fatal("message_start must reach the client")
+	}
+	if res.SemanticSeen || !res.FirstSemanticAt.IsZero() || res.TTFT() != 0 {
+		t.Fatalf("message_start alone must not stamp TTFT/semantic: seen=%v semanticAt=%v ttft=%v",
+			res.SemanticSeen, res.FirstSemanticAt, res.TTFT())
+	}
+	if res.FirstByteAt.IsZero() {
+		t.Fatal("FirstByteAt still records first body byte")
 	}
 }
 

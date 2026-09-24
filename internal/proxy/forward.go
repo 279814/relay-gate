@@ -19,12 +19,13 @@ import (
 //
 // 它是 outbound.Budget 的投影，只取 forward.go 实际用得到的那几段：
 // Connect 由连接池承载（不在这里用），Total 是最外层硬上限，FirstToken 管
-// 「响应头 + 首字节」，Idle 管首字节之后的流内静默。
+// 「响应头 / 首字节 / 首事件 / 首语义」投影成的单一截止（§7.4），Idle 在
+// §8.8 首语义证据出现之后才启用（流内静默）。
 //
 // 为什么不直接用 outbound.Budget：Budget 的四个观察点（response_header /
-// first_byte / first_event / first_semantic）要到 P0-07 的增量 Decoder 落地
-// 之后才分得开 —— 现在没有「首语义」的判据，硬拆只会造出四个取同一个值的
-// 字段。TimeoutsFrom 是那次拆分的唯一入口。
+// first_byte / first_event / first_semantic）要到阶段计时器拆开之后才分得开
+// —— 现阶段用 SemanticSeen 决定何时结束 FirstToken、何时启用 Idle，
+// 而不另起一套计时器。TimeoutsFrom 是投影入口。
 type Timeouts struct {
 	Connect    time.Duration
 	FirstToken time.Duration
@@ -32,7 +33,7 @@ type Timeouts struct {
 	// Safe/Balanced use a short bound (2s); Aggressive uses real_first_byte_sec.
 	// Zero means fall back to FirstToken.
 	PeekWait time.Duration
-	Idle     time.Duration // 流内两个 chunk 之间的静默上限
+	Idle     time.Duration // 首语义之后，流内两个 chunk 之间的静默上限
 	Total    time.Duration
 }
 
@@ -92,10 +93,14 @@ func RealTimeouts(s model.Settings) Timeouts {
 type Result struct {
 	Status      int
 	RespHeaders http.Header
-	// FirstByteAt 是收到响应体首字节的时刻（近似 TTFT）。零值表示始终没收到。
+	// FirstByteAt 是收到响应体首字节的时刻。零值表示始终没收到。
+	// 样本 TSFirstByte 用它；不等同于 TTFT（见 FirstSemanticAt）。
 	FirstByteAt time.Time
-	SentAt      time.Time
-	DoneAt      time.Time
+	// FirstSemanticAt 是首次见到 §8.8 语义证据的时刻（与 SemanticSeen 同源）。
+	// message_start / ping / SSE 注释单独到达时不置位。TTFT 用它。
+	FirstSemanticAt time.Time
+	SentAt          time.Time
+	DoneAt          time.Time
 	// BytesWritten 是已写给客户端的字节数。> 0 时禁止重试（§3.5）。
 	BytesWritten int64
 	// HeadersSent 表示是否已经调用过 w.WriteHeader。
@@ -119,7 +124,8 @@ type Result struct {
 	ErrBody []byte
 
 	// SemanticSeen 表示流式/非流式响应里已出现 §8.8 判活证据
-	//（非空 text/thinking/tool delta 或非流式非空模型输出）。
+	//（非空 text/thinking/tool/refusal delta、正数 output usage、
+	// 或非流式非空模型输出）。
 	// 由 streamBody 在客户端 flush 之后增量嗅探置位，不缓冲整段流、
 	// 不改变写出字节。classifyReal 必须见到它才 VerdictOK / piggyback。
 	SemanticSeen bool
@@ -131,12 +137,24 @@ type Result struct {
 // 8KB 足够容纳任何结构化错误信息，又不会因为一个巨大的错误页而占住内存。
 const maxErrBodyCapture = 8 << 10
 
-// TTFT 返回首 Token 延迟。未收到首字节时返回 0。
+// TTFT 返回首语义 Token 延迟（§8.8）。未见语义证据时返回 0。
 func (r *Result) TTFT() time.Duration {
-	if r.FirstByteAt.IsZero() || r.SentAt.IsZero() {
+	if r.FirstSemanticAt.IsZero() || r.SentAt.IsZero() {
 		return 0
 	}
-	return r.FirstByteAt.Sub(r.SentAt)
+	return r.FirstSemanticAt.Sub(r.SentAt)
+}
+
+// stampFirstSemantic 在首次 SemanticSeen 时记下时刻，供 TTFT / OnFirstByte。
+// 必须在客户端字节已写出（或非流式 body 已缓冲）之后调用，不推迟 flush。
+func (r *Result) stampFirstSemantic(f *Forwarder) {
+	if r == nil || !r.FirstSemanticAt.IsZero() {
+		return
+	}
+	r.FirstSemanticAt = time.Now()
+	if f != nil && f.OnFirstByte != nil {
+		f.OnFirstByte()
+	}
 }
 
 // Forwarder 执行单次转发。
@@ -150,7 +168,7 @@ type Forwarder struct {
 	// 「探活顺带把连接热着」这份收益的来源。
 	Transport http.RoundTripper
 	Timeouts  Timeouts
-	// OnFirstByte 在收到首字节时回调（用于记录 TTFT、结束探活等）。可为 nil。
+	// OnFirstByte 在首次 §8.8 语义证据时回调（用于记录 TTFT 等）。可为 nil。
 	OnFirstByte func()
 
 	// RespTee 收一份响应体副本，供样本记录用（§3.6.3a）。可为 nil。
@@ -372,10 +390,8 @@ func (at *Attempt) Peek() []byte {
 	n, err := at.resp.Body.Read(buf)
 	if n > 0 {
 		at.peeked = buf[:n]
+		// 只记首字节时刻；TTFT / OnFirstByte 等 §8.8 语义证据（streamBody）。
 		res.FirstByteAt = time.Now()
-		if f.OnFirstByte != nil {
-			f.OnFirstByte()
-		}
 	}
 
 	// n > 0 时一律算拿到了内容，即使同时带回 EOF —— 那是「短响应一次读完」
@@ -615,14 +631,10 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 
 		if n > 0 {
 			// FirstByteAt 可能已由 Peek 填过。不能覆盖：Commit 重放的是
-			// **早先**读到的字节，用此刻的时间会把 TTFT 记成「预读到提交」
-			// 的间隔（几微秒），于是所有经过预读的请求都报出一个假的超快
-			// TTFT —— 而它会经 last_ttft_ms 显示在管理界面上。
+			// **早先**读到的字节，用此刻的时间会把「首字节」记成「预读到提交」
+			// 的间隔（几微秒）。TTFT 另走 FirstSemanticAt，见下方嗅探。
 			if res.FirstByteAt.IsZero() {
 				res.FirstByteAt = time.Now()
-				if f.OnFirstByte != nil {
-					f.OnFirstByte()
-				}
 			}
 			wn, werr := w.Write(buf[:n])
 			total += int64(wn)
@@ -654,25 +666,28 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 				semSniffer.Feed(buf[:n], ct)
 				if semSniffer.Seen() {
 					res.SemanticSeen = true
+					res.stampFirstSemantic(f)
 				}
 			}
 			if werr != nil {
 				// 客户端断开。不是上游的问题，不该计入健康失败。
 				return total, fmt.Errorf("%w: %v", ErrClientGone, werr)
 			}
-			// 首字节之后改用 Idle 超时。每收到数据就重置，
-			// 计的是「两个 chunk 之间的静默」而不是流的总时长。
-			timer.Reset(f.Timeouts.Idle)
+			// §7.4：首语义之后才启用可重置的流内 idle。message_start /
+			// ping / 注释到达时继续跑 FirstToken，避免长思考被 Idle 砍断。
+			if captureErr || res.SemanticSeen {
+				timer.Reset(f.Timeouts.Idle)
+			}
 		}
 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return total, nil
 			}
-			// 区分「首 Token 超时」与「流内静默超时」：前者说明站没响应，
+			// 区分「首语义超时」与「流内静默超时」：前者说明站没吐语义，
 			// 后者说明流中断了。两者对健康状态的含义不同（§4.3）。
 			switch {
-			case timedOut.Load() && total == 0:
+			case timedOut.Load() && !res.SemanticSeen:
 				return total, fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.FirstToken)
 			case timedOut.Load():
 				return total, fmt.Errorf("%w: 流内静默超过 %v", ErrStreamStalled, f.Timeouts.Idle)
