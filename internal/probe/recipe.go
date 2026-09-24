@@ -293,11 +293,20 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 
 	// profile 存的是 shape，不含 method 与超时档 —— 它是从真实请求学来的，
 	// 而真实请求的方法由 endpoint 决定。
+	//
+	// 再跑一遍 sanitize：旧行或旁路写入可能仍带 Authorization / Cookie
+	// relay_session；认证必须走 Endpoint auth profile（§7.2），不能从学来的
+	// 形状回放。
+	safe := sanitizeLearnedShape(model.ClientRequestShape{
+		SafeHeaders:   profile.SafeHeaders,
+		FixedRawQuery: profile.FixedRawQuery,
+		BodyTemplate:  profile.BodyTemplate,
+	})
 	compiled, err := probetemplate.CompileContent(query.Endpoint, probetemplate.TemplateContent{
 		Method:   query.Endpoint.Method(),
-		RawQuery: profile.FixedRawQuery,
-		Headers:  profile.SafeHeaders,
-		Body:     profile.BodyTemplate,
+		RawQuery: safe.FixedRawQuery,
+		Headers:  safe.SafeHeaders,
+		Body:     safe.BodyTemplate,
 	})
 	if err != nil {
 		// 同 fromBinding：不包成 ErrNoRecipe。读取后要再校验一次是

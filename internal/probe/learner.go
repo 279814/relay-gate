@@ -5,10 +5,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probetemplate"
+	"github.com/279814/relay-gate/internal/sample"
 )
+
+// gatewaySessionCookieName 与 proxy/api 的 relay_session 同名。
+//
+// 学习器绝不能把管理会话 Cookie 写进 profile：那是本进程凭据，不是上游指纹。
+// 这里再钉一次名字，避免只依赖 sample.IsSensitiveHeader 的 Cookie 整头丢弃时
+// 有人改清单漏掉「只剥会话名」这条语义。
+const gatewaySessionCookieName = "relay_session"
 
 // Learner 把已脱敏的 ClientRequestShape 收成 candidate profile。
 type Learner struct {
@@ -38,10 +49,15 @@ func NewLearner(store LearnerStore) *Learner {
 }
 
 // ObserveSuccessful 只接收正常成功与已 sanitizer 的 shape。
+//
+// §8.4：不得保存认证值。入站 shape 仍可能带 Authorization / X-Api-Key /
+// Api-Key、Cookie 里的 relay_session、或纯凭据 query —— 在入库前再剥一层，
+// 不信任上游 sanitizer 已做完。安全协议头（如 anthropic-beta）保留。
 func (l *Learner) ObserveSuccessful(ctx context.Context, upstreamID int64, endpoint model.EndpointKind, shape model.ClientRequestShape) error {
 	if l == nil {
 		return nil
 	}
+	shape = sanitizeLearnedShape(shape)
 	hash := ShapeHash(shape)
 	if hash == "" {
 		return nil
@@ -76,6 +92,110 @@ func (l *Learner) ObserveSuccessful(ctx context.Context, upstreamID int64, endpo
 		return l.store.UpsertClientProbeProfile(ctx, profile)
 	}
 	return nil
+}
+
+// sanitizeLearnedShape 丢掉凭据类字段，只留下可学习的安全形状（§8.4）。
+//
+// 不记录被丢掉的值 —— 那正是凭据，进日志等于泄露。
+func sanitizeLearnedShape(shape model.ClientRequestShape) model.ClientRequestShape {
+	return model.ClientRequestShape{
+		SafeHeaders:    filterLearnedHeaders(shape.SafeHeaders),
+		FixedRawQuery:  filterLearnedQuery(shape.FixedRawQuery),
+		QueryShapeJSON: shape.QueryShapeJSON,
+		BodyTemplate:   shape.BodyTemplate,
+		BodyShapeJSON:  shape.BodyShapeJSON,
+	}
+}
+
+// filterLearnedHeaders 排除认证头与 Cookie（含 relay_session）。
+//
+// 清单复用 sample.IsSensitiveHeader（由 model.AuthHeaders 派生，另含 Cookie /
+// Proxy-Authorization），与样本导出探活头同一道门 —— 两处各抄一份会分叉。
+func filterLearnedHeaders(headers []model.HeaderTemplate) []model.HeaderTemplate {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make([]model.HeaderTemplate, 0, len(headers))
+	for _, header := range headers {
+		if sample.IsSensitiveHeader(header.Name) {
+			continue
+		}
+		if cookieValuesContainGatewaySession(header) {
+			continue
+		}
+		out = append(out, model.HeaderTemplate{
+			Name:   header.Name,
+			Values: append([]string(nil), header.Values...),
+		})
+	}
+	return out
+}
+
+// cookieValuesContainGatewaySession 是纵深防御：IsSensitiveHeader 已整头丢
+// Cookie，若将来清单漏掉 Cookie，仍不能让 relay_session 进 profile。
+func cookieValuesContainGatewaySession(header model.HeaderTemplate) bool {
+	if !strings.EqualFold(strings.TrimSpace(header.Name), "Cookie") {
+		return false
+	}
+	for _, line := range header.Values {
+		for _, part := range strings.Split(line, ";") {
+			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+			if strings.TrimSpace(name) == gatewaySessionCookieName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// filterLearnedQuery 丢掉「值整段就是凭据」的 query 参数。
+//
+// 保序、不重编码：形状哈希依赖 FixedRawQuery 的字节稳定。只删段，不改其余段。
+func filterLearnedQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	segments := strings.Split(raw, "&")
+	kept := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		value := ""
+		hasEquals := false
+		if separator := strings.IndexByte(segment, '='); separator >= 0 {
+			value, hasEquals = segment[separator+1:], true
+		}
+		if hasEquals && isSecretOnlyQueryValue(value) {
+			continue
+		}
+		kept = append(kept, segment)
+	}
+	return strings.Join(kept, "&")
+}
+
+// isSecretOnlyQueryValue 判断 query 值是不是整段凭据（占位符或字面 key）。
+//
+// 字面 key 复用 recipe 凭据门禁：与入库扫描同一判据，避免学习器放行而
+// Upsert 再拒（或反过来）。错误文本不回显 value。
+func isSecretOnlyQueryValue(value string) bool {
+	decoded := value
+	if unescaped, err := url.QueryUnescape(value); err == nil {
+		decoded = unescaped
+	}
+	decoded = strings.TrimSpace(decoded)
+	if decoded == "" {
+		return false
+	}
+	if decoded == "{{UPSTREAM_API_KEY}}" {
+		return true
+	}
+	if strings.HasPrefix(decoded, "{{SECRET:") && strings.HasSuffix(decoded, "}}") &&
+		strings.Count(decoded, "{{") == 1 {
+		return true
+	}
+	_, err := probetemplate.ScanRequiredSecrets(model.EndpointModels, probetemplate.TemplateContent{
+		Method:   "GET",
+		RawQuery: "x=" + value,
+	})
+	return err != nil
 }
 
 // ShapeHash 对排序规范化后的安全 shape 做带域 SHA-256。
