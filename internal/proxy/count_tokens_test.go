@@ -239,6 +239,15 @@ func (m *memoryCountCaps) MarkCountTokensConfigError(routeID int64, _ uint64, st
 	m.markedConfigError++
 }
 
+func (m *memoryCountCaps) set(routeID int64, state model.CapabilityState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.states == nil {
+		m.states = map[int64]model.CapabilityState{}
+	}
+	m.states[routeID] = state
+}
+
 // recordingReporter 数健康回写的次数。
 //
 // count_tokens 的关键不变量是「一次都不该调」（§3.1），所以这个替身
@@ -444,6 +453,98 @@ func TestCountTokens_FallsBackWhenAllRoutesDead(t *testing.T) {
 	if decodeInputTokens(t, rec.Body.String()) <= 0 {
 		t.Error("兜底应给出正数 token")
 	}
+}
+
+// §6.4 / PR #145：count_tokens 选路须与模型流量共用精确→最长前缀 walk。
+// 精确 Route 因 unsupported / config_error 不合格时，仍应选健康前缀；
+// 精确仍合格时不得抢前缀。
+func TestCountTokens_ExcludedExactFallsToPrefix(t *testing.T) {
+	body := `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+
+	setup := func(t *testing.T) (*harness, *memoryCountCaps) {
+		t.Helper()
+		hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"input_tokens":42}`))
+		})
+		prefixMN := &model.ModelName{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true}
+		up2 := &model.Upstream{ID: 20, Name: "prefix-up", BaseURL: hs.up.URL,
+			APIKey: "sk-prefix", AuthStyle: model.AuthAuto, Enabled: true}
+		rt2 := &model.Route{ID: 200, ModelNameID: 2, UpstreamID: 20,
+			Priority: 1, Weight: 100, Enabled: true}
+		hs.cfg.snap.ModelNames = append(hs.cfg.snap.ModelNames, prefixMN)
+		hs.cfg.snap.Upstreams[20] = up2
+		hs.cfg.snap.RoutesByModelName[2] = []*model.Route{rt2}
+		caps := &memoryCountCaps{}
+		hs.h.WithCountTokensCapability(caps)
+		return hs, caps
+	}
+
+	t.Run("unsupported exact falls to prefix", func(t *testing.T) {
+		hs, caps := setup(t)
+		caps.set(100, model.CapabilityUnsupported)
+		caps.set(200, model.CapabilitySupported)
+
+		rec := hs.serve(hs.countTokensRequest(body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if rec.Header().Get("X-Relay-Count-Tokens") == "estimated" {
+			t.Fatal("eligible prefix must be used, not local estimate")
+		}
+		if got := decodeInputTokens(t, rec.Body.String()); got != 42 {
+			t.Fatalf("input_tokens = %d, want 42", got)
+		}
+		acq, open, _ := hs.health.stats()
+		if open != 0 {
+			t.Fatalf("in-flight after request = %d, want 0", open)
+		}
+		if len(acq) == 0 || acq[len(acq)-1] != 200 {
+			t.Fatalf("last acquired Route = %v, want …200 (prefix)", acq)
+		}
+	})
+
+	t.Run("config_error exact falls to prefix", func(t *testing.T) {
+		hs, caps := setup(t)
+		caps.set(100, model.CapabilityConfigError)
+		caps.set(200, model.CapabilitySupported)
+
+		rec := hs.serve(hs.countTokensRequest(body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if rec.Header().Get("X-Relay-Count-Tokens") == "estimated" {
+			t.Fatal("eligible prefix must be used, not local estimate")
+		}
+		acq, _, _ := hs.health.stats()
+		if len(acq) == 0 || acq[len(acq)-1] != 200 {
+			t.Fatalf("last acquired Route = %v, want …200 (prefix)", acq)
+		}
+	})
+
+	t.Run("eligible exact beats prefix", func(t *testing.T) {
+		hs, caps := setup(t)
+		caps.set(100, model.CapabilitySupported)
+		caps.set(200, model.CapabilitySupported)
+
+		rec := hs.serve(hs.countTokensRequest(body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if rec.Header().Get("X-Relay-Count-Tokens") == "estimated" {
+			t.Fatal("eligible exact must proxy, not local estimate")
+		}
+		acq, _, _ := hs.health.stats()
+		if len(acq) == 0 || acq[len(acq)-1] != 100 {
+			t.Fatalf("last acquired Route = %v, want …100 (exact)", acq)
+		}
+		for _, id := range acq {
+			if id == 200 {
+				t.Fatalf("prefix route 200 must not be acquired when exact is eligible: %v", acq)
+			}
+		}
+	})
 }
 
 // recovering 选路须占 RecoveryGate（§9.1 / §9.4）。count_tokens 是真实上游流量，

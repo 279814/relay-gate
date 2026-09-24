@@ -32,18 +32,13 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mn, err := router.MatchModelName(pre.snapshot, pre.inModel, model.ProtoAnthropic)
-	if err != nil || mn.Protocol != model.ProtoAnthropic {
-		h.log.Info("count_tokens 无匹配 ModelName，本地粗算", "model", pre.inModel, "err", err)
-		h.localCountTokens(w, pre.body)
-		return
-	}
-
+	// 选路与模型流量共用 SelectExcluding 的精确→最长前缀 walk（§6.4 / PR #145）：
+	// 精确 Route 因 count_tokens unsupported / config_error 不合格时，仍可选健康前缀。
 	tried := map[int64]bool{}
-	if h.tryCountTokensPass(w, r, pre, mn, tried, preferSupported) {
+	if h.tryCountTokensPass(w, r, pre, tried, preferSupported) {
 		return
 	}
-	if h.tryCountTokensPass(w, r, pre, mn, tried, preferUnknown) {
+	if h.tryCountTokensPass(w, r, pre, tried, preferUnknown) {
 		return
 	}
 
@@ -59,10 +54,10 @@ const (
 )
 
 func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
-	pre *preambleResult, mn *model.ModelName, tried map[int64]bool, prefer countTokensPrefer) bool {
+	pre *preambleResult, tried map[int64]bool, prefer countTokensPrefer) bool {
 
 	for {
-		cand, err := h.selectCountTokensCandidate(pre.snapshot, mn, tried, prefer)
+		cand, err := h.selectCountTokensCandidate(pre.snapshot, pre.inModel, tried, prefer)
 		if err != nil || cand == nil {
 			return false
 		}
@@ -92,72 +87,53 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 	}
 }
 
-func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, mn *model.ModelName,
-	exclude map[int64]bool, prefer countTokensPrefer) (*router.Candidate, error) {
+// selectCountTokensCandidate 与模型流量共用 SelectExcluding 的匹配 walk：
+// 精确 → 最长前缀（名称已命中时不回落兜底）。prefer 不合格的 Route 只进
+// 本趟局部 exclude，不污染跨 preferSupported→preferUnknown 的 tried ——
+// 否则「精确 unknown + 前缀 supported」会在 supported 趟把精确排除掉后，
+// unknown 趟再也选不到它。
+func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, inModel string,
+	tried map[int64]bool, prefer countTokensPrefer) (*router.Candidate, error) {
 
-	all := snap.RoutesByModelName[mn.ID]
-	type scored struct {
-		rt    *model.Route
-		score int
-	}
-	var pool []scored
-	for _, rt := range all {
-		if rt == nil || !rt.Enabled || exclude[rt.ID] {
-			continue
-		}
-		up := snap.Upstreams[rt.UpstreamID]
-		if up == nil || !up.Enabled {
-			continue
-		}
-		if h.health != nil {
-			if h.health.State(rt.ID) == model.StateDead {
-				continue
-			}
-			if h.health.CoolingDown(rt.ID) {
-				continue
-			}
-		}
-		capState := model.CapabilityUnknown
-		if h.countCaps != nil {
-			capState = h.countCaps.Effective(model.RecipeScopeRoute, rt.ID, model.EndpointCountTokens, "")
-		}
-		switch prefer {
-		case preferSupported:
-			if capState != model.CapabilitySupported {
-				continue
-			}
-		case preferUnknown:
-			if capState == model.CapabilityUnsupported ||
-				capState == model.CapabilityConfigError ||
-				capState == model.CapabilitySupported {
-				continue
-			}
-		}
-		pool = append(pool, scored{rt: rt, score: rt.Priority})
-	}
-	if len(pool) == 0 {
+	if snap == nil || h.health == nil {
 		return nil, router.ErrNoRouteAvailable
 	}
-	best := pool[0]
-	for _, p := range pool[1:] {
-		if p.score < best.score || (p.score == best.score && p.rt.ID < best.rt.ID) {
-			best = p
+	localExclude := map[int64]bool{}
+	for id, v := range tried {
+		if v {
+			localExclude[id] = true
 		}
 	}
-	up := snap.Upstreams[best.rt.UpstreamID]
-	var release func()
-	var gen uint64
-	if h.health != nil {
-		var ok bool
-		release, gen, ok = h.health.TryAcquire(best.rt.ID, best.rt.MaxConcurrency)
-		if !ok {
-			exclude[best.rt.ID] = true
-			return h.selectCountTokensCandidate(snap, mn, exclude, prefer)
+	for {
+		cand, err := router.SelectExcluding(snap, h.health, inModel, model.ProtoAnthropic, localExclude)
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		release = func() {}
+		if !h.countTokensPreferOK(cand.Route.ID, prefer) {
+			localExclude[cand.Route.ID] = true
+			cand.Release()
+			continue
+		}
+		return cand, nil
 	}
-	return router.NewCandidate(best.rt, up, mn, release, gen), nil
+}
+
+// countTokensPreferOK 按本趟 prefer 过滤 count_tokens Capability。
+// unsupported / config_error 两趟都不选（§10.3），不得打到上游。
+func (h *Handler) countTokensPreferOK(routeID int64, prefer countTokensPrefer) bool {
+	capState := model.CapabilityUnknown
+	if h.countCaps != nil {
+		capState = h.countCaps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, "")
+	}
+	switch prefer {
+	case preferSupported:
+		return capState == model.CapabilitySupported
+	case preferUnknown:
+		return capState != model.CapabilityUnsupported &&
+			capState != model.CapabilityConfigError &&
+			capState != model.CapabilitySupported
+	}
+	return false
 }
 
 // proxyCountTokens 把 count_tokens 转发给上游。
