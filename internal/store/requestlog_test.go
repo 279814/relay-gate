@@ -11,9 +11,8 @@ import (
 // 请求日志（M6）。
 //
 // 这一组盯的是两处不平凡的 SQL：
-//   - PruneRequestLogs 按 **req_id 整组**清理。按行截会把一次重试的后半截
-//     切掉，详情页于是显示「第 2、3 次尝试」而没有第 1 次 —— 看起来像
-//     数据坏了，而实际是清理逻辑把组切开了。
+//   - PruneRequestLogs 按 **req_id 整组**清理孤儿日志。按行截会把一次重试的
+//     后半截切掉；仍有 sample 的组不得删（§5.4，无独立更短寿命）。
 //   - RetryStatsSince 用一条 CTE 算五个数。分五条查询跑的话，五个数可能
 //     来自不同时刻的快照，于是出现「救回来的比重试过的还多」这种
 //     自相矛盾的展示。
@@ -310,6 +309,86 @@ func TestPruneRequestLogsZeroMeansUnlimited(t *testing.T) {
 	left, _ := st.ListRequestLogs(RequestLogFilter{})
 	if len(left) != 3 {
 		t.Errorf("应全部保留，得到 %d 条", len(left))
+	}
+}
+
+// §5.4：request_log 随 Sample Group 存活，文档未给日志单独更短寿命。
+// PruneRequestLogs 不得把仍有 sample 的 Attempt 日志清掉；无样本的孤儿仍可按 keep 删。
+func TestPruneRequestLogs_PreservesLiveSampleAttempts(t *testing.T) {
+	st := testStore(t)
+
+	live := mkSample(time.Now().UnixMilli())
+	live.ReqID = "req-live"
+	if err := st.InsertSample(live); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range []*model.RequestLog{
+		mkLog("req-live", 1, 2, model.OutcomeUpstreamError),
+		mkLog("req-live", 2, 2, model.OutcomeOK),
+	} {
+		if err := st.InsertRequestLog(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 两条过期孤儿：天数清理应删掉它们，但不碰 live 组。
+	for _, id := range []string{"orphan-old-a", "orphan-old-b"} {
+		orphan := mkLog(id, 1, 1, model.OutcomeOK)
+		orphan.TSRecv = time.Now().Add(-10 * 24 * time.Hour).UnixMilli()
+		if err := st.InsertRequestLog(orphan); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := st.PruneRequestLogs(0, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("应只删 2 条过期孤儿，得到 %d", n)
+	}
+
+	liveLogs, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-live"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(liveLogs) != 2 {
+		t.Fatalf("仍有 sample 的两次 Attempt 日志应完整保留，得到 %d 行", len(liveLogs))
+	}
+
+	// 条数维度：再塞若干新孤儿，只保留 1 组孤儿；live 组仍不动。
+	for i := 0; i < 3; i++ {
+		if err := st.InsertRequestLog(
+			mkLog(fmt.Sprintf("orphan-new-%d", i), 1, 1, model.OutcomeOK)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err = st.PruneRequestLogs(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("应删掉 2 组多余孤儿，得到 %d", n)
+	}
+	liveLogs, err = st.ListRequestLogs(RequestLogFilter{ReqID: "req-live"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(liveLogs) != 2 {
+		t.Fatalf("条数清理后 live 组仍应完整，得到 %d 行", len(liveLogs))
+	}
+	orphans, err := st.ListRequestLogs(RequestLogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanGroups := map[string]struct{}{}
+	for _, l := range orphans {
+		if l.ReqID != "req-live" {
+			orphanGroups[l.ReqID] = struct{}{}
+		}
+	}
+	if len(orphanGroups) != 1 {
+		t.Fatalf("孤儿应只剩 1 组，得到 %d 组：%v", len(orphanGroups), orphanGroups)
 	}
 }
 
