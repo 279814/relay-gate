@@ -177,6 +177,9 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	// §15: bindings are (route_id, endpoint_id); drop any for this endpoint so a
+	// later row that reuses the numeric id cannot inherit a published transform.
+	s.detachTransformBindingsForEndpoint(id)
 	if getErr == nil && cur.UpstreamID > 0 {
 		s.invalidateUpstream(cur.UpstreamID)
 	}
