@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -587,6 +588,14 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 	if policy == model.RetryPolicySafe && !safeRetryEvidence(la) {
 		return false
 	}
+	// §11.2: Balanced/Aggressive inherit Safe's connect-failure scope.
+	// ErrConnect after possible write (GotConn) must not failover — retrying
+	// that POST on another upstream can double-apply it. Status-based retries
+	// (429/5xx/…) and non-ErrConnect faults keep existing policy rules.
+	if res := la.at.Result(); res != nil && res.Err != nil &&
+		errors.Is(res.Err, ErrConnect) && !safeRetryEvidence(la) {
+		return false
+	}
 	if la.instr.Retry == nil {
 		return true
 	}
@@ -637,11 +646,17 @@ func safeRetryEvidence(la *liveAttempt) bool {
 // 「已写出字节后不得重试」这条不在这里判 —— 结构上到不了：判定发生在
 // Commit 之前，而 Commit 是唯一会写字节给客户端的地方。
 func retryable(at *Attempt) bool {
-	// Send 阶段就失败：连不上、TLS 失败、响应头超时。
+	// Send 阶段就失败：连不上、TLS 失败、首 Token 超时。
 	//
 	// 客户端断开/取消时重试毫无意义；我们自己的超时则算上游的账、可以换站。
 	// 这个区分已经在 IsUpstreamFault 里做好了，在这里重写一遍迟早会与它分叉。
+	//
+	// ErrUpstreamBroke：GotConn 后、无响应头的传输失败（或 Peek 零字节断流）。
+	// 请求可能已写入上游，§11.2 不允许按 Safe 建连失败换站。
 	if err := at.Result().Err; err != nil {
+		if errors.Is(err, ErrUpstreamBroke) {
+			return false
+		}
 		return IsUpstreamFault(err)
 	}
 
@@ -675,6 +690,9 @@ func retryable(at *Attempt) bool {
 	// 一次 —— 只在函数开头读一次的话，这一整类故障永远等不到重试，
 	// 而「响应头回得很快、body 一个字节都不来」正是公益站最常见的挂法。
 	if err := at.Result().Err; err != nil {
+		if errors.Is(err, ErrUpstreamBroke) {
+			return false
+		}
 		return IsUpstreamFault(err)
 	}
 	return verdict == payloadError

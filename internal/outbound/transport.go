@@ -26,6 +26,11 @@ import (
 // 站级 Reachability 的证据，后者只是这次请求的问题。
 var ErrConnectTimeout = errors.New("建立连接超时")
 
+// ErrAfterGotConn marks a RoundTrip failure after the connection was obtained.
+// The request may already have been written; proxy must not treat this as a
+// Safe pre-write connect failure (§11.2).
+var ErrAfterGotConn = errors.New("transport error after GotConn")
+
 // dialFunc 是 NetworkConfig 可替换的拨号面，只给测试用。
 type dialFunc interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
@@ -155,14 +160,27 @@ func (transport *Transport) CloseIdleConnections() { transport.base.CloseIdleCon
 // 手段是 httptrace 的 GotConn 回调 + 一个 timer：timer 到期就 cancel 这次请求
 // 的 context，GotConn 一到就 Stop timer。
 func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, error) {
+	// gotConn 把「失败发生在建连阶段」变成可判定的（§11.2 / connect timeout）。
+	var gotConn atomic.Bool
+	baseTrace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			gotConn.Store(true)
+			if tr := TraceFromContext(request.Context()); tr != nil {
+				tr.MarkGotConn(time.Now(), info.Reused)
+			}
+		},
+	}
+
 	if transport.connect <= 0 {
-		return transport.base.RoundTrip(request)
+		traced := httptrace.WithClientTrace(request.Context(), baseTrace)
+		response, err := transport.base.RoundTrip(request.WithContext(traced))
+		if err != nil && gotConn.Load() {
+			return nil, fmt.Errorf("%w: %w", ErrAfterGotConn, err)
+		}
+		return response, err
 	}
 
 	ctx, cancel := context.WithCancel(request.Context())
-	// gotConn 与 timedOut 一起把「失败发生在建连阶段」这件事变成可判定的，
-	// 而不依赖谁先响 —— 见 connectPhaseTimeout。
-	var gotConn atomic.Bool
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(transport.connect, func() {
 		close(timedOut)
@@ -172,9 +190,12 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 	// 已有的 trace（调用方装的观测）必须保留：httptrace.WithClientTrace 会
 	// 把两个 trace 合并（同名回调都调用），所以这里叠加而不是替换。
 	traced := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
+		GotConn: func(info httptrace.GotConnInfo) {
 			gotConn.Store(true)
 			timer.Stop()
+			if tr := TraceFromContext(request.Context()); tr != nil {
+				tr.MarkGotConn(time.Now(), info.Reused)
+			}
 		},
 	})
 	response, err := transport.base.RoundTrip(request.WithContext(traced))
@@ -186,6 +207,9 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 		// Reachability 的证据，后者可能只是这一次的问题。
 		if transport.connectPhaseTimeout(request, err, gotConn.Load(), timedOut) {
 			return nil, fmt.Errorf("%w: 超过 %v", ErrConnectTimeout, transport.connect)
+		}
+		if gotConn.Load() {
+			return nil, fmt.Errorf("%w: %w", ErrAfterGotConn, err)
 		}
 		return nil, err
 	}

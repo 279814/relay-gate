@@ -801,6 +801,63 @@ func TestRetry_StopsWhenClientGone(t *testing.T) {
 	}
 }
 
+// §11.2 Safe connect-failure scope (default Balanced inherits it):
+// post-write transport ErrConnect must not failover; pre-write dial still may.
+func TestRetry_PostWriteConnectDoesNotFailover_PreWriteDialStillDoes(t *testing.T) {
+	t.Run("post-write reset stays on one upstream", func(t *testing.T) {
+		// Accept (GotConn) then drop without HTTP headers → ErrConnect after write may have occurred.
+		resetAfterAccept := func(w http.ResponseWriter, r *http.Request) {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("ResponseWriter 不支持 Hijack")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			_ = conn.Close()
+		}
+		hs := newMultiHarness(t, resetAfterAccept, respondOK(`{"id":"must-not-reach"}`))
+		hs.cfg.settings.RealTotalSec = 30
+		// Default Balanced — the production retry mode.
+		if hs.cfg.settings.RetryPolicy.Normalize() != model.RetryPolicyBalanced {
+			t.Fatalf("测试默认应为 Balanced，得到 %q", hs.cfg.settings.RetryPolicy)
+		}
+
+		rec := hs.serve(hs.req())
+
+		if rec.Code == 200 {
+			t.Fatalf("GotConn 后断连不应换站成功，body=%q", rec.Body.String())
+		}
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("网关应回 502，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "must-not-reach") {
+			t.Error("不应换到第二个站 —— 可能重复执行 POST")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("pre-write dial still switches", func(t *testing.T) {
+		hs := newMultiHarness(t,
+			respondOK(`{"id":"unreachable-handler"}`),
+			respondOK(`{"id":"from-good-station"}`))
+		hs.cfg.settings.RealTotalSec = 30
+		// Dial never reaches the first listener → no GotConn / write evidence.
+		hs.cfg.snap.Upstreams[10].BaseURL = "http://127.0.0.1:1"
+
+		rec := hs.serve(hs.req())
+
+		if rec.Code != 200 {
+			t.Fatalf("建连前失败应换站成功，得到 %d：%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "from-good-station") {
+			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
+		}
+		hs.assertHits(t, 0, 1)
+	})
+}
+
 // ── 样本：客户端的一次请求 = 一条样本 ─────────────────────
 
 // 重试不该让一次客户端请求变成多条样本。

@@ -761,6 +761,11 @@ func classifyTransportErr(err error, clientCtx context.Context,
 	if headerTimedOut {
 		return fmt.Errorf("%w: 响应头超过 %v 未返回", ErrFirstTokenTimeout, firstToken)
 	}
+	// GotConn 已到：请求可能已写出。不得再标成 ErrConnect，否则 Balanced
+	// 会按 Safe 建连失败换站并可能双写 POST（§11.2）。
+	if errors.Is(err, outbound.ErrAfterGotConn) {
+		return fmt.Errorf("%w: %v", ErrUpstreamBroke, err)
+	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
 		return fmt.Errorf("%w: 超时 %v", ErrConnect, err)
