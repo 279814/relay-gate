@@ -127,8 +127,11 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	// Transform operates on raw upstream bytes (no decompress). If the body
 	// changed, an upstream Content-Encoding (gzip/deflate/br) would lie about
 	// the bytes we are about to write — clients would try to decode them.
+	// Content-MD5 / ETag likewise describe the upstream body, so drop them too.
 	if !bytes.Equal(out.Body, body) {
 		dst.Del("Content-Encoding")
+		dst.Del("Content-MD5")
+		dst.Del("ETag")
 	}
 	w.WriteHeader(out.Status)
 	res.HeadersSent = true
@@ -246,7 +249,10 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	// ApplySSEEvent always re-encodes event.Raw via encodeSSE, so the wire
 	// body is not the upstream byte stream. A leftover Content-Encoding
 	// (gzip/deflate/br) would ask the client to decode transformed frames.
+	// Content-MD5 / ETag likewise describe the upstream body.
 	dst.Del("Content-Encoding")
+	dst.Del("Content-MD5")
+	dst.Del("ETag")
 	w.WriteHeader(hdrOut.Status)
 	res.HeadersSent = true
 	res.Status = hdrOut.Status
