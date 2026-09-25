@@ -186,6 +186,104 @@ func TestCalibration_LazyRejectsAutomaticPlan(t *testing.T) {
 	}
 }
 
+func TestCalibration_RejectsDisabledUpstream(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	up.Enabled = false
+	if err := st.UpdateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		t.Fatal("停用 Upstream 不得 RoundTrip")
+		return nil, nil
+	})
+
+	_, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err == nil {
+		t.Fatal("停用 Upstream 的手动 Plan 必须拒绝")
+	}
+	if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Upstream") {
+		t.Fatalf("应为配置校验错误且点名 Upstream: %v", err)
+	}
+	if counter.count() != 0 {
+		t.Fatalf("拒绝后不得出网，RoundTrip=%d", counter.count())
+	}
+
+	// 启用兄弟站仍可校准：停用站不得拖累管理员对启用站的操作。
+	sib := &model.Upstream{
+		Name: "cal-up-sibling", BaseURL: "https://cal-sib.example.test",
+		APIKey: "sk-cal-sibling-key", AuthStyle: model.AuthAuto, Enabled: true,
+		ProbeMode: model.ProbeModeActive,
+	}
+	if err := st.CreateUpstream(sib); err != nil {
+		t.Fatal(err)
+	}
+	mn, err := st.GetModelName(rt.ModelNameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibRT := &model.Route{ModelNameID: mn.ID, UpstreamID: sib.ID, Priority: 1, Weight: 1, Enabled: true}
+	if err := st.CreateRoute(sibRT); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.Plan(context.Background(), sibRT.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatalf("启用兄弟 Route 应可 Plan: %v", err)
+	}
+}
+
+func TestCalibration_RejectsDisabledRoute(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	rt.Enabled = false
+	if err := st.UpdateRoute(rt); err != nil {
+		t.Fatal(err)
+	}
+	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		t.Fatal("停用 Route 不得 RoundTrip")
+		return nil, nil
+	})
+
+	_, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err == nil {
+		t.Fatal("停用 Route 的手动 Plan 必须拒绝")
+	}
+	if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Route") {
+		t.Fatalf("应为配置校验错误且点名 Route: %v", err)
+	}
+	if counter.count() != 0 {
+		t.Fatalf("拒绝后不得出网，RoundTrip=%d", counter.count())
+	}
+}
+
+func TestCalibration_StartRejectsAfterDisable(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		t.Fatal("Start 拒绝后不得 RoundTrip")
+		return nil, nil
+	})
+
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Enabled = false
+	if err := st.UpdateRoute(rt); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.Start(context.Background(), run.ID, run.Revision)
+	if err == nil {
+		t.Fatal("Plan 后停用 Route，Start 必须拒绝")
+	}
+	if !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("应为配置校验错误: %v", err)
+	}
+	if counter.count() != 0 {
+		t.Fatalf("拒绝后不得出网，RoundTrip=%d", counter.count())
+	}
+}
+
 func TestCalibration_EachCandidateOneRoundTrip_NoHiddenRetry(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)

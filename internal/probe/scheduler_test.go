@@ -2,11 +2,14 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -859,6 +862,38 @@ func TestScheduler_ProbeNowRejectsBrokenConfig(t *testing.T) {
 	if _, _, err := hs.sched.ProbeNow(context.Background(), snap,
 		&model.Route{ID: 999, ModelNameID: 88888, UpstreamID: 10}); err == nil {
 		t.Error("ModelName 不存在应报错")
+	}
+}
+
+func TestScheduler_ProbeNowRejectsDisabled(t *testing.T) {
+	var hits int32
+	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(200)
+	})
+	snap, _ := hs.cfg.Snapshot()
+	rt := snap.RoutesByModelName[1][0]
+
+	disabledRoute := *rt
+	disabledRoute.Enabled = false
+	if _, _, err := hs.sched.ProbeNow(context.Background(), snap, &disabledRoute); err == nil {
+		t.Fatal("停用 Route 的 ProbeNow 必须拒绝")
+	} else if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Route") {
+		t.Fatalf("应为配置校验错误且点名 Route: %v", err)
+	}
+
+	up := snap.Upstreams[rt.UpstreamID]
+	disabledUp := *up
+	disabledUp.Enabled = false
+	snap.Upstreams[rt.UpstreamID] = &disabledUp
+	if _, _, err := hs.sched.ProbeNow(context.Background(), snap, rt); err == nil {
+		t.Fatal("停用 Upstream 的 ProbeNow 必须拒绝")
+	} else if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Upstream") {
+		t.Fatalf("应为配置校验错误且点名 Upstream: %v", err)
+	}
+
+	if hits != 0 {
+		t.Fatalf("配置拒绝后不得 RoundTrip，hits=%d", hits)
 	}
 }
 

@@ -157,6 +157,9 @@ func (s *CalibrationService) Plan(ctx context.Context, routeID int64, endpoint m
 	if err != nil {
 		return model.CalibrationRun{}, err
 	}
+	if err := errDisabledProbeTarget(route, upstream); err != nil {
+		return model.CalibrationRun{}, err
+	}
 	ep, err := s.store.Endpoint(ctx, upstream.ID, endpoint)
 	if err != nil {
 		return model.CalibrationRun{}, err
@@ -209,6 +212,21 @@ func (s *CalibrationService) Plan(ctx context.Context, routeID int64, endpoint m
 
 // Start 把 planned run 置为 running，并唤醒 Run 循环。
 func (s *CalibrationService) Start(ctx context.Context, runID string, expectedRevision int64) (model.CalibrationRun, error) {
+	planned, err := s.store.GetCalibrationRun(ctx, runID)
+	if err != nil {
+		return model.CalibrationRun{}, err
+	}
+	route, err := s.store.GetRoute(planned.RouteID)
+	if err != nil {
+		return model.CalibrationRun{}, err
+	}
+	upstream, err := s.store.GetUpstream(route.UpstreamID)
+	if err != nil {
+		return model.CalibrationRun{}, err
+	}
+	if err := errDisabledProbeTarget(route, upstream); err != nil {
+		return model.CalibrationRun{}, err
+	}
 	if err := s.store.StartCalibrationRun(ctx, runID, expectedRevision); err != nil {
 		return model.CalibrationRun{}, err
 	}
@@ -381,6 +399,22 @@ func (s *CalibrationService) sendCandidate(ctx context.Context, run *model.Calib
 	if err != nil {
 		return err
 	}
+
+	// 发送前再读一次启用状态：Plan/Start 之后可能被停用；拒绝必须早于
+	// send_started 与 RoundTrip，避免把配置拒绝拖成 interrupted。
+	route, err := s.store.GetRoute(run.RouteID)
+	if err != nil {
+		return err
+	}
+	upstream, err := s.store.GetUpstream(route.UpstreamID)
+	if err != nil {
+		return err
+	}
+	if err := errDisabledProbeTarget(route, upstream); err != nil {
+		_ = s.store.FinishCalibrationRun(ctx, run.ID, model.CalibrationFailed, run.Revision)
+		return err
+	}
+
 	if candidate.State == model.CalibrationCandidatePrepared {
 		if err := s.store.MarkCalibrationSendStarted(ctx, run.ID, candidate.Ordinal, executionID, run.Revision); err != nil {
 			return err
@@ -408,12 +442,16 @@ func (s *CalibrationService) sendCandidate(ctx context.Context, run *model.Calib
 	run = freshCancel
 	candidate = run.Candidates[run.Current]
 
-	route, err := s.store.GetRoute(run.RouteID)
+	route, err = s.store.GetRoute(run.RouteID)
 	if err != nil {
 		return err
 	}
-	upstream, err := s.store.GetUpstream(route.UpstreamID)
+	upstream, err = s.store.GetUpstream(route.UpstreamID)
 	if err != nil {
+		return err
+	}
+	if err := errDisabledProbeTarget(route, upstream); err != nil {
+		_ = s.store.FinishCalibrationRun(ctx, run.ID, model.CalibrationFailed, run.Revision)
 		return err
 	}
 	modelName, err := s.store.GetModelName(route.ModelNameID)

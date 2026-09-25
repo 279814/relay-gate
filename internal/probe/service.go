@@ -96,6 +96,9 @@ func (s *Service) RunManual(ctx context.Context, routeID int64) (model.ProbeExec
 	if err != nil {
 		return model.ProbeExecution{}, err
 	}
+	if err := errDisabledProbeTarget(rt, up); err != nil {
+		return model.ProbeExecution{}, err
+	}
 	mn, err := s.store.GetModelName(rt.ModelNameID)
 	if err != nil {
 		return model.ProbeExecution{}, err
