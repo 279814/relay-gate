@@ -532,6 +532,9 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 		if up == nil {
 			continue
 		}
+		if model.APIKeyTooShortForOutbound(up.APIKey) {
+			continue
+		}
 		relGate, ok := h.recovery.TryAcquire(rt.ID)
 		if !ok {
 			continue

@@ -19,7 +19,7 @@ var fixedTime = time.Date(2026, 8, 20, 12, 34, 56, 789_000_000, time.UTC)
 
 func testValues() TemplateValues {
 	return TemplateValues{
-		UpstreamAPIKey: probetemplate.ResolvedValue{Plain: []byte("sk-up-key"), Revision: 3},
+		UpstreamAPIKey: probetemplate.ResolvedValue{Plain: []byte("sk-up-key-12"), Revision: 3},
 		UpstreamModel:  probetemplate.ResolvedValue{Plain: []byte("claude-3-5-haiku"), Revision: 4},
 		ModelName:      probetemplate.ResolvedValue{Plain: []byte("haiku"), Revision: 5},
 		ProbePrompt:    probetemplate.ResolvedValue{Plain: []byte("1+1=?"), Revision: 6},
@@ -46,7 +46,7 @@ func TestTemplateValues_ResolvesEveryBuiltInPlaceholder(t *testing.T) {
 		want        string
 		revision    int64
 	}{
-		{"UPSTREAM_API_KEY", "sk-up-key", 3},
+		{"UPSTREAM_API_KEY", "sk-up-key-12", 3},
 		{"UPSTREAM_MODEL", "claude-3-5-haiku", 4},
 		{"MODEL_NAME", "haiku", 5},
 		{"PROBE_PROMPT", "1+1=?", 6},
@@ -188,7 +188,7 @@ func TestTemplateValues_ResolvedPlainIsNotAliased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(second.Plain) != "sk-up-key" {
+	if string(second.Plain) != "sk-up-key-12" {
 		t.Errorf("第二次解析被第一次的改动污染，得到 %q", second.Plain)
 	}
 }
@@ -217,7 +217,7 @@ func TestTemplateValues_RendersInHeaderQueryAndBody(t *testing.T) {
 		t.Fatalf("渲染失败: %v", err)
 	}
 
-	if want := "key=sk-up-key&tenant=tenant-42"; rendered.RawQuery != want {
+	if want := "key=sk-up-key-12&tenant=tenant-42"; rendered.RawQuery != want {
 		t.Errorf("query want %q got %q", want, rendered.RawQuery)
 	}
 	if got := rendered.Header.Get("X-Session"); got != "sess-abc" {

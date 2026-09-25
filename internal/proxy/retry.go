@@ -294,6 +294,15 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 				cand.Release()
 				continue
 			}
+			// 脏行/历史短 api_key：当作 config_error 跳过，不占出站、不换站重试额度。
+			if model.APIKeyTooShortForOutbound(cand.Upstream.APIKey) {
+				h.log.Warn("上游 api_key 短于脱敏下限，跳过本 Route",
+					"upstream", cand.Upstream.ID, "route", cand.Route.ID,
+					"min_len", model.MinRedactableKeyLen, "got_len", len(cand.Upstream.APIKey))
+				exclude[cand.Route.ID] = true
+				cand.Release()
+				continue
+			}
 			wrapped, ok := h.wrapRecoveryIfNeeded(cand)
 			if ok {
 				return wrapped, false, nil
@@ -401,7 +410,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			// Resolve upstream_api_key for secret_ref / {{SECRET:…}} on the
 			// live path; rendered plaintext is tainted for sample redaction.
 			var secrets transform.SecretMap
-			if key := cand.Upstream.APIKey; key != "" {
+			if key := cand.Upstream.APIKey; key != "" && !model.APIKeyTooShortForOutbound(key) {
 				secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
 			}
 			tr := compiled.ApplyRequestSecrets(

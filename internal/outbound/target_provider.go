@@ -92,6 +92,12 @@ func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedVal
 		if len(values.UpstreamAPIKey) == 0 {
 			return ResolvedValue{}, model.WrapValidation("upstream api_key 未配置")
 		}
+		// 脏行/历史短钥：不得进 FixedQuery / URL 模板。写入路径已拒短钥；
+		// 这里是选路漏网与探活共用的最后一道门（与 ApplyAuth 同源）。
+		if model.APIKeyTooShortForOutbound(string(values.UpstreamAPIKey)) {
+			return ResolvedValue{}, fmt.Errorf("%w: 上游 api_key 短于脱敏下限 %d（无法在 Location 等 URI 头中脱敏）",
+				ErrAuthConfig, model.MinRedactableKeyLen)
+		}
 		return ResolvedValue{Plain: values.UpstreamAPIKey, Revision: values.CredentialRevision}, nil
 	}
 	const prefix = "SECRET:"

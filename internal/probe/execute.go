@@ -112,6 +112,12 @@ func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *mode
 	rt *model.Route, endpoint model.EndpointKind, resolved ResolvedRecipe,
 	authOverride *model.EndpointAuthProfile) (*preparedProbe, ResolvedRecipe, error) {
 
+	// 脏行/历史短钥：渲染前 fail closed，避免短串进 recipe body / query / Location。
+	if model.APIKeyTooShortForOutbound(up.APIKey) {
+		return nil, resolved, fmt.Errorf("%w: 上游 api_key 短于脱敏下限 %d（无法在 Location 等 URI 头中脱敏）",
+			outbound.ErrAuthConfig, model.MinRedactableKeyLen)
+	}
+
 	values, err := p.templateValues(ctx, up, mn, rt, resolved)
 	if err != nil {
 		return nil, resolved, err

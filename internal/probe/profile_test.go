@@ -17,9 +17,9 @@ func TestSingleAuthProfile_WritesExactlyOneForm(t *testing.T) {
 		wantOnly  string
 		wantValue string
 	}{
-		{model.AuthModeBearer, "Authorization", "Bearer sk-up"},
-		{model.AuthModeXAPIKey, "X-Api-Key", "sk-up"},
-		{model.AuthModeAPIKey, "Api-Key", "sk-up"},
+		{model.AuthModeBearer, "Authorization", "Bearer sk-up-test-key"},
+		{model.AuthModeXAPIKey, "X-Api-Key", "sk-up-test-key"},
+		{model.AuthModeAPIKey, "Api-Key", "sk-up-test-key"},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.mode), func(t *testing.T) {
@@ -32,7 +32,7 @@ func TestSingleAuthProfile_WritesExactlyOneForm(t *testing.T) {
 			header.Set("X-Api-Key", "rk-relay")
 			header.Set("Api-Key", "rk-relay")
 			if err := ApplyCandidateAuth(context.Background(), header, profile, outbound.Values{
-				UpstreamAPIKey: []byte("sk-up"), CredentialRevision: 1,
+				UpstreamAPIKey: []byte("sk-up-test-key"), CredentialRevision: 1,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -61,11 +61,11 @@ func TestAutoCalibrated_DoesNotSendBothBearerAndXAPIKey(t *testing.T) {
 	header.Set("Authorization", "Bearer rk")
 	header.Set("X-Api-Key", "rk")
 	if err := ApplyCandidateAuth(context.Background(), header, profile, outbound.Values{
-		UpstreamAPIKey: []byte("sk-up"), CredentialRevision: 1,
+		UpstreamAPIKey: []byte("sk-up-test-key"), CredentialRevision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if header.Get("Authorization") != "Bearer sk-up" {
+	if header.Get("Authorization") != "Bearer sk-up-test-key" {
 		t.Fatalf("Authorization = %q", header.Get("Authorization"))
 	}
 	if header.Get("X-Api-Key") != "" {
@@ -78,7 +78,7 @@ func TestLegacyAuto_SyntheticConfigErrorPointsAtCalibration(t *testing.T) {
 		Mode: model.AuthModeLegacyAutoRealOnly, SecretRef: "upstream_api_key", Revision: 1,
 	}
 	err := ApplyCandidateAuth(context.Background(), http.Header{}, profile, outbound.Values{
-		UpstreamAPIKey: []byte("sk-up"), CredentialRevision: 1,
+		UpstreamAPIKey: []byte("sk-up-test-key"), CredentialRevision: 1,
 	})
 	if err == nil {
 		t.Fatal("synthetic 必须 config_error")
@@ -102,14 +102,14 @@ func TestStripInboundAliasesBeforeWritingProfile(t *testing.T) {
 	header.Set("X-Api-Key", "relay-secret-plaintext")
 	header.Set("Api-Key", "relay-secret-plaintext")
 	if err := ApplyCandidateAuth(context.Background(), header, profile, outbound.Values{
-		UpstreamAPIKey: []byte("sk-up"), CredentialRevision: 1,
+		UpstreamAPIKey: []byte("sk-up-test-key"), CredentialRevision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if header.Get("Authorization") != "" || header.Get("Api-Key") != "" {
 		t.Fatal("入站认证别名必须先删干净")
 	}
-	if header.Get("X-Api-Key") != "sk-up" {
+	if header.Get("X-Api-Key") != "sk-up-test-key" {
 		t.Fatalf("X-Api-Key = %q", header.Get("X-Api-Key"))
 	}
 }

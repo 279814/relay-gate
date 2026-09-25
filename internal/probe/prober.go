@@ -64,7 +64,8 @@ func (p *Prober) values(up *model.Upstream) outbound.Values {
 // 精确的 config_error 状态要等 P0-08 的 ResponseClassifier 与 P0-09 的
 // ProbeExecution 落库，那时才有地方记「这次失败的类别」。
 func probeConfigOutcome(err error) Outcome {
-	if errors.Is(err, outbound.ErrLegacyNeedsReview) {
+	if errors.Is(err, outbound.ErrLegacyNeedsReview) || errors.Is(err, outbound.ErrAuthConfig) {
+		// 本地配置问题（含脏行短 api_key）：不发请求，也不把站判死。
 		return Outcome{Verdict: health.VerdictIgnore, Err: err}
 	}
 	return Outcome{Verdict: health.VerdictUnavailable, Err: err}

@@ -120,6 +120,11 @@ func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, inModel stri
 		if err != nil {
 			return nil, err
 		}
+		if model.APIKeyTooShortForOutbound(cand.Upstream.APIKey) {
+			localExclude[cand.Route.ID] = true
+			cand.Release()
+			continue
+		}
 		if !h.countTokensPreferOK(cand.Route.ID, prefer) {
 			localExclude[cand.Route.ID] = true
 			cand.Release()
