@@ -3,6 +3,9 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -243,4 +246,142 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	if !bytes.Equal(gotPlain.InBody, plainBody) {
 		t.Fatalf("plaintext dual-read after rewrap: got %q want %q", gotPlain.InBody, plainBody)
 	}
+}
+
+// TestRewrapSampleField_MultipartPerFrameNoAssemble pins master rotation
+// resealing v1m frames one at a time: peak plaintext held is one frame, the
+// blob stays multipart, and GetSample bytes match. A small v1 sample still
+// rewraps as a single envelope.
+func TestRewrapSampleField_MultipartPerFrameNoAssemble(t *testing.T) {
+	prevChunk := sampleBlobChunk
+	sampleBlobChunk = 4 << 10 // 4 KiB
+	defer func() { sampleBlobChunk = prevChunk }()
+
+	oldMaster := "old-master-multipart-rewrap-aaaa"
+	newMaster := "new-master-multipart-rewrap-bbbb"
+	oldC, err := NewCipher(oldMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "multipart-rewrap.db"), oldC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	want := bytes.Repeat([]byte("abcdefghij"), 2000) // 20 KiB > 2 chunks
+	spillPath := filepath.Join(t.TempDir(), "spill.tmp")
+	if err := os.WriteFile(spillPath, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := mkSample(42)
+	s.InBody, s.OutBody, s.RespBody = nil, nil, nil
+	s.RespBodyFile = spillPath
+	if err := st.InsertSample(s); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw []byte
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample WHERE id=?`, s.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !isSampleMultipart(raw) {
+		t.Fatalf("want v1m before rewrap, got prefix %q", raw[:min(16, len(raw))])
+	}
+	framesBefore, err := countSampleMultipartFrames(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if framesBefore < 2 {
+		t.Fatalf("need ≥2 frames to pin per-frame rewrap, got %d", framesBefore)
+	}
+
+	rewrapMultipartPlainPeak = 0
+	neu, err := rewrapSampleField(oldC, newMaster, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isSampleMultipart(neu) {
+		t.Fatalf("multipart rewrap must stay v1m, got prefix %q", neu[:min(16, len(neu))])
+	}
+	framesAfter, err := countSampleMultipartFrames(neu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if framesAfter != framesBefore {
+		t.Fatalf("frame count: got %d want %d", framesAfter, framesBefore)
+	}
+	if rewrapMultipartPlainPeak <= 0 {
+		t.Fatal("expected rewrap to record a plaintext peak")
+	}
+	if rewrapMultipartPlainPeak > sampleBlobChunk {
+		t.Fatalf("rewrap plaintext peak %d exceeds one frame (%d)", rewrapMultipartPlainPeak, sampleBlobChunk)
+	}
+	if rewrapMultipartPlainPeak >= len(want) {
+		t.Fatalf("rewrap assembled whole body into one slice (%d)", rewrapMultipartPlainPeak)
+	}
+
+	onlyNew, err := NewCipher(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := onlyNew.DecryptSampleBlob(neu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("GetSample bytes after per-frame rewrap: want %d got %d", len(want), len(got))
+	}
+
+	smallPlain := []byte(`{"tiny":true}`)
+	smallEnc, err := oldC.EncryptSampleBlob(smallPlain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallNeu, err := rewrapSampleField(oldC, newMaster, smallEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isSampleMultipart(smallNeu) || !IsSampleEnvelope(smallNeu) {
+		t.Fatalf("small sample must stay single v1 envelope, got %q", smallNeu[:min(24, len(smallNeu))])
+	}
+	gotSmall, err := onlyNew.DecryptSampleBlob(smallNeu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotSmall, smallPlain) {
+		t.Fatalf("small rewrap plaintext: got %q want %q", gotSmall, smallPlain)
+	}
+}
+
+func countSampleMultipartFrames(raw []byte) (int, error) {
+	if !isSampleMultipart(raw) {
+		return 0, fmt.Errorf("not multipart")
+	}
+	rest := raw[len(sampleMultipartPrefix):]
+	colon := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon < 0 || colon+1 >= len(rest) || rest[colon+1] != '\n' {
+		return 0, fmt.Errorf("分块样本信封格式无效")
+	}
+	payload := rest[colon+2:]
+	nFrames := 0
+	for len(payload) > 0 {
+		if len(payload) < 4 {
+			return 0, fmt.Errorf("分块样本信封截断")
+		}
+		n := int(binary.BigEndian.Uint32(payload[:4]))
+		payload = payload[4:]
+		if n < 0 || n > len(payload) {
+			return 0, fmt.Errorf("分块样本信封长度无效")
+		}
+		payload = payload[n:]
+		nFrames++
+	}
+	return nFrames, nil
 }
