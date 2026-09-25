@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // ellipsisFmt 是截断处的省略标记。
@@ -13,6 +14,13 @@ import (
 // 按 JSON 高亮显示 body，一个裸的 "..." 会让它解析失败并显示成一团乱码。
 // 用注释风格的标记，人一眼能看懂，机器也不会当成数据。
 const ellipsisFmt = "\n/* …relay-gate: 省略 %d 字节… */\n"
+
+// spillTempGlob 是完整模式 spill 临时文件的 CreateTemp 模式。
+//
+// 落在 os.TempDir()（CreateTemp 第一参为空）。成功落库走 Bytes→closeSpill
+// 删掉；崩溃会跳过 closeSpill，残留仍含响应字节。启动时按此前缀清掉，
+// 不得动已落库样本（SQLite）与无关临时文件。
+const spillTempGlob = "relay-gate-sample-*.tmp"
 
 // fullSpillAt 是完整模式下内存缓冲的上限：超过后溢出到临时文件。
 //
@@ -199,13 +207,43 @@ func (h *HeadTail) openSpill() bool {
 	if h.spill != nil {
 		return true
 	}
-	f, err := os.CreateTemp("", "relay-gate-sample-*.tmp")
+	f, err := os.CreateTemp("", spillTempGlob)
 	if err != nil {
 		return false
 	}
 	h.spill = f
 	h.spillPath = f.Name()
 	return true
+}
+
+// RemoveOrphanSpills 删除 dir 下匹配 spillTempGlob 的残留临时文件。
+//
+// dir 为空时用 os.TempDir()（与 openSpill 一致）。崩溃跳过 closeSpill 时，
+// 这些文件仍可读到响应正文；下次启动必须在接流量前清掉。
+// 只按 spill 前缀删，不碰已落库样本与其它临时文件。
+func RemoveOrphanSpills(dir string) (int, error) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, spillTempGlob))
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	var first error
+	for _, p := range matches {
+		if err := os.Remove(p); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		n++
+	}
+	return n, first
 }
 
 func (h *HeadTail) appendSpill(p []byte) {

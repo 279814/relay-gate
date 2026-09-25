@@ -2,6 +2,8 @@ package sample
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -610,5 +612,57 @@ func TestHeadTail_QuotaOverflowAfterSpillKeepsMemBounded(t *testing.T) {
 	}
 	if ht.SpillBytes() != 0 {
 		t.Fatal("切到头尾后 spill 应已清理")
+	}
+}
+
+// 崩溃跳过 closeSpill 时，TempDir 里仍会留下带 spill 前缀的文件（含响应字节）。
+// 下次启动必须只清掉该前缀；已落库样本文件与无关临时文件不得动。
+func TestRemoveOrphanSpills_RemovesSpillPrefixKeepsFinishedSample(t *testing.T) {
+	dir := t.TempDir()
+
+	spill, err := os.CreateTemp(dir, spillTempGlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte(`{"secret":"upstream-response-body"}`)
+	if _, err := spill.Write(secret); err != nil {
+		t.Fatal(err)
+	}
+	spillPath := spill.Name()
+	if err := spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟崩溃：文件留在磁盘，进程不再持有句柄。
+
+	finishedPath := filepath.Join(dir, "finished-sample-record.bin")
+	finishedBody := []byte(`{"id":1,"resp_body":"already committed to store"}`)
+	if err := os.WriteFile(finishedPath, finishedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(dir, "other-temp-xyz.tmp")
+	if err := os.WriteFile(unrelated, []byte("keep-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := RemoveOrphanSpills(dir)
+	if err != nil {
+		t.Fatalf("RemoveOrphanSpills: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应只删 1 个 spill 残留，got %d", n)
+	}
+	if _, err := os.Stat(spillPath); !os.IsNotExist(err) {
+		t.Fatalf("spill 残留应已删除，stat=%v", err)
+	}
+	gotFinished, err := os.ReadFile(finishedPath)
+	if err != nil {
+		t.Fatalf("已完成样本文件不应被删: %v", err)
+	}
+	if !bytes.Equal(gotFinished, finishedBody) {
+		t.Fatalf("已完成样本内容被改写: %q", gotFinished)
+	}
+	gotUnrelated, err := os.ReadFile(unrelated)
+	if err != nil || string(gotUnrelated) != "keep-me" {
+		t.Fatalf("无关临时文件不应被删: err=%v body=%q", err, gotUnrelated)
 	}
 }
