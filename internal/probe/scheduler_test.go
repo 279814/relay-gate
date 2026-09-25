@@ -680,6 +680,137 @@ func TestScheduler_SkipsDisabled(t *testing.T) {
 	}
 }
 
+// gatingCfg lets a test freeze the second Snapshot (armed runL*) until disable lands.
+type gatingCfg struct {
+	inner       *fakeCfg
+	snapCalls   atomic.Int32
+	blockSecond chan struct{} // closed when test has disabled the target
+	secondSeen  chan struct{} // closed when runL* is blocked on Snapshot
+}
+
+func (g *gatingCfg) Snapshot() (*router.Snapshot, error) {
+	n := g.snapCalls.Add(1)
+	if n == 1 {
+		return g.inner.Snapshot()
+	}
+	select {
+	case <-g.secondSeen:
+	default:
+		close(g.secondSeen)
+	}
+	<-g.blockSecond
+	return g.inner.Snapshot()
+}
+func (g *gatingCfg) Settings() (model.Settings, error) { return g.inner.Settings() }
+func (g *gatingCfg) RunState() (store.RunState, error) { return g.inner.RunState() }
+
+// Armed L2 must not RoundTrip after the Route is disabled between Claim and send.
+// An enabled sibling's armed probe still sends. Re-enable does not replay the skip.
+func TestScheduler_ArmedL2SkipsRoundTripAfterDisable(t *testing.T) {
+	var hits atomic.Int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(200)
+			return
+		}
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "event: message_start\ndata: {}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"4\"}}\n\n")
+		_, _ = io.WriteString(w, "event: message_stop\ndata: {}\n\n")
+	}
+
+	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+
+	srvA := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srvA.Close)
+	srvB := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srvB.Close)
+
+	upA := &model.Upstream{ID: 10, Name: "up-a", BaseURL: srvA.URL,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+		L1Path: "/v1/models", Enabled: true}
+	upB := &model.Upstream{ID: 20, Name: "up-b", BaseURL: srvB.URL,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+		L1Path: "/v1/models", Enabled: true}
+	rtA := &model.Route{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true}
+	rtB := &model.Route{ID: 200, ModelNameID: 1, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true}
+
+	inner := &fakeCfg{
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{upA, upB}, []*model.Route{rtA, rtB}),
+		settings: fastSettings(),
+		state:    store.StateRunning,
+	}
+	gate := &gatingCfg{
+		inner:       inner,
+		blockSecond: make(chan struct{}),
+		secondSeen:  make(chan struct{}),
+	}
+	track := newRecordingTracker()
+	track.l1Allowed = map[int64]bool{}    // L1 would also re-check Snapshot; keep this race on L2 only
+	track.l2Allowed = map[int64]bool{100: true}
+	sched := NewScheduler(gate, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
+		WithTargets(testTargets(), nil)
+
+	done := make(chan struct{})
+	go func() {
+		sched.tick(context.Background())
+		sched.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-gate.secondSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("armed L2 never re-checked Snapshot")
+	}
+
+	inner.mu.Lock()
+	rtA.Enabled = false
+	inner.mu.Unlock()
+	close(gate.blockSecond)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tick did not finish after disable")
+	}
+
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("disabled Route 的已武装 L2 不得 RoundTrip，hits=%d", n)
+	}
+
+	// Sibling still enabled: a fresh Claim/send must RoundTrip.
+	hits.Store(0)
+	gate.snapCalls.Store(0)
+	gate.blockSecond = make(chan struct{})
+	gate.secondSeen = make(chan struct{})
+	close(gate.blockSecond) // no disable race
+	track.l2Allowed = map[int64]bool{200: true}
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if n := hits.Load(); n == 0 {
+		t.Fatal("启用兄弟 Route 的探活仍应 RoundTrip")
+	}
+
+	// Re-enable the skipped Route: do not force an immediate probe; next send
+	// waits for a later Claim (normal schedule).
+	inner.mu.Lock()
+	rtA.Enabled = true
+	inner.mu.Unlock()
+	hits.Store(0)
+	track.l2Allowed = map[int64]bool{}
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("重新启用不得重放被跳过的探活，hits=%d", n)
+	}
+}
+
 // ── Run 的生命周期 ───────────────────────────────────────
 
 // ctx 结束时 Run 必须返回，且等在途探活收尾 ——
