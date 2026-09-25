@@ -90,11 +90,10 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 	// §4.5：只有改了模型映射或指向的站才需要重探 —— 那两项决定探活
 	// 打的是哪个模型、哪个站。改 priority / weight 只影响选路的偏好，
 	// 探活结果一模一样，重探纯属浪费一次请求。
-	// 从停用变启用也要探：那是「重新启用它，想知道还通不通」的时刻。
+	// 仅把 Enabled 从 false 翻回 true 只发布 livecfg，不触发合成探活或校准。
 	if before.UpstreamModel != cur.UpstreamModel ||
 		before.UpstreamID != cur.UpstreamID ||
-		before.ModelNameID != cur.ModelNameID ||
-		(!before.Enabled && cur.Enabled) {
+		before.ModelNameID != cur.ModelNameID {
 		s.invalidateRoute(id)
 	}
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
