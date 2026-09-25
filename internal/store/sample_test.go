@@ -811,6 +811,76 @@ func TestInsertSampleWithinQuota_SpillFileChunkedNoAssemble(t *testing.T) {
 	}
 }
 
+// 剩余配额为正但连丢掉全部正文后仍无可用字节时，不得插入仅头空壳（占 Group 名额）。
+// 回归：EncryptSampleBlob(空)=空 → need=0<=rem 曾误走 INSERT。
+func TestInsertSampleWithinQuota_SkipEmptyShellWhenNothingFits(t *testing.T) {
+	st := testStore(t)
+	s := mkSample(20)
+	// rem=1：明文截断后仍可能留 1 字节，但信封膨胀后三路都放不下，最终正文全丢。
+	ok, err := st.InsertSampleWithinQuota(s, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("正文全因配额放不下时不得插入空壳行")
+	}
+	cnt, err := st.CountSamples()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 0 {
+		t.Fatalf("空壳不得占 Sample Group：count=%d", cnt)
+	}
+	if !s.Truncated.Has(model.TruncInBody) || !s.Truncated.Has(model.TruncOutBody) || !s.Truncated.Has(model.TruncRespBody) {
+		t.Fatalf("应标记三路正文因配额丢弃，truncated=%v", s.Truncated)
+	}
+}
+
+// 丢掉 resp（及必要时 out）后若 in 仍放得下，应插入缩小后的行，而非跳过。
+func TestInsertSampleWithinQuota_PartialDropStillInserts(t *testing.T) {
+	st := testStore(t)
+	inPlain := []byte(`{"model":"keep-in"}`)
+	encIn, err := st.encryptSampleBody(inPlain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 配额刚好够加密后的 in，不够再加 out/resp。
+	quota := int64(len(encIn))
+
+	s := mkSample(21)
+	s.InBody = append([]byte(nil), inPlain...)
+	s.OutBody = bytes.Repeat([]byte("o"), 512)
+	s.RespBody = bytes.Repeat([]byte("r"), 512)
+
+	ok, err := st.InsertSampleWithinQuota(s, quota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("丢掉超预算正文后 in 应能落库")
+	}
+	cnt, err := st.CountSamples()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 1 {
+		t.Fatalf("应插入 1 行，got %d", cnt)
+	}
+	got, err := st.GetSample(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.InBody, inPlain) {
+		t.Fatalf("in 应完整保留，got %q", got.InBody)
+	}
+	if len(got.OutBody) != 0 || len(got.RespBody) != 0 {
+		t.Fatalf("out/resp 应已丢弃，out=%d resp=%d", len(got.OutBody), len(got.RespBody))
+	}
+	if !s.Truncated.Has(model.TruncOutBody) || !s.Truncated.Has(model.TruncRespBody) {
+		t.Fatalf("应标记 out/resp 截断，truncated=%v", s.Truncated)
+	}
+}
+
 // 配额跳过时也必须删掉 spill 临时文件。
 func TestInsertSampleWithinQuota_SkipRemovesSpillFile(t *testing.T) {
 	st := testStore(t)

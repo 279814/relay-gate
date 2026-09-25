@@ -50,7 +50,8 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 // 采集侧 LimitToRemaining 在 tee 开始时读一次剩余配额；多个在途请求若读到
 // 同一剩余值，各自按该值收满，串行 InsertSample 仍会把总量写成 N 倍。
 // Recorder 单 writer 每条插入前走这里：放得下就写，否则截断放不下的正文，
-// 连截断后仍放不下（例如配额已耗尽）则跳过本条，不报错给客户端。
+// 连截断后仍放不下（例如配额已耗尽，或信封膨胀后丢掉全部正文仍无可用字节）
+// 则跳过本条，不插入仅含头的空壳行（空壳会占 Sample Group 名额），不报错给客户端。
 //
 // maxBytes <= 0 表示该维度不限，行为与 InsertSample 相同。
 // 返回 inserted=false 表示因配额跳过（不是错误）。
@@ -93,6 +94,10 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 			}
 			need := int64(len(inBody)+len(outBody)) + fi.Size()
 			if need <= rem {
+				if need == 0 {
+					_ = os.Remove(encPath)
+					return false, nil
+				}
 				err := s.insertSampleEncryptedFile(smp, inBody, outBody, encPath)
 				_ = os.Remove(encPath)
 				return true, err
@@ -109,6 +114,9 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 		}
 		need := int64(len(inBody) + len(outBody) + len(respBody))
 		if need <= rem {
+			if need == 0 {
+				return false, nil
+			}
 			return true, s.insertSampleEncrypted(smp, inBody, outBody, respBody)
 		}
 		// 信封膨胀后仍超剩余：继续丢掉正文（先 resp，与采集侧预算顺序一致）。
