@@ -266,6 +266,13 @@ func (s *Store) DeleteModelName(id int64) (err error) {
 		return err
 	}
 
+	// probe_cost_daily has no FK; child Routes CASCADE without DeleteRoute.
+	// Drop their rollups here so a reused route id cannot inherit totals.
+	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE route_id IN (
+		SELECT id FROM route WHERE model_name_id=?)`, id); err != nil {
+		return err
+	}
+
 	res, err := tx.Exec(`DELETE FROM model_name WHERE id=?`, id)
 	if err != nil {
 		return err

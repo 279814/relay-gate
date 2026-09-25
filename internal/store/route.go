@@ -304,6 +304,12 @@ func (s *Store) DeleteRoute(id int64) (err error) {
 		return err
 	}
 
+	// probe_cost_daily has no FK; ListProbeCostDaily filters by bare route_id.
+	// Drop rollups in this transaction so a reused id cannot inherit totals.
+	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE route_id=?`, id); err != nil {
+		return err
+	}
+
 	res, err := tx.Exec(`DELETE FROM route WHERE id=?`, id)
 	if err != nil {
 		return err
