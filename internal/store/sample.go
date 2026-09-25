@@ -17,19 +17,6 @@ import (
 // 但**必须假设 body 已脱敏** —— 本函数不做脱敏，那是 sample 包的职责。
 // Body BLOBs are stored as v1 envelopes when a Cipher is configured.
 func (s *Store) InsertSample(smp *model.Sample) error {
-	inH, err := marshalJSONHeaders(smp.InHeaders)
-	if err != nil {
-		return err
-	}
-	outH, err := marshalJSONHeaders(smp.OutHeaders)
-	if err != nil {
-		return err
-	}
-	respH, err := marshalJSONHeaders(smp.RespHeaders)
-	if err != nil {
-		return err
-	}
-
 	inBody, err := s.encryptSampleBody(smp.InBody)
 	if err != nil {
 		return err
@@ -39,6 +26,116 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 		return err
 	}
 	respBody, err := s.encryptSampleBody(smp.RespBody)
+	if err != nil {
+		return err
+	}
+	return s.insertSampleEncrypted(smp, inBody, outBody, respBody)
+}
+
+// InsertSampleWithinQuota 在落库前重读当前正文磁盘占用（§5.4）。
+//
+// 采集侧 LimitToRemaining 在 tee 开始时读一次剩余配额；多个在途请求若读到
+// 同一剩余值，各自按该值收满，串行 InsertSample 仍会把总量写成 N 倍。
+// Recorder 单 writer 每条插入前走这里：放得下就写，否则截断放不下的正文，
+// 连截断后仍放不下（例如配额已耗尽）则跳过本条，不报错给客户端。
+//
+// maxBytes <= 0 表示该维度不限，行为与 InsertSample 相同。
+// 返回 inserted=false 表示因配额跳过（不是错误）。
+func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inserted bool, err error) {
+	if maxBytes <= 0 {
+		return true, s.InsertSample(smp)
+	}
+	used, err := s.SampleDiskBytes()
+	if err != nil {
+		return false, fmt.Errorf("统计样本磁盘: %w", err)
+	}
+	rem := maxBytes - used
+	if rem <= 0 {
+		return false, nil
+	}
+	if plainSampleBodyBytes(smp) > rem {
+		truncateSamplePlainBodies(smp, rem)
+	}
+	for {
+		inBody, err := s.encryptSampleBody(smp.InBody)
+		if err != nil {
+			return false, err
+		}
+		outBody, err := s.encryptSampleBody(smp.OutBody)
+		if err != nil {
+			return false, err
+		}
+		respBody, err := s.encryptSampleBody(smp.RespBody)
+		if err != nil {
+			return false, err
+		}
+		need := int64(len(inBody) + len(outBody) + len(respBody))
+		if need <= rem {
+			return true, s.insertSampleEncrypted(smp, inBody, outBody, respBody)
+		}
+		// 信封膨胀后仍超剩余：继续丢掉正文（先 resp，与采集侧预算顺序一致）。
+		switch {
+		case len(smp.RespBody) > 0:
+			smp.RespBody = nil
+			smp.Truncated |= model.TruncRespBody
+		case len(smp.OutBody) > 0:
+			smp.OutBody = nil
+			smp.Truncated |= model.TruncOutBody
+		case len(smp.InBody) > 0:
+			smp.InBody = nil
+			smp.Truncated |= model.TruncInBody
+		default:
+			return false, nil
+		}
+	}
+}
+
+func plainSampleBodyBytes(smp *model.Sample) int64 {
+	if smp == nil {
+		return 0
+	}
+	return int64(len(smp.InBody) + len(smp.OutBody) + len(smp.RespBody))
+}
+
+// truncateSamplePlainBodies 把三条正文裁到合计不超过 rem。
+// 预算顺序与采集侧一致：先保留 in，再 out，剩余给 resp。
+func truncateSamplePlainBodies(smp *model.Sample, rem int64) {
+	if smp == nil {
+		return
+	}
+	if rem < 0 {
+		rem = 0
+	}
+	if int64(len(smp.InBody)) > rem {
+		smp.InBody = append([]byte(nil), smp.InBody[:rem]...)
+		smp.Truncated |= model.TruncInBody
+		rem = 0
+	} else {
+		rem -= int64(len(smp.InBody))
+	}
+	if int64(len(smp.OutBody)) > rem {
+		smp.OutBody = append([]byte(nil), smp.OutBody[:rem]...)
+		smp.Truncated |= model.TruncOutBody
+		rem = 0
+	} else {
+		rem -= int64(len(smp.OutBody))
+	}
+	if int64(len(smp.RespBody)) > rem {
+		smp.RespBody = append([]byte(nil), smp.RespBody[:rem]...)
+		smp.Truncated |= model.TruncRespBody
+	}
+}
+
+func (s *Store) insertSampleEncrypted(smp *model.Sample, inBody, outBody, respBody []byte) error {
+	inH, err := marshalJSONHeaders(smp.InHeaders)
+	if err != nil {
+		return err
+	}
+	outH, err := marshalJSONHeaders(smp.OutHeaders)
+	if err != nil {
+		return err
+	}
+	respH, err := marshalJSONHeaders(smp.RespHeaders)
 	if err != nil {
 		return err
 	}

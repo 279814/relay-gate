@@ -697,3 +697,61 @@ func TestInsertSample_BinarySafeBody(t *testing.T) {
 		t.Errorf("含 NUL 与非法 UTF-8 的 body 往返失败：%v vs %v", got.InBody, s.InBody)
 	}
 }
+
+// 两条本可各自吃满「同一剩余配额」的样本，串行插入后合计不得超过配额。
+// 回归：仅 tee 时 LimitToRemaining 读一次 used 时，两路在途会把磁盘写成约 2× remaining。
+func TestInsertSampleWithinQuota_TwoSamplesShareBudget(t *testing.T) {
+	st := testStore(t)
+	body := bytes.Repeat([]byte("y"), 2048)
+
+	probe := mkSample(1)
+	probe.InBody, probe.OutBody = nil, nil
+	probe.RespBody = body
+	if err := st.InsertSample(probe); err != nil {
+		t.Fatal(err)
+	}
+	oneCost, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oneCost <= 0 {
+		t.Fatal("探测样本应占用正的正文磁盘")
+	}
+	if _, err := st.ClearSamples(false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 够装一条全文，不够装两条 —— 模拟两路采集都读到同一大块 remaining。
+	quota := oneCost + oneCost/2
+
+	s1 := mkSample(2)
+	s1.InBody, s1.OutBody = nil, nil
+	s1.RespBody = append([]byte(nil), body...)
+	s2 := mkSample(3)
+	s2.InBody, s2.OutBody = nil, nil
+	s2.RespBody = append([]byte(nil), body...)
+
+	ok1, err := st.InsertSampleWithinQuota(s1, quota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok1 {
+		t.Fatal("第一条应能完整落入配额")
+	}
+	ok2, err := st.InsertSampleWithinQuota(s2, quota)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	used, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used > quota {
+		t.Fatalf("两条插入后磁盘 %d 超过配额 %d（ok2=%v）", used, quota, ok2)
+	}
+	if ok2 && !s2.Truncated.Has(model.TruncRespBody) && used > oneCost+oneCost/4 {
+		// 第二条入且未截断时，占用约 2×oneCost，必然破配额；走到这里说明断言有洞。
+		t.Fatalf("第二条未截断却仍声称插入成功：used=%d oneCost=%d", used, oneCost)
+	}
+}

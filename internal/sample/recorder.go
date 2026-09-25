@@ -16,6 +16,13 @@ type Writer interface {
 	PruneSamples(keepCount, keepDays int, maxBytes int64) (int64, error)
 }
 
+// quotaWriter 在每条插入前重读磁盘占用并截断/跳过，防止多个在途采集
+// 各自按同一「剩余配额」收满后串行写入把总量写成 N 倍（§5.4）。
+// store.Store 实现；测试用 fakeWriter 可不实现，走普通 InsertSample。
+type quotaWriter interface {
+	InsertSampleWithinQuota(s *model.Sample, maxBytes int64) (inserted bool, err error)
+}
+
 // pruneEvery 是每写入多少条样本触发一次清理。
 //
 // 不每条都清：清理是 DELETE + 索引维护，而 SQLite 只有一条连接，
@@ -131,12 +138,42 @@ func (r *Recorder) loop() {
 }
 
 func (r *Recorder) write(s *model.Sample) {
+	if qw, ok := r.w.(quotaWriter); ok {
+		inserted, err := qw.InsertSampleWithinQuota(s, r.diskQuotaBytes())
+		if err != nil {
+			// 只记日志，不重试：重试会让积压更严重，而样本本身是可丢的。
+			r.log.Error("样本落库失败", "err", err, "route", s.RouteID)
+			return
+		}
+		if !inserted {
+			n := r.dropped.Add(1)
+			if n <= 3 || n%100 == 0 {
+				r.log.Warn("样本磁盘配额不足，丢弃样本",
+					"dropped_total", n, "route", s.RouteID)
+			}
+			return
+		}
+		r.written.Add(1)
+		return
+	}
 	if err := r.w.InsertSample(s); err != nil {
 		// 只记日志，不重试：重试会让积压更严重，而样本本身是可丢的。
 		r.log.Error("样本落库失败", "err", err, "route", s.RouteID)
 		return
 	}
 	r.written.Add(1)
+}
+
+// diskQuotaBytes 现读 sample_disk_quota_bytes；读失败则回落默认，不打清理告警。
+func (r *Recorder) diskQuotaBytes() int64 {
+	if r.retention != nil {
+		s, err := r.retention.Settings()
+		if err == nil {
+			return s.SampleDiskQuotaBytes
+		}
+	}
+	_, _, maxBytes := defaultRetention()
+	return maxBytes
 }
 
 func (r *Recorder) prune() {
