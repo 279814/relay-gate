@@ -497,7 +497,9 @@ func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
 	hs := newHarness(t, nil)
 	now := time.Now()
 	creds := credential.New().WithNow(func() time.Time { return now })
-	creds.SetActiveRelayKey(hs.relayPW)
+	if err := creds.SetActiveRelayKey(hs.relayPW); err != nil {
+		t.Fatal(err)
+	}
 	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).
 		WithRelayKeyValidator(creds).
 		WithTargets(testTargets(hs.cfg), nil)

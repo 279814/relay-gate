@@ -18,10 +18,23 @@ var ErrReauthRequired = errors.New("需要重新输入管理员密码")
 // ErrNotFound is returned when a relay key id is unknown.
 var ErrNotFound = errors.New("凭据不存在")
 
+// ErrRevealUnavailable means no Master-Key envelope is available for the
+// current active Relay Key (§12.6 view-after-reauth).
+var ErrRevealUnavailable = errors.New("当前 Relay Key 不可查看（缺少加密副本）")
+
+// EnvelopeCipher seals high-entropy Relay Key plaintext under the Master Key
+// (§12.6). Implemented by store.Cipher (EncryptEnvelope / DecryptEnvelope).
+type EnvelopeCipher interface {
+	EncryptEnvelope(plain string) (string, error)
+	DecryptEnvelope(encoded string) (string, error)
+}
+
 // Service holds admin-facing credential operations (§12.3–12.6).
 //
 // Master Key plaintext lives only in Keyring; Relay key digests are held here
-// for hot-path auth with optional grace overlap (§6.1 / §12.6). Admin password
+// for hot-path auth with optional grace overlap (§6.1 / §12.6). An envelope
+// ciphertext of the active Relay Key is kept beside the digest so operators
+// can view the current key after re-auth without rotating. Admin password
 // verification is delegated to the caller (API compares against configured adminPW).
 type Service struct {
 	mu sync.Mutex
@@ -29,11 +42,16 @@ type Service struct {
 	revealUntil time.Time
 	revealValue string
 
+	envelope EnvelopeCipher
+
 	// relayActive / relayGrace / relayAlso store irreversible SHA-256 digests
 	// (hex), never raw key material. ValidRelayKey digests the presented key
 	// before comparing against this snapshot.
 	relayActive string
-	relayGrace  string
+	// relayActiveEnc is the Master-Key envelope of the current active raw key
+	// (§12.6). Never returned by Status / list snapshots.
+	relayActiveEnc string
+	relayGrace     string
 	// relayAlso holds digests of extra bootstrap keys (comma-separated
 	// RELAY_KEYS) that remain accepted alongside active/grace. Rotation moves
 	// only relayActive into grace; also-keys are unchanged (§12.6 single
@@ -63,21 +81,33 @@ func New() *Service {
 	}
 }
 
+// WithEnvelope wires Master-Key envelope crypto for Relay Key view-after-reauth.
+func (s *Service) WithEnvelope(e EnvelopeCipher) *Service {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.envelope = e
+	return s
+}
+
 // SetActiveRelayKey installs the primary relay key (bootstrap / env import).
-func (s *Service) SetActiveRelayKey(key string) {
-	s.SetActiveRelayKeys([]string{key})
+func (s *Service) SetActiveRelayKey(key string) error {
+	return s.SetActiveRelayKeys([]string{key})
 }
 
 // SetActiveRelayKeys installs the accepted relay key set from env / bootstrap.
 // Raw keys are digested on insert; the first non-empty becomes active and the
-// rest are also-keys. Empty input clears the snapshot (all requests rejected).
-func (s *Service) SetActiveRelayKeys(keys []string) {
+// rest are also-keys. When an EnvelopeCipher is wired, the active raw key is
+// sealed beside its digest (§12.6). Empty input clears the snapshot (all
+// requests rejected).
+func (s *Service) SetActiveRelayKeys(keys []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.relayActive = ""
+	s.relayActiveEnc = ""
 	s.relayAlso = nil
 	s.relayGrace = ""
 	s.graceUntil = time.Time{}
+	var primaryPlain string
 	for _, key := range keys {
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -86,6 +116,7 @@ func (s *Service) SetActiveRelayKeys(keys []string) {
 		d := digestRelayKey(key)
 		if s.relayActive == "" {
 			s.relayActive = d
+			primaryPlain = key
 			continue
 		}
 		if s.relayAlso == nil {
@@ -93,6 +124,17 @@ func (s *Service) SetActiveRelayKeys(keys []string) {
 		}
 		s.relayAlso[d] = struct{}{}
 	}
+	if primaryPlain == "" || s.envelope == nil {
+		return nil
+	}
+	enc, err := s.envelope.EncryptEnvelope(primaryPlain)
+	if err != nil {
+		s.relayActive = ""
+		s.relayAlso = nil
+		return fmt.Errorf("加密 Relay Key: %w", err)
+	}
+	s.relayActiveEnc = enc
+	return nil
 }
 
 // WithNow overrides the time source (tests: grace expiry without sleeping).
@@ -157,8 +199,9 @@ func (s *Service) ActiveRelayKeys() []string {
 }
 
 // RotateRelayKey generates a new active key; old digest remains in grace.
-// The returned newKey is plaintext for one-time admin display; only its digest
-// is retained in the hot-path snapshot.
+// The returned newKey is plaintext for one-time admin display; the hot-path
+// snapshot keeps only the digest, and (when EnvelopeCipher is wired) an
+// envelope of the new active key for later re-auth reveal (§12.6).
 func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,13 +209,41 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 	if err != nil {
 		return "", 0, err
 	}
+	enc := ""
+	if s.envelope != nil {
+		enc, err = s.envelope.EncryptEnvelope(newKey)
+		if err != nil {
+			return "", 0, fmt.Errorf("加密 Relay Key: %w", err)
+		}
+	}
 	if s.relayActive != "" {
 		s.relayGrace = s.relayActive
 		s.graceUntil = s.now().Add(time.Duration(s.graceSec) * time.Second)
 	}
 	s.relayActive = digestRelayKey(newKey)
+	s.relayActiveEnc = enc
 	s.noteLocked("relay_rotate", "new active; old in grace")
 	return newKey, s.graceSec, nil
+}
+
+// RevealActiveRelayKey decrypts the sealed active Relay Key (§12.6).
+// Callers must re-check the admin password and set Cache-Control: no-store.
+// The digest snapshot remains the auth path; this does not rotate the key.
+func (s *Service) RevealActiveRelayKey() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.envelope == nil || s.relayActiveEnc == "" {
+		return "", ErrRevealUnavailable
+	}
+	plain, err := s.envelope.DecryptEnvelope(s.relayActiveEnc)
+	if err != nil {
+		return "", fmt.Errorf("解密 Relay Key: %w", err)
+	}
+	if digestRelayKey(plain) != s.relayActive {
+		return "", errors.New("Relay Key 密文与摘要不一致")
+	}
+	s.noteLocked("relay_reveal", "active key revealed after reauth")
+	return plain, nil
 }
 
 // RevokeGrace drops the overlapping old relay key immediately.

@@ -69,6 +69,34 @@ func (s *Server) postRevealMasterKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) postRevealRelayKey(w http.ResponseWriter, r *http.Request) {
+	if s.creds == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"credentials 未装配"})
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if !s.passwordOK(body.Password) {
+		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
+		return
+	}
+	plain, err := s.creds.RevealActiveRelayKey()
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"relay_key": plain,
+		"note":      "当前 Key；重新认证后查看，勿写入 localStorage / 前端日志",
+	})
+}
+
 func (s *Server) postRotateRelayKey(w http.ResponseWriter, r *http.Request) {
 	if s.creds == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"credentials 未装配"})
