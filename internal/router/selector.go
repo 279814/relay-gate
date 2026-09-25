@@ -213,6 +213,10 @@ func Select(snap *Snapshot, hv HealthView, inModel string,
 // Route 因 config_error 被 selectFor 放入 exclude 后，仍可选健康前缀）。
 // 有可用桶却全部达并发上限时不跨 ModelName 回落——那是额度耗尽，不是
 // 「该匹配不合格」。
+//
+// 例外：名称已命中的 ModelName 下，候选仅因上游 api_key 短于脱敏下限而不
+// 合格时，不得落到更短前缀或兜底（与停用精确名同口径：点名命中后不换站）。
+// 同名的其他启用精确 ModelName 仍可继续试；短钥兄弟站跳过后仍可选长钥兄弟。
 func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 	endpointProto model.Protocol, exclude map[int64]bool) (*Candidate, error) {
 
@@ -233,7 +237,11 @@ func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 	}
 
 	var lastNoRoute error
+	skipPrefixes := false
 	for _, mn := range matches {
+		if skipPrefixes && mn.MatchMode == model.MatchPrefix {
+			break
+		}
 		// 协议必须一致。配错了要明确报错，而不是把 Anthropic 的 body
 		// 发到 /v1/chat/completions —— 那会得到一个难以理解的上游 400。
 		// 名称已命中时协议错误是 request-global，不跨到下一匹配。
@@ -242,9 +250,17 @@ func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 				ErrProtocolMismatch, endpointProto, mn.Name, mn.Protocol)
 		}
 
-		buckets, reason := viableBuckets(snap, hv, mn, exclude)
+		buckets, reason, shortKeyOnly := viableBuckets(snap, hv, mn, exclude)
 		if len(buckets) == 0 {
 			lastNoRoute = fmt.Errorf("%w: ModelName %q %s", ErrNoRouteAvailable, mn.Name, reason)
+			if shortKeyOnly {
+				// 本匹配仅因短 api_key 不合格：精确名仍可试同名其他精确行，
+				// 但不得再走前缀；前缀命中则立刻停（不换更短前缀/兜底）。
+				if mn.MatchMode == model.MatchPrefix {
+					return nil, lastNoRoute
+				}
+				skipPrefixes = true
+			}
 			continue
 		}
 
@@ -293,20 +309,22 @@ func SelectExcluding(snap *Snapshot, hv HealthView, inModel string,
 
 // viableBuckets 按 priority 把可用 Route 分桶。
 // 第二个返回值是「没有可用 Route」时给人看的原因，便于在 503 里说明。
+// 第三个返回值表示本 ModelName 下桶空的原因是「仅短 api_key」——调用方不得
+// 因此落到更短前缀或兜底。
 //
 // exclude 是本次请求已经试过的 Route（§3.5 重试）。它单独计数并写进原因里 ——
 // 「3 个 Route 都试过了」与「3 个 Route 都 dead」是完全不同的处境，
 // 混成一句话会让人去查健康状态，而实际该看的是那几次尝试各自失败在哪。
 func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
-	exclude map[int64]bool) (map[int][]*model.Route, string) {
+	exclude map[int64]bool) (map[int][]*model.Route, string, bool) {
 
 	all := snap.RoutesByModelName[mn.ID]
 	if len(all) == 0 {
-		return nil, "下没有绑定任何 Route"
+		return nil, "下没有绑定任何 Route", false
 	}
 
 	buckets := map[int][]*model.Route{}
-	var disabled, dead, cooling, tried int
+	var disabled, dead, cooling, tried, shortKey int
 	for _, r := range all {
 		switch {
 		case exclude[r.ID]:
@@ -323,8 +341,15 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 			continue
 		}
 		// 上游被手动停用时也不选。Route 启用但站停用是常见的临时下线方式。
-		if up := snap.Upstreams[r.UpstreamID]; up == nil || !up.Enabled {
+		up := snap.Upstreams[r.UpstreamID]
+		if up == nil || !up.Enabled {
 			disabled++
+			continue
+		}
+		// 脏行/历史短 api_key：不出站，也不把「仅短钥」当成可回落前缀的
+		// dead/exclude（与停用精确名同口径）。
+		if model.APIKeyTooShortForOutbound(up.APIKey) {
+			shortKey++
 			continue
 		}
 		buckets[r.Priority] = append(buckets[r.Priority], r)
@@ -333,12 +358,18 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 	if len(buckets) == 0 {
 		reason := fmt.Sprintf("下的 %d 个 Route 均不可用（%d 个已停用，%d 个 dead，%d 个限流冷却中",
 			len(all), disabled, dead, cooling)
+		if shortKey > 0 {
+			reason += fmt.Sprintf("，%d 个 api_key 短于脱敏下限", shortKey)
+		}
 		if tried > 0 {
 			reason += fmt.Sprintf("，%d 个本次已试过", tried)
 		}
-		return nil, reason + "）"
+		// 仅短钥（无 dead/冷却/已试过）→ 阻断前缀/兜底回落。停用行不参与
+		// 匹配候选，不影响「点名命中后仅因短钥不合格」的判定。
+		shortKeyOnly := shortKey > 0 && dead == 0 && cooling == 0 && tried == 0
+		return nil, reason + "）", shortKeyOnly
 	}
-	return buckets, ""
+	return buckets, "", false
 }
 
 // DeadRoutesFor 返回该 ModelName 下所有 dead 的 Route，按优先级升序。

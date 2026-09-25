@@ -120,10 +120,10 @@ func (h *Handler) selectCountTokensCandidate(snap *router.Snapshot, inModel stri
 		if err != nil {
 			return nil, err
 		}
+		// SelectExcluding 已剔除短钥并阻断前缀/兜底回落；若仍选出则 fail closed。
 		if model.APIKeyTooShortForOutbound(cand.Upstream.APIKey) {
-			localExclude[cand.Route.ID] = true
 			cand.Release()
-			continue
+			return nil, fmt.Errorf("%w: 上游 api_key 短于脱敏下限", router.ErrNoRouteAvailable)
 		}
 		if !h.countTokensPreferOK(cand.Route.ID, prefer) {
 			localExclude[cand.Route.ID] = true
