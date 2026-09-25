@@ -1039,6 +1039,31 @@ func TestEstimateInputTokens_CountsToolDefinitions(t *testing.T) {
 	}
 }
 
+// 数千层嵌套数组不得把估算路径的 goroutine 栈打爆。
+// encoding/json 允许约 10000 层；若 walk 用递归，深度合法仍可能 abort 进程。
+func TestEstimateInputTokens_DeepNestingDoesNotPanic(t *testing.T) {
+	const depth = 8000
+	inner := strings.Repeat("[", depth) + `"hello world"` + strings.Repeat("]", depth)
+	deep := `{"model":"m","messages":[{"role":"user","content":` + inner + `}]}`
+	got, err := estimateInputTokens([]byte(deep))
+	if err != nil {
+		t.Fatalf("深嵌套估算失败: %v", err)
+	}
+	if got < 0 {
+		t.Fatalf("token = %d, want >= 0", got)
+	}
+
+	// 正常几层 messages body 仍应给出正估算（与既有用例一致）。
+	normal := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	n, err := estimateInputTokens([]byte(normal))
+	if err != nil {
+		t.Fatalf("正常 body 估算失败: %v", err)
+	}
+	if n <= 0 {
+		t.Fatalf("正常 body token = %d, want > 0", n)
+	}
+}
+
 // 长文本要给出更大的值。这是估算唯一真正需要保证的性质：
 // 绝对精度做不到（真实是 BPE subword），但单调性必须成立 ——
 // 上下文越长预算越大，否则它作为预算就完全没用。
