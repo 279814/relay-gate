@@ -147,7 +147,7 @@ func (secrets fakeSecrets) ResolveProbeSecret(_ context.Context,
 
 func TestValues_ResolvesURLPlaceholders(t *testing.T) {
 	values := Values{
-		UpstreamAPIKey:     []byte("sk-up"),
+		UpstreamAPIKey:     []byte("sk-up-test-key"),
 		CredentialRevision: 5,
 		Secrets: fakeSecrets{byName: map[string]probetemplate.ResolvedSecret{
 			"site-token": {ID: 1, Plain: []byte("tok"), Revision: 9},
@@ -158,7 +158,7 @@ func TestValues_ResolvesURLPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(key.Plain) != "sk-up" || key.Revision != 5 {
+	if string(key.Plain) != "sk-up-test-key" || key.Revision != 5 {
 		t.Errorf("api key 应带 credential revision，得到 %q@%d", key.Plain, key.Revision)
 	}
 
@@ -174,7 +174,7 @@ func TestValues_ResolvesURLPlaceholders(t *testing.T) {
 // URL 只支持这两类占位符。模型名、prompt 属于 body 模板（P0-05），
 // 在这里放行会让「谁提供什么」变得模糊，也会让一个拼错的占位符静默渲染成空。
 func TestValues_RejectsNonURLPlaceholders(t *testing.T) {
-	values := Values{UpstreamAPIKey: []byte("sk-up"), CredentialRevision: 1}
+	values := Values{UpstreamAPIKey: []byte("sk-up-test-key"), CredentialRevision: 1}
 	for _, name := range []string{"UPSTREAM_MODEL", "PROBE_PROMPT", "SESSION_ID", "TIMESTAMP", "", "SECRET:"} {
 		if _, err := values.ResolveValue(context.Background(), name); err == nil {
 			t.Errorf("占位符 %q 不该被 URL 层接受", name)
@@ -188,5 +188,19 @@ func TestValues_FailsWhenKeyOrSourceMissing(t *testing.T) {
 	}
 	if _, err := (Values{}).ResolveValue(context.Background(), "SECRET:x"); err == nil {
 		t.Error("没有 Secret 源时应报错")
+	}
+}
+
+func TestValues_RejectsShortUpstreamAPIKey(t *testing.T) {
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	_, err := (Values{UpstreamAPIKey: []byte(short)}).ResolveValue(context.Background(), "UPSTREAM_API_KEY")
+	if err == nil {
+		t.Fatal("短于脱敏下限的 api_key 不得进 URL 模板")
+	}
+	if !errors.Is(err, ErrAuthConfig) {
+		t.Fatalf("应是 ErrAuthConfig，得到 %v", err)
+	}
+	if strings.Contains(err.Error(), short) {
+		t.Errorf("错误不得含短钥明文，得到 %q", err.Error())
 	}
 }

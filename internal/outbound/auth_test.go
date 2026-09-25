@@ -45,14 +45,14 @@ func TestApplyAuth_RemovesEveryInboundAliasFirst(t *testing.T) {
 		wantOnly  string // 最终应存在的那一个认证头
 		wantValue string
 	}{
-		{model.AuthModeBearer, "Authorization", "Bearer sk-up"},
-		{model.AuthModeXAPIKey, "X-Api-Key", "sk-up"},
-		{model.AuthModeAPIKey, "Api-Key", "sk-up"},
+		{model.AuthModeBearer, "Authorization", "Bearer sk-up-test-key"},
+		{model.AuthModeXAPIKey, "X-Api-Key", "sk-up-test-key"},
+		{model.AuthModeAPIKey, "Api-Key", "sk-up-test-key"},
 	}
 	for _, testCase := range modes {
 		t.Run(string(testCase.mode), func(t *testing.T) {
 			header := inboundHeaders()
-			if err := applyAuth(t, header, authProfile(testCase.mode), authValues("sk-up")); err != nil {
+			if err := applyAuth(t, header, authProfile(testCase.mode), authValues("sk-up-test-key")); err != nil {
 				t.Fatalf("ApplyAuth 失败: %v", err)
 			}
 
@@ -84,7 +84,7 @@ func TestApplyAuth_RemovesAllValuesOfAnAlias(t *testing.T) {
 	header.Add("Authorization", "Bearer rk-one")
 	header.Add("Authorization", "Bearer rk-two")
 
-	if err := applyAuth(t, header, authProfile(model.AuthModeXAPIKey), authValues("sk-up")); err != nil {
+	if err := applyAuth(t, header, authProfile(model.AuthModeXAPIKey), authValues("sk-up-test-key")); err != nil {
 		t.Fatal(err)
 	}
 	if values := header.Values("Authorization"); len(values) != 0 {
@@ -101,7 +101,7 @@ func TestApplyAuth_FixedQueryWritesNoHeader(t *testing.T) {
 	profile := authProfile(model.AuthModeFixedQuery)
 	profile.QueryName = "key"
 
-	if err := applyAuth(t, header, profile, authValues("sk-up")); err != nil {
+	if err := applyAuth(t, header, profile, authValues("sk-up-test-key")); err != nil {
 		t.Fatalf("ApplyAuth 失败: %v", err)
 	}
 	for _, name := range model.AuthHeaders {
@@ -118,7 +118,7 @@ func TestApplyAuth_FixedQueryWritesNoHeader(t *testing.T) {
 // 一个上游不认的参数发出去，而 key 其实根本没送到。
 func TestApplyAuth_FixedQueryWithoutQueryNameIsConfigError(t *testing.T) {
 	header := inboundHeaders()
-	err := applyAuth(t, header, authProfile(model.AuthModeFixedQuery), authValues("sk-up"))
+	err := applyAuth(t, header, authProfile(model.AuthModeFixedQuery), authValues("sk-up-test-key"))
 	if err == nil {
 		t.Fatal("fixed_query 缺 query_name 必须报 config_error")
 	}
@@ -136,7 +136,7 @@ func TestApplyAuth_FixedQueryWithoutQueryNameIsConfigError(t *testing.T) {
 // 一个候选，不能无依据地同时发送多个认证头」。
 func TestApplyAuth_UncalibratedAutoFailsBeforeSocket(t *testing.T) {
 	header := inboundHeaders()
-	err := applyAuth(t, header, authProfile(model.AuthModeAutoCalibrated), authValues("sk-up"))
+	err := applyAuth(t, header, authProfile(model.AuthModeAutoCalibrated), authValues("sk-up-test-key"))
 	if err == nil {
 		t.Fatal("未校准的 auto 必须失败，而不是猜一种或双发")
 	}
@@ -157,10 +157,10 @@ func TestApplyAuth_CalibratedAutoUsesCalibratedMode(t *testing.T) {
 	profile := authProfile(model.AuthModeAutoCalibrated)
 	profile.CalibratedMode = model.AuthModeBearer
 
-	if err := applyAuth(t, header, profile, authValues("sk-up")); err != nil {
+	if err := applyAuth(t, header, profile, authValues("sk-up-test-key")); err != nil {
 		t.Fatalf("已校准的 auto 应可用: %v", err)
 	}
-	if got := header.Get("Authorization"); got != "Bearer sk-up" {
+	if got := header.Get("Authorization"); got != "Bearer sk-up-test-key" {
 		t.Errorf("应按校准结果写 Bearer，得到 %q", got)
 	}
 	if header.Get("X-Api-Key") != "" {
@@ -175,13 +175,13 @@ func TestApplyAuth_CalibratedAutoUsesCalibratedMode(t *testing.T) {
 func TestApplyAuth_LegacyAutoKeepsDualSendForRealTraffic(t *testing.T) {
 	header := inboundHeaders()
 	if err := applyAuth(t, header, authProfile(model.AuthModeLegacyAutoRealOnly),
-		authValues("sk-up")); err != nil {
+		authValues("sk-up-test-key")); err != nil {
 		t.Fatalf("legacy auto 对真实流量应可用: %v", err)
 	}
-	if got := header.Get("X-Api-Key"); got != "sk-up" {
+	if got := header.Get("X-Api-Key"); got != "sk-up-test-key" {
 		t.Errorf("legacy auto 应发 X-Api-Key，得到 %q", got)
 	}
-	if got := header.Get("Authorization"); got != "Bearer sk-up" {
+	if got := header.Get("Authorization"); got != "Bearer sk-up-test-key" {
 		t.Errorf("legacy auto 应发 Bearer，得到 %q", got)
 	}
 	// 第三个位置仍不该出现：双发指的是那两个，不是「全都发」。
@@ -200,7 +200,7 @@ func TestApplyAuth_LegacyAutoFailsClosedForSyntheticProbe(t *testing.T) {
 	header := inboundHeaders()
 	err := ApplyAuth(context.Background(), header, AuthInput{
 		Profile: authProfile(model.AuthModeLegacyAutoRealOnly),
-		Values:  authValues("sk-up"),
+		Values:  authValues("sk-up-test-key"),
 		Use:     ResolveSyntheticProbe,
 	})
 	if err == nil {
@@ -225,10 +225,10 @@ func TestApplyAuth_ManualHeadersRenderPlaceholders(t *testing.T) {
 		{Name: "X-Tenant", Values: []string{"acme"}},
 	}
 
-	if err := applyAuth(t, header, profile, authValues("sk-up")); err != nil {
+	if err := applyAuth(t, header, profile, authValues("sk-up-test-key")); err != nil {
 		t.Fatalf("ApplyAuth 失败: %v", err)
 	}
-	if got := header.Get("X-Custom-Auth"); got != "tok sk-up" {
+	if got := header.Get("X-Custom-Auth"); got != "tok sk-up-test-key" {
 		t.Errorf("占位符应被渲染，得到 %q", got)
 	}
 	if got := header.Get("X-Tenant"); got != "acme" {
@@ -251,7 +251,7 @@ func TestApplyAuth_ManualHeadersCannotOverrideStandardAliases(t *testing.T) {
 		{Name: "Authorization", Values: []string{"Bearer {{UPSTREAM_API_KEY}}"}},
 	}
 
-	err := applyAuth(t, header, profile, authValues("sk-up"))
+	err := applyAuth(t, header, profile, authValues("sk-up-test-key"))
 	if err == nil {
 		t.Fatal("manual_headers 不该能写标准认证别名 —— 那会让『恰好一种 profile』" +
 			"这条约束失效，而它是防 relay key 泄露的那道闸")
@@ -268,7 +268,7 @@ func TestApplyAuth_ManualHeadersRejectsProtectedHeaders(t *testing.T) {
 			profile := authProfile(model.AuthModeManualHeaders)
 			profile.ManualHeaders = []model.HeaderTemplate{{Name: name, Values: []string{"x"}}}
 
-			if err := applyAuth(t, header, profile, authValues("sk-up")); err == nil {
+			if err := applyAuth(t, header, profile, authValues("sk-up-test-key")); err == nil {
 				t.Errorf("manual_headers 不该能设置受保护头 %s", name)
 			}
 		})
@@ -369,16 +369,44 @@ func TestApplyAuth_MissingCredentialIsConfigError(t *testing.T) {
 	}
 }
 
+// 脏行/历史短钥：ApplyAuth 必须 fail closed，不得把短串写进 Authorization。
+func TestApplyAuth_ShortKeyIsConfigError(t *testing.T) {
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	for _, mode := range []model.AuthMode{
+		model.AuthModeBearer, model.AuthModeXAPIKey, model.AuthModeAPIKey,
+		model.AuthModeLegacyAutoRealOnly,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			header := inboundHeaders()
+			err := applyAuth(t, header, authProfile(mode), authValues(short))
+			if err == nil {
+				t.Fatal("短于脱敏下限的 api_key 必须 config_error")
+			}
+			if !errors.Is(err, ErrAuthConfig) {
+				t.Errorf("应可识别为 config_error，得到 %v", err)
+			}
+			for _, name := range model.AuthHeaders {
+				if got := header.Get(name); got != "" {
+					t.Errorf("失败时不得留下认证头 %s=%q", name, got)
+				}
+			}
+			if strings.Contains(err.Error(), short) {
+				t.Errorf("错误文本不得含短钥明文，得到 %q", err.Error())
+			}
+		})
+	}
+}
+
 func TestApplyAuth_RejectsInvalidMode(t *testing.T) {
 	header := inboundHeaders()
-	if err := applyAuth(t, header, authProfile("no_such_mode"), authValues("sk-up")); err == nil {
+	if err := applyAuth(t, header, authProfile("no_such_mode"), authValues("sk-up-test-key")); err == nil {
 		t.Fatal("无效 auth_mode 必须报错")
 	}
 }
 
 func TestApplyAuth_RejectsNilHeader(t *testing.T) {
 	if err := ApplyAuth(context.Background(), nil,
-		AuthInput{Profile: authProfile(model.AuthModeXAPIKey), Values: authValues("sk-up")}); err == nil {
+		AuthInput{Profile: authProfile(model.AuthModeXAPIKey), Values: authValues("sk-up-test-key")}); err == nil {
 		t.Fatal("nil header 必须报错而不是 panic")
 	}
 }

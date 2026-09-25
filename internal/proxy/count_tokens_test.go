@@ -598,7 +598,7 @@ func TestCountTokens_ExcludedExactFallsToPrefix(t *testing.T) {
 		prefixMN := &model.ModelName{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
 			MatchMode: model.MatchPrefix, Enabled: true}
 		up2 := &model.Upstream{ID: 20, Name: "prefix-up", BaseURL: hs.up.URL,
-			APIKey: "sk-prefix", AuthStyle: model.AuthAuto, Enabled: true}
+			APIKey: "sk-prefix-key1", AuthStyle: model.AuthAuto, Enabled: true}
 		rt2 := &model.Route{ID: 200, ModelNameID: 2, UpstreamID: 20,
 			Priority: 1, Weight: 100, Enabled: true}
 		hs.cfg.snap.ModelNames = append(hs.cfg.snap.ModelNames, prefixMN)
@@ -683,7 +683,7 @@ func TestCountTokens_RecoveringRequiresRecoveryGate(t *testing.T) {
 		w.Write([]byte(`{"input_tokens":9}`))
 	})
 	up2 := &model.Upstream{ID: 20, Name: "backup", BaseURL: hs.up.URL,
-		APIKey: "sk-backup", AuthStyle: model.AuthAuto, Enabled: true}
+		APIKey: "sk-backup-key1", AuthStyle: model.AuthAuto, Enabled: true}
 	rt2 := &model.Route{ID: 200, ModelNameID: 1, UpstreamID: 20,
 		Priority: 2, Weight: 100, Enabled: true}
 	hs.cfg.snap.Upstreams[20] = up2
@@ -772,31 +772,31 @@ func TestCountTokens_InboundKeyRedactedInLog(t *testing.T) {
 	}
 }
 
-// 短 key 同样不能漏进日志。
-//
-// sample.RedactBodyKeys 有 12 字符的下限（短于此不脱敏），那对样本是对的 ——
-// 样本存的是完整对话原文，短 key 会偶然命中无数次，把原文打得千疮百孔。
-// 但日志这条路径进来的只是 200 字符的错误原文，多打几个码无所谓，
-// 漏一个 key 才是实实在在的泄露。
-//
-// 而这是**真实可达**的配置：RELAY_KEYS 只校验非空、没有长度下限
-// （config.validate），上游 api_key 同样没有。
-func TestCountTokens_ShortKeyRedactedInLog(t *testing.T) {
+// 脏行/历史短上游 api_key：count_tokens 选路必须跳过，不得出站。
+// （写入路径已拒绝短钥；本用例覆盖脏行。）
+func TestCountTokens_ShortKeySkippedNoOutbound(t *testing.T) {
+	var upstreamHits int
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":"bad credential sk-short99"}`))
+		w.Write([]byte(`{"error":"should not be reached"}`))
 	})
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
 	for _, up := range hs.cfg.snap.Upstreams {
-		up.APIKey = "sk-short99" // 10 字符，短于 sample 包的 12 字符下限
+		up.APIKey = short
 	}
 
-	var logs bytes.Buffer
-	hs.h.log = slog.New(slog.NewTextHandler(&logs, nil))
+	rec := hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
 
-	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
-
-	if strings.Contains(logs.String(), "sk-short99") {
-		t.Errorf("短 key 未被脱敏:\n%s", logs.String())
+	if upstreamHits != 0 {
+		t.Fatalf("短钥不得出站，上游收到 %d 次", upstreamHits)
+	}
+	// 无可用上游时降级本地粗算（与空 key 同口径），不得把短钥回给客户端。
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应降级本地粗算，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), short) {
+		t.Fatal("响应不得含短钥明文")
 	}
 }
 

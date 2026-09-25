@@ -191,6 +191,18 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 	}
 }
 
+func TestAPIKeyTooShortForOutbound(t *testing.T) {
+	if APIKeyTooShortForOutbound("") {
+		t.Fatal("空串不是「过短」—— 出站按未配置处理")
+	}
+	if APIKeyTooShortForOutbound(strings.Repeat("x", MinRedactableKeyLen-1)) != true {
+		t.Fatal("短于下限应判定为过短")
+	}
+	if APIKeyTooShortForOutbound(strings.Repeat("y", MinRedactableKeyLen)) {
+		t.Fatal("恰好下限不得判定为过短")
+	}
+}
+
 // probe_max_tokens 的默认值按协议不同：Responses 给 1 会被部分站直接拒绝。
 func TestModelNameDefaultsPerProtocol(t *testing.T) {
 	cases := map[Protocol]int{

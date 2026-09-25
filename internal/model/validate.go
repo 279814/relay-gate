@@ -17,6 +17,14 @@ var ErrValidation = errors.New("validation")
 // 限：更新时留空表示「不改已存 key」。
 const MinRedactableKeyLen = 12
 
+// APIKeyTooShortForOutbound 报告已存非空 api_key 是否短于脱敏下限。
+//
+// 脏行/历史短钥不得进入选路或探活出站：一旦进 query / Authorization /
+// Location，RedactText 不会遮它。空串另计（出站路径按「未配置」fail closed）。
+func APIKeyTooShortForOutbound(key string) bool {
+	return key != "" && len(key) < MinRedactableKeyLen
+}
+
 func invalid(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrValidation, fmt.Sprintf(format, a...))
 }

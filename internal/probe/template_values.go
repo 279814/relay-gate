@@ -62,7 +62,17 @@ func (values TemplateValues) ResolveValue(ctx context.Context, name string) (pro
 
 	switch name {
 	case "UPSTREAM_API_KEY":
-		return required(name, values.UpstreamAPIKey)
+		resolved, err := required(name, values.UpstreamAPIKey)
+		if err != nil {
+			return resolved, err
+		}
+		// 与 outbound.Values 同口径：短钥不得进 recipe header/query/body。
+		if model.APIKeyTooShortForOutbound(string(resolved.Plain)) {
+			return probetemplate.ResolvedValue{}, fmt.Errorf(
+				"%w: UPSTREAM_API_KEY 短于脱敏下限 %d（无法在 Location 等 URI 头中脱敏）",
+				ErrTemplateValue, model.MinRedactableKeyLen)
+		}
+		return resolved, nil
 	case "UPSTREAM_MODEL":
 		return required(name, values.UpstreamModel)
 	case "MODEL_NAME":
