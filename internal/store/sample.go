@@ -52,6 +52,7 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 // Recorder 单 writer 每条插入前走这里：放得下就写，否则截断放不下的正文，
 // 连截断后仍放不下（例如配额已耗尽，或信封膨胀后丢掉全部正文仍无可用字节）
 // 则跳过本条，不插入仅含头的空壳行（空壳会占 Sample Group 名额），不报错给客户端。
+// 正文原本就空的样本（真实空响应）在配额有余时仍入库头/状态元数据。
 //
 // maxBytes <= 0 表示该维度不限，行为与 InsertSample 相同。
 // 返回 inserted=false 表示因配额跳过（不是错误）。
@@ -73,6 +74,8 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 	if plainSampleBodyBytes(smp) > rem {
 		truncateSamplePlainBodies(smp, rem)
 	}
+	// droppedForQuota：因放不下而丢掉正文后 need==0 时跳过空壳；原本就无正文的样本仍入库（头/状态元数据）。
+	droppedForQuota := false
 	for {
 		inBody, err := s.encryptSampleBody(smp.InBody)
 		if err != nil {
@@ -94,7 +97,7 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 			}
 			need := int64(len(inBody)+len(outBody)) + fi.Size()
 			if need <= rem {
-				if need == 0 {
+				if need == 0 && droppedForQuota {
 					_ = os.Remove(encPath)
 					return false, nil
 				}
@@ -106,6 +109,7 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 			_ = os.Remove(smp.RespBodyFile)
 			smp.RespBodyFile = ""
 			smp.Truncated |= model.TruncRespBody
+			droppedForQuota = true
 			continue
 		}
 		respBody, err := s.encryptSampleBody(smp.RespBody)
@@ -114,7 +118,7 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 		}
 		need := int64(len(inBody) + len(outBody) + len(respBody))
 		if need <= rem {
-			if need == 0 {
+			if need == 0 && droppedForQuota {
 				return false, nil
 			}
 			return true, s.insertSampleEncrypted(smp, inBody, outBody, respBody)
@@ -128,12 +132,15 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 				smp.RespBodyFile = ""
 			}
 			smp.Truncated |= model.TruncRespBody
+			droppedForQuota = true
 		case len(smp.OutBody) > 0:
 			smp.OutBody = nil
 			smp.Truncated |= model.TruncOutBody
+			droppedForQuota = true
 		case len(smp.InBody) > 0:
 			smp.InBody = nil
 			smp.Truncated |= model.TruncInBody
+			droppedForQuota = true
 		default:
 			return false, nil
 		}
