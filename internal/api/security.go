@@ -60,9 +60,9 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// maxScanReqID caps finding.req_id from the admin scan body. decodeJSON allows
-// up to 1MiB; an unbounded client string must not land on every finding row.
-const maxScanReqID = 256
+// maxFindingClientField caps free-text client strings written onto findings
+// (admin scan req_id; canary note → Detail). decodeJSON allows up to 1MiB.
+const maxFindingClientField = 256
 
 // postSecurityScan runs a passive scan on caller-provided plain text (admin diagnostic).
 func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
@@ -89,8 +89,8 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 		keys = append(keys, upKey)
 	}
 	reqID := body.ReqID
-	if len(reqID) > maxScanReqID {
-		reqID = reqID[:maxScanReqID]
+	if len(reqID) > maxFindingClientField {
+		reqID = reqID[:maxFindingClientField]
 	}
 	found := security.ScanText(body.Text, "admin_scan", keys...)
 	out := make([]security.Finding, 0, len(found))
@@ -190,6 +190,10 @@ func (s *Server) postSecurityCanary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	note := strings.TrimSpace(body.Note)
+	if len(note) > maxFindingClientField {
+		note = note[:maxFindingClientField]
+	}
 	result := map[string]any{
 		"accepted": true,
 		"route_id": routeID,
@@ -206,7 +210,7 @@ func (s *Server) postSecurityCanary(w http.ResponseWriter, r *http.Request) {
 		result["status_code"] = exec.StatusCode
 		result["error_class"] = exec.ErrorClass
 		if s.security != nil {
-			detail := strings.TrimSpace(body.Note)
+			detail := note
 			if exec.RedactedDetail != "" {
 				if detail != "" {
 					detail += "; "
@@ -231,7 +235,7 @@ func (s *Server) postSecurityCanary(w http.ResponseWriter, r *http.Request) {
 			Severity: security.SeverityInfo,
 			Category: "canary_manual",
 			Summary:  "手动 canary 已记录（探活未装配）",
-			Detail:   strings.TrimSpace(body.Note),
+			Detail:   note,
 			Source:   "canary",
 			RouteID:  routeID,
 		})
