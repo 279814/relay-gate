@@ -58,6 +58,10 @@ func (s *Server) createRoute(w http.ResponseWriter, r *http.Request) {
 	// 想知道的正是「这个映射到底通不通」。不探的话它会以 unknown 状态
 	// 直接参与选路（乐观策略），真实请求撞上去才发现配错了。
 	s.invalidateRoute(rt.ID)
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, rt)
 }
 
@@ -93,6 +97,10 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 		(!before.Enabled && cur.Enabled) {
 		s.invalidateRoute(id)
 	}
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, cur)
 }
 
@@ -113,7 +121,7 @@ func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	// Capability 仍按 id 索引；若不 Forget，调度器 RetainOnly 之前（或 id
 	// 被复用时）新行会继承 StateDead / 旧 capability。
 	s.invalidateRoute(id)
-	if err := s.publishAfterSuccessfulDelete(); err != nil {
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)
 		return
 	}

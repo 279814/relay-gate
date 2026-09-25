@@ -42,6 +42,10 @@ func (s *Server) createModelName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("新增 model_name", "id", m.ID, "name", m.Name, "protocol", m.Protocol)
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -76,6 +80,10 @@ func (s *Server) updateModelName(w http.ResponseWriter, r *http.Request) {
 		(!before.Enabled && cur.Enabled) {
 		s.invalidateModelName(id)
 	}
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, cur)
 }
 
@@ -98,7 +106,7 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.detachTransformBindingsForRoute(rid)
 	}
 	s.invalidateModelNameDeleted(id, childRoutes)
-	if err := s.publishAfterSuccessfulDelete(); err != nil {
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)
 		return
 	}

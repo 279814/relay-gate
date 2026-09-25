@@ -53,8 +53,8 @@ type Server struct {
 	// 那只意味着回到「等下一个探活周期」，不是错误。
 	invalidator ConfigInvalidator
 
-	// publisher 在成功删除 Upstream / ModelName / Route 后使 livecfg
-	// routing 快照立即可见（不等 2s TTL）。为 nil 时静默跳过。
+	// publisher 在成功 create/update/delete Upstream / ModelName / Route
+	// 后使 livecfg routing 快照立即可见（不等 2s TTL）。为 nil 时静默跳过。
 	publisher ConfigPublisher
 
 	// runState 是 P0-12 服务总闸。未注入时 state GET/SET fail closed 503。
