@@ -184,6 +184,11 @@ type Forwarder struct {
 	// **只读 req.Host**，塞进 Header 的 Host 会被静默丢弃 —— 那正是
 	// 「配了 host_override 却完全没生效」这类问题的来源。
 	RequestHost string
+
+	// RedactSecrets 是写给客户端前脱敏 Location 等 URL 头用的已知凭据。
+	// 由 Handler 在每次尝试时填入 credentialsOf（含 transform taint）。
+	// 为空时 URL 头原样透传（低层 Forward 测试不必关心）。
+	RedactSecrets []string
 }
 
 // Attempt 是一次**尚未提交**的转发：请求已发出、响应头已拿到，
@@ -447,7 +452,7 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 			dst.Add(k, v)
 		}
 	}
-	FinalizeClientResponseHeaders(dst)
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 

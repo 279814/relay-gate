@@ -451,7 +451,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		to = to.WithAggressivePeek(time.Duration(settings.RealFirstByteSec) * time.Second)
 	}
 	fwd := &Forwarder{Transport: tr, Timeouts: to,
-		RequestHost: target.RequestHost}
+		RequestHost: target.RequestHost, RedactSecrets: redactKeys}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会
 	// 混进最终样本的 resp_body —— 样本就变成了两个站的响应拼起来的东西。
