@@ -184,3 +184,62 @@ func TestBootstrapSecretsDirPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestWritePersistedRoundTripAndFailedWriteLeavesBytes(t *testing.T) {
+	dir := t.TempDir()
+	first := Persisted{
+		FormatVersion:     1,
+		AdminPasswordHash: "$argon2id$v=19$m=65536,t=1,p=4$aaaaaaaaaaaaaaaaaaaaaa$bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		RelayKey:          "rk-roundtrip-relay-key-value",
+		MasterKeyID:       "mkid-roundtrip-01",
+		UpdatedAt:         "2026-01-01T00:00:00Z",
+	}
+	if err := WritePersisted(dir, first); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AdminPasswordHash != first.AdminPasswordHash ||
+		got.RelayKey != first.RelayKey ||
+		got.MasterKeyID != first.MasterKeyID {
+		t.Fatalf("successful write must round-trip three values: got %+v want %+v", got, first)
+	}
+	before, err := os.ReadFile(CredentialsFile(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-empty directory at path.tmp makes writeSyncedFile fail before rename;
+	// an existing secrets file must stay byte-identical.
+	tmp := CredentialsFile(dir) + ".tmp"
+	if err := os.MkdirAll(filepath.Join(tmp, "blocker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = WritePersisted(dir, Persisted{
+		FormatVersion:     1,
+		AdminPasswordHash: "$argon2id$v=19$m=65536,t=1,p=4$cccccccccccccccccccccc$ddddddddddddddddddddddddddddddddddddddddddd",
+		RelayKey:          "rk-should-not-replace",
+		MasterKeyID:       "mkid-should-not-replace",
+	})
+	if err == nil {
+		t.Fatal("expected write failure")
+	}
+	after, err := os.ReadFile(CredentialsFile(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed write must leave existing secrets file bytes unchanged")
+	}
+	still, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.AdminPasswordHash != first.AdminPasswordHash ||
+		still.RelayKey != first.RelayKey ||
+		still.MasterKeyID != first.MasterKeyID {
+		t.Fatalf("after failed write got %+v want %+v", still, first)
+	}
+}
