@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -242,6 +244,130 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	c, vid, err = reg.PublishedCompiled(reusedID, endpointID)
 	if err != nil || c != nil || vid != 0 {
 		t.Fatalf("reused id must stay passthrough: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+}
+
+// Endpoint delete must detach transform bindings inside the SQL transaction
+// (and around it for in-memory state). A failed delete keeps bindings; after a
+// successful delete commits, bindings attached for a reused id must survive.
+func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
+	s, _ := newTestServer(t)
+	reg := transform.NewRegistry(20).WithPersist(s.st)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).
+		WithTransformRegistry(reg).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"xform-ep-u","base_url":"https://ep-x.example.com","api_key":"sk-xxxxxxxxxxxx"}`)
+
+	rec := do(t, h, "GET", "/admin/api/upstream-endpoints?upstream_id="+itoa(upID), "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list endpoints: %d %s", rec.Code, rec.Body.String())
+	}
+	page := decodeBody[model.Page[model.UpstreamEndpoint]](t, rec)
+	var target, sibling model.UpstreamEndpoint
+	for _, ep := range page.Items {
+		switch ep.Kind {
+		case model.EndpointModels:
+			target = ep
+		case model.EndpointMessages:
+			sibling = ep
+		}
+	}
+	if target.ID == 0 || sibling.ID == 0 {
+		t.Fatalf("missing endpoints: target=%d sibling=%d", target.ID, sibling.ID)
+	}
+
+	const routeID int64 = 1
+	rec = do(t, h, "POST", "/admin/api/transforms", `{"name":"ep-reuse-set"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("transform set: %d %s", rec.Code, rec.Body.String())
+	}
+	setID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "PUT", "/admin/api/transforms/"+itoa(setID)+"/draft",
+		`{"rules":[{"kind":"replace_bytes","from":"OLD","to":"NEW"}]}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draft: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(target.ID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish target: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(sibling.ID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish sibling: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Failed delete (upstream still enabled) must keep bindings.
+	rec = do(t, h, "DELETE",
+		"/admin/api/upstream-endpoints/"+itoa(target.ID)+"?expected_revision="+itoa(target.Revision),
+		"", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("enabled upstream must reject endpoint delete")
+	}
+	c, _, err := reg.PublishedCompiled(routeID, target.ID)
+	if err != nil || c == nil {
+		t.Fatalf("failed delete must keep target binding: c=%v err=%v", c != nil, err)
+	}
+
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "DELETE",
+		"/admin/api/upstream-endpoints/"+itoa(target.ID)+"?expected_revision="+itoa(target.Revision),
+		"", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete endpoint: %d %s", rec.Code, rec.Body.String())
+	}
+	c, vid, err := reg.PublishedCompiled(routeID, target.ID)
+	if err != nil || c != nil || vid != 0 {
+		t.Fatalf("deleted endpoint binding must be gone: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+	cSibling, _, err := reg.PublishedCompiled(routeID, sibling.ID)
+	if err != nil || cSibling == nil {
+		t.Fatalf("live sibling binding must remain: c=%v err=%v", cSibling != nil, err)
+	}
+
+	// Empty endpoint table + reset AUTOINCREMENT so the next create reuses id.
+	for _, ep := range page.Items {
+		if ep.ID == target.ID {
+			continue
+		}
+		cur, err := s.st.GetEndpoint(ep.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec = do(t, h, "DELETE",
+			"/admin/api/upstream-endpoints/"+itoa(cur.ID)+"?expected_revision="+itoa(cur.Revision),
+			"", true)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("delete leftover endpoint %d: %d %s", cur.ID, rec.Code, rec.Body.String())
+		}
+	}
+	if _, err := s.st.DB().Exec(`DELETE FROM sqlite_sequence WHERE name='upstream_endpoint'`); err != nil {
+		t.Fatalf("reset endpoint sequence: %v", err)
+	}
+
+	body := `{"upstream_id":` + itoa(upID) + `,"endpoint":"models","url_mode":"canonical","auth_profile":{"mode":"x_api_key","header_name":"x-api-key","secret_ref":"upstream_api_key"}}`
+	rec = do(t, h, "POST", "/admin/api/upstream-endpoints", body, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("recreate endpoint: %d %s", rec.Code, rec.Body.String())
+	}
+	reused := decodeBody[model.UpstreamEndpoint](t, rec)
+	if reused.ID != target.ID {
+		t.Fatalf("forced reuse failed: new id=%d old=%d", reused.ID, target.ID)
+	}
+
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(reused.ID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish reused: %d %s", rec.Code, rec.Body.String())
+	}
+	c, _, err = reg.PublishedCompiled(routeID, reused.ID)
+	if err != nil || c == nil {
+		t.Fatalf("bindings attached after delete commits must remain: c=%v err=%v", c != nil, err)
 	}
 }
 

@@ -192,3 +192,68 @@ func TestMigrationOnlyEndpointCannotBeDeleted(t *testing.T) {
 		t.Errorf("needs_review 的 Endpoint 删除 error = %v, want ErrDependencyConflict", err)
 	}
 }
+
+func countTransformBindings(t *testing.T, store *Store, endpointID int64) int {
+	t.Helper()
+	var n int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM transform_binding WHERE endpoint_id=?`, endpointID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func insertTransformBinding(t *testing.T, store *Store, routeID, endpointID, setID int64) {
+	t.Helper()
+	if _, err := store.db.Exec(`INSERT OR IGNORE INTO transform_set (id, name, created_at, draft_json) VALUES (?,?,?,?)`,
+		setID, "detach-set", 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO transform_binding
+		(route_id, endpoint_id, set_id, published_id, shadow_id, revision) VALUES (?,?,?,?,?,?)`,
+		routeID, endpointID, setID, 1, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// DeleteEndpoint must drop transform_binding rows in the same transaction as the
+// endpoint row. A failed delete rolls the detach back; a sibling endpoint's
+// bindings stay. Callers must not bare-id detach again after commit.
+func TestDeleteEndpoint_DetachesTransformBindingsInSameTx(t *testing.T) {
+	store := testStore(t)
+	upstream := disabledUpstreamWithEndpoints(t, store, "xform-ep-detach")
+	target := endpointOf(t, store, upstream.ID, model.EndpointCountTokens)
+	sibling := endpointOf(t, store, upstream.ID, model.EndpointMessages)
+
+	insertTransformBinding(t, store, 100, target.ID, 50)
+	insertTransformBinding(t, store, 100, sibling.ID, 50)
+	if got := countTransformBindings(t, store, target.ID); got != 1 {
+		t.Fatalf("setup target bindings=%d", got)
+	}
+
+	if err := store.DeleteEndpoint(target.ID, target.Revision+99); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("failed delete error=%v want ErrRevisionConflict", err)
+	}
+	if got := countTransformBindings(t, store, target.ID); got != 1 {
+		t.Fatalf("failed delete must keep bindings: got %d", got)
+	}
+	if got := countTransformBindings(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay after failed delete: got %d", got)
+	}
+
+	if err := store.DeleteEndpoint(target.ID, target.Revision); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := countTransformBindings(t, store, target.ID); got != 0 {
+		t.Fatalf("successful delete must detach bindings: got %d", got)
+	}
+	if got := countTransformBindings(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay: got %d", got)
+	}
+
+	// Simulate id reuse + a new binding attached after the delete committed.
+	// There must be no finishing bare-id detach that would strip it.
+	insertTransformBinding(t, store, 200, target.ID, 50)
+	if got := countTransformBindings(t, store, target.ID); got != 1 {
+		t.Fatalf("post-commit binding must remain: got %d", got)
+	}
+}

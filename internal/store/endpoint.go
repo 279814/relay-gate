@@ -450,6 +450,12 @@ func (store *Store) DeleteEndpoint(id, expectedRevision int64) (err error) {
 	if dependent != 0 {
 		return fmt.Errorf("%w: Endpoint 有 Route 或历史记录", ErrDependencyConflict)
 	}
+	// §15: transform bindings are keyed by numeric endpoint id. Drop them in
+	// this same transaction so a later row that reuses the id cannot inherit
+	// a published transform, and a failed delete rolls the detach back.
+	if _, err := tx.Exec(`DELETE FROM transform_binding WHERE endpoint_id=?`, id); err != nil {
+		return err
+	}
 	result, err := tx.Exec(`DELETE FROM upstream_endpoint WHERE id=? AND revision=?`, id, expectedRevision)
 	if err != nil {
 		return err
