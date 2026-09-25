@@ -129,6 +129,35 @@ func (f *File) AbortPrepared(rotationID string) error {
 	return f.writeLocked(doc)
 }
 
+// RecoverUnfinished applies §12.7 startup recovery before admitting traffic.
+//
+// prepared (DB not committed): AbortPrepared — pending deleted, old active kept;
+// HoldMaintenance is false so the gateway may leave maintenance.
+// db_committed / key_activated: forward recovery only; HoldMaintenance is true.
+// Idle/cleaned keyrings return HoldMaintenance false with no mutation.
+// Does not log or return key material.
+func (f *File) RecoverUnfinished() (holdMaintenance bool, st Status, err error) {
+	st, err = f.Status()
+	if err != nil {
+		return false, Status{}, err
+	}
+	switch st.Phase {
+	case PhasePrepared:
+		if err := f.AbortPrepared(st.RotationID); err != nil {
+			return false, st, err
+		}
+		st, err = f.Status()
+		if err != nil {
+			return false, Status{}, err
+		}
+		return false, st, nil
+	case PhaseDBCommitted, PhaseKeyActivated:
+		return true, st, nil
+	default:
+		return false, st, nil
+	}
+}
+
 // LoadPending returns the pending master key during rotation.
 func (f *File) LoadPending() (string, error) {
 	f.mu.Lock()

@@ -248,15 +248,18 @@ func runServer() error {
 		return fmt.Errorf("绑定 synthetic controller: %w", err)
 	}
 	runCtrl.BindWarmupSource(tracker)
-	if krStatus, err := kr.Status(); err == nil {
-		switch krStatus.Phase {
-		case keyring.PhasePrepared, keyring.PhaseDBCommitted, keyring.PhaseKeyActivated:
-			if err := runCtrl.EnterMaintenance("master_key_rotation_incomplete"); err != nil {
-				return fmt.Errorf("未完成 Master Key 轮换，进入 maintenance: %w", err)
-			}
-			log.Warn("Keyring 轮换未完成，保持 maintenance 直至恢复",
-				"phase", krStatus.Phase, "rotation_id", krStatus.RotationID)
+	// §12.7：进程重启发现未完成阶段时先执行恢复，恢复完成前保持 maintenance。
+	// prepared 且数据库未提交：AbortPrepared（删 pending 并回滚），然后可准入。
+	holdMaint, krStatus, err := kr.RecoverUnfinished()
+	if err != nil {
+		return fmt.Errorf("恢复未完成 Master Key 轮换: %w", err)
+	}
+	if holdMaint {
+		if err := runCtrl.EnterMaintenance("master_key_rotation_incomplete"); err != nil {
+			return fmt.Errorf("未完成 Master Key 轮换，进入 maintenance: %w", err)
 		}
+		log.Warn("Keyring 轮换未完成，保持 maintenance 直至恢复",
+			"phase", krStatus.Phase, "rotation_id", krStatus.RotationID)
 	}
 	if err := runCtrl.EnsureStartupPrepare(); err != nil {
 		return fmt.Errorf("启动 PrepareResume: %w", err)
