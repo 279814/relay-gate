@@ -90,7 +90,34 @@ func (f *File) LoadActive() (keyID, master string, err error) {
 }
 
 func (f *File) readLocked() (document, error) {
-	raw, err := os.ReadFile(f.path)
+	doc, err := f.parseKeyringFile(f.path)
+	if err == nil {
+		return doc, nil
+	}
+	// Prefer a valid current file over keyring.previous (PR #176). Only fall
+	// back when current is missing or does not parse (§12.7 recovery).
+	currentMissing := errors.Is(err, ErrNotInitialized)
+	currentCorrupt := !currentMissing && errors.Is(err, errParseKeyring)
+	if !currentMissing && !currentCorrupt {
+		return document{}, err
+	}
+	prev, prevErr := f.parseKeyringFile(f.previousPath())
+	if prevErr == nil {
+		return prev, nil
+	}
+	if currentMissing && errors.Is(prevErr, ErrNotInitialized) {
+		return document{}, ErrNotInitialized
+	}
+	if currentCorrupt {
+		return document{}, fmt.Errorf("parse keyring (current and previous): %w", err)
+	}
+	return document{}, fmt.Errorf("parse keyring.previous after missing current: %w", prevErr)
+}
+
+var errParseKeyring = errors.New("parse keyring")
+
+func (f *File) parseKeyringFile(path string) (document, error) {
+	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return document{}, ErrNotInitialized
 	}
@@ -99,7 +126,7 @@ func (f *File) readLocked() (document, error) {
 	}
 	var doc document
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return document{}, fmt.Errorf("parse keyring: %w", err)
+		return document{}, fmt.Errorf("%w: %w", errParseKeyring, err)
 	}
 	return doc, nil
 }

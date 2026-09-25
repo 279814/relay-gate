@@ -86,6 +86,92 @@ func TestWriteKeepsVerifiedPrevious(t *testing.T) {
 	}
 }
 
+func TestLoadFallsBackToPreviousWhenCurrentCorrupt(t *testing.T) {
+	const master = "master-secret-value-32b!!!!"
+	f := Open(t.TempDir())
+	if err := f.EnsureInitialized("k1", master); err != nil {
+		t.Fatal(err)
+	}
+	good, err := os.ReadFile(f.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevPath := filepath.Join(filepath.Dir(f.Path()), "keyring.previous")
+	if err := os.WriteFile(prevPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.Path(), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id, active, err := f.LoadActive()
+	if err != nil {
+		t.Fatalf("expected load from previous: %v", err)
+	}
+	if id != "k1" || active != master {
+		t.Fatalf("got id=%q active=%q", id, active)
+	}
+	// Load must not rewrite current when falling back.
+	after, err := os.ReadFile(f.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != "{not-json" {
+		t.Fatalf("current was rewritten on load-from-previous: %q", after)
+	}
+}
+
+func TestLoadPrefersValidCurrentOverPrevious(t *testing.T) {
+	const currentMaster = "master-secret-value-32b!!!!"
+	const previousMaster = "master-previous-secret-32b!"
+	f := Open(t.TempDir())
+	if err := f.EnsureInitialized("k1", currentMaster); err != nil {
+		t.Fatal(err)
+	}
+	prevDoc := document{
+		FormatVersion: 1,
+		KeyID:         "k-prev",
+		Active:        previousMaster,
+		UpdatedAt:     "2020-01-01T00:00:00Z",
+	}
+	prevRaw, err := json.MarshalIndent(prevDoc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevPath := filepath.Join(filepath.Dir(f.Path()), "keyring.previous")
+	if err := os.WriteFile(prevPath, append(prevRaw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id, active, err := f.LoadActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "k1" || active != currentMaster {
+		t.Fatalf("valid current must win: id=%q active=%q", id, active)
+	}
+}
+
+func TestLoadErrorsWhenCurrentAndPreviousCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f := Open(dir)
+	if err := os.WriteFile(f.Path(), []byte("{bad-current"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevPath := filepath.Join(secrets, "keyring.previous")
+	if err := os.WriteFile(prevPath, []byte("{bad-previous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := f.LoadActive(); err == nil {
+		t.Fatal("expected error when both keyring files are corrupt")
+	}
+}
+
 func TestFailedWriteLeavesCurrentAndPreviousIntact(t *testing.T) {
 	const firstMaster = "master-secret-value-32b!!!!"
 	f := Open(t.TempDir())
