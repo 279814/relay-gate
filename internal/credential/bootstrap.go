@@ -319,17 +319,47 @@ func writeJSON0600(path string, v any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	// Same-directory temp + file fsync + rename so a crash mid-write cannot
+	// truncate an existing secrets / journal file (matches keyring §12.7).
 	tmp := path + ".tmp"
 	_ = os.Remove(tmp)
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := writeSyncedFile(tmp, raw, 0o600); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	_ = os.Chmod(tmp, 0o600)
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	_ = os.Chmod(path, 0o600)
+	return nil
+}
+
+// writeSyncedFile writes content then fsyncs before close so rename of a
+// same-directory temp file promotes durable bytes (same pattern as keyring).
+func writeSyncedFile(path string, content []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(content); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
 	return nil
 }
 
