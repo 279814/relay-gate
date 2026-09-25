@@ -157,6 +157,11 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // (%2f vs %2F) that some clients emit. Response bodies can echo query/URL
 // text where the secret appears only percent-encoded; scanning still uses
 // the original text.
+//
+// Also replaces the JSON \u00XX form of each key (one \u00XX per byte,
+// lowercase hex as encoding/json emits for escaped bytes). Observer scans
+// raw response bytes, so a secret may appear only as those escapes inside
+// a JSON string; the whole document is never decoded.
 func redactSecrets(s string, keys []string) string {
 	for _, k := range keys {
 		if k == "" {
@@ -170,8 +175,30 @@ func redactSecrets(s string, keys []string) string {
 				s = strings.ReplaceAll(s, lower, masked)
 			}
 		}
+		if esc := jsonByteUnicodeEscape(k); esc != k {
+			s = strings.ReplaceAll(s, esc, masked)
+		}
 	}
 	return s
+}
+
+// jsonByteUnicodeEscape encodes each byte of s as \u00XX with lowercase hex
+// (the style encoding/json uses for escaped bytes). Unrelated \u sequences
+// are not invented; callers only ReplaceAll this exact form of a known key.
+func jsonByteUnicodeEscape(s string) string {
+	if s == "" {
+		return ""
+	}
+	const hex = "0123456789abcdef"
+	var b strings.Builder
+	b.Grow(len(s) * 6)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		b.WriteString(`\u00`)
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0xf])
+	}
+	return b.String()
 }
 
 // percentEncodingLowerHex returns s with A–F hex digits inside %XX sequences

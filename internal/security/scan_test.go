@@ -95,6 +95,35 @@ func TestScanText_RedactsLowercasePercentEncodedSecretInDetail(t *testing.T) {
 	}
 }
 
+func TestScanText_RedactsJSONUnicodeEscapedSecretInDetail(t *testing.T) {
+	const key = "sk-FINDING-OMIT-TEST-KEY-7e4d9a2c"
+	esc := jsonByteUnicodeEscape(key)
+	if esc == key {
+		t.Fatal("test key must differ under jsonByteUnicodeEscape")
+	}
+	// Body carries only the \u00XX form (raw JSON bytes, never decoded).
+	const unrelated = `\u4e2d\u6587`
+	body := `Hello <script>x</script> token=` + esc + ` note=` + unrelated + ` trailer`
+	fs := ScanText(body, "body", key)
+	if len(fs) == 0 {
+		t.Fatal("expected finding")
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, esc) {
+			t.Fatalf("Detail still contains JSON \\u-escaped secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("Detail still contains raw secret: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, unrelated) {
+			t.Fatalf("Detail dropped unrelated \\u sequence: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, "…") {
+			t.Fatalf("Detail missing masked secret form: %q", f.Detail)
+		}
+	}
+}
+
 func TestCenterRingBound(t *testing.T) {
 	c := NewCenter(3)
 	for i := 0; i < 5; i++ {
