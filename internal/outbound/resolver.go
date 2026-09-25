@@ -199,7 +199,10 @@ func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
-	target.RawQuery = joinQuery(fixedQuery, in.IncomingRawQuery)
+	// 凭据参数名只从固定 query 模板里认：值整段是占位符的那些。
+	// 入站同名段丢掉，避免客户端覆盖或并列网关写入的上游 key。
+	target.RawQuery = joinQuery(fixedQuery, in.IncomingRawQuery,
+		credentialQueryParamNames(in.Endpoint.FixedQueryTemplate))
 	target.Fragment = ""
 	target.RawFragment = ""
 
@@ -253,8 +256,10 @@ func (resolver *Resolver) resolveLegacy(ctx context.Context, in ResolveInput,
 
 	target := *exact
 	// 已捕获的 RawQuery 不再次编码，也不与 FixedQueryTemplate 混合：
-	// 那份字节就是旧版本发出去的原文。
-	target.RawQuery = joinQuery(exact.RawQuery, in.IncomingRawQuery)
+	// 那份字节就是旧版本发出去的原文。凭据名来自显式 QueryName（若出现在
+	// 捕获 query 里）以及高置信凭据前缀命中的参数名。
+	target.RawQuery = joinQuery(exact.RawQuery, in.IncomingRawQuery,
+		legacyCredentialQueryParamNames(exact.RawQuery, in.Endpoint.AuthProfile))
 	target.Fragment = ""
 	target.RawFragment = ""
 
@@ -385,17 +390,95 @@ func (tracker *identityTracker) identity() string {
 
 // joinQuery 把固定 query 与入站 RawQuery 接起来。
 //
-// 固定在前、入站在后（§7.1 第 5 条），只插一个 &，不解析、不排序、不去重：
-// 同名参数由上游决定取第一个还是最后一个，我们无权替它决定。
-func joinQuery(fixed, incoming string) string {
+// 固定在前、入站在后（§7.1 第 5 条），只插一个 &。普通同名参数两者都保留、
+// 不排序（由上游决定取第一个还是最后一个）。dropIncomingNames 里的名字是
+// 固定 query 已写入的凭据参数：入站同名段必须丢掉，否则客户端能覆盖或并列
+// 一份假 key。固定 query 不含凭据参数时 drop 为空，入站（含 key=）原样追加。
+func joinQuery(fixed, incoming string, dropIncomingNames map[string]struct{}) string {
 	switch {
 	case fixed == "":
 		return incoming
 	case incoming == "":
 		return fixed
 	default:
-		return fixed + "&" + incoming
+		filtered := stripQueryParamNames(incoming, dropIncomingNames)
+		if filtered == "" {
+			return fixed
+		}
+		return fixed + "&" + filtered
 	}
+}
+
+// credentialQueryParamNames 从固定 query 模板收集「值整段是凭据占位符」的参数名。
+//
+// 只认模板里已经写出的那些名字，不另起 denylist：beta 等普通参数即使与
+// 入站同名也照常保留；模板里没有凭据占位符时返回 nil，入站 key= 可原样通过。
+func credentialQueryParamNames(template string) map[string]struct{} {
+	if template == "" {
+		return nil
+	}
+	names := make(map[string]struct{})
+	for _, segment := range strings.Split(template, "&") {
+		name, value, ok := splitQuerySegment(segment)
+		if !ok || !isWholeCredentialPlaceholder(value) {
+			continue
+		}
+		names[name] = struct{}{}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// legacyCredentialQueryParamNames 识别 legacy exact URL 里已携带的凭据参数名。
+//
+// 捕获 query 已是渲染后的明文，没有占位符可认。只收 AuthProfile 显式给出、
+// 且确实出现在捕获 query 里的 QueryName —— 不另起参数名 denylist。
+func legacyCredentialQueryParamNames(raw string, profile model.EndpointAuthProfile) map[string]struct{} {
+	queryName := strings.TrimSpace(profile.QueryName)
+	if queryName == "" || raw == "" {
+		return nil
+	}
+	for _, segment := range strings.Split(raw, "&") {
+		name, _, _ := splitQuerySegment(segment)
+		if name == queryName {
+			return map[string]struct{}{queryName: {}}
+		}
+	}
+	return nil
+}
+
+func splitQuerySegment(segment string) (name, value string, hasEquals bool) {
+	if separator := strings.IndexByte(segment, '='); separator >= 0 {
+		return segment[:separator], segment[separator+1:], true
+	}
+	return segment, "", false
+}
+
+func isWholeCredentialPlaceholder(value string) bool {
+	if value == "{{UPSTREAM_API_KEY}}" {
+		return true
+	}
+	return strings.HasPrefix(value, "{{SECRET:") && strings.HasSuffix(value, "}}") &&
+		strings.Count(value, "{{") == 1 && strings.Count(value, "}}") == 1
+}
+
+// stripQueryParamNames 丢掉 raw 里名称落在 names 中的段，其余段保序、不重编码。
+func stripQueryParamNames(raw string, names map[string]struct{}) string {
+	if raw == "" || len(names) == 0 {
+		return raw
+	}
+	segments := strings.Split(raw, "&")
+	kept := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		name, _, _ := splitQuerySegment(segment)
+		if _, drop := names[name]; drop {
+			continue
+		}
+		kept = append(kept, segment)
+	}
+	return strings.Join(kept, "&")
 }
 
 // parseOrigin 解析并校验一个 URL 的 origin 部分。
