@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 )
@@ -248,11 +249,18 @@ func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
 	return nil
 }
 
+// rewrapMultipartPlainPeak records the largest plaintext buffer held while
+// rewrapping one v1m frame. Tests assert it stays within a single frame.
+var rewrapMultipartPlainPeak int
+
 func rewrapSampleField(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return raw, nil
 	}
-	if !IsSampleEnvelope(raw) && !isSampleMultipart(raw) {
+	if isSampleMultipart(raw) {
+		return rewrapSampleMultipart(c, newMaster, raw)
+	}
+	if !IsSampleEnvelope(raw) {
 		return raw, nil
 	}
 	plain, err := c.DecryptSampleBlob(raw)
@@ -264,6 +272,72 @@ func rewrapSampleField(c *Cipher, newMaster string, raw []byte) ([]byte, error) 
 		return nil, err
 	}
 	return []byte(neu), nil
+}
+
+// rewrapSampleMultipart reseals each v1m frame under newMaster without
+// assembling the whole plaintext into one slice (rotation must not spike to
+// the disk-quota size).
+func rewrapSampleMultipart(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
+	rest := raw[len(sampleMultipartPrefix):]
+	colon := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon < 0 || colon+1 >= len(rest) || rest[colon+1] != '\n' {
+		return nil, fmt.Errorf("分块样本信封格式无效")
+	}
+	payload := rest[colon+2:]
+
+	_, root, err := deriveMaster(newMaster)
+	if err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(raw) + 64)
+	if _, err := out.WriteString(sampleMultipartPrefix + keyIDOf(root) + ":\n"); err != nil {
+		return nil, err
+	}
+
+	var lenBuf [4]byte
+	peak := 0
+	for len(payload) > 0 {
+		if len(payload) < 4 {
+			return nil, fmt.Errorf("分块样本信封截断")
+		}
+		n := int(binary.BigEndian.Uint32(payload[:4]))
+		payload = payload[4:]
+		if n < 0 || n > len(payload) {
+			return nil, fmt.Errorf("分块样本信封长度无效")
+		}
+		frame := payload[:n]
+		payload = payload[n:]
+
+		plain, err := c.DecryptSampleBlob(frame)
+		if err != nil {
+			return nil, err
+		}
+		if len(plain) > peak {
+			peak = len(plain)
+		}
+		neu, err := encryptEnvelopeUnder(newMaster, string(plain))
+		if err != nil {
+			return nil, err
+		}
+		enc := []byte(neu)
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(enc)))
+		if _, err := out.Write(lenBuf[:]); err != nil {
+			return nil, err
+		}
+		if _, err := out.Write(enc); err != nil {
+			return nil, err
+		}
+	}
+	rewrapMultipartPlainPeak = peak
+	return out.Bytes(), nil
 }
 
 func encryptUnder(passphrase, plain string) (string, error) {
