@@ -159,9 +159,11 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // the original text.
 //
 // Also replaces the JSON \u00XX form of each key (one \u00XX per byte,
-// lowercase hex as encoding/json emits for escaped bytes). Observer scans
-// raw response bytes, so a secret may appear only as those escapes inside
-// a JSON string; the whole document is never decoded.
+// lowercase hex as encoding/json emits for escaped bytes), plus the
+// equivalent form with uppercase hex digits (\u006B vs \u006b) that JSON
+// also accepts. Observer scans raw response bytes, so a secret may appear
+// only as those escapes inside a JSON string; the whole document is never
+// decoded.
 func redactSecrets(s string, keys []string) string {
 	for _, k := range keys {
 		if k == "" {
@@ -177,6 +179,9 @@ func redactSecrets(s string, keys []string) string {
 		}
 		if esc := jsonByteUnicodeEscape(k); esc != k {
 			s = strings.ReplaceAll(s, esc, masked)
+			if upper := jsonUnicodeEscapeUpperHex(esc); upper != esc {
+				s = strings.ReplaceAll(s, upper, masked)
+			}
 		}
 	}
 	return s
@@ -199,6 +204,37 @@ func jsonByteUnicodeEscape(s string) string {
 		b.WriteByte(hex[c&0xf])
 	}
 	return b.String()
+}
+
+// jsonUnicodeEscapeUpperHex returns s with a–f hex digits inside \uXXXX
+// sequences uppercased. Other bytes are unchanged so unrelated \u sequences
+// are not invented or dropped.
+func jsonUnicodeEscapeUpperHex(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if i+5 < len(s) && s[i] == '\\' && s[i+1] == 'u' &&
+			isHexDigit(s[i+2]) && isHexDigit(s[i+3]) && isHexDigit(s[i+4]) && isHexDigit(s[i+5]) {
+			b.WriteByte('\\')
+			b.WriteByte('u')
+			b.WriteByte(toUpperHexDigit(s[i+2]))
+			b.WriteByte(toUpperHexDigit(s[i+3]))
+			b.WriteByte(toUpperHexDigit(s[i+4]))
+			b.WriteByte(toUpperHexDigit(s[i+5]))
+			i += 6
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func toUpperHexDigit(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - ('a' - 'A')
+	}
+	return c
 }
 
 // percentEncodingLowerHex returns s with A–F hex digits inside %XX sequences
