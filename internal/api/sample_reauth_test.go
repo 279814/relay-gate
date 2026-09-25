@@ -80,3 +80,111 @@ func TestGetSample_RequiresReauth(t *testing.T) {
 		t.Fatal("list must not include unredacted sample body")
 	}
 }
+
+// TestPinSample_RequiresReauth covers §5.4: pinning unredacted samples needs
+// passwordOK; session alone must not pin.
+func TestPinSample_RequiresReauth(t *testing.T) {
+	s, h := newTestServer(t)
+
+	smp := &model.Sample{
+		ReqID:       "reauth-pin",
+		TSRecv:      time.Now().UnixMilli(),
+		TSSent:      time.Now().UnixMilli(),
+		TSDone:      time.Now().UnixMilli(),
+		Endpoint:    "/v1/messages",
+		InMethod:    "POST",
+		InPath:      "/v1/messages",
+		InHeaders:   http.Header{},
+		InBody:      []byte(`{"msg":1}`),
+		OutHeaders:  http.Header{},
+		OutBody:     []byte(`{"out":1}`),
+		RespStatus:  200,
+		RespHeaders: http.Header{},
+		RespBody:    []byte(`{"resp":1}`),
+		Outcome:     model.OutcomeOK,
+	}
+	if err := s.st.InsertSample(smp); err != nil {
+		t.Fatal(err)
+	}
+	path := "/admin/api/samples/" + itoa(smp.ID) + "/pin"
+
+	noPW := do(t, h, "POST", path, `{"pinned":true}`, true)
+	if noPW.Code != http.StatusUnauthorized {
+		t.Fatalf("session alone want 401, got %d body=%s", noPW.Code, noPW.Body.String())
+	}
+	got, err := s.st.GetSample(smp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pinned {
+		t.Fatal("pin must not apply without password")
+	}
+
+	bad := do(t, h, "POST", path, `{"pinned":true,"password":"not-the-admin"}`, true)
+	if bad.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password want 401, got %d body=%s", bad.Code, bad.Body.String())
+	}
+
+	ok := do(t, h, "POST", path, `{"pinned":true,"password":"`+testAdminPW+`"}`, true)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("correct password want 200, got %d body=%s", ok.Code, ok.Body.String())
+	}
+	got, err = s.st.GetSample(smp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pinned {
+		t.Fatal("pin should apply after reauth")
+	}
+}
+
+// TestClearSamples_RequiresReauth covers §5.4: bulk-delete of unredacted
+// samples needs passwordOK; session alone must not clear.
+func TestClearSamples_RequiresReauth(t *testing.T) {
+	s, h := newTestServer(t)
+
+	smp := &model.Sample{
+		ReqID:       "reauth-clear",
+		TSRecv:      time.Now().UnixMilli(),
+		TSSent:      time.Now().UnixMilli(),
+		TSDone:      time.Now().UnixMilli(),
+		Endpoint:    "/v1/messages",
+		InMethod:    "POST",
+		InPath:      "/v1/messages",
+		InHeaders:   http.Header{},
+		InBody:      []byte(`{"msg":1}`),
+		OutHeaders:  http.Header{},
+		OutBody:     []byte(`{"out":1}`),
+		RespStatus:  200,
+		RespHeaders: http.Header{},
+		RespBody:    []byte(`{"resp":1}`),
+		Outcome:     model.OutcomeOK,
+	}
+	if err := s.st.InsertSample(smp); err != nil {
+		t.Fatal(err)
+	}
+
+	noPW := do(t, h, "DELETE", "/admin/api/samples", "", true)
+	if noPW.Code != http.StatusUnauthorized {
+		t.Fatalf("session alone want 401, got %d body=%s", noPW.Code, noPW.Body.String())
+	}
+	if n, _ := s.st.CountSamples(); n != 1 {
+		t.Fatalf("clear must not run without password, count=%d", n)
+	}
+
+	bad := do(t, h, "DELETE", "/admin/api/samples", `{"password":"not-the-admin"}`, true)
+	if bad.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password want 401, got %d body=%s", bad.Code, bad.Body.String())
+	}
+	if n, _ := s.st.CountSamples(); n != 1 {
+		t.Fatalf("clear must not run with wrong password, count=%d", n)
+	}
+
+	ok := do(t, h, "DELETE", "/admin/api/samples", `{"password":"`+testAdminPW+`"}`, true)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("correct password want 200, got %d body=%s", ok.Code, ok.Body.String())
+	}
+	if n, _ := s.st.CountSamples(); n != 0 {
+		t.Fatalf("clear should delete after reauth, count=%d", n)
+	}
+}
