@@ -94,23 +94,30 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Snapshot child Route ids before CASCADE: SQL removes them with the
-	// ModelName, but §9.2 Forget and §15 transform detach still need the ids.
+	// ModelName, but §9.2 Forget still needs the ids. Durable transform_binding
+	// rows are dropped inside DeleteModelName's transaction; in-memory bindings
+	// are detached around that call — never by bare id after commit.
 	// Clear in-memory health only after DeleteModelName succeeds — otherwise a
 	// store error would wipe RouteHealth while the rows remain.
 	childRoutes := s.routeIDsOfModelName(id)
-	if err := s.st.DeleteModelName(id); err != nil {
-		s.writeErr(w, err)
-		return
+	var delErr error
+	if s.transforms != nil {
+		delErr = s.transforms.DetachRouteBindingsAround(childRoutes, func() error {
+			return s.st.DeleteModelName(id)
+		})
+	} else {
+		delErr = s.st.DeleteModelName(id)
 	}
-	for _, rid := range childRoutes {
-		s.detachTransformBindingsForRoute(rid)
+	if delErr != nil {
+		s.writeErr(w, delErr)
+		return
 	}
 	s.invalidateModelNameDeleted(id, childRoutes)
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	// route 表对 model_name 是 ON DELETE CASCADE；transform_binding 需显式卸绑。
+	// route 表对 model_name 是 ON DELETE CASCADE；transform_binding 已在事务内卸绑。
 	s.log.Info("删除 model_name（其 route 已级联删除）", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }

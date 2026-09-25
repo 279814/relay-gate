@@ -258,6 +258,14 @@ func (s *Store) DeleteModelName(id int64) (err error) {
 		}
 	}
 
+	// §15: child Routes CASCADE without DeleteRoute, so drop their transform
+	// bindings here. Same transaction as the ModelName row — rollback keeps
+	// bindings, and a reused route id cannot inherit a published transform.
+	if _, err = tx.Exec(`DELETE FROM transform_binding WHERE route_id IN (
+		SELECT id FROM route WHERE model_name_id=?)`, id); err != nil {
+		return err
+	}
+
 	res, err := tx.Exec(`DELETE FROM model_name WHERE id=?`, id)
 	if err != nil {
 		return err
