@@ -182,13 +182,14 @@ func TestRedactBodyKeys_Edges(t *testing.T) {
 	}
 }
 
-// Location / Content-Location / Refresh 可能回显带 ?key= 的出站 URL。
-// 只替凭据值，不动无关 query；其它头不碰。
+// Location / Content-Location / Refresh / Link 可能回显带 ?key= 的出站 URL。
+// 只替凭据值，不动无关 query 与 Link 的 rel=；其它头不碰。
 func TestRedactCredentialURLHeaders(t *testing.T) {
 	const secret = "sk-upstream-secret-in-query-hdr"
 	h := http.Header{}
 	h.Set("Location", "https://a.example/x?key="+secret+"&beta=true")
 	h.Add("Location", "https://b.example/y?token="+secret)
+	h.Set("Link", `<https://a.example/x?key=`+secret+`&beta=true>; rel="next"`)
 	h.Set("X-Request-Id", "keep")
 
 	RedactCredentialURLHeaders(h, []string{secret})
@@ -200,6 +201,16 @@ func TestRedactCredentialURLHeaders(t *testing.T) {
 	}
 	if !strings.Contains(h.Get("Location"), "beta=true") {
 		t.Errorf("无关 query 应保留：%q", h.Get("Location"))
+	}
+	link := h.Get("Link")
+	if strings.Contains(link, secret) {
+		t.Errorf("Link 残留完整 key：%q", link)
+	}
+	if !strings.Contains(link, "beta=true") {
+		t.Errorf("Link 无关 query 应保留：%q", link)
+	}
+	if !strings.Contains(link, `rel="next"`) {
+		t.Errorf("Link rel 应保留：%q", link)
 	}
 	if h.Get("X-Request-Id") != "keep" {
 		t.Error("非 URL 头不得改写")

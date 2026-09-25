@@ -154,12 +154,13 @@ const headerRelayCountTokens = "X-Relay-Count-Tokens"
 
 // FinalizeClientResponseHeaders 在把上游响应头写给客户端之前做最后清理：
 // 逐跳头 + 本网关会话 Cookie 的 Set-Cookie + 上游伪造的 X-Relay-Count-Tokens
-// + Location / Content-Location / Refresh 里的凭据 query。
+// + Location / Content-Location / Refresh / Link 里的凭据 query。
 //
 // keys 是已知 Secret（上游 key、relay key、transform secret_ref）。上游 3xx
-// 常把出站 URL 原样放进 Location；FixedQueryTemplate / legacy_exact 可能把
-// key 放在 query 里（§7.1），不脱敏就等于把上游 key 交给外部客户端。
-// 脱敏复用 sample.RedactText：只替凭据值，beta=true 等无关参数与状态码不动。
+// 常把出站 URL 原样放进 Location；Link 也可能把带 key 的 URL 放进尖括号；
+// FixedQueryTemplate / legacy_exact 可能把 key 放在 query 里（§7.1），不脱敏
+// 就等于把上游 key 交给外部客户端。脱敏复用 sample.RedactText：只替凭据值，
+// beta=true、rel= 等无关参数与状态码不动。
 //
 // 其它 Set-Cookie 照常透传；管理登录走 api 包自己的 SetCookie，不经此路径。
 // 其它 X-Relay-* 不在这里剥 —— 成功透传不得新增 Attempts/Half-Open，

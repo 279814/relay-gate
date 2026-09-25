@@ -435,20 +435,21 @@ func TestFinalizeClientResponseHeaders_DropsGatewaySessionSetCookie(t *testing.T
 	}
 }
 
-// 上游 3xx Location（及 Content-Location / Refresh）若回显出站 URL，
-// FixedQueryTemplate 里的上游 key 绝不能原样到客户端；beta=true 等无关
-// query 与头本身必须保留。
+// 上游 3xx Location（及 Content-Location / Refresh / Link）若回显出站 URL，
+// FixedQueryTemplate 里的上游 key 绝不能原样到客户端；beta=true、rel= 等无关
+// 参数与头本身必须保留。
 func TestFinalizeClientResponseHeaders_RedactsCredentialQueryInURLHeaders(t *testing.T) {
 	const secret = "sk-upstream-secret-in-location"
 	h := http.Header{}
 	h.Set("Location", "https://up.example/v1/messages?key="+secret+"&beta=true")
 	h.Set("Content-Location", "https://up.example/v1/messages?key="+secret+"&beta=true")
 	h.Set("Refresh", "0; url=https://up.example/v1?key="+secret+"&beta=true")
+	h.Set("Link", `<https://up.example/v1/messages?key=`+secret+`&beta=true>; rel="next"`)
 	h.Set("X-Request-Id", "req-keep")
 
 	FinalizeClientResponseHeaders(h, []string{secret})
 
-	for _, name := range []string{"Location", "Content-Location", "Refresh"} {
+	for _, name := range []string{"Location", "Content-Location", "Refresh", "Link"} {
 		got := h.Get(name)
 		if strings.Contains(got, secret) {
 			t.Errorf("%s 回显了上游 key：%q", name, got)
@@ -456,6 +457,9 @@ func TestFinalizeClientResponseHeaders_RedactsCredentialQueryInURLHeaders(t *tes
 		if !strings.Contains(got, "beta=true") {
 			t.Errorf("%s 不应丢掉无关 query：%q", name, got)
 		}
+	}
+	if link := h.Get("Link"); !strings.Contains(link, `rel="next"`) {
+		t.Errorf("Link 应保留 rel 参数：%q", link)
 	}
 	if h.Get("X-Request-Id") != "req-keep" {
 		t.Error("普通响应头应保留")

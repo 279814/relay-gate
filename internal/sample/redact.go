@@ -171,10 +171,12 @@ func RedactText(s string, keys []string) string {
 // urlCarryingResponseHeaders 是响应里可能携带完整 URL 的头。
 // 上游若把出站请求 URL（含 FixedQueryTemplate / legacy_exact 里的 key）
 // 回显到这些头，原样透传就把上游 key 交给了外部客户端。
+// Link 的 URL 在尖括号内；RedactText 只替凭据子串，rel= 等参数不动。
 var urlCarryingResponseHeaders = []string{
 	"Location",
 	"Content-Location",
 	"Refresh",
+	"Link",
 }
 
 // RedactCredentialURLHeaders 就地脱敏响应头里 URL 携带的已知 Secret。
