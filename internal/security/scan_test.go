@@ -66,6 +66,35 @@ func TestScanText_RedactsPercentEncodedSecretInDetail(t *testing.T) {
 	}
 }
 
+func TestScanText_RedactsLowercasePercentEncodedSecretInDetail(t *testing.T) {
+	// Same key as uppercase QueryEscape case; body uses lowercase hex (%2f).
+	const key = "sk-FINDING/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	lower := percentEncodingLowerHex(enc)
+	if lower == enc {
+		t.Fatal("test key QueryEscape form must contain A-F hex digits")
+	}
+	body := `Hello <script>x</script> token=` + lower + ` trailer`
+	fs := ScanText(body, "body", key)
+	if len(fs) == 0 {
+		t.Fatal("expected finding")
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, lower) {
+			t.Fatalf("Detail still contains lowercase percent-encoded secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, enc) {
+			t.Fatalf("Detail still contains percent-encoded secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("Detail still contains raw secret: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, "…") {
+			t.Fatalf("Detail missing masked secret form: %q", f.Detail)
+		}
+	}
+}
+
 func TestCenterRingBound(t *testing.T) {
 	c := NewCenter(3)
 	for i := 0; i < 5; i++ {

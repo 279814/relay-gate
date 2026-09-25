@@ -153,8 +153,10 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // store already imports this package).
 //
 // Also replaces the url.QueryEscape form of each key (same one-pass encoding
-// as sample.RedactText). Response bodies can echo query/URL text where the
-// secret appears only percent-encoded; scanning still uses the original text.
+// as sample.RedactText), plus the equivalent form with lowercase hex digits
+// (%2f vs %2F) that some clients emit. Response bodies can echo query/URL
+// text where the secret appears only percent-encoded; scanning still uses
+// the original text.
 func redactSecrets(s string, keys []string) string {
 	for _, k := range keys {
 		if k == "" {
@@ -164,9 +166,43 @@ func redactSecrets(s string, keys []string) string {
 		s = strings.ReplaceAll(s, k, masked)
 		if enc := url.QueryEscape(k); enc != k {
 			s = strings.ReplaceAll(s, enc, masked)
+			if lower := percentEncodingLowerHex(enc); lower != enc {
+				s = strings.ReplaceAll(s, lower, masked)
+			}
 		}
 	}
 	return s
+}
+
+// percentEncodingLowerHex returns s with A–F hex digits inside %XX sequences
+// lowercased. Other bytes are unchanged so unrelated percent-sequences are
+// not invented or dropped.
+func percentEncodingLowerHex(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '%' && i+2 < len(s) && isHexDigit(s[i+1]) && isHexDigit(s[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(toLowerHexDigit(s[i+1]))
+			b.WriteByte(toLowerHexDigit(s[i+2]))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func toLowerHexDigit(c byte) byte {
+	if c >= 'A' && c <= 'F' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 func maskSecret(key string) string {
