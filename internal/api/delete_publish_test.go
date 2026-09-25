@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,10 +25,12 @@ func (alwaysHealthy) TryAcquire(int64, int) (func(), uint64, bool) {
 }
 
 type recordingPublisher struct {
-	mu          sync.Mutex
-	invalidates int
-	refreshes   int
-	inner       ConfigPublisher
+	mu               sync.Mutex
+	invalidates      int
+	refreshes        int
+	inner            ConfigPublisher
+	refreshErr       error
+	skipInnerRefresh bool
 }
 
 func (p *recordingPublisher) Invalidate() {
@@ -42,7 +45,15 @@ func (p *recordingPublisher) Invalidate() {
 func (p *recordingPublisher) Refresh() error {
 	p.mu.Lock()
 	p.refreshes++
+	errInject := p.refreshErr
+	skip := p.skipInnerRefresh
 	p.mu.Unlock()
+	if errInject != nil {
+		if !skip && p.inner != nil {
+			_ = p.inner.Refresh()
+		}
+		return errInject
+	}
 	if p.inner != nil {
 		return p.inner.Refresh()
 	}
@@ -247,3 +258,75 @@ func TestDelete_FailedStoreDoesNotPublish(t *testing.T) {
 		t.Fatalf("failed delete must not publish: inv=%d ref=%d", inv, ref)
 	}
 }
+
+// Refresh failure after a successful SQL delete must not return 204 while the
+// pre-delete routing pointer is still live. Re-Invalidate keeps the TTL open
+// so the next Snapshot() reloads from Store and omits the removed row.
+func TestDelete_RefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T) {
+	c, err := store.NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	src := livecfg.New(st, log)
+	pub := &recordingPublisher{
+		inner:            src,
+		refreshErr:       errRefreshBoom,
+		skipInnerRefresh: true,
+	}
+	s := New(st, log).WithConfigPublisher(pub)
+	h := s.Routes(testAdminPW)
+
+	mnID := mkModelNameViaAPI(t, h, "refresh-fail-m")
+	upKeep := mkUpstreamViaAPI(t, h,
+		`{"name":"rf-keep-u","base_url":"https://rf-keep.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	upDrop := mkUpstreamViaAPI(t, h,
+		`{"name":"rf-drop-u","base_url":"https://rf-drop.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	rtKeep := mkRouteViaAPI(t, h, mnID, upKeep)
+	rtDrop := mkRouteViaAPI(t, h, mnID, upDrop)
+
+	warm, err := src.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !routeIDsInSnap(warm, mnID)[rtDrop] {
+		t.Fatal("warm snapshot must contain route to delete")
+	}
+
+	beforeInv, beforeRef := pub.counts()
+	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtDrop), "", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("Refresh failure must not return 204 while routing may be stale")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	afterInv, afterRef := pub.counts()
+	// Invalidate + failed Refresh + re-Invalidate to keep TTL forced open.
+	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
+		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
+	}
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := routeIDsInSnap(snap, mnID)
+	if got[rtDrop] {
+		t.Fatalf("deleted route %d still selectable after Refresh failure", rtDrop)
+	}
+	if !got[rtKeep] {
+		t.Fatal("sibling route must remain selectable")
+	}
+	if id := selectRouteID(t, snap, "refresh-fail-m"); id != rtKeep {
+		t.Fatalf("Select got route %d want %d", id, rtKeep)
+	}
+}
+
+var errRefreshBoom = errors.New("refresh boom")

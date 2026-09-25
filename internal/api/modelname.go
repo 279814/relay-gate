@@ -98,7 +98,10 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.detachTransformBindingsForRoute(rid)
 	}
 	s.invalidateModelNameDeleted(id, childRoutes)
-	s.publishAfterSuccessfulDelete()
+	if err := s.publishAfterSuccessfulDelete(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	// route 表对 model_name 是 ON DELETE CASCADE；transform_binding 需显式卸绑。
 	s.log.Info("删除 model_name（其 route 已级联删除）", "id", id)
 	w.WriteHeader(http.StatusNoContent)

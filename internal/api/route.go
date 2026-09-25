@@ -113,7 +113,10 @@ func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	// Capability 仍按 id 索引；若不 Forget，调度器 RetainOnly 之前（或 id
 	// 被复用时）新行会继承 StateDead / 旧 capability。
 	s.invalidateRoute(id)
-	s.publishAfterSuccessfulDelete()
+	if err := s.publishAfterSuccessfulDelete(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	s.log.Info("删除 route", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
