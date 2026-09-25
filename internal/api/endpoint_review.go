@@ -55,5 +55,10 @@ func (s *Server) postConfirmEndpointReview(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.invalidateUpstream(ep.UpstreamID)
+	// confirm-review 写入 url_override，须立刻发布 livecfg Probe 快照。
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, ep)
 }

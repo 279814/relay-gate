@@ -128,6 +128,12 @@ func (s *Server) createUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	// §9.2: Endpoint URL / Auth Profile changes clear child RouteHealth.
 	// Create also invalidates: a new kind/URL is part of the request identity.
 	s.invalidateUpstream(ep.UpstreamID)
+	// livecfg Probe 快照含 Endpoint：url_override / path 影响下一次出站 URL
+	// （outbound 读同代 Bundle），须 Invalidate+Refresh，不能等 2s TTL。
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, ep)
 }
 
@@ -167,6 +173,11 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	// §9.2: Endpoint 来源/URL and Auth Profile must Forget RouteHealth immediately
 	// (probe.Service alone only reaches Scheduler, not SemanticInvalidator).
 	s.invalidateUpstream(ep.UpstreamID)
+	// url_override / path 变更必须立刻进入 livecfg Probe 快照（同代 Bundle）。
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, ep)
 }
 
