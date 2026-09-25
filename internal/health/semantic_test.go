@@ -59,6 +59,40 @@ func TestSemanticInvalidatorClearsTrackerGateCapsSchedule(t *testing.T) {
 	}
 }
 
+// ForgetRouteHealth clears dead/cooldown without scheduling or clearing Capability.
+func TestSemanticInvalidatorForgetRouteHealthNoSchedule(t *testing.T) {
+	tr, fs, _ := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	tr.Report(Report{RouteID: 7, Verdict: VerdictUnavailable, Source: SourceL2})
+	tr.Report(Report{RouteID: 8, Verdict: VerdictUnavailable, Source: SourceL2})
+	if tr.State(7) != model.StateDead || tr.State(8) != model.StateDead {
+		t.Fatalf("setup dead: %s %s", tr.State(7), tr.State(8))
+	}
+	gate := NewRecoveryGate()
+	if _, ok := gate.TryAcquire(7); !ok {
+		t.Fatal("acquire")
+	}
+	caps := &memCaps{}
+	sched := &memSched{}
+	inv := NewSemanticInvalidator(tr, gate, caps, sched, nil)
+	inv.ForgetRouteHealth(7)
+	if tr.State(7) != model.StateUnknown {
+		t.Fatalf("forgotten state=%s want unknown", tr.State(7))
+	}
+	if gate.InFlight(7) {
+		t.Fatal("recovery gate still held")
+	}
+	if tr.State(8) != model.StateDead {
+		t.Fatalf("sibling state=%s want dead", tr.State(8))
+	}
+	if len(caps.cleared) != 0 {
+		t.Fatalf("must not clear Capability: %v", caps.cleared)
+	}
+	if len(sched.routes) != 0 {
+		t.Fatalf("must not schedule: %v", sched.routes)
+	}
+}
+
 // Upstream network-origin change (§9.2) must Forget child RouteHealth: an old
 // alive verdict must not keep selecting routes for the new host.
 func TestSemanticInvalidatorInvalidateUpstreamClearsAliveRouteHealth(t *testing.T) {

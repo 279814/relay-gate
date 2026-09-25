@@ -75,6 +75,32 @@ func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
 	}
 }
 
+// ForgetRouteHealth clears RouteHealth / RecoveryGate for one Route without
+// scheduling synthetic probes (Enabled false→true path).
+func (s *SemanticConfigInvalidator) ForgetRouteHealth(routeID int64) {
+	if s == nil || s.Semantic == nil {
+		return
+	}
+	if f, ok := s.Semantic.(interface{ ForgetRouteHealth(routeID int64) }); ok {
+		f.ForgetRouteHealth(routeID)
+	}
+}
+
+// ForgetUpstreamHealth clears RouteHealth for every known child Route of an
+// Upstream without scheduling probes. Sibling upstreams are untouched.
+func (s *SemanticConfigInvalidator) ForgetUpstreamHealth(upstreamID int64) {
+	if s == nil {
+		return
+	}
+	var routeIDs []int64
+	if s.RoutesOfUpstream != nil {
+		routeIDs = s.RoutesOfUpstream(upstreamID)
+	}
+	for _, id := range routeIDs {
+		s.ForgetRouteHealth(id)
+	}
+}
+
 // InvalidateUpstreamDeleted clears §9.2 state after a successful Upstream delete.
 //
 // routeIDs must be snapshotted before CASCADE — after DeleteUpstream the SQL
@@ -182,6 +208,34 @@ func (s *Server) invalidateModelName(modelNameID int64) {
 	}
 }
 
+// forgetHealthOnReEnableRoute drops a pre-disable dead/cooldown verdict so the
+// Route is selectable again as unknown, without scheduling L1/L2.
+func (s *Server) forgetHealthOnReEnableRoute(routeID int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetRouteHealth(routeID int64) }); ok {
+		f.ForgetRouteHealth(routeID)
+	}
+}
+
+// forgetHealthOnReEnableUpstream drops child RouteHealth under one Upstream
+// without scheduling probes. Other upstreams' health is left alone.
+func (s *Server) forgetHealthOnReEnableUpstream(upstreamID int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetUpstreamHealth(upstreamID int64) }); ok {
+		f.ForgetUpstreamHealth(upstreamID)
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetRouteHealth(routeID int64) }); ok {
+		for _, id := range s.routeIDsOfUpstream(upstreamID) {
+			f.ForgetRouteHealth(id)
+		}
+	}
+}
+
 // invalidateUpstreamDeleted runs only after DeleteUpstream succeeded, using
 // route IDs collected before CASCADE removed the child rows.
 func (s *Server) invalidateUpstreamDeleted(upstreamID int64, routeIDs []int64) {
@@ -249,7 +303,8 @@ func (s *Server) routeIDsOfModelName(modelNameID int64) []int64 {
 // 鉴权过不过」的字段变化时才触发。
 //
 // enabled 不在这里判：启用↔停用都不触发重探。停用不必探；重新启用只
-// 发布 livecfg，由真实流量或显式手动探活/校准覆盖健康未知。
+// 发布 livecfg 并 Forget 旧 dead/cooldown，由真实流量或显式手动探活/校准
+// 覆盖健康未知。
 func probeAffectingUpstream(before, after *model.Upstream) bool {
 	// HostOverride / TLSServerName bump NetworkRevision (store.networkChanged) and
 	// are §9.2 network-origin fields: must invalidate so RouteHealth is forgotten

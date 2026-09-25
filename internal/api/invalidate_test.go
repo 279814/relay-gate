@@ -465,6 +465,128 @@ func TestInvalidate_RouteReEnableDoesNotTriggerProbe(t *testing.T) {
 	}
 }
 
+// Re-enable must Forget a pre-disable dead verdict so selection can pick the
+// Route as unknown — without scheduling Inner Invalidate (no L1/L2).
+func TestInvalidate_RouteReEnableClearsDeadWithoutProbe(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	sem := health.NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	inner := &recordingInvalidator{}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"re-en-rt-u","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"re-en-rt-m","protocol":"anthropic"}`, true)
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	// Sibling route on another upstream: its dead + in-flight must survive.
+	upSib := mkUpstreamViaAPI(t, h,
+		`{"name":"re-en-rt-sib","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upSib)+`}`, true)
+	sibID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	tr.Report(health.Report{RouteID: sibID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	if tr.State(rtID) != model.StateDead || tr.State(sibID) != model.StateDead {
+		t.Fatalf("setup dead: target=%s sibling=%s", tr.State(rtID), tr.State(sibID))
+	}
+	if _, _, ok := tr.TryAcquire(sibID, 10); !ok {
+		t.Fatal("setup: acquire sibling inFlight")
+	}
+	beforeRoutes, beforeUps, _ := inner.counts()
+
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":true}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enable: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("re-enable RouteHealth=%s want unknown (old dead must not block select)", got)
+	}
+	if tr.State(sibID) != model.StateDead {
+		t.Fatalf("sibling RouteHealth=%s want dead (must not clear other routes)", tr.State(sibID))
+	}
+	if tr.InFlight(sibID) != 1 {
+		t.Fatalf("sibling inFlight=%d want 1", tr.InFlight(sibID))
+	}
+	afterRoutes, afterUps, _ := inner.counts()
+	if afterRoutes != beforeRoutes || afterUps != beforeUps {
+		t.Fatalf("re-enable must not schedule probes: routes %d→%d ups %d→%d",
+			beforeRoutes, afterRoutes, beforeUps, afterUps)
+	}
+}
+
+// Upstream re-enable Forget-s child RouteHealth without Inner Invalidate.
+func TestInvalidate_UpstreamReEnableClearsDeadWithoutProbe(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	sem := health.NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	inner := &recordingInvalidator{}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic:         sem,
+		Inner:            inner,
+		RoutesOfUpstream: s.routeIDsOfUpstream,
+	}).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"re-en-up-u","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"re-en-up-m","protocol":"anthropic"}`, true)
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`}`, true)
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	upSib := mkUpstreamViaAPI(t, h,
+		`{"name":"re-en-up-sib","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upSib)+`}`, true)
+	sibID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	tr.Report(health.Report{RouteID: rtID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	tr.Report(health.Report{RouteID: sibID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+	if _, _, ok := tr.TryAcquire(sibID, 10); !ok {
+		t.Fatal("setup: acquire sibling inFlight")
+	}
+	beforeRoutes, beforeUps, _ := inner.counts()
+
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":true}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enable: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := tr.State(rtID); got != model.StateUnknown {
+		t.Fatalf("re-enable child RouteHealth=%s want unknown", got)
+	}
+	if tr.State(sibID) != model.StateDead {
+		t.Fatalf("sibling RouteHealth=%s want dead", tr.State(sibID))
+	}
+	if tr.InFlight(sibID) != 1 {
+		t.Fatalf("sibling inFlight=%d want 1", tr.InFlight(sibID))
+	}
+	afterRoutes, afterUps, _ := inner.counts()
+	if afterRoutes != beforeRoutes || afterUps != beforeUps {
+		t.Fatalf("re-enable must not schedule probes: routes %d→%d ups %d→%d",
+			beforeRoutes, afterRoutes, beforeUps, afterUps)
+	}
+}
+
 func TestInvalidate_RouteModelMappingChangeTriggersProbe(t *testing.T) {
 	// 改 upstream_model 会改变探活打的模型名，必须重探 ——
 	// 否则「探活通过但真实请求 model_not_found」。
