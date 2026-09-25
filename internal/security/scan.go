@@ -4,6 +4,7 @@
 package security
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -150,12 +151,20 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // redactSecrets replaces known credential values in evidence text.
 // Keep behavior aligned with store.MaskKey (security cannot import store:
 // store already imports this package).
+//
+// Also replaces the url.QueryEscape form of each key (same one-pass encoding
+// as sample.RedactText). Response bodies can echo query/URL text where the
+// secret appears only percent-encoded; scanning still uses the original text.
 func redactSecrets(s string, keys []string) string {
 	for _, k := range keys {
-		if k == "" || !strings.Contains(s, k) {
+		if k == "" {
 			continue
 		}
-		s = strings.ReplaceAll(s, k, maskSecret(k))
+		masked := maskSecret(k)
+		s = strings.ReplaceAll(s, k, masked)
+		if enc := url.QueryEscape(k); enc != k {
+			s = strings.ReplaceAll(s, enc, masked)
+		}
 	}
 	return s
 }

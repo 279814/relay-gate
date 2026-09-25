@@ -1,6 +1,7 @@
 package security
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -30,6 +31,32 @@ func TestScanText_RedactsKnownSecretInDetail(t *testing.T) {
 		t.Fatal("expected finding")
 	}
 	for _, f := range fs {
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("Detail still contains raw secret: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, "…") {
+			t.Fatalf("Detail missing masked secret form: %q", f.Detail)
+		}
+	}
+}
+
+func TestScanText_RedactsPercentEncodedSecretInDetail(t *testing.T) {
+	// Key chars that QueryEscape rewrites (/ + =) so encoded form ≠ raw.
+	const key = "sk-FINDING/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	if enc == key {
+		t.Fatal("test key must differ under QueryEscape")
+	}
+	// Body carries only the encoded form (common in echoed query/URL text).
+	body := `Hello <script>x</script> token=` + enc + ` trailer`
+	fs := ScanText(body, "body", key)
+	if len(fs) == 0 {
+		t.Fatal("expected finding")
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, enc) {
+			t.Fatalf("Detail still contains percent-encoded secret: %q", f.Detail)
+		}
 		if strings.Contains(f.Detail, key) {
 			t.Fatalf("Detail still contains raw secret: %q", f.Detail)
 		}
