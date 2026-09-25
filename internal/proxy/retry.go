@@ -270,6 +270,12 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		// 「500 + body 里写着 rate limit」会被判成故障而累计判死，
 		// 本该只是冷却 60 秒。
 		la.at.Discard()
+		// 完整模式可能已 spill 到临时文件；丢弃的尝试不会走 recordSample/Bytes，
+		// 必须在这里 Close，否则临时文件泄漏。
+		if la.tee != nil {
+			la.tee.Close()
+			la.tee = nil
+		}
 		finishObserver(la, health.AttemptFinish{})
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
