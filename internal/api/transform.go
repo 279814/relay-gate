@@ -26,16 +26,6 @@ func (s *Server) detachTransformBindingsForRoute(routeID int64) {
 	}
 }
 
-// detachTransformBindingsForEndpoint removes bindings for a deleted Endpoint.
-func (s *Server) detachTransformBindingsForEndpoint(endpointID int64) {
-	if s == nil || s.transforms == nil || endpointID <= 0 {
-		return
-	}
-	if err := s.transforms.RemoveBindingsForEndpoint(endpointID); err != nil && s.log != nil {
-		s.log.Error("detach transform bindings after endpoint delete", "endpoint_id", endpointID, "err", err)
-	}
-}
-
 func (s *Server) listTransformSets(w http.ResponseWriter, r *http.Request) {
 	if s.transforms == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"sets": []any{}})

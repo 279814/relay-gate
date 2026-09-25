@@ -194,13 +194,21 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	expected, _ := strconv.ParseInt(r.URL.Query().Get("expected_revision"), 10, 64)
 	// Read UpstreamID before DELETE so §9.2 Forget still targets the right station.
 	cur, getErr := s.probeAdmin.GetEndpoint(r.Context(), id)
-	if err := s.probeAdmin.DeleteEndpoint(r.Context(), id, expected); err != nil {
-		s.writeErr(w, err)
+	// §15: durable transform_binding rows are dropped inside DeleteEndpoint's
+	// SQL transaction. In-memory bindings are detached around that call and
+	// restored if it fails — never by bare id after commit (id reuse race).
+	var delErr error
+	if s.transforms != nil {
+		delErr = s.transforms.DetachEndpointBindingsAround(id, func() error {
+			return s.probeAdmin.DeleteEndpoint(r.Context(), id, expected)
+		})
+	} else {
+		delErr = s.probeAdmin.DeleteEndpoint(r.Context(), id, expected)
+	}
+	if delErr != nil {
+		s.writeErr(w, delErr)
 		return
 	}
-	// §15: bindings are (route_id, endpoint_id); drop any for this endpoint so a
-	// later row that reuses the numeric id cannot inherit a published transform.
-	s.detachTransformBindingsForEndpoint(id)
 	if getErr == nil && cur.UpstreamID > 0 {
 		s.invalidateUpstream(cur.UpstreamID)
 	}

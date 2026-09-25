@@ -2,6 +2,7 @@ package transform
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -169,6 +170,47 @@ func TestRemoveBindingsForEndpoint_DropsOnlyThatEndpoint(t *testing.T) {
 	cKeep, _, err := reg.PublishedCompiled(1, 20)
 	if err != nil || cKeep == nil {
 		t.Fatalf("other endpoint binding must remain: c=%v err=%v", cKeep != nil, err)
+	}
+}
+
+func TestDetachEndpointBindingsAround_RestoresOnFailureKeepsPostCommitAttach(t *testing.T) {
+	reg := NewRegistry(10)
+	set, err := reg.CreateSet("around")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.UpdateDraft(set.ID, []Rule{{Kind: KindReplaceBytes, From: "a", To: "b"}}, FailClosed, FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 3, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := errors.New("delete failed")
+	if err := reg.DetachEndpointBindingsAround(7, func() error { return boom }); !errors.Is(err, boom) {
+		t.Fatalf("error=%v want boom", err)
+	}
+	c, _, err := reg.PublishedCompiled(3, 7)
+	if err != nil || c == nil {
+		t.Fatalf("failed delete must restore binding: c=%v err=%v", c != nil, err)
+	}
+
+	if err := reg.DetachEndpointBindingsAround(7, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err = reg.PublishedCompiled(3, 7)
+	if err != nil || c != nil {
+		t.Fatalf("successful delete must drop in-memory binding: c=%v err=%v", c != nil, err)
+	}
+
+	// Bindings attached after the delete commits must not be stripped by any
+	// finishing bare-id detach (DetachEndpointBindingsAround already returned).
+	if _, _, err := reg.PublishSnapshot(set.ID, 3, 7); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err = reg.PublishedCompiled(3, 7)
+	if err != nil || c == nil {
+		t.Fatalf("post-commit attach must remain: c=%v err=%v", c != nil, err)
 	}
 }
 
