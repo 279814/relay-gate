@@ -112,8 +112,11 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	// §4.5：改了 key / 地址 / 探活头就立刻重探整站，不等下一个周期。
 	// 用 fresh 而不是 cur 比对：cur 的 APIKey 可能是「留空表示不改」的空串，
 	// 而 fresh 是库里的真实现值。
-	// 仅把 Enabled 从 false 翻回 true 只发布 livecfg，不触发合成探活或校准；
-	// 真实流量可在健康未知时选中该站。
+	// 仅把 Enabled 从 false 翻回 true：发布 livecfg，并 Forget 停用前留下的
+	// dead/cooldown，但不调度合成探活或校准；真实流量可在健康未知时选中该站。
+	if !before.Enabled && fresh.Enabled {
+		s.forgetHealthOnReEnableUpstream(id)
+	}
 	if probeAffectingUpstream(&before, fresh) {
 		s.invalidateUpstream(id)
 	}

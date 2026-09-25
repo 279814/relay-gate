@@ -70,6 +70,25 @@ func (s *SemanticInvalidator) InvalidateRoute(routeID int64) {
 	}
 }
 
+// ForgetRouteHealth drops RouteHealth and RecoveryGate for one Route without
+// scheduling probes or clearing Capability.
+//
+// Used when Enabled flips false→true: a pre-disable dead/cooldown verdict must
+// not permanently block selection, but re-enable must not start L1/L2.
+func (s *SemanticInvalidator) ForgetRouteHealth(routeID int64) {
+	if s == nil || routeID <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tracker != nil {
+		s.tracker.Forget(routeID)
+	}
+	if s.recovery != nil {
+		s.recovery.Forget(routeID)
+	}
+}
+
 // InvalidateUpstream clears reachability-adjacent Route state for every known
 // Route under upstreamID when the caller also passes those route IDs.
 //
