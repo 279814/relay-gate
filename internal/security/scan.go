@@ -158,12 +158,11 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // text where the secret appears only percent-encoded; scanning still uses
 // the original text.
 //
-// Also replaces the JSON \u00XX form of each key (one \u00XX per byte,
-// lowercase hex as encoding/json emits for escaped bytes), plus the
-// equivalent form with uppercase hex digits (\u006B vs \u006b) that JSON
-// also accepts. Observer scans raw response bytes, so a secret may appear
-// only as those escapes inside a JSON string; the whole document is never
-// decoded.
+// Also replaces the JSON \u00XX form of each key (one \u00XX per byte).
+// Hex digits inside each \uXXXX are matched case-insensitively so lowercase
+// (\u006b), uppercase (\u006B), and mixed per-unit forms are all removed.
+// Observer scans raw response bytes, so a secret may appear only as those
+// escapes inside a JSON string; the whole document is never decoded.
 func redactSecrets(s string, keys []string) string {
 	for _, k := range keys {
 		if k == "" {
@@ -178,13 +177,80 @@ func redactSecrets(s string, keys []string) string {
 			}
 		}
 		if esc := jsonByteUnicodeEscape(k); esc != k {
-			s = strings.ReplaceAll(s, esc, masked)
-			if upper := jsonUnicodeEscapeUpperHex(esc); upper != esc {
-				s = strings.ReplaceAll(s, upper, masked)
-			}
+			s = replaceJSONUnicodeEscapedSecret(s, k, masked)
 		}
 	}
 	return s
+}
+
+// replaceJSONUnicodeEscapedSecret replaces any hex-case variant of the
+// JSON \u00XX-per-byte form of key with masked. Unrelated \u sequences are
+// left untouched; the surrounding text is never decoded.
+func replaceJSONUnicodeEscapedSecret(s, key, masked string) string {
+	n := len(key)
+	if n == 0 {
+		return s
+	}
+	patLen := n * 6
+	if len(s) < patLen {
+		return s
+	}
+	var b strings.Builder
+	matched := false
+	for i := 0; i < len(s); {
+		if i+patLen <= len(s) && matchJSONByteUnicodeEscape(s[i:i+patLen], key) {
+			if !matched {
+				b.Grow(len(s))
+				b.WriteString(s[:i])
+				matched = true
+			}
+			b.WriteString(masked)
+			i += patLen
+			continue
+		}
+		if matched {
+			b.WriteByte(s[i])
+		}
+		i++
+	}
+	if !matched {
+		return s
+	}
+	return b.String()
+}
+
+// matchJSONByteUnicodeEscape reports whether chunk is key encoded as one
+// \u00XX per byte, with hex digits in either case.
+func matchJSONByteUnicodeEscape(chunk, key string) bool {
+	if len(chunk) != len(key)*6 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		off := i * 6
+		if chunk[off] != '\\' || chunk[off+1] != 'u' {
+			return false
+		}
+		c := key[i]
+		if hexDigitVal(chunk[off+2]) != 0 || hexDigitVal(chunk[off+3]) != 0 ||
+			hexDigitVal(chunk[off+4]) != c>>4 || hexDigitVal(chunk[off+5]) != c&0xf {
+			return false
+		}
+	}
+	return true
+}
+
+// hexDigitVal returns the 0–15 value of c, or 0xFF if c is not a hex digit.
+func hexDigitVal(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	default:
+		return 0xFF
+	}
 }
 
 // jsonByteUnicodeEscape encodes each byte of s as \u00XX with lowercase hex
