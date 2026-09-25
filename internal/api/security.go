@@ -60,6 +60,10 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// maxScanReqID caps finding.req_id from the admin scan body. decodeJSON allows
+// up to 1MiB; an unbounded client string must not land on every finding row.
+const maxScanReqID = 256
+
 // postSecurityScan runs a passive scan on caller-provided plain text (admin diagnostic).
 func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	if s.security == nil {
@@ -75,19 +79,24 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	// When the admin names an existing upstream, pass its stored API key into
-	// ScanText so redactSecrets can strip it from Detail — same contract as
-	// traffic scan's credentialsOf → ObserveJob.Keys. Unnamed / unknown
-	// upstreams have no stored key to add; do not invent one.
+	// Resolve upstream once: only a DB name/id may be stored on findings, and
+	// only a resolved row supplies an API key for ScanText redaction. Unknown
+	// / empty refs leave Upstream empty — never persist the raw client string
+	// (it can be nearly the whole 1MiB body).
+	upLabel, upKey := s.resolveUpstreamForScan(body.Upstream)
 	var keys []string
-	if key := s.upstreamAPIKeyForScan(body.Upstream); key != "" {
-		keys = append(keys, key)
+	if upKey != "" {
+		keys = append(keys, upKey)
+	}
+	reqID := body.ReqID
+	if len(reqID) > maxScanReqID {
+		reqID = reqID[:maxScanReqID]
 	}
 	found := security.ScanText(body.Text, "admin_scan", keys...)
 	out := make([]security.Finding, 0, len(found))
 	for _, f := range found {
-		f.Upstream = body.Upstream
-		f.ReqID = body.ReqID
+		f.Upstream = upLabel
+		f.ReqID = reqID
 		f.ScannerVersion = security.ScannerVersion
 		f.RuleVersion = security.RuleVersion
 		f.BytesScanned = int64(len(body.Text))
@@ -96,30 +105,41 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"findings": out, "count": len(out)})
 }
 
-// upstreamAPIKeyForScan resolves body.upstream as id or name and returns the
-// decrypted API key when that upstream exists. Empty name / missing store /
-// unknown target → "" (caller must not invent a key).
-func (s *Server) upstreamAPIKeyForScan(ref string) string {
+// resolveUpstreamForScan resolves body.upstream as id or name. On hit it
+// returns a canonical label (name, else decimal id) and the decrypted API key.
+// Empty / missing store / unknown → "", "" (caller must not invent a key or
+// store the raw ref).
+func (s *Server) resolveUpstreamForScan(ref string) (label, apiKey string) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" || s.st == nil {
-		return ""
+		return "", ""
 	}
 	if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 {
 		up, err := s.st.GetUpstream(id)
 		if err == nil && up != nil {
-			return up.APIKey
+			return upstreamScanLabel(up), up.APIKey
 		}
 	}
 	ups, err := s.st.ListUpstreams()
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	for _, up := range ups {
 		if up != nil && up.Name == ref {
-			return up.APIKey
+			return upstreamScanLabel(up), up.APIKey
 		}
 	}
-	return ""
+	return "", ""
+}
+
+func upstreamScanLabel(up *model.Upstream) string {
+	if up == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(up.Name); name != "" {
+		return name
+	}
+	return strconv.FormatInt(up.ID, 10)
 }
 
 // postSecurityCanary runs a one-shot Active Upstream canary via manual probe (§14.4).
