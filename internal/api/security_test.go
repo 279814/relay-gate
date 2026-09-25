@@ -103,6 +103,84 @@ func assertScanResponseOmitsKey(t *testing.T, body, key string) {
 	}
 }
 
+// Unknown body.upstream must not be copied onto findings (client string can be
+// nearly 1MiB). A resolved short name is stored; req_id is capped.
+func TestAPI_SecurityScan_OmitsUnknownUpstreamString(t *testing.T) {
+	s, _ := newTestServer(t)
+	up := &model.Upstream{
+		Name: "scan-known-up", BaseURL: "https://scan-known.example",
+		APIKey: "sk-KNOWN-SCAN-UPSTREAM-KEY", Enabled: true,
+	}
+	up.Defaults()
+	if err := s.st.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	h := s.WithSecurityCenter(security.NewCenter(50)).Routes(testAdminPW)
+
+	unknown := "not-a-real-upstream-" + strings.Repeat("X", 400)
+	longReq := strings.Repeat("r", maxScanReqID+80)
+	payload := fmt.Sprintf(
+		`{"text":"<script>x</script>","upstream":%q,"req_id":%q}`,
+		unknown, longReq,
+	)
+	rec := do(t, h, "POST", "/admin/api/security/scan", payload, true)
+	if rec.Code != 200 {
+		t.Fatalf("unknown upstream scan status %d %s", rec.Code, rec.Body.String())
+	}
+	var scan struct {
+		Findings []security.Finding `json:"findings"`
+		Count    int                `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &scan); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if scan.Count < 1 {
+		t.Fatalf("expected findings, body=%s", rec.Body.String())
+	}
+	for _, f := range scan.Findings {
+		if f.Upstream != "" {
+			t.Fatalf("unknown upstream must not persist; got Upstream=%q", f.Upstream)
+		}
+		if strings.Contains(f.Upstream, "not-a-real-upstream") || strings.Contains(rec.Body.String(), unknown) {
+			t.Fatalf("raw unknown upstream leaked into scan response: %s", rec.Body.String())
+		}
+		if len(f.ReqID) != maxScanReqID {
+			t.Fatalf("req_id len=%d, want capped to %d", len(f.ReqID), maxScanReqID)
+		}
+		if f.ReqID != longReq[:maxScanReqID] {
+			t.Fatalf("req_id not prefix-capped")
+		}
+	}
+	for _, f := range s.security.List("", 50) {
+		if f.Upstream != "" {
+			t.Fatalf("stored finding kept unknown upstream: %q", f.Upstream)
+		}
+	}
+
+	payloadOK := fmt.Sprintf(
+		`{"text":"<script>x</script>","upstream":%q,"req_id":"short-req"}`,
+		up.Name,
+	)
+	rec2 := do(t, h, "POST", "/admin/api/security/scan", payloadOK, true)
+	if rec2.Code != 200 {
+		t.Fatalf("named upstream scan status %d %s", rec2.Code, rec2.Body.String())
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &scan); err != nil {
+		t.Fatalf("parse named: %v", err)
+	}
+	if scan.Count < 1 {
+		t.Fatalf("expected findings for named upstream, body=%s", rec2.Body.String())
+	}
+	for _, f := range scan.Findings {
+		if f.Upstream != up.Name {
+			t.Fatalf("matched name: Upstream=%q, want %q", f.Upstream, up.Name)
+		}
+		if f.ReqID != "short-req" {
+			t.Fatalf("short req_id: got %q", f.ReqID)
+		}
+	}
+}
+
 // SMTP dial/auth errors are uncontrolled I/O text. The admin test endpoint
 // must not echo them — writeErr's default maps unknowns to "internal error".
 func TestAPI_SMTPTestDoesNotEchoRawSendError(t *testing.T) {
