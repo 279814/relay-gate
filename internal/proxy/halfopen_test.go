@@ -4,8 +4,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // ── 半开放行（§4.4c）─────────────────────────────────────
@@ -175,5 +180,99 @@ func TestHandler_HalfOpenGatewayErrorCarriesHeader(t *testing.T) {
 	}
 	if rec.Header().Get("X-Relay-Half-Open") != "1" {
 		t.Error("半开失败的网关错误应带 X-Relay-Half-Open=1")
+	}
+}
+
+// gatingConfig freezes the second Snapshot (armed halfOpenStillEnabled)
+// until the test disables the target and closes blockSecond.
+type gatingConfig struct {
+	inner       *fakeConfig
+	snapCalls   atomic.Int32
+	blockSecond chan struct{}
+	secondSeen  chan struct{}
+}
+
+func (g *gatingConfig) Snapshot() (*router.Snapshot, error) {
+	n := g.snapCalls.Add(1)
+	if n == 1 {
+		return g.inner.Snapshot()
+	}
+	select {
+	case <-g.secondSeen:
+	default:
+		close(g.secondSeen)
+	}
+	<-g.blockSecond
+	return g.inner.Snapshot()
+}
+func (g *gatingConfig) Settings() (model.Settings, error) { return g.inner.Settings() }
+func (g *gatingConfig) RunState() (store.RunState, error) { return g.inner.RunState() }
+
+// Armed half-open must not RoundTrip after the Route is disabled between
+// RecoveryGate acquire and send. Re-enable does not replay the skipped send.
+func TestHandler_ArmedHalfOpenSkipsRoundTripAfterDisable(t *testing.T) {
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+	hs.cfg.settings.HalfOpenEnabled = true
+	hs.health.dead[100] = true
+
+	rt := hs.cfg.snap.RoutesByModelName[1][0]
+	gate := &gatingConfig{
+		inner:       hs.cfg,
+		blockSecond: make(chan struct{}),
+		secondSeen:  make(chan struct{}),
+	}
+	hs.h = NewHandler(gate, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+		WithTargets(testTargets(hs.cfg), nil)
+	t.Cleanup(hs.h.CloseIdleConnections)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+	}()
+
+	select {
+	case <-gate.secondSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("armed half-open never re-checked Snapshot")
+	}
+
+	rt.Enabled = false
+	close(gate.blockSecond)
+
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not finish after disable")
+	}
+	if rec.Code != 503 {
+		t.Fatalf("disabled Route 的已武装半开应得 503，got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("disabled Route 的已武装半开不得 RoundTrip，hits=%d", n)
+	}
+
+	// Re-enable: do not force an immediate half-open replay; next send waits
+	// for a later client request that re-selects.
+	rt.Enabled = true
+	hits.Store(0)
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("重新启用不得重放被跳过的半开，hits=%d", n)
+	}
+	gate.snapCalls.Store(0)
+	gate.blockSecond = make(chan struct{})
+	gate.secondSeen = make(chan struct{})
+	close(gate.blockSecond)
+	rec2 := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+	if rec2.Code != 200 {
+		t.Fatalf("重新启用后新请求半开仍应 RoundTrip，got %d", rec2.Code)
+	}
+	if n := hits.Load(); n == 0 {
+		t.Fatal("重新启用后新客户端请求仍应 RoundTrip")
 	}
 }

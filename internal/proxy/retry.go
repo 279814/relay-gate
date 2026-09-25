@@ -164,6 +164,18 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		}
 	}()
 
+	// RecoveryGate/TryAcquire 之后、RoundTrip 之前再读一次：停用可能已经
+	// 落库并发布。halfOpen 选路用的是 preamble 快照；已武装的试探必须自己
+	// 停在出网前，且不得另起一次探活。
+	if halfOpen && !h.halfOpenStillEnabled(cand.Route.ID, cand.Upstream.ID) {
+		h.log.Info("Route/Upstream 已停用，跳过已武装的半开试探",
+			"upstream", cand.Upstream.Name, "route", cand.Route.ID)
+		held.Release()
+		held = nil
+		h.writeSelectError(w, router.ErrNoRouteAvailable, proto, pre.inModel)
+		return nil, false
+	}
+
 	// reqID 在这里生成而不是在写日志时：同一次客户端请求的所有尝试
 	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
 	reqID := sample.NewReqID()
