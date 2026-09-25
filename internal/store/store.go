@@ -99,7 +99,9 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 }
 
 // ActivateMaster switches the live Cipher after Keyring key_activated (§12.7).
-// New sample envelopes encrypt under the new key; prior envelopes still decrypt (§5.4).
+// New sample envelopes encrypt under the new key. Enveloped sample bodies are
+// rewrapped in RewrapDirectSecrets so a restart with only the new master still
+// decrypts them; ActivateMaster also retains the prior key for in-process reads.
 func (s *Store) ActivateMaster(passphrase string) error {
 	if s == nil || s.cipher == nil {
 		return ErrNoKey

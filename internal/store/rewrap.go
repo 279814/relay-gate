@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
@@ -10,9 +11,11 @@ import (
 
 // RewrapDirectSecrets re-encrypts Master-Key–sealed direct secrets under
 // newMaster in one SQLite transaction (§12.7 step 7): upstream api_key,
-// probe_secret, SMTP password, and legacy_full_url. Does not switch the live
-// Cipher — caller ActivateMaster after Keyring key_activated. Sample body
-// envelopes are not rewritten (§5.4).
+// probe_secret, SMTP password, legacy_full_url, and enveloped sample body
+// BLOBs. Legacy plaintext sample rows are left untouched (dual-read). Does
+// not switch the live Cipher — caller ActivateMaster after Keyring
+// key_activated. Failed rewrap rolls back the TX so activation never leaves
+// half the samples on the old key.
 func (s *Store) RewrapDirectSecrets(newMaster string) error {
 	if s == nil || s.cipher == nil {
 		return ErrNoKey
@@ -37,6 +40,9 @@ func (s *Store) RewrapDirectSecrets(newMaster string) error {
 	}
 	if err := rewrapLegacyURLs(tx, s.cipher, newMaster); err != nil {
 		return fmt.Errorf("rewrap legacy_full_url: %w", err)
+	}
+	if err := rewrapSampleBodies(tx, s.cipher, newMaster); err != nil {
+		return fmt.Errorf("rewrap sample: %w", err)
 	}
 	return tx.Commit()
 }
@@ -193,6 +199,68 @@ func rewrapLegacyURLs(tx *sql.Tx, c *Cipher, newMaster string) error {
 		}
 	}
 	return nil
+}
+
+// rewrapSampleBodies reseals v1 sample body envelopes under newMaster.
+// Plaintext rows stay as-is so dual-read history is not corrupted.
+func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
+	rows, err := tx.Query(`SELECT id, in_body, out_body, resp_body FROM sample`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type row struct {
+		id            int64
+		in, out, resp []byte
+	}
+	var batch []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.in, &r.out, &r.resp); err != nil {
+			return err
+		}
+		batch = append(batch, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range batch {
+		in, err := rewrapSampleField(c, newMaster, r.in)
+		if err != nil {
+			return fmt.Errorf("id=%d in_body: %w", r.id, err)
+		}
+		out, err := rewrapSampleField(c, newMaster, r.out)
+		if err != nil {
+			return fmt.Errorf("id=%d out_body: %w", r.id, err)
+		}
+		resp, err := rewrapSampleField(c, newMaster, r.resp)
+		if err != nil {
+			return fmt.Errorf("id=%d resp_body: %w", r.id, err)
+		}
+		if bytes.Equal(in, r.in) && bytes.Equal(out, r.out) && bytes.Equal(resp, r.resp) {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE sample SET in_body=?, out_body=?, resp_body=? WHERE id=?`,
+			in, out, resp, r.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rewrapSampleField(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
+	if len(raw) == 0 || !IsSampleEnvelope(raw) {
+		return raw, nil
+	}
+	plain, err := c.DecryptSampleBlob(raw)
+	if err != nil {
+		return nil, err
+	}
+	neu, err := encryptEnvelopeUnder(newMaster, string(plain))
+	if err != nil {
+		return nil, err
+	}
+	return []byte(neu), nil
 }
 
 func encryptUnder(passphrase, plain string) (string, error) {
