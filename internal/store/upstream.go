@@ -192,6 +192,12 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	if err := upstream.Validate(); err != nil {
 		return err
 	}
+	// 脏行/历史短钥：留空或 mask 回显不能再成功「保留」——否则短钥继续
+	// 出现在 Location 等 URI 头且 RedactText 不会遮。必须提交足够长的新钥。
+	if upstream.APIKey == "" && current.APIKey != "" && len(current.APIKey) < model.MinRedactableKeyLen {
+		return model.WrapValidation("api_key 长度至少为 %d（短于此无法在 Location 等 URI 头中脱敏），收到 %d",
+			model.MinRedactableKeyLen, len(current.APIKey))
+	}
 	credentialChanged := upstream.APIKey != "" && upstream.APIKey != current.APIKey
 	networkChanged := upstream.BaseURL != current.BaseURL || upstream.ProxyURL != current.ProxyURL ||
 		upstream.HostOverride != current.HostOverride || upstream.TLSServerName != current.TLSServerName ||
