@@ -66,6 +66,11 @@ func (s *Server) createUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("新增 upstream", "id", u.ID, "name", u.Name)
 	// 新建的站还没有 Route，没什么可探的。等 Route 建好时由那边触发。
+	// 仍须发布 routing 快照：enabled / base_url 等进入同代视图，不等 TTL。
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, maskUpstream(&u))
 }
 
@@ -110,6 +115,10 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	if probeAffectingUpstream(&before, fresh) || (!before.Enabled && fresh.Enabled) {
 		s.invalidateUpstream(id)
 	}
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, maskUpstream(fresh))
 }
 
@@ -132,7 +141,7 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 		s.detachTransformBindingsForRoute(rid)
 	}
 	s.invalidateUpstreamDeleted(id, childRoutes)
-	if err := s.publishAfterSuccessfulDelete(); err != nil {
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)
 		return
 	}

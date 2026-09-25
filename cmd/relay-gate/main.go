@@ -349,9 +349,9 @@ func runServer() error {
 	// 日志的丢弃更要紧：它会让重试统计偏低，而那个统计正是用来决定
 	// 「要不要保留重试」的。
 	//
-	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它只触发探活；
-	// create/update 的配置生效仍靠 livecfg 的 2s TTL。成功删除则另经
-	// WithConfigPublisher 立刻刷掉 routing 快照，避免 TTL 内仍选到已删行。
+	// WithInvalidator 让配置写入立刻触发探活（§4.5）。它只触发探活。
+	// WithConfigPublisher 在 Upstream/ModelName/Route 写成功后立刻刷新
+	// routing 快照，使新请求看到新 enabled/路由，不等 livecfg 的 2s TTL。
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).

@@ -129,7 +129,7 @@ func assertPublished(t *testing.T, pub *recordingPublisher, beforeInv, beforeRef
 	t.Helper()
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+1 || afterRef != beforeRef+1 {
-		t.Fatalf("delete must Invalidate+Refresh once: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
+		t.Fatalf("write must Invalidate+Refresh once: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
 	}
 }
 
@@ -248,14 +248,16 @@ func TestDelete_FailedStoreDoesNotPublish(t *testing.T) {
 	mnID := mkModelNameViaAPI(t, h, "fail-del-m")
 	rtID := mkRouteViaAPI(t, h, mnID, upID)
 
+	beforeInv, beforeRef := pub.counts()
 	forceTableDeleteFail(t, s, "route")
 	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID), "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("expected delete failure, got 204")
 	}
-	inv, ref := pub.counts()
-	if inv != 0 || ref != 0 {
-		t.Fatalf("failed delete must not publish: inv=%d ref=%d", inv, ref)
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("failed delete must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
 	}
 }
 
@@ -275,11 +277,7 @@ func TestDelete_RefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	src := livecfg.New(st, log)
-	pub := &recordingPublisher{
-		inner:            src,
-		refreshErr:       errRefreshBoom,
-		skipInnerRefresh: true,
-	}
+	pub := &recordingPublisher{inner: src}
 	s := New(st, log).WithConfigPublisher(pub)
 	h := s.Routes(testAdminPW)
 
@@ -298,6 +296,11 @@ func TestDelete_RefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T
 	if !routeIDsInSnap(warm, mnID)[rtDrop] {
 		t.Fatal("warm snapshot must contain route to delete")
 	}
+
+	pub.mu.Lock()
+	pub.refreshErr = errRefreshBoom
+	pub.skipInnerRefresh = true
+	pub.mu.Unlock()
 
 	beforeInv, beforeRef := pub.counts()
 	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtDrop), "", true)
