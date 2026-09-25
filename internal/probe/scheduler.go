@@ -824,6 +824,9 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	if up == nil {
 		return l1, l2, errNoUpstream
 	}
+	if err := errDisabledProbeTarget(rt, up); err != nil {
+		return l1, l2, err
+	}
 	mn := findModelName(snap, rt.ModelNameID)
 	if mn == nil {
 		return l1, l2, errNoModelName
