@@ -132,6 +132,7 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 		s.detachTransformBindingsForRoute(rid)
 	}
 	s.invalidateUpstreamDeleted(id, childRoutes)
+	s.publishAfterSuccessfulDelete()
 	s.log.Info("删除 upstream", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
