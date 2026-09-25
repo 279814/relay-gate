@@ -157,6 +157,51 @@ func TestScanText_RedactsUppercaseJSONUnicodeEscapedSecretInDetail(t *testing.T)
 	}
 }
 
+func TestScanText_RedactsMixedCaseJSONUnicodeEscapedSecretInDetail(t *testing.T) {
+	// Alternating per-unit hex case (\u0073\u006B…) — neither all-lower nor all-upper.
+	const key = "sk-FINDING-OMIT-TEST-KEY-7e4d9a2c"
+	esc := jsonByteUnicodeEscape(key)
+	upper := jsonUnicodeEscapeUpperHex(esc)
+	var mixed strings.Builder
+	for i := 0; i+6 <= len(esc); i += 6 {
+		unit := esc[i : i+6]
+		if (i/6)%2 == 1 {
+			unit = jsonUnicodeEscapeUpperHex(unit)
+		}
+		mixed.WriteString(unit)
+	}
+	m := mixed.String()
+	if m == esc || m == upper {
+		t.Fatal("test mixed form must differ from uniform lower/upper")
+	}
+	const unrelated = `\u4e2d\u6587`
+	body := `Hello <script>x</script> token=` + m + ` note=` + unrelated + ` trailer`
+	fs := ScanText(body, "body", key)
+	if len(fs) == 0 {
+		t.Fatal("expected finding")
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, m) {
+			t.Fatalf("Detail still contains mixed-case JSON \\u-escaped secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, esc) {
+			t.Fatalf("Detail still contains JSON \\u-escaped secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, upper) {
+			t.Fatalf("Detail still contains uppercase JSON \\u-escaped secret: %q", f.Detail)
+		}
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("Detail still contains raw secret: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, unrelated) {
+			t.Fatalf("Detail dropped unrelated \\u sequence: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, "…") {
+			t.Fatalf("Detail missing masked secret form: %q", f.Detail)
+		}
+	}
+}
+
 func TestCenterRingBound(t *testing.T) {
 	c := NewCenter(3)
 	for i := 0; i < 5; i++ {
