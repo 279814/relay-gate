@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -253,6 +255,145 @@ func TestWrite_FailedStoreDoesNotPublish(t *testing.T) {
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv || afterRef != beforeRef {
 		t.Fatalf("failed update must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
+	}
+}
+
+// Endpoint url_override lives in the same livecfg Probe snapshot outbound uses.
+// A successful update must Invalidate+Refresh so the next Endpoint() read sees
+// the new URL within TTL; siblings stay put.
+func TestWrite_EndpointURLOverrideVisibleBeforeHandlerReturns(t *testing.T) {
+	s, _, src, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-pub-u","base_url":"https://ep-pub.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+
+	warm, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingWarm, err := src.Endpoint(context.Background(), upID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warm.URLOverride != "" {
+		t.Fatalf("warm messages override should be empty, got %q", warm.URLOverride)
+	}
+
+	override := "https://ep-pub.example.com/v1/custom-messages"
+	beforeInv, beforeRef := pub.counts()
+	rec := do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(warm.ID),
+		`{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(warm.Revision)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update endpoint: %d %s", rec.Code, rec.Body.String())
+	}
+	assertPublished(t, pub, beforeInv, beforeRef)
+
+	got, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URLOverride != override {
+		t.Fatalf("messages url_override still %q within TTL, want %q", got.URLOverride, override)
+	}
+	sibling, err := src.Endpoint(context.Background(), upID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sibling.URLOverride != siblingWarm.URLOverride || sibling.Revision != siblingWarm.Revision {
+		t.Fatalf("sibling models endpoint changed: before=%+v after=%+v", siblingWarm, sibling)
+	}
+
+	// Validation failure must leave the published snapshot unchanged.
+	beforeInv, beforeRef = pub.counts()
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(got.ID),
+		`{"url_override":"https://other.example.com/x","expected_revision":`+itoa(got.Revision)+`}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("cross-origin url_override must be rejected")
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("validation failure must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
+	}
+	still, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.URLOverride != override {
+		t.Fatalf("rejected write changed snapshot override to %q", still.URLOverride)
+	}
+}
+
+func TestWrite_EndpointRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T) {
+	s, _, src, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-rf-u","base_url":"https://ep-rf.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	warm, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pub.mu.Lock()
+	pub.refreshErr = errRefreshBoom
+	pub.skipInnerRefresh = true
+	pub.mu.Unlock()
+
+	override := "https://ep-rf.example.com/v1/after-fail"
+	beforeInv, beforeRef := pub.counts()
+	rec := do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(warm.ID),
+		`{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(warm.Revision)+`}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("Refresh failure must not return 200 while Probe may be stale")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
+		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
+	}
+
+	// Re-Invalidate forces get() to reload SQL: override must appear.
+	got, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URLOverride != override {
+		t.Fatalf("after Refresh failure + re-Invalidate want override %q, got %q", override, got.URLOverride)
+	}
+}
+
+func TestWrite_EndpointFailedStoreDoesNotPublish(t *testing.T) {
+	s, _, _, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-fail-u","base_url":"https://ep-fail.example.com","api_key":"sk-cccccccccccc"}`)
+	rec := do(t, h, "GET", "/admin/api/upstream-endpoints?upstream_id="+itoa(upID), "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list endpoints: %d %s", rec.Code, rec.Body.String())
+	}
+	page := decodeBody[model.Page[model.UpstreamEndpoint]](t, rec)
+	if len(page.Items) == 0 {
+		t.Fatal("expected auto-created endpoints")
+	}
+	ep := page.Items[0]
+
+	beforeInv, beforeRef := pub.counts()
+	forceTableUpdateFail(t, s, "upstream_endpoint")
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(ep.ID),
+		`{"url_override":`+mustJSON(t, "https://ep-fail.example.com/x")+
+			`,"expected_revision":`+itoa(ep.Revision)+`}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("expected update failure, got 200")
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("failed endpoint update must not publish: inv=%d→%d ref=%d→%d",
 			beforeInv, afterInv, beforeRef, afterRef)
 	}
 }
