@@ -118,7 +118,7 @@ func TestAPI_SecurityScan_OmitsUnknownUpstreamString(t *testing.T) {
 	h := s.WithSecurityCenter(security.NewCenter(50)).Routes(testAdminPW)
 
 	unknown := "not-a-real-upstream-" + strings.Repeat("X", 400)
-	longReq := strings.Repeat("r", maxScanReqID+80)
+	longReq := strings.Repeat("r", maxFindingClientField+80)
 	payload := fmt.Sprintf(
 		`{"text":"<script>x</script>","upstream":%q,"req_id":%q}`,
 		unknown, longReq,
@@ -144,10 +144,10 @@ func TestAPI_SecurityScan_OmitsUnknownUpstreamString(t *testing.T) {
 		if strings.Contains(f.Upstream, "not-a-real-upstream") || strings.Contains(rec.Body.String(), unknown) {
 			t.Fatalf("raw unknown upstream leaked into scan response: %s", rec.Body.String())
 		}
-		if len(f.ReqID) != maxScanReqID {
-			t.Fatalf("req_id len=%d, want capped to %d", len(f.ReqID), maxScanReqID)
+		if len(f.ReqID) != maxFindingClientField {
+			t.Fatalf("req_id len=%d, want capped to %d", len(f.ReqID), maxFindingClientField)
 		}
-		if f.ReqID != longReq[:maxScanReqID] {
+		if f.ReqID != longReq[:maxFindingClientField] {
 			t.Fatalf("req_id not prefix-capped")
 		}
 	}
@@ -178,6 +178,73 @@ func TestAPI_SecurityScan_OmitsUnknownUpstreamString(t *testing.T) {
 		if f.ReqID != "short-req" {
 			t.Fatalf("short req_id: got %q", f.ReqID)
 		}
+	}
+}
+
+// Canary note is persisted into finding Detail; an unbounded body.note must not
+// bloat the row (same 256-byte cap as scan req_id).
+func TestAPI_SecurityCanary_CapsNoteInDetail(t *testing.T) {
+	s, _ := newTestServer(t)
+	up := &model.Upstream{
+		Name: "canary-note-up", BaseURL: "https://canary-note.example",
+		APIKey: "sk-CANARY-NOTE-KEY", Enabled: true,
+	}
+	up.Defaults()
+	if err := s.st.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	mn := &model.ModelName{Name: "canary-note-model", Protocol: model.ProtoAnthropic, Enabled: true}
+	mn.Defaults()
+	if err := s.st.CreateModelName(mn); err != nil {
+		t.Fatal(err)
+	}
+	rt := &model.Route{ModelNameID: mn.ID, UpstreamID: up.ID, Enabled: true}
+	rt.Defaults()
+	if err := s.st.CreateRoute(rt); err != nil {
+		t.Fatal(err)
+	}
+	h := s.WithSecurityCenter(security.NewCenter(50)).Routes(testAdminPW)
+
+	longNote := strings.Repeat("n", maxFindingClientField+120)
+	payload := fmt.Sprintf(`{"route_id":%d,"note":%q}`, rt.ID, longNote)
+	rec := do(t, h, "POST", "/admin/api/security/canary", payload, true)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("canary status %d %s", rec.Code, rec.Body.String())
+	}
+	var found *security.Finding
+	for _, f := range s.security.List("", 50) {
+		if f.Category == "canary_manual" && f.RouteID == rt.ID {
+			cp := f
+			found = &cp
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected canary_manual finding")
+	}
+	if len(found.Detail) != maxFindingClientField {
+		t.Fatalf("Detail len=%d, want capped to %d", len(found.Detail), maxFindingClientField)
+	}
+	if found.Detail != longNote[:maxFindingClientField] {
+		t.Fatalf("Detail not prefix-capped")
+	}
+
+	short := "brief-note"
+	payloadShort := fmt.Sprintf(`{"route_id":%d,"note":%q}`, rt.ID, short)
+	rec2 := do(t, h, "POST", "/admin/api/security/canary", payloadShort, true)
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("short canary status %d %s", rec2.Code, rec2.Body.String())
+	}
+	var shortFound *security.Finding
+	for _, f := range s.security.List("", 50) {
+		if f.Category == "canary_manual" && f.RouteID == rt.ID && f.Detail == short {
+			cp := f
+			shortFound = &cp
+			break
+		}
+	}
+	if shortFound == nil {
+		t.Fatalf("short note Detail not preserved; listed=%v", s.security.List("", 50))
 	}
 }
 
