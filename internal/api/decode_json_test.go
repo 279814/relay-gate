@@ -12,7 +12,7 @@ func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 	server, handler := newTestServer(t)
 
 	created := do(t, handler, http.MethodPost, "/admin/api/upstreams",
-		`{"name":"keep","base_url":"https://keep.example.com","api_key":"sk-keep","auth_style":"bearer"}`, true)
+		`{"name":"keep","base_url":"https://keep.example.com","api_key":"sk-keep-key-12","auth_style":"bearer"}`, true)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("seed create = %d: %s", created.Code, created.Body.String())
 	}
@@ -28,7 +28,7 @@ func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 
 	// 两个对象：必须 400，且既不新建也不改已有行。
 	dupCreate := do(t, handler, http.MethodPost, "/admin/api/upstreams",
-		`{"name":"ok","base_url":"https://ok.example.com","api_key":"sk-ok","auth_style":"bearer"}{"name":"evil"}`, true)
+		`{"name":"ok","base_url":"https://ok.example.com","api_key":"sk-ok-key-1234","auth_style":"bearer"}{"name":"evil"}`, true)
 	if dupCreate.Code != http.StatusBadRequest {
 		t.Fatalf("trailing create = %d: %s, want 400", dupCreate.Code, dupCreate.Body.String())
 	}
@@ -57,8 +57,8 @@ func TestDecodeJSON_SingleObjectStillSaves(t *testing.T) {
 
 	// 单个对象，以及对象后仅空白，都应正常写入。
 	for _, body := range []string{
-		`{"name":"one","base_url":"https://one.example.com","api_key":"sk-one","auth_style":"bearer"}`,
-		`{"name":"two","base_url":"https://two.example.com","api_key":"sk-two","auth_style":"bearer"}` + " \n\t",
+		`{"name":"one","base_url":"https://one.example.com","api_key":"sk-one-key-123","auth_style":"bearer"}`,
+		`{"name":"two","base_url":"https://two.example.com","api_key":"sk-two-key-123","auth_style":"bearer"}` + " \n\t",
 	} {
 		rec := do(t, handler, http.MethodPost, "/admin/api/upstreams", body, true)
 		if rec.Code != http.StatusCreated {

@@ -116,7 +116,7 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 	// 一个字节都不拷。
 	var hit bool
 	for _, k := range keys {
-		if len(k) >= minRedactableKey && bytes.Contains(body, []byte(k)) {
+		if len(k) >= model.MinRedactableKeyLen && bytes.Contains(body, []byte(k)) {
 			hit = true
 			break
 		}
@@ -127,7 +127,7 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 
 	out := body
 	for _, k := range keys {
-		if len(k) < minRedactableKey {
+		if len(k) < model.MinRedactableKeyLen {
 			continue
 		}
 		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
@@ -151,7 +151,7 @@ func RedactText(s string, keys []string) string {
 		return s
 	}
 	for _, k := range keys {
-		if len(k) < minRedactableKey {
+		if len(k) < model.MinRedactableKeyLen {
 			continue
 		}
 		masked := store.MaskKey(k)
@@ -203,7 +203,7 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 //
 // 与 RedactBodyKeys 的区别只有一条：**不设长度下限**，短 key 也脱敏。
 //
-// 为什么要两个函数而不是一个：minRedactableKey 那个下限对**样本**是对的 ——
+// 为什么要两个函数而不是一个：MinRedactableKeyLen 那个下限对**样本**是对的 ——
 // 样本存的是完整对话原文，一个 4 字符的 key 会在正文里偶然命中无数次，
 // 把原文打得千疮百孔，反而毁掉样本的诊断价值。
 //
@@ -212,8 +212,8 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 // 落进 route_health 表、经 /admin/api/health 显示出来、或者写进日志文件。
 // 两种代价不对称，这里就该按「宁可多打码」取舍。
 //
-// 而短 key 是**真实可达**的配置：config.validate 对 RELAY_KEYS 只校验非空，
-// 上游 api_key 同样没有长度下限。
+// 上游 api_key 写入路径已拒绝短于此下限的非空 key；此处仍处理短 key，
+// 是为了脏行/历史数据与 RELAY_KEYS（仍只校验非空）的纵深防御。
 func RedactDiagnostic(body []byte, keys []string) []byte {
 	out := RedactBodyKeys(body, keys) // 长 key：保留 MaskKey 的部分可辨形式
 	for _, k := range keys {
@@ -223,7 +223,7 @@ func RedactDiagnostic(body []byte, keys []string) []byte {
 		// ReplaceAll 等于原地不动），但那依赖 MaskKey 的实现细节 ——
 		// 若它日后改成返回固定掩码，空串替换会在**每个字节之间**插入掩码，
 		// 把一段错误原文变成几倍长的乱码。写死这个跳过，不押在别处的行为上。
-		if k == "" || len(k) >= minRedactableKey {
+		if k == "" || len(k) >= model.MinRedactableKeyLen {
 			continue
 		}
 		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
@@ -238,12 +238,3 @@ func RedactDiagnosticText(s string, keys []string) string {
 	}
 	return string(RedactDiagnostic([]byte(s), keys))
 }
-
-// minRedactableKey 是参与 body 扫描的最短 key 长度。
-//
-// 太短的字符串在正常 body 里会大量偶然命中（想象一个 4 字符的 key
-// 恰好是对话内容的子串），把对话原文打得千疮百孔，反而毁掉样本的诊断价值。
-// 真实的 relay key 与上游 key 都远长于此。
-//
-// 注意这个下限**只对样本适用**。诊断文本走 RedactDiagnostic，它不设下限。
-const minRedactableKey = 12

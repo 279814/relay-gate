@@ -10,6 +10,13 @@ import (
 // ErrValidation 是所有校验失败的哨兵错误，API 层据此回 400 而非 500。
 var ErrValidation = errors.New("validation")
 
+// MinRedactableKeyLen 是允许落库的最短非空上游 api_key 长度。
+//
+// sample.RedactText 会跳过更短的字符串（避免在 URL/正文里误伤），因此短于此
+// 的 key 一旦写入，会原样出现在客户端可见的 Location 等 URI 头里。空串不在此
+// 限：更新时留空表示「不改已存 key」。
+const MinRedactableKeyLen = 12
+
 func invalid(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrValidation, fmt.Sprintf(format, a...))
 }
@@ -25,6 +32,11 @@ func (u *Upstream) Validate() error {
 	}
 	if err := validateBaseURL(u.BaseURL, u.FullURLMode); err != nil {
 		return err
+	}
+	// 空串表示更新时「不改 key」，不是短 key。非空则必须达到脱敏下限。
+	if u.APIKey != "" && len(u.APIKey) < MinRedactableKeyLen {
+		return invalid("api_key 长度至少为 %d（短于此无法在 Location 等 URI 头中脱敏），收到 %d",
+			MinRedactableKeyLen, len(u.APIKey))
 	}
 	if !u.AuthStyle.Valid() {
 		return invalid("auth_style 必须是 auto / x-api-key / bearer，收到 %q", u.AuthStyle)

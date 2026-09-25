@@ -85,7 +85,7 @@ func TestResultRecorder_RealStoreRoundTrip(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	upstream := &model.Upstream{Name: "rr", BaseURL: "https://rr.example", APIKey: "sk-rr", Enabled: true}
+	upstream := &model.Upstream{Name: "rr", BaseURL: "https://rr.example", APIKey: "sk-rr-recorder1", Enabled: true}
 	if err := st.CreateUpstream(upstream); err != nil {
 		t.Fatal(err)
 	}
