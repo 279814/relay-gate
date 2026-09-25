@@ -20,6 +20,10 @@ var ErrNoModelField = errors.New("body 中没有顶层 model 字段")
 // 完整 body 模板不得制造重复 model；网关拒绝并零上游调用。
 var ErrDuplicateModel = errors.New("body 顶层 model 键重复")
 
+// ErrModelNotString 表示顶层 model 存在但其值不是 JSON 字符串。
+// 错误文案固定，不得附带 body 切片或 model 原文，以免 400 回显密钥。
+var ErrModelNotString = errors.New("顶层 model 的值不是字符串")
+
 // ExtractModel 只读出 body 顶层的 model 值，不做任何修改。
 // 选路阶段用它来匹配 ModelName。
 //
@@ -37,11 +41,12 @@ func ExtractModel(body []byte) (string, error) {
 	// json.Unmarshal([]byte("null"), &s) 是**空操作**，返回 ("", nil) 而不报错，
 	// 空 model 会一路流进选路并静默匹配到兜底。
 	if len(raw) == 0 || raw[0] != '"' {
-		return "", fmt.Errorf("顶层 model 的值不是字符串（收到 %s）", raw)
+		return "", ErrModelNotString
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", fmt.Errorf("解析 model 的值: %w", err)
+		// 不包装 json 错误：解码器文案可能带原文片段，经 preamble 会进 400。
+		return "", errors.New("解析 model 的值失败")
 	}
 	return s, nil
 }
