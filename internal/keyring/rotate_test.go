@@ -102,26 +102,44 @@ func TestRecoverUnfinished_PreparedAbortsWithoutMaintenance(t *testing.T) {
 	}
 }
 
-func TestRecoverUnfinished_DBCommittedHoldsMaintenance(t *testing.T) {
+// §12.7：db_committed 必须前滚 ActivatePending；新 Key 成为 active，不得把
+// pending 留成唯一未用密钥，也不得声称已提交数据库可回滚。
+func TestRecoverUnfinished_DBCommittedActivatesForward(t *testing.T) {
+	const oldMaster = "aaaaaaaaaaaaaaaa"
+	const newMaster = "bbbbbbbbbbbbbbbb"
 	f := Open(t.TempDir())
-	if err := f.EnsureInitialized("mk_a", "aaaaaaaaaaaaaaaa"); err != nil {
+	if err := f.EnsureInitialized("mk_a", oldMaster); err != nil {
 		t.Fatal(err)
 	}
-	rid, err := f.BeginRotation("bbbbbbbbbbbbbbbb")
+	rid, err := f.BeginRotation(newMaster)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := f.MarkDBCommitted(rid); err != nil {
 		t.Fatal(err)
 	}
+
 	hold, st, err := f.RecoverUnfinished()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hold {
-		t.Fatal("db_committed must hold maintenance for forward recovery")
+	if hold {
+		t.Fatal("db_committed forward activate finished; must not keep maintenance hold")
 	}
-	if !st.HasPending || st.Phase != PhaseDBCommitted {
-		t.Fatalf("must leave pending for forward recovery: %+v", st)
+	if st.HasPending {
+		t.Fatalf("pending must not remain unused after activate: %+v", st)
+	}
+	if st.Phase != PhaseKeyActivated {
+		t.Fatalf("phase=%s want key_activated", st.Phase)
+	}
+	id, active, err := f.LoadActive()
+	if err != nil || active != newMaster {
+		t.Fatalf("active must be new master: id=%s active=%q err=%v", id, active, err)
+	}
+	if id == "" {
+		t.Fatal("empty new key id")
+	}
+	if active == oldMaster {
+		t.Fatal("must not keep old master as sole decryptor after db_committed")
 	}
 }

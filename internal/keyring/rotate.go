@@ -133,7 +133,10 @@ func (f *File) AbortPrepared(rotationID string) error {
 //
 // prepared (DB not committed): AbortPrepared — pending deleted, old active kept;
 // HoldMaintenance is false so the gateway may leave maintenance.
-// db_committed / key_activated: forward recovery only; HoldMaintenance is true.
+// db_committed: must roll forward via ActivatePending (DB already under new key);
+// HoldMaintenance is false once activation finishes. Never claims rollback.
+// key_activated: HoldMaintenance true until an existing verify/cleaned path runs;
+// this helper does not invent a full verifier.
 // Idle/cleaned keyrings return HoldMaintenance false with no mutation.
 // Does not log or return key material.
 func (f *File) RecoverUnfinished() (holdMaintenance bool, st Status, err error) {
@@ -151,7 +154,18 @@ func (f *File) RecoverUnfinished() (holdMaintenance bool, st Status, err error) 
 			return false, Status{}, err
 		}
 		return false, st, nil
-	case PhaseDBCommitted, PhaseKeyActivated:
+	case PhaseDBCommitted:
+		// Forward only: ciphertext is already under pending; ActivatePending is
+		// the same step the online rotation happy path uses after MarkDBCommitted.
+		if _, err := f.ActivatePending(st.RotationID); err != nil {
+			return true, st, err
+		}
+		st, err = f.Status()
+		if err != nil {
+			return false, Status{}, err
+		}
+		return false, st, nil
+	case PhaseKeyActivated:
 		return true, st, nil
 	default:
 		return false, st, nil
