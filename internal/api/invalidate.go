@@ -248,8 +248,8 @@ func (s *Server) routeIDsOfModelName(modelNameID int64) []int64 {
 // （而 §5.2d 刚刚才让这些请求变得可见）。只在真正影响「能不能连上、
 // 鉴权过不过」的字段变化时才触发。
 //
-// enabled 不在这里判：它由调用方单独处理 —— 从停用变启用要探（那是
-// 「刚配好，想知道通不通」的时刻），而启用变停用不必探（都停了）。
+// enabled 不在这里判：启用↔停用都不触发重探。停用不必探；重新启用只
+// 发布 livecfg，由真实流量或显式手动探活/校准覆盖健康未知。
 func probeAffectingUpstream(before, after *model.Upstream) bool {
 	// HostOverride / TLSServerName bump NetworkRevision (store.networkChanged) and
 	// are §9.2 network-origin fields: must invalidate so RouteHealth is forgotten

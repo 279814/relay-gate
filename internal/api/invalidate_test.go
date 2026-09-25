@@ -209,8 +209,8 @@ func TestInvalidate_UpstreamNoOpUpdateDoesNotTriggerProbe(t *testing.T) {
 	}
 }
 
-func TestInvalidate_UpstreamReEnableTriggersProbe(t *testing.T) {
-	// 从停用变启用要探：那是「重新启用它，想知道还通不通」的时刻。
+func TestInvalidate_UpstreamReEnableDoesNotTriggerProbe(t *testing.T) {
+	// 重新启用只发布 livecfg，不因 Enabled 翻转而启动合成探活或校准。
 	h, inv := newInvalidatorServer(t)
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa","enabled":false}`)
@@ -220,8 +220,8 @@ func TestInvalidate_UpstreamReEnableTriggersProbe(t *testing.T) {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
 	_, ups, _ := inv.counts()
-	if ups != 1 {
-		t.Errorf("重新启用应触发探活，得到 %d", ups)
+	if ups != 0 {
+		t.Errorf("重新启用不该触发探活，却触发了 %d 次", ups)
 	}
 }
 
@@ -436,6 +436,32 @@ func TestInvalidate_RoutePriorityChangeDoesNotTriggerProbe(t *testing.T) {
 	after, _, _ := inv.counts()
 	if after != before {
 		t.Errorf("只改 priority/weight 不该触发重探，却多触发了 %d 次", after-before)
+	}
+}
+
+func TestInvalidate_RouteReEnableDoesNotTriggerProbe(t *testing.T) {
+	// 重新启用 Route 只发布 livecfg，不因 Enabled 翻转而启动合成探活或校准。
+	h, inv := newInvalidatorServer(t)
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"m1","protocol":"anthropic"}`, true)
+	mnID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnID)+`,"upstream_id":`+itoa(upID)+`,"enabled":false}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route 失败：%s", rec.Body.String())
+	}
+	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	before, _, _ := inv.counts()
+
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":true}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("重新启用失败：%s", rec.Body.String())
+	}
+	after, _, _ := inv.counts()
+	if after != before {
+		t.Errorf("重新启用不该触发探活，却多触发了 %d 次", after-before)
 	}
 }
 
