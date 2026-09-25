@@ -149,7 +149,10 @@ func (s *Server) postRevokeRelayGrace(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, model.WrapValidation("管理员密码不正确"))
 		return
 	}
-	s.creds.RevokeGrace()
+	if err := s.creds.RevokeGrace(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

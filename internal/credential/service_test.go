@@ -20,7 +20,9 @@ func TestRelayRotateGraceAndRevoke(t *testing.T) {
 	if !s.ValidRelayKey("rk_old") || !s.ValidRelayKey(newKey) {
 		t.Fatal("both keys should work during grace")
 	}
-	s.RevokeGrace()
+	if err := s.RevokeGrace(); err != nil {
+		t.Fatal(err)
+	}
 	if s.ValidRelayKey("rk_old") {
 		t.Fatal("old should be revoked")
 	}
@@ -64,7 +66,9 @@ func TestRelayAlsoKeysSurviveRotate(t *testing.T) {
 	if !s.ValidRelayKey(newKey) || !s.ValidRelayKey("rk_a") || !s.ValidRelayKey("rk_b") {
 		t.Fatalf("new+old-grace+also should work; activeKeys=%v", s.ActiveRelayKeys())
 	}
-	s.RevokeGrace()
+	if err := s.RevokeGrace(); err != nil {
+		t.Fatal(err)
+	}
 	if s.ValidRelayKey("rk_a") {
 		t.Fatal("rotated-away primary must not survive revoke")
 	}
@@ -186,5 +190,108 @@ func TestRevealActiveRelayKey_SealedBesideDigest(t *testing.T) {
 	}
 	if !s.ValidRelayKey(got2) {
 		t.Fatal("rotated revealed key must authorize")
+	}
+}
+
+// TestRelayGraceSurvivesRestart covers §12.6: unexpired grace digest/deadline
+// persist in bootstrap-credentials.json and reload after SetActiveRelayKeys
+// (startup clears the in-memory snapshot).
+func TestRelayGraceSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	const oldKey = "rk_grace_restart_old"
+	if err := WritePersisted(dir, Persisted{
+		FormatVersion: 1, AdminPasswordHash: "hash", RelayKey: oldKey, MasterKeyID: "kid",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	s1 := New().WithDataDir(dir).WithNow(func() time.Time { return now })
+	if err := s1.SetActiveRelayKey(oldKey); err != nil {
+		t.Fatal(err)
+	}
+	newKey, _, err := s1.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.RelayKey != newKey {
+		t.Fatalf("persisted active=%q want %q", doc.RelayKey, newKey)
+	}
+	if doc.RelayGraceDigest != digestRelayKey(oldKey) {
+		t.Fatalf("persisted grace digest=%q", doc.RelayGraceDigest)
+	}
+	if doc.RelayGraceUntil == "" {
+		t.Fatal("persisted grace deadline missing")
+	}
+	if strings.Contains(doc.RelayGraceDigest, oldKey) || doc.RelayGraceDigest == oldKey {
+		t.Fatal("must not persist raw previous key")
+	}
+
+	// Simulate process restart: SetActiveRelayKeys clears grace; restore reloads it.
+	s2 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(2 * time.Minute) })
+	if err := s2.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+		t.Fatal(err)
+	}
+	if s2.ValidRelayKey(oldKey) {
+		t.Fatal("without RestorePersistedGrace, previous key must die after reload")
+	}
+	if err := s2.RestorePersistedGrace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if !s2.ValidRelayKey(newKey) {
+		t.Fatal("current key must work after reload")
+	}
+	if !s2.ValidRelayKey(oldKey) {
+		t.Fatal("unexpired grace key must work after reload")
+	}
+
+	// Deadline already passed stays rejected.
+	s3 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(11 * time.Minute) })
+	if err := s3.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s3.RestorePersistedGrace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if s3.ValidRelayKey(oldKey) {
+		t.Fatal("expired grace must stay rejected after reload")
+	}
+	if !s3.ValidRelayKey(newKey) {
+		t.Fatal("current key must remain after expired grace reload")
+	}
+
+	// Revoke before restart stays revoked after restart.
+	s4 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(3 * time.Minute) })
+	if err := s4.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s4.RestorePersistedGrace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := s4.RevokeGrace(); err != nil {
+		t.Fatal(err)
+	}
+	afterRevoke, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRevoke.RelayGraceDigest != "" || afterRevoke.RelayGraceUntil != "" {
+		t.Fatal("revoke must clear persisted grace fields")
+	}
+	s5 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(4 * time.Minute) })
+	if err := s5.SetActiveRelayKeys([]string{afterRevoke.RelayKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s5.RestorePersistedGrace(dir); err != nil {
+		t.Fatal(err)
+	}
+	if s5.ValidRelayKey(oldKey) {
+		t.Fatal("revoked grace must stay revoked after restart")
+	}
+	if !s5.ValidRelayKey(newKey) {
+		t.Fatal("active key must remain after revoke restart")
 	}
 }

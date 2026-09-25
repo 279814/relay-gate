@@ -122,9 +122,12 @@ func runServer() error {
 	if err := kr.EnsureInitialized(cipher.KeyID(), cfg.EncKey); err != nil {
 		return fmt.Errorf("初始化 keyring: %w", err)
 	}
-	credSvc := credential.New().WithEnvelope(cipher)
+	credSvc := credential.New().WithEnvelope(cipher).WithDataDir(dataDir)
 	if err := credSvc.SetActiveRelayKeys(cfg.RelayKeys); err != nil {
 		return fmt.Errorf("装载 Relay Key: %w", err)
+	}
+	if err := credSvc.RestorePersistedGrace(dataDir); err != nil {
+		return fmt.Errorf("恢复 Relay grace: %w", err)
 	}
 	st, err := store.Open(cfg.DBPath, cipher)
 	if err != nil {
