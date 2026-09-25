@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanTextDetectsScriptAndInjection(t *testing.T) {
@@ -209,6 +210,19 @@ func TestCenterRingBound(t *testing.T) {
 	}
 	if c.Count() != 3 {
 		t.Fatalf("count = %d", c.Count())
+	}
+}
+
+// Restart resets the in-process seq while the wall clock is only second-
+// granular. Two ids with the same timestamp+seq must still differ so
+// InsertSecurityFinding's INSERT OR REPLACE cannot wipe the older row.
+func TestFindingID_ResetSeqSameSecondDiffer(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	const seq = 1
+	id1 := newFindingID(now, seq)
+	id2 := newFindingID(now, seq)
+	if id1 == id2 {
+		t.Fatalf("same-second restart reused finding id %q", id1)
 	}
 }
 
