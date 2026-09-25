@@ -3,7 +3,6 @@ package probe
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -132,6 +131,10 @@ func (c *SyntheticCoordinator) AcquireSynthetic(ctx context.Context, trigger mod
 	return child, release, nil
 }
 
+// errCancelSyntheticPanic is fixed text only — never include the panic value
+// (secrets / request fragments must not reach pause-drain API responses).
+var errCancelSyntheticPanic = errors.New("CancelSynthetic panic")
+
 // CancelSynthetic 先关闭 admission，再广播 cancel，最后等待 lease 释放。
 //
 // panic 隔离、可重复调用。ctx 超时返回错误，但 admission 保持关闭。
@@ -140,8 +143,8 @@ func (c *SyntheticCoordinator) CancelSynthetic(ctx context.Context, cause error)
 		return errors.New("SyntheticCoordinator 为空")
 	}
 	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("CancelSynthetic panic: %v", rec)
+		if recover() != nil {
+			err = errCancelSyntheticPanic
 		}
 	}()
 	if ctx == nil {
