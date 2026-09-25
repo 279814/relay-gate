@@ -62,10 +62,29 @@ func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 // body 是 []byte，encoding/json 会编成 base64 —— 这是刻意的：
 // 样本 body 可能含非法 UTF-8（对话里的二进制片段、被截断的多字节字符），
 // 直接当字符串编码会被替换成 U+FFFD，而「到底是哪些字节」正是这个功能的全部意义。
+//
+// §16.3 / §5.4：查看未脱敏样本正文需要重新认证。管理会话（Cookie / Bearer）
+// 只证明「已登录」；口令须再经 passwordOK 校验，与 reveal/rotate 同级。
+// 口令放在 JSON body（{"password":"..."}）；缺省或错误一律 401 且不返回正文。
 func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
+		return
+	}
+	password := ""
+	if r.Body != nil && r.ContentLength != 0 {
+		var body struct {
+			Password string `json:"password"`
+		}
+		if err := decodeJSON(r, &body); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		password = body.Password
+	}
+	if !s.passwordOK(password) {
+		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
 		return
 	}
 	smp, err := s.st.GetSample(id)
@@ -73,6 +92,7 @@ func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, smp)
 }
 
