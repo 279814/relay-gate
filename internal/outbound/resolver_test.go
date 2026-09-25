@@ -330,6 +330,24 @@ func TestResolve_DropsIncomingCredentialQueryParam(t *testing.T) {
 		}
 	})
 
+	t.Run("百分号编码同名也丢弃大小写不同保留", func(t *testing.T) {
+		endpoint := canonicalEndpoint(model.EndpointMessages)
+		endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
+		got := resolve(t, ResolveInput{
+			Upstream: testUpstream(), Endpoint: endpoint,
+			// ke%79 经 QueryUnescape 即 key；Key 大小写不同，按 ParseQuery 不是同名。
+			IncomingRawQuery: "ke%79=evil&beta=true&Key=keep&other=" + gatewayKey,
+			Values:           values,
+		})
+		want := "key=" + gatewayKey + "&beta=true&Key=keep&other=" + gatewayKey
+		if got.URL.RawQuery != want {
+			t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
+		}
+		if strings.Contains(got.URL.RawQuery, "ke%79=") || strings.Contains(got.URL.RawQuery, "evil") {
+			t.Fatalf("编码后的同名 key 不得出现在出站 query：%q", got.URL.RawQuery)
+		}
+	})
+
 	for _, kind := range []model.EndpointKind{
 		model.EndpointMessages, model.EndpointResponses,
 		model.EndpointChatCompletions, model.EndpointCountTokens,

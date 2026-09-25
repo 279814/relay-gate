@@ -413,6 +413,7 @@ func joinQuery(fixed, incoming string, dropIncomingNames map[string]struct{}) st
 //
 // 只认模板里已经写出的那些名字，不另起 denylist：beta 等普通参数即使与
 // 入站同名也照常保留；模板里没有凭据占位符时返回 nil，入站 key= 可原样通过。
+// 名字按 url.QueryUnescape 归一（与 ParseQuery 一致），这样入站 ke%79= 也算同名。
 func credentialQueryParamNames(template string) map[string]struct{} {
 	if template == "" {
 		return nil
@@ -423,7 +424,7 @@ func credentialQueryParamNames(template string) map[string]struct{} {
 		if !ok || !isWholeCredentialPlaceholder(value) {
 			continue
 		}
-		names[name] = struct{}{}
+		names[canonicalQueryParamName(name)] = struct{}{}
 	}
 	if len(names) == 0 {
 		return nil
@@ -436,13 +437,13 @@ func credentialQueryParamNames(template string) map[string]struct{} {
 // 捕获 query 已是渲染后的明文，没有占位符可认。只收 AuthProfile 显式给出、
 // 且确实出现在捕获 query 里的 QueryName —— 不另起参数名 denylist。
 func legacyCredentialQueryParamNames(raw string, profile model.EndpointAuthProfile) map[string]struct{} {
-	queryName := strings.TrimSpace(profile.QueryName)
+	queryName := canonicalQueryParamName(strings.TrimSpace(profile.QueryName))
 	if queryName == "" || raw == "" {
 		return nil
 	}
 	for _, segment := range strings.Split(raw, "&") {
 		name, _, _ := splitQuerySegment(segment)
-		if name == queryName {
+		if canonicalQueryParamName(name) == queryName {
 			return map[string]struct{}{queryName: {}}
 		}
 	}
@@ -456,6 +457,18 @@ func splitQuerySegment(segment string) (name, value string, hasEquals bool) {
 	return segment, "", false
 }
 
+// canonicalQueryParamName 按 application/x-www-form-urlencoded 解析规则归一参数名。
+//
+// 与 url.ParseQuery 一致：先 QueryUnescape（%XX 与 +），大小写保持原样。
+// 非法转义时退回原文，避免把坏段误当成空名去匹配。
+func canonicalQueryParamName(raw string) string {
+	decoded, err := url.QueryUnescape(raw)
+	if err != nil {
+		return raw
+	}
+	return decoded
+}
+
 func isWholeCredentialPlaceholder(value string) bool {
 	if value == "{{UPSTREAM_API_KEY}}" {
 		return true
@@ -465,6 +478,7 @@ func isWholeCredentialPlaceholder(value string) bool {
 }
 
 // stripQueryParamNames 丢掉 raw 里名称落在 names 中的段，其余段保序、不重编码。
+// 比较用 canonicalQueryParamName，所以 ke%79= 与 key= 视为同名；Key= 仍不同名。
 func stripQueryParamNames(raw string, names map[string]struct{}) string {
 	if raw == "" || len(names) == 0 {
 		return raw
@@ -473,7 +487,7 @@ func stripQueryParamNames(raw string, names map[string]struct{}) string {
 	kept := make([]string, 0, len(segments))
 	for _, segment := range segments {
 		name, _, _ := splitQuerySegment(segment)
-		if _, drop := names[name]; drop {
+		if _, drop := names[canonicalQueryParamName(name)]; drop {
 			continue
 		}
 		kept = append(kept, segment)
