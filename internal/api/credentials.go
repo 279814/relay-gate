@@ -253,11 +253,16 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			s.writeErr(w, err)
 			return
 		}
-		// Local/dev path: mark db committed without full secret rewrite when Store
-		// rotation helper is unavailable; production wiring re-encrypts then calls
-		// MarkDBCommitted separately.
-		if err := s.keyring.MarkDBCommitted(rid); err != nil {
+		// §12.7 step 7: re-encrypt direct secrets under pending master in one TX
+		// before MarkDBCommitted. Failure here aborts prepared (DB unchanged).
+		if err := s.st.RewrapDirectSecrets(body.NewMaster); err != nil {
 			_ = s.keyring.AbortPrepared(rid)
+			s.writeErr(w, err)
+			return
+		}
+		if err := s.keyring.MarkDBCommitted(rid); err != nil {
+			// DB already under new master — keep pending + maintenance for recovery.
+			exitMaint = false
 			s.writeErr(w, err)
 			return
 		}
@@ -273,19 +278,24 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			s.writeErr(w, err)
 			return
 		}
+		if s.creds != nil {
+			if err := s.creds.ResealActiveRelayEnvelope(); err != nil {
+				exitMaint = false
+				s.writeErr(w, err)
+				return
+			}
+			s.creds.ClearMasterReveal()
+		}
 		if err := s.keyring.MarkCleaned(rid); err != nil {
 			exitMaint = false
 			s.writeErr(w, err)
 			return
 		}
-		if s.creds != nil {
-			s.creds.ClearMasterReveal()
-		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"rotation_id": rid,
 			"new_key_id":  newID,
 			"phase":       keyring.PhaseCleaned,
-			"note":        "Keyring active 与 live Cipher 已切换；新信封用新 key-id，旧样本信封仍可读（§5.4）",
+			"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 已重封，旧样本信封仍可读（§5.4）",
 		})
 		return
 	}
@@ -294,8 +304,12 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.keyring.MarkDBCommitted(rid); err != nil {
+	if err := s.st.RewrapDirectSecrets(body.NewMaster); err != nil {
 		_ = s.keyring.AbortPrepared(rid)
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.keyring.MarkDBCommitted(rid); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -308,18 +322,22 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
+	if s.creds != nil {
+		if err := s.creds.ResealActiveRelayEnvelope(); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		s.creds.ClearMasterReveal()
+	}
 	if err := s.keyring.MarkCleaned(rid); err != nil {
 		s.writeErr(w, err)
 		return
-	}
-	if s.creds != nil {
-		s.creds.ClearMasterReveal()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rotation_id": rid,
 		"new_key_id":  newID,
 		"phase":       keyring.PhaseCleaned,
-		"note":        "Keyring active 与 live Cipher 已切换；新信封用新 key-id，旧样本信封仍可读（§5.4）",
+		"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 已重封，旧样本信封仍可读（§5.4）",
 	})
 }
 
