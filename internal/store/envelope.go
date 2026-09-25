@@ -23,7 +23,8 @@ func (c *Cipher) EncryptEnvelope(plain string) (string, error) {
 
 // DecryptEnvelope accepts v1:key-id:payload or legacy bare base64 from Encrypt.
 // After ActivateMaster, envelopes whose key-id matches a retired master still
-// decrypt (§5.4: Master Key rotation does not re-encrypt all large samples).
+// decrypt in-process. Durable rotation reseals sample envelopes in
+// RewrapDirectSecrets so a restart with only the new master succeeds.
 func (c *Cipher) DecryptEnvelope(encoded string) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

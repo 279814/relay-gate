@@ -295,7 +295,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			"rotation_id": rid,
 			"new_key_id":  newID,
 			"phase":       keyring.PhaseCleaned,
-			"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 已重封，旧样本信封仍可读（§5.4）",
+			"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 与样本信封已重封",
 		})
 		return
 	}
@@ -337,7 +337,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		"rotation_id": rid,
 		"new_key_id":  newID,
 		"phase":       keyring.PhaseCleaned,
-		"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 已重封，旧样本信封仍可读（§5.4）",
+		"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 与样本信封已重封",
 	})
 }
 
