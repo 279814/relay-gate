@@ -205,6 +205,5 @@ func TestRedactCredentialURLHeaders(t *testing.T) {
 		t.Error("非 URL 头不得改写")
 	}
 	RedactCredentialURLHeaders(nil, []string{secret}) // 不得 panic
-	RedactCredentialURLHeaders(h, nil)                 // 空 keys 空操作
+	RedactCredentialURLHeaders(h, nil)                // 空 keys 空操作
 }
-
