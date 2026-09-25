@@ -464,6 +464,12 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 }
 
 func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings model.Settings) {
+	// Claim/beginL1 之后、RoundTrip 之前再读一次：停用可能已经落库并发布。
+	// tick 只在调度时跳过 !Enabled；已武装的 goroutine 必须自己停在出网前。
+	if !s.syntheticUpstreamStillEnabled(up.ID) {
+		s.log.Info("Upstream 已停用，跳过已武装的 L1", "upstream", up.Name)
+		return
+	}
 	gateGen := s.gate.EnsureGeneration(up.ID)
 	var out Outcome
 	var reachable bool
@@ -588,6 +594,12 @@ func (s *Scheduler) triggerDeadRoutes(upstreamID int64) int {
 func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	mn *model.ModelName, rt *model.Route, settings model.Settings, generation uint64) {
 
+	// 同 runL1：已 Claim/beginL2 的回调在 RoundTrip 前必须再确认目标仍启用。
+	if !s.syntheticRouteStillEnabled(rt.ID, up.ID) {
+		s.log.Info("Route/Upstream 已停用，跳过已武装的 L2",
+			"upstream", up.Name, "route", rt.ID)
+		return
+	}
 	var out Outcome
 	if s.executor != nil {
 		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
@@ -915,6 +927,49 @@ func findModelName(snap *router.Snapshot, id int64) *model.ModelName {
 		}
 	}
 	return nil
+}
+
+func findRoute(snap *router.Snapshot, routeID int64) *model.Route {
+	if snap == nil {
+		return nil
+	}
+	for _, rts := range snap.RoutesByModelName {
+		for _, rt := range rts {
+			if rt.ID == routeID {
+				return rt
+			}
+		}
+	}
+	return nil
+}
+
+// syntheticUpstreamStillEnabled is the L1 pre-send gate: an armed station probe
+// must not RoundTrip after the Upstream was disabled between Claim and send.
+func (s *Scheduler) syntheticUpstreamStillEnabled(upstreamID int64) bool {
+	snap, err := s.cfg.Snapshot()
+	if err != nil || snap == nil {
+		return false
+	}
+	up := snap.Upstreams[upstreamID]
+	return up != nil && up.Enabled
+}
+
+// syntheticRouteStillEnabled is the L2 pre-send gate for an armed Route probe.
+func (s *Scheduler) syntheticRouteStillEnabled(routeID, upstreamID int64) bool {
+	snap, err := s.cfg.Snapshot()
+	if err != nil || snap == nil {
+		return false
+	}
+	up := snap.Upstreams[upstreamID]
+	if up == nil || !up.Enabled {
+		return false
+	}
+	rt := findRoute(snap, routeID)
+	if rt == nil || !rt.Enabled || rt.UpstreamID != upstreamID {
+		return false
+	}
+	mn := findModelName(snap, rt.ModelNameID)
+	return mn != nil && mn.Enabled
 }
 
 // ensureRouteGeneration 在未先 Claim 的路径上绑定世代（手动探活 / piggyback）。
