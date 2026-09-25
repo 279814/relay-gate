@@ -836,6 +836,42 @@ func TestInsertSampleWithinQuota_SkipEmptyShellWhenNothingFits(t *testing.T) {
 	}
 }
 
+// 正文原本就空（真实空响应）且配额有余时，仍应入库头/状态元数据，不得被 need==0 误跳。
+func TestInsertSampleWithinQuota_GenuinelyEmptyStillInserts(t *testing.T) {
+	st := testStore(t)
+	s := mkSample(22)
+	s.InBody, s.OutBody, s.RespBody = nil, nil, nil
+	s.RespStatus = 204
+
+	ok, err := st.InsertSampleWithinQuota(s, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("配额有余时原本无正文的样本应插入")
+	}
+	cnt, err := st.CountSamples()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 1 {
+		t.Fatalf("应插入 1 行，got %d", cnt)
+	}
+	got, err := st.GetSample(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RespStatus != 204 {
+		t.Fatalf("status want 204, got %d", got.RespStatus)
+	}
+	if len(got.InBody) != 0 || len(got.OutBody) != 0 || len(got.RespBody) != 0 {
+		t.Fatalf("正文应仍为空，in=%d out=%d resp=%d", len(got.InBody), len(got.OutBody), len(got.RespBody))
+	}
+	if s.Truncated != 0 {
+		t.Fatalf("原本无正文不得标记截断，truncated=%v", s.Truncated)
+	}
+}
+
 // 丢掉 resp（及必要时 out）后若 in 仍放得下，应插入缩小后的行，而非跳过。
 func TestInsertSampleWithinQuota_PartialDropStillInserts(t *testing.T) {
 	st := testStore(t)
