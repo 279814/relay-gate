@@ -111,7 +111,7 @@ func (s *SemanticConfigInvalidator) InvalidateModelNameDeleted(modelNameID int64
 // livecfg.Source 实现本接口。Upstream / ModelName / Route 的成功
 // create/update/delete 必须在 SQL 成功后 Invalidate+Refresh，否则 2s TTL
 // 内下一次 preamble/Select 仍可能看到旧 enabled、旧路由或已删行
-//（docs/01 §6.4 候选须启用；§9.2 内存立即失效不等待 livecfg TTL）。
+// （docs/01 §6.4 候选须启用；§9.2 内存立即失效不等待 livecfg TTL）。
 type ConfigPublisher interface {
 	Invalidate()
 	Refresh() error
