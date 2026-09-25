@@ -119,23 +119,11 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	// Collect child Route ids before CASCADE so §15 transform bindings can be
-	// detached after a successful delete (same id-reuse hole as Route delete).
-	var childRoutes []int64
-	if s.transforms != nil {
-		if routes, err := s.st.ListRoutes(0); err == nil {
-			for _, rt := range routes {
-				if rt != nil && rt.UpstreamID == id {
-					childRoutes = append(childRoutes, rt.ID)
-				}
-			}
-		}
-	}
-	// Invalidate before DELETE: RoutesOfUpstream reads the live SQL table, and
-	// ON DELETE CASCADE removes child Routes with the Upstream. After delete,
-	// SemanticConfigInvalidator would see zero route IDs and leave their
-	// RouteHealth / RecoveryGate / Capability in memory (§9.2).
-	s.invalidateUpstream(id)
+	// Snapshot child Route ids before CASCADE: SQL removes them with the
+	// Upstream, but §9.2 Forget and §15 transform detach still need the ids.
+	// Clear in-memory health only after DeleteUpstream succeeds — otherwise a
+	// store error would wipe Reachability / RouteHealth while the rows remain.
+	childRoutes := s.routeIDsOfUpstream(id)
 	if err := s.st.DeleteUpstream(id); err != nil {
 		s.writeErr(w, err)
 		return
@@ -143,6 +131,7 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 	for _, rid := range childRoutes {
 		s.detachTransformBindingsForRoute(rid)
 	}
+	s.invalidateUpstreamDeleted(id, childRoutes)
 	s.log.Info("删除 upstream", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -533,8 +534,8 @@ func TestInvalidate_DeleteRouteClearsDeadRouteHealth(t *testing.T) {
 	}
 }
 
-// Delete Upstream cascades child Routes in SQL; invalidate must run first so
-// RoutesOfUpstream still returns those ids for Semantic Forget.
+// Delete Upstream cascades child Routes in SQL; snapshot those ids before
+// DELETE, then Forget after success (RoutesOfUpstream would be empty post-CASCADE).
 func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
@@ -600,8 +601,8 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 	}
 }
 
-// Delete ModelName cascades child Routes in SQL; invalidate must run first so
-// RoutesOfModelName still returns those ids for Semantic Forget.
+// Delete ModelName cascades child Routes in SQL; snapshot those ids before
+// DELETE, then Forget after success (RoutesOfModelName would be empty post-CASCADE).
 func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
@@ -666,6 +667,179 @@ func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 	if mns < 1 {
 		t.Fatal("delete model_name 应调用 InvalidateModelName")
 	}
+}
+
+// forceTableDeleteFail aborts SQL DELETE so the API store call fails after any
+// pre-delete work. Used to prove failed deletes must not wipe in-memory health.
+func forceTableDeleteFail(t *testing.T, s *Server, table string) {
+	t.Helper()
+	_, err := s.st.DB().Exec(`CREATE TEMP TRIGGER block_del_` + table + ` BEFORE DELETE ON ` + table + `
+		BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// reachForgetInner clears UpstreamGate on InvalidateUpstream (production Inner
+// is probe.Scheduler, which Forget-s reachability).
+type reachForgetInner struct {
+	*recordingInvalidator
+	gate *health.UpstreamGate
+}
+
+func (r *reachForgetInner) InvalidateUpstream(id int64) {
+	if r.gate != nil {
+		r.gate.Forget(id)
+	}
+	r.recordingInvalidator.InvalidateUpstream(id)
+}
+
+// A store error on delete must leave Reachability / Capability / RouteHealth
+// for still-living rows unchanged — including siblings that were not targeted.
+func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
+	s, _ := newTestServer(t)
+	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
+	fs.s.FailThreshold = 1
+	tr := health.NewTracker(fs)
+	recGate := health.NewRecoveryGate()
+	upGate := health.NewUpstreamGate()
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, recGate, caps, nil, nil)
+	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, gate: upGate}
+	h := s.WithInvalidator(&SemanticConfigInvalidator{
+		Semantic: sem,
+		Inner:    inner,
+		RoutesOfUpstream: func(upstreamID int64) []int64 {
+			routes, err := s.st.ListRoutes(0)
+			if err != nil {
+				return nil
+			}
+			var ids []int64
+			for _, rt := range routes {
+				if rt.UpstreamID == upstreamID {
+					ids = append(ids, rt.ID)
+				}
+			}
+			return ids
+		},
+		RoutesOfModelName: func(modelNameID int64) []int64 {
+			routes, err := s.st.ListRoutes(modelNameID)
+			if err != nil {
+				return nil
+			}
+			ids := make([]int64, 0, len(routes))
+			for _, rt := range routes {
+				ids = append(ids, rt.ID)
+			}
+			return ids
+		},
+	}).Routes(testAdminPW)
+
+	upA := mkUpstreamViaAPI(t, h, `{"name":"keep-h-a","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	upB := mkUpstreamViaAPI(t, h, `{"name":"keep-h-b","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+	rec := do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"keep-h-m1","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name A 失败：%s", rec.Body.String())
+	}
+	mnA := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/model-names",
+		`{"name":"keep-h-m2","protocol":"anthropic"}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 model_name B 失败：%s", rec.Body.String())
+	}
+	mnB := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnA)+`,"upstream_id":`+itoa(upA)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route A 失败：%s", rec.Body.String())
+	}
+	rtA := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+	rec = do(t, h, "POST", "/admin/api/routes",
+		`{"model_name_id":`+itoa(mnB)+`,"upstream_id":`+itoa(upB)+`}`, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("建 route B 失败：%s", rec.Body.String())
+	}
+	rtB := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
+
+	seedDead := func(routeID int64) {
+		t.Helper()
+		tr.Report(health.Report{RouteID: routeID, Verdict: health.VerdictUnavailable, Source: health.SourceL2})
+		if tr.State(routeID) != model.StateDead {
+			t.Fatalf("setup route %d state=%s want dead", routeID, tr.State(routeID))
+		}
+		if _, ok := recGate.TryAcquire(routeID); !ok {
+			t.Fatalf("setup: acquire RecoveryGate for route %d", routeID)
+		}
+	}
+	seedDead(rtA)
+	seedDead(rtB)
+	upGate.Report(upA, 0, false, errors.New("forced probe fail"))
+	upGate.Report(upB, 0, false, errors.New("forced probe fail"))
+	if st := upGate.Status(upA); !st.Probed || st.OK {
+		t.Fatalf("setup upstream A reachability probed=%v ok=%v", st.Probed, st.OK)
+	}
+	// createRoute triggers InvalidateRoute (counts + capability clears); only
+	// assert no further invalidate after the failed deletes below.
+	beforeRoutes, beforeUps, beforeMns := inner.counts()
+	caps.cleared = nil
+	caps.upstreamCleared = nil
+
+	assertKept := func(label string, routeID, upstreamID int64) {
+		t.Helper()
+		if got := tr.State(routeID); got != model.StateDead {
+			t.Fatalf("%s: RouteHealth=%s want dead (must not Forget on failed delete)", label, got)
+		}
+		if !recGate.InFlight(routeID) {
+			t.Fatalf("%s: RecoveryGate must stay held", label)
+		}
+		if caps.has(routeID) {
+			t.Fatalf("%s: Capability must not InvalidateScope on failed delete", label)
+		}
+		if upstreamID > 0 {
+			if caps.hasUpstream(upstreamID) {
+				t.Fatalf("%s: upstream Capability must not clear on failed delete", label)
+			}
+			if st := upGate.Status(upstreamID); !st.Probed || st.OK {
+				t.Fatalf("%s: Reachability probed=%v ok=%v want probed+not-ok", label, st.Probed, st.OK)
+			}
+		}
+	}
+	assertNoInvalidate := func(label string) {
+		t.Helper()
+		routes, ups, mns := inner.counts()
+		if routes != beforeRoutes || ups != beforeUps || mns != beforeMns {
+			t.Fatalf("%s: failed delete must not invalidate; before routes/ups/mns=%d/%d/%d after=%d/%d/%d",
+				label, beforeRoutes, beforeUps, beforeMns, routes, ups, mns)
+		}
+	}
+
+	forceTableDeleteFail(t, s, "upstream")
+	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upA), "", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("forced upstream delete must fail")
+	}
+	assertNoInvalidate("failed upstream delete")
+	assertKept("failed delete upstream A (target)", rtA, upA)
+	assertKept("failed delete upstream A (sibling)", rtB, upB)
+
+	forceTableDeleteFail(t, s, "model_name")
+	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnA), "", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("forced model_name delete must fail")
+	}
+	assertNoInvalidate("failed model_name delete")
+	assertKept("failed delete model_name A (target)", rtA, upA)
+	assertKept("failed delete model_name A (sibling)", rtB, upB)
+
+	forceTableDeleteFail(t, s, "route")
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtA), "", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("forced route delete must fail")
+	}
+	assertNoInvalidate("failed route delete")
+	assertKept("failed delete route A (target)", rtA, 0)
+	assertKept("failed delete route A (sibling)", rtB, upB)
 }
 
 type recordingCaps struct {
