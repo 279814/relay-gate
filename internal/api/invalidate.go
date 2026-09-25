@@ -75,6 +75,37 @@ func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
 	}
 }
 
+// InvalidateUpstreamDeleted clears §9.2 state after a successful Upstream delete.
+//
+// routeIDs must be snapshotted before CASCADE — after DeleteUpstream the SQL
+// rows are gone, so RoutesOfUpstream would return nil and leave dead RouteHealth.
+func (s *SemanticConfigInvalidator) InvalidateUpstreamDeleted(upstreamID int64, routeIDs []int64) {
+	if s == nil {
+		return
+	}
+	if s.Semantic != nil {
+		s.Semantic.InvalidateUpstream(upstreamID, routeIDs)
+	}
+	if s.Inner != nil {
+		s.Inner.InvalidateUpstream(upstreamID)
+	}
+}
+
+// InvalidateModelNameDeleted clears §9.2 state after a successful ModelName delete.
+//
+// routeIDs must be snapshotted before CASCADE — same id-reuse hole as Upstream.
+func (s *SemanticConfigInvalidator) InvalidateModelNameDeleted(modelNameID int64, routeIDs []int64) {
+	if s == nil {
+		return
+	}
+	if s.Semantic != nil {
+		s.Semantic.InvalidateModelName(modelNameID, routeIDs)
+	}
+	if s.Inner != nil {
+		s.Inner.InvalidateModelName(modelNameID)
+	}
+}
+
 // WithInvalidator 接上配置变更钩子（§4.5）。
 //
 // ── 为什么这个钩子不违反 livecfg 的「不做写后失效」原则 ──
@@ -115,6 +146,66 @@ func (s *Server) invalidateModelName(modelNameID int64) {
 	if s.invalidator != nil {
 		s.invalidator.InvalidateModelName(modelNameID)
 	}
+}
+
+// invalidateUpstreamDeleted runs only after DeleteUpstream succeeded, using
+// route IDs collected before CASCADE removed the child rows.
+func (s *Server) invalidateUpstreamDeleted(upstreamID int64, routeIDs []int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if d, ok := s.invalidator.(interface {
+		InvalidateUpstreamDeleted(upstreamID int64, routeIDs []int64)
+	}); ok {
+		d.InvalidateUpstreamDeleted(upstreamID, routeIDs)
+		return
+	}
+	s.invalidator.InvalidateUpstream(upstreamID)
+}
+
+// invalidateModelNameDeleted runs only after DeleteModelName succeeded, using
+// route IDs collected before CASCADE removed the child rows.
+func (s *Server) invalidateModelNameDeleted(modelNameID int64, routeIDs []int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if d, ok := s.invalidator.(interface {
+		InvalidateModelNameDeleted(modelNameID int64, routeIDs []int64)
+	}); ok {
+		d.InvalidateModelNameDeleted(modelNameID, routeIDs)
+		return
+	}
+	s.invalidator.InvalidateModelName(modelNameID)
+}
+
+// routeIDsOfUpstream lists live Route ids under an Upstream (pre-CASCADE snapshot).
+func (s *Server) routeIDsOfUpstream(upstreamID int64) []int64 {
+	routes, err := s.st.ListRoutes(0)
+	if err != nil {
+		return nil
+	}
+	var ids []int64
+	for _, rt := range routes {
+		if rt != nil && rt.UpstreamID == upstreamID {
+			ids = append(ids, rt.ID)
+		}
+	}
+	return ids
+}
+
+// routeIDsOfModelName lists live Route ids under a ModelName (pre-CASCADE snapshot).
+func (s *Server) routeIDsOfModelName(modelNameID int64) []int64 {
+	routes, err := s.st.ListRoutes(modelNameID)
+	if err != nil {
+		return nil
+	}
+	ids := make([]int64, 0, len(routes))
+	for _, rt := range routes {
+		if rt != nil {
+			ids = append(ids, rt.ID)
+		}
+	}
+	return ids
 }
 
 // probeAffectingUpstream 判断一次 Upstream 更新是否值得重探。
