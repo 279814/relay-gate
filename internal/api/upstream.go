@@ -76,7 +76,7 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 以库中现值为基底：PUT 未提供的字段保持原样，
-	// 尤其 api_key 留空表示「不改 key」（前端拿到的是脱敏值，不能当真 key 回写）。
+	// 尤其 api_key 留空或回写脱敏值表示「不改 key」（前端拿到的是脱敏值，不能当真 key 回写）。
 	cur, err := s.st.GetUpstream(id)
 	if err != nil {
 		s.writeErr(w, err)

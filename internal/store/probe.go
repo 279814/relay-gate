@@ -40,8 +40,39 @@ func (store *Store) CreateProbeSecret(name string, plain []byte) (*model.ProbeSe
 }
 
 func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []byte) (*model.ProbeSecret, error) {
-	if len(plain) == 0 || expectedRevision < 1 {
+	if expectedRevision < 1 {
 		return nil, model.WrapValidation("Secret value/expected revision 无效")
+	}
+	var enc, currentMasked string
+	var currentRev int64
+	err := store.db.QueryRow(`SELECT value_enc,masked,revision FROM probe_secret WHERE id=?`, id).
+		Scan(&enc, &currentMasked, &currentRev)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if currentRev != expectedRevision {
+		return nil, ErrRevisionConflict
+	}
+	// 空串或读接口回显的 mask 表示「不改」——不能把 MaskKey 结果当新明文入库。
+	keep := len(plain) == 0 || string(plain) == currentMasked
+	if !keep {
+		currentPlain, decErr := store.cipher.Decrypt(enc)
+		if decErr != nil {
+			return nil, decErr
+		}
+		keep = string(plain) == MaskKey(currentPlain)
+	}
+	if keep {
+		var secret model.ProbeSecret
+		if err := store.db.QueryRow(`SELECT id,name,masked,fingerprint,revision,created_at,updated_at
+			FROM probe_secret WHERE id=?`, id).Scan(&secret.ID, &secret.Name, &secret.Masked,
+			&secret.Fingerprint, &secret.Revision, &secret.CreatedAt, &secret.UpdatedAt); err != nil {
+			return nil, err
+		}
+		return &secret, nil
 	}
 	encrypted, err := store.cipher.Encrypt(string(plain))
 	if err != nil {
@@ -57,13 +88,6 @@ func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []
 		return nil, err
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
-		var exists int
-		if scanErr := store.db.QueryRow(`SELECT COUNT(*) FROM probe_secret WHERE id=?`, id).Scan(&exists); scanErr != nil {
-			return nil, scanErr
-		}
-		if exists == 0 {
-			return nil, ErrNotFound
-		}
 		return nil, ErrRevisionConflict
 	}
 	var secret model.ProbeSecret
