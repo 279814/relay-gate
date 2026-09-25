@@ -394,15 +394,19 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 4. 取出 model 值用于选路。只读不改。
+	// 400 文案必须是固定 reason，不得附带 body 切片、model 值或 body 里出现过的 key。
 	inModel, err := ExtractModel(body)
 	if err != nil {
-		if errors.Is(err, ErrDuplicateModel) {
-			writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
-				"请求体顶层 model 键重复")
-			return nil, false
+		msg := "请求体 JSON 无效"
+		switch {
+		case errors.Is(err, ErrDuplicateModel):
+			msg = "请求体顶层 model 键重复"
+		case errors.Is(err, ErrNoModelField):
+			msg = "请求体缺少顶层 model 字段"
+		case errors.Is(err, ErrModelNotString):
+			msg = "顶层 model 的值不是字符串"
 		}
-		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error",
-			fmt.Sprintf("无法确定请求的 model: %v", err))
+		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error", msg)
 		return nil, false
 	}
 

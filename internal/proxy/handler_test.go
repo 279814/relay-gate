@@ -660,6 +660,54 @@ func TestHandler_SelectErrors(t *testing.T) {
 	}
 }
 
+// ExtractModel 失败时的 400 必须只用固定 reason，不得把 body 里的密钥原文回显给客户端。
+func TestHandler_ExtractModelErrorDoesNotEchoBodySecret(t *testing.T) {
+	const secret = "LEAKME_EXTRACTMODEL_SECRET_9f3a7c"
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "非字符串 model 含密钥",
+			body: `{"model":{"token":"` + secret + `"},"max_tokens":1}`,
+			want: "顶层 model 的值不是字符串",
+		},
+		{
+			name: "缺 model 但 body 含密钥字段",
+			body: `{"api_key":"` + secret + `","max_tokens":1}`,
+			want: "请求体缺少顶层 model 字段",
+		},
+		{
+			name: "非法 JSON 键旁夹密钥",
+			body: `{"` + secret + `":`,
+			want: "请求体 JSON 无效",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hs := newHarness(t, nil)
+			rec := hs.serve(hs.anthropicRequest(c.body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("状态码 want 400 got %d：%s", rec.Code, rec.Body.String())
+			}
+			got := rec.Body.String()
+			if !strings.Contains(got, "invalid_request_error") {
+				t.Errorf("响应应含 invalid_request_error，得到 %s", got)
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("响应应含固定 reason %q，得到 %s", c.want, got)
+			}
+			if strings.Contains(got, secret) {
+				t.Errorf("400 不得回显 body 密钥 %q，得到 %s", secret, got)
+			}
+			if hs.gotReq.method != "" {
+				t.Error("ExtractModel 失败的请求不该转发到上游")
+			}
+		})
+	}
+}
+
 // 点名已配置但停用的精确 ModelName 时，不得落到兜底上游（零 RoundTrip）。
 // 从未配置的名字仍可走兜底；启用精确名仍正常转发。
 func TestHandler_DisabledExactModelNameZeroUpstream(t *testing.T) {
