@@ -572,6 +572,44 @@ func TestHeadTail_FullModeSpillsLargeBody(t *testing.T) {
 	}
 }
 
+// DetachBody 移交 spill 文件所有权，不得把全文拼进 mem。
+func TestHeadTail_DetachBodyKeepsSpillOnDisk(t *testing.T) {
+	prev := fullSpillAt
+	fullSpillAt = 4 << 10
+	defer func() { fullSpillAt = prev }()
+
+	ht := NewHeadTail(0, 0)
+	defer ht.Close()
+	const total = 50 << 10
+	var want []byte
+	chunk := bytes.Repeat([]byte("abcdefghij"), 100)
+	for len(want) < total {
+		ht.Write(chunk)
+		want = append(want, chunk...)
+	}
+	if ht.SpillBytes() == 0 {
+		t.Fatal("应已 spill")
+	}
+	mem, path := ht.DetachBody()
+	if path == "" {
+		t.Fatal("DetachBody 应交出 spill 路径")
+	}
+	if len(mem) != 0 {
+		t.Fatalf("有 spill 时 mem 应为空，got %d", len(mem))
+	}
+	if ht.SpillBytes() != 0 {
+		t.Fatal("Detach 后 HeadTail 不应再持有 spill")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("spill 文件应保留全文，want %d got %d", len(want), len(got))
+	}
+}
+
 // 短响应仍整段进内存、不建临时文件 —— 默认路径不能被 spill 拖慢。
 func TestHeadTail_FullModeShortStaysInMemory(t *testing.T) {
 	ht := NewHeadTail(0, 0)

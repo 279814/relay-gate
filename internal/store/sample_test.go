@@ -3,6 +3,8 @@ package store
 import (
 	"bytes"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -755,3 +757,94 @@ func TestInsertSampleWithinQuota_TwoSamplesShareBudget(t *testing.T) {
 		t.Fatalf("第二条未截断却仍声称插入成功：used=%d oneCost=%d", used, oneCost)
 	}
 }
+
+// spill 正文大于内存窗口时，Insert 不得把全文读进一个 []byte；落库后内容完整且临时文件已删。
+func TestInsertSampleWithinQuota_SpillFileChunkedNoAssemble(t *testing.T) {
+	prevChunk := sampleBlobChunk
+	sampleBlobChunk = 4 << 10 // 4 KiB
+	defer func() { sampleBlobChunk = prevChunk }()
+
+	st := testStore(t)
+	dir := t.TempDir()
+	spillPath := filepath.Join(dir, "spill.tmp")
+	want := bytes.Repeat([]byte("abcdefghij"), 2000) // 20 KiB > 2 chunks
+	if err := os.WriteFile(spillPath, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := mkSample(10)
+	s.InBody, s.OutBody, s.RespBody = nil, nil, nil
+	s.RespBodyFile = spillPath
+
+	ok, err := st.InsertSampleWithinQuota(s, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("应写入 spill 样本")
+	}
+	if s.RespBodyFile != "" {
+		t.Fatal("成功落库后应清理 RespBodyFile")
+	}
+	if _, err := os.Stat(spillPath); !os.IsNotExist(err) {
+		t.Fatalf("spill 临时文件应已删除，stat=%v", err)
+	}
+
+	var raw []byte
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample WHERE id=?`, s.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !isSampleMultipart(raw) {
+		prefix := raw
+		if len(prefix) > 16 {
+			prefix = prefix[:16]
+		}
+		t.Fatalf("大于分块窗口的 spill 应存 v1m 分帧信封，got prefix %q", prefix)
+	}
+
+	got, err := st.GetSample(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.RespBody, want) {
+		t.Fatalf("分块落库后正文应完整，want %d got %d", len(want), len(got.RespBody))
+	}
+}
+
+// 配额跳过时也必须删掉 spill 临时文件。
+func TestInsertSampleWithinQuota_SkipRemovesSpillFile(t *testing.T) {
+	st := testStore(t)
+	filler := mkSample(1)
+	filler.InBody, filler.OutBody = nil, nil
+	filler.RespBody = bytes.Repeat([]byte("x"), 4096)
+	if err := st.InsertSample(filler); err != nil {
+		t.Fatal(err)
+	}
+	used, err := st.SampleDiskBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spillPath := filepath.Join(t.TempDir(), "skip-spill.tmp")
+	if err := os.WriteFile(spillPath, bytes.Repeat([]byte("y"), 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := mkSample(2)
+	s.InBody, s.OutBody, s.RespBody = nil, nil, nil
+	s.RespBodyFile = spillPath
+
+	ok, err := st.InsertSampleWithinQuota(s, used) // rem == 0
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("配额已满时应跳过")
+	}
+	if s.RespBodyFile != "" {
+		t.Fatal("跳过后应清理 RespBodyFile")
+	}
+	if _, err := os.Stat(spillPath); !os.IsNotExist(err) {
+		t.Fatalf("跳过后 spill 应已删除，stat=%v", err)
+	}
+}
+

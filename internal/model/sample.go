@@ -1,6 +1,9 @@
 package model
 
-import "net/http"
+import (
+	"net/http"
+	"os"
+)
 
 // Outcome 是一次转发的结果分类（§3.6.2）。
 type Outcome string
@@ -86,10 +89,23 @@ type Sample struct {
 	RespStatus  int         `json:"resp_status"`
 	RespHeaders http.Header `json:"resp_headers"`
 	RespBody    []byte      `json:"resp_body,omitempty"`
+	// RespBodyFile 是完整模式 spill 临时文件路径（≥1 MiB 响应）。
+	// 非空时 RespBody 应为空；落库/跳过/丢弃后必须 ReleaseTempFiles。
+	// 不进 JSON，避免把本机路径泄漏到管理 API。
+	RespBodyFile string `json:"-"`
 
 	Outcome   Outcome    `json:"outcome"`
 	Error     string     `json:"error"`
 	Truncated TruncFlags `json:"truncated"`
 	// Pinned 的样本不参与滚动清理（§3.6.3c）。
 	Pinned bool `json:"pinned"`
+}
+
+// ReleaseTempFiles 删除样本持有的 spill 临时文件。可重复调用。
+func (s *Sample) ReleaseTempFiles() {
+	if s == nil || s.RespBodyFile == "" {
+		return
+	}
+	_ = os.Remove(s.RespBodyFile)
+	s.RespBodyFile = ""
 }

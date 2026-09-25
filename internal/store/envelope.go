@@ -72,11 +72,17 @@ func (c *Cipher) EncryptSampleBlob(plain []byte) ([]byte, error) {
 	return []byte(enc), nil
 }
 
-// DecryptSampleBlob accepts v1 envelopes or legacy plaintext sample rows.
+// DecryptSampleBlob accepts v1 envelopes, v1m chunked envelopes, or legacy plaintext.
 // Plaintext history is never refused so unread rows survive migration.
 func (c *Cipher) DecryptSampleBlob(raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return raw, nil
+	}
+	if isSampleMultipart(raw) {
+		if c == nil {
+			return nil, fmt.Errorf("分块样本信封需要 Cipher")
+		}
+		return decryptSampleMultipart(c, raw)
 	}
 	if !IsSampleEnvelope(raw) {
 		return append([]byte(nil), raw...), nil

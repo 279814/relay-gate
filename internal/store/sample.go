@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -16,7 +17,11 @@ import (
 // 调用方（sample.Recorder）已在后台单 goroutine 里，所以这里不必再考虑并发；
 // 但**必须假设 body 已脱敏** —— 本函数不做脱敏，那是 sample 包的职责。
 // Body BLOBs are stored as v1 envelopes when a Cipher is configured.
+// RespBodyFile（spill）按 sampleBlobChunk 分块加密写入，不把全文读进一个 []byte。
 func (s *Store) InsertSample(smp *model.Sample) error {
+	if smp != nil {
+		defer smp.ReleaseTempFiles()
+	}
 	inBody, err := s.encryptSampleBody(smp.InBody)
 	if err != nil {
 		return err
@@ -24,6 +29,14 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 	outBody, err := s.encryptSampleBody(smp.OutBody)
 	if err != nil {
 		return err
+	}
+	if smp.RespBodyFile != "" {
+		encPath, err := s.encryptSampleBodyFile(smp.RespBodyFile)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(encPath)
+		return s.insertSampleEncryptedFile(smp, inBody, outBody, encPath)
 	}
 	respBody, err := s.encryptSampleBody(smp.RespBody)
 	if err != nil {
@@ -42,8 +55,11 @@ func (s *Store) InsertSample(smp *model.Sample) error {
 // maxBytes <= 0 表示该维度不限，行为与 InsertSample 相同。
 // 返回 inserted=false 表示因配额跳过（不是错误）。
 func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inserted bool, err error) {
+	if smp != nil {
+		defer smp.ReleaseTempFiles()
+	}
 	if maxBytes <= 0 {
-		return true, s.InsertSample(smp)
+		return true, s.insertSampleKeepTemps(smp)
 	}
 	used, err := s.SampleDiskBytes()
 	if err != nil {
@@ -65,6 +81,28 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 		if err != nil {
 			return false, err
 		}
+		if smp.RespBodyFile != "" {
+			encPath, err := s.encryptSampleBodyFile(smp.RespBodyFile)
+			if err != nil {
+				return false, err
+			}
+			fi, statErr := os.Stat(encPath)
+			if statErr != nil {
+				_ = os.Remove(encPath)
+				return false, statErr
+			}
+			need := int64(len(inBody)+len(outBody)) + fi.Size()
+			if need <= rem {
+				err := s.insertSampleEncryptedFile(smp, inBody, outBody, encPath)
+				_ = os.Remove(encPath)
+				return true, err
+			}
+			_ = os.Remove(encPath)
+			_ = os.Remove(smp.RespBodyFile)
+			smp.RespBodyFile = ""
+			smp.Truncated |= model.TruncRespBody
+			continue
+		}
 		respBody, err := s.encryptSampleBody(smp.RespBody)
 		if err != nil {
 			return false, err
@@ -75,8 +113,12 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 		}
 		// 信封膨胀后仍超剩余：继续丢掉正文（先 resp，与采集侧预算顺序一致）。
 		switch {
-		case len(smp.RespBody) > 0:
+		case len(smp.RespBody) > 0 || smp.RespBodyFile != "":
 			smp.RespBody = nil
+			if smp.RespBodyFile != "" {
+				_ = os.Remove(smp.RespBodyFile)
+				smp.RespBodyFile = ""
+			}
 			smp.Truncated |= model.TruncRespBody
 		case len(smp.OutBody) > 0:
 			smp.OutBody = nil
@@ -90,11 +132,42 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 	}
 }
 
+// insertSampleKeepTemps 与 InsertSample 相同但不 ReleaseTempFiles（供 WithinQuota 的 defer 统一清理）。
+func (s *Store) insertSampleKeepTemps(smp *model.Sample) error {
+	inBody, err := s.encryptSampleBody(smp.InBody)
+	if err != nil {
+		return err
+	}
+	outBody, err := s.encryptSampleBody(smp.OutBody)
+	if err != nil {
+		return err
+	}
+	if smp.RespBodyFile != "" {
+		encPath, err := s.encryptSampleBodyFile(smp.RespBodyFile)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(encPath)
+		return s.insertSampleEncryptedFile(smp, inBody, outBody, encPath)
+	}
+	respBody, err := s.encryptSampleBody(smp.RespBody)
+	if err != nil {
+		return err
+	}
+	return s.insertSampleEncrypted(smp, inBody, outBody, respBody)
+}
+
 func plainSampleBodyBytes(smp *model.Sample) int64 {
 	if smp == nil {
 		return 0
 	}
-	return int64(len(smp.InBody) + len(smp.OutBody) + len(smp.RespBody))
+	n := int64(len(smp.InBody) + len(smp.OutBody) + len(smp.RespBody))
+	if smp.RespBodyFile != "" {
+		if fi, err := os.Stat(smp.RespBodyFile); err == nil {
+			n += fi.Size()
+		}
+	}
+	return n
 }
 
 // truncateSamplePlainBodies 把三条正文裁到合计不超过 rem。
@@ -119,6 +192,26 @@ func truncateSamplePlainBodies(smp *model.Sample, rem int64) {
 		rem = 0
 	} else {
 		rem -= int64(len(smp.OutBody))
+	}
+	if smp.RespBodyFile != "" {
+		fi, err := os.Stat(smp.RespBodyFile)
+		if err != nil {
+			_ = os.Remove(smp.RespBodyFile)
+			smp.RespBodyFile = ""
+			smp.Truncated |= model.TruncRespBody
+			return
+		}
+		if fi.Size() > rem {
+			if rem <= 0 {
+				_ = os.Remove(smp.RespBodyFile)
+				smp.RespBodyFile = ""
+			} else if err := os.Truncate(smp.RespBodyFile, rem); err != nil {
+				_ = os.Remove(smp.RespBodyFile)
+				smp.RespBodyFile = ""
+			}
+			smp.Truncated |= model.TruncRespBody
+		}
+		return
 	}
 	if int64(len(smp.RespBody)) > rem {
 		smp.RespBody = append([]byte(nil), smp.RespBody[:rem]...)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -661,8 +662,21 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
 	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
 	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
-	// 它已被 HeadTail 限长，不需要再截。
-	respSafe := sample.RedactBodyKeys(oc.respTee.Bytes(), keys)
+	// 完整模式大包：DetachBody 保留 spill，不把全文拼进 []byte。
+	// 有界头尾 / 短响应：仍走 Bytes()（含省略标记与尾缓冲拼装）。
+	var respSafe []byte
+	var respSpill string
+	if oc.respTee.SpillBytes() > 0 {
+		_, respSpill = oc.respTee.DetachBody()
+		if err := sample.RedactBodyFile(respSpill, keys); err != nil {
+			h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
+				"err", err, "route", cand.Route.ID)
+			_ = os.Remove(respSpill)
+			respSpill = ""
+		}
+	} else {
+		respSafe = sample.RedactBodyKeys(oc.respTee.Bytes(), keys)
+	}
 
 	var flags model.TruncFlags
 	if inCut {
@@ -677,10 +691,16 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	if oc.respTee.QuotaOverflow() {
 		// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。
 		// 采集是旁路，只记日志，绝不回写或中断已完成的转发。
+		kept := len(respSafe)
+		if respSpill != "" {
+			if fi, err := os.Stat(respSpill); err == nil {
+				kept = int(fi.Size())
+			}
+		}
 		h.log.Warn("样本响应超过剩余磁盘配额，已改留头尾",
 			"route", cand.Route.ID,
 			"resp_total", oc.respTee.Total(),
-			"resp_kept", len(respSafe))
+			"resp_kept", kept)
 	}
 
 	modelOut := inModel
@@ -720,8 +740,9 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		RespStatus: res.Status,
 		// 响应头也要过脱敏：上游可能回 Set-Cookie，也可能把 key 回显在
 		// 自定义头里。三组头走同一条规则，不留例外。
-		RespHeaders: sample.RedactHeaders(res.RespHeaders, keys),
-		RespBody:    respSafe,
+		RespHeaders:  sample.RedactHeaders(res.RespHeaders, keys),
+		RespBody:     respSafe,
+		RespBodyFile: respSpill,
 
 		Outcome:   classifyOutcome(res),
 		Truncated: flags,
