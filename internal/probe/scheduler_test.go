@@ -751,7 +751,7 @@ func TestScheduler_ArmedL2SkipsRoundTripAfterDisable(t *testing.T) {
 		secondSeen:  make(chan struct{}),
 	}
 	track := newRecordingTracker()
-	track.l1Allowed = map[int64]bool{}    // L1 would also re-check Snapshot; keep this race on L2 only
+	track.l1Allowed = map[int64]bool{} // L1 would also re-check Snapshot; keep this race on L2 only
 	track.l2Allowed = map[int64]bool{100: true}
 	sched := NewScheduler(gate, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
 		WithTargets(testTargets(), nil)
