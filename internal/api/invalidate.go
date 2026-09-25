@@ -108,11 +108,11 @@ func (s *SemanticConfigInvalidator) InvalidateModelNameDeleted(modelNameID int64
 
 // ConfigPublisher 发布 livecfg 同代 routing + Probe 快照（§4.9）。
 //
-// livecfg.Source 实现本接口。Upstream / ModelName / Route 的成功
-// create/update/delete，以及 Endpoint 的成功 create/update，必须在 SQL
-// 成功后 Invalidate+Refresh，否则 2s TTL 内下一次 preamble/Select 仍可能
-// 看到旧 enabled、旧路由或已删行，且 outbound 仍可能用旧 url_override
-// （docs/01 §6.4 候选须启用；§9.2 内存立即失效不等待 livecfg TTL）。
+// livecfg.Source 实现本接口。Upstream / ModelName / Route / Endpoint 的成功
+// create/update/delete 必须在 SQL 成功后 Invalidate+Refresh，否则 2s TTL
+// 内下一次 preamble/Select 仍可能看到旧 enabled、旧路由或已删行，且
+// outbound 仍可能用旧 url_override（docs/01 §6.4 候选须启用；§9.2 内存
+// 立即失效不等待 livecfg TTL）。
 type ConfigPublisher interface {
 	Invalidate()
 	Refresh() error
@@ -137,8 +137,8 @@ func (s *Server) WithConfigPublisher(p ConfigPublisher) *Server {
 
 // publishAfterSuccessfulWrite forces the next select/preamble (and Probe)
 // snapshot to reflect rows just written to SQL. Only call after
-// Create*/Update*/Delete* of Upstream / ModelName / Route, or after
-// Create*/Update* of Endpoint, succeeded.
+// Create*/Update*/Delete* of Upstream / ModelName / Route / Endpoint
+// succeeded.
 //
 // On Refresh failure the HTTP write must not return success: a failed
 // Refresh stamps lastAttempt while leaving the pre-write routing pointer,

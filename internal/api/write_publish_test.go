@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -394,6 +395,123 @@ func TestWrite_EndpointFailedStoreDoesNotPublish(t *testing.T) {
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv || afterRef != beforeRef {
 		t.Fatalf("failed endpoint update must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
+	}
+}
+
+// Endpoint delete must Invalidate+Refresh so the next Probe/outbound Endpoint()
+// read omits the row within TTL; a sibling kind on the same upstream stays.
+func TestWrite_EndpointDeleteGoneBeforeHandlerReturns(t *testing.T) {
+	s, _, src, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-del-u","base_url":"https://ep-del.example.com","api_key":"sk-dddddddddddd"}`)
+	drop, err := src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingWarm, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// DeleteEndpoint requires a disabled upstream with no Route dependents.
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
+	}
+
+	beforeInv, beforeRef := pub.counts()
+	rec = do(t, h, "DELETE",
+		"/admin/api/upstream-endpoints/"+itoa(drop.ID)+"?expected_revision="+itoa(drop.Revision),
+		"", true)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete endpoint: %d %s", rec.Code, rec.Body.String())
+	}
+	assertPublished(t, pub, beforeInv, beforeRef)
+
+	_, err = src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted endpoint still in Probe snapshot within TTL: %v", err)
+	}
+	sibling, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sibling.ID != siblingWarm.ID || sibling.Revision != siblingWarm.Revision {
+		t.Fatalf("sibling messages endpoint changed: before=%+v after=%+v", siblingWarm, sibling)
+	}
+}
+
+func TestWrite_EndpointDeleteRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T) {
+	s, _, src, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-del-rf-u","base_url":"https://ep-del-rf.example.com","api_key":"sk-eeeeeeeeeeee"}`)
+	drop, err := src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
+	}
+
+	pub.mu.Lock()
+	pub.refreshErr = errRefreshBoom
+	pub.skipInnerRefresh = true
+	pub.mu.Unlock()
+
+	beforeInv, beforeRef := pub.counts()
+	rec = do(t, h, "DELETE",
+		"/admin/api/upstream-endpoints/"+itoa(drop.ID)+"?expected_revision="+itoa(drop.Revision),
+		"", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("Refresh failure must not return 204 while Probe may be stale")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
+		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
+	}
+
+	// Re-Invalidate forces get() to reload SQL: deleted row must be gone.
+	_, err = src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("after Refresh failure + re-Invalidate want ErrNotFound, got %v", err)
+	}
+}
+
+func TestWrite_EndpointDeleteFailedStoreDoesNotPublish(t *testing.T) {
+	s, _, src, pub := newLivecfgServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upID := mkUpstreamViaAPI(t, h,
+		`{"name":"ep-del-fail-u","base_url":"https://ep-del-fail.example.com","api_key":"sk-ffffffffffff"}`)
+	drop, err := src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
+	}
+
+	beforeInv, beforeRef := pub.counts()
+	forceTableDeleteFail(t, s, "upstream_endpoint")
+	rec = do(t, h, "DELETE",
+		"/admin/api/upstream-endpoints/"+itoa(drop.ID)+"?expected_revision="+itoa(drop.Revision),
+		"", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("expected delete failure, got 204")
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("failed endpoint delete must not publish: inv=%d→%d ref=%d→%d",
 			beforeInv, afterInv, beforeRef, afterRef)
 	}
 }

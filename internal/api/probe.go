@@ -204,6 +204,12 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	if getErr == nil && cur.UpstreamID > 0 {
 		s.invalidateUpstream(cur.UpstreamID)
 	}
+	// Deleted Endpoint must leave the livecfg Probe snapshot immediately;
+	// otherwise outbound/probe keep the pre-delete URL/path for the 2s TTL.
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusNoContent, nil)
 }
 
