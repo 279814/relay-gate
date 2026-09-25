@@ -3,6 +3,7 @@ package runstate
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -240,6 +241,40 @@ func TestController_PauseDrainPendingAndOldRevision409(t *testing.T) {
 	}
 	if c.PauseDrainPending() {
 		t.Fatal("后台 drain 应最终清除 pending")
+	}
+}
+
+// Pause drain recover must not put the panic value into TransitionPendingError:
+// setState echoes pending.Error() to the client, and panics may hold secrets.
+func TestController_PauseDrainPanicOmitsPanicValue(t *testing.T) {
+	st := newMemStore(model.RunStateRunning, 1)
+	c, err := NewController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.drainRetry = 50 * time.Millisecond
+
+	const panicSecret = "drain boom"
+	synth := &fakeSynth{cancelPanic: true}
+	_ = c.BindSyntheticController(synth)
+
+	_, err = c.Set(context.Background(), model.RunStatePaused, 1)
+	var pending *TransitionPendingError
+	if !errors.As(err, &pending) || pending.Code != PauseDrainPendingCode {
+		t.Fatalf("期望 pause_drain_pending，got %v", err)
+	}
+	if strings.Contains(pending.Error(), panicSecret) {
+		t.Fatalf("Error 不得含 panic 值: %q", pending.Error())
+	}
+	if pending.Cause != nil && strings.Contains(pending.Cause.Error(), panicSecret) {
+		t.Fatalf("Cause 不得含 panic 值: %v", pending.Cause)
+	}
+	if !errors.Is(pending.Cause, errCancelSyntheticPanic) {
+		t.Fatalf("Cause 应为固定 CancelSynthetic panic，got %v", pending.Cause)
+	}
+	if !c.PauseDrainPending() {
+		t.Fatal("应标记 drain pending")
 	}
 }
 

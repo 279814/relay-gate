@@ -460,10 +460,15 @@ func RevisionConflict(err error) bool {
 	return errors.Is(err, errRevisionConflict)
 }
 
+// errCancelSyntheticPanic is the fixed client/log-safe stand-in when
+// CancelSynthetic panics. The panic value must never be formatted into an
+// error that reaches HTTP responses (it may hold secrets or request data).
+var errCancelSyntheticPanic = errors.New("CancelSynthetic panic")
+
 func safeCancel(synth SyntheticController, ctx context.Context) (err error) {
 	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("CancelSynthetic panic: %v", rec)
+		if recover() != nil {
+			err = errCancelSyntheticPanic
 		}
 	}()
 	if ctx == nil {
