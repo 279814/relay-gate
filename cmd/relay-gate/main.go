@@ -95,6 +95,19 @@ func runServer() error {
 		return fmt.Errorf("首次凭据: %w", err)
 	}
 
+	// §12.7：进程重启发现未完成阶段时先执行恢复。db_committed 必须在
+	// LoadActive / NewCipher / Open Store 之前 ActivatePending，否则旧 active
+	// 无法解密已在新 Key 下重封的库密文。恢复完成前保持 maintenance。
+	kr := keyring.Open(dataDir)
+	holdMaint, krStatus, err := kr.RecoverUnfinished()
+	if err != nil {
+		if !errors.Is(err, keyring.ErrNotInitialized) {
+			return fmt.Errorf("恢复未完成 Master Key 轮换: %w", err)
+		}
+		holdMaint = false
+		krStatus = keyring.Status{}
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -105,7 +118,7 @@ func runServer() error {
 		return err
 	}
 	dataDir = cfg.DataDir()
-	kr := keyring.Open(dataDir)
+	kr = keyring.Open(dataDir)
 	if err := kr.EnsureInitialized(cipher.KeyID(), cfg.EncKey); err != nil {
 		return fmt.Errorf("初始化 keyring: %w", err)
 	}
@@ -248,12 +261,8 @@ func runServer() error {
 		return fmt.Errorf("绑定 synthetic controller: %w", err)
 	}
 	runCtrl.BindWarmupSource(tracker)
-	// §12.7：进程重启发现未完成阶段时先执行恢复，恢复完成前保持 maintenance。
-	// prepared 且数据库未提交：AbortPrepared（删 pending 并回滚），然后可准入。
-	holdMaint, krStatus, err := kr.RecoverUnfinished()
-	if err != nil {
-		return fmt.Errorf("恢复未完成 Master Key 轮换: %w", err)
-	}
+	// §12.7：key_activated 等仍需 hold 的阶段在此进入 maintenance（db_committed
+	// 已在打开 Store 前前滚完成，holdMaint 为 false）。
 	if holdMaint {
 		if err := runCtrl.EnterMaintenance("master_key_rotation_incomplete"); err != nil {
 			return fmt.Errorf("未完成 Master Key 轮换，进入 maintenance: %w", err)
