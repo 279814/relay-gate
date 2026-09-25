@@ -33,6 +33,24 @@ func TestProbeSecretCRUDNeverListsCiphertextAndUsesRevisionCAS(t *testing.T) {
 	if _, err := store.UpdateProbeSecret(secret.ID, 1, []byte("stale")); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("stale update = %v", err)
 	}
+
+	// 读接口回显的 mask / 空 value 回写时必须保留密文，不能把 mask 当新明文。
+	kept, err := store.UpdateProbeSecret(secret.ID, 2, []byte(updated.Masked))
+	if err != nil || kept.Revision != 2 || kept.Fingerprint != updated.Fingerprint {
+		t.Fatalf("masked echo overwrite: %+v err=%v", kept, err)
+	}
+	resolvedKeep, err := store.ResolveProbeSecret(context.Background(), "tenant_token")
+	if err != nil || !bytes.Equal(resolvedKeep.Plain, []byte("rotated-secret-value")) {
+		t.Fatalf("masked echo must keep plaintext: %+v err=%v", resolvedKeep, err)
+	}
+	keptEmpty, err := store.UpdateProbeSecret(secret.ID, 2, nil)
+	if err != nil || keptEmpty.Revision != 2 {
+		t.Fatalf("empty value keep: %+v err=%v", keptEmpty, err)
+	}
+	resolvedEmpty, err := store.ResolveProbeSecret(context.Background(), "tenant_token")
+	if err != nil || !bytes.Equal(resolvedEmpty.Plain, []byte("rotated-secret-value")) {
+		t.Fatalf("empty value must keep plaintext: %+v err=%v", resolvedEmpty, err)
+	}
 }
 
 func TestRecipeVersionIsImmutableAndSecretBindingDoesNotReattachByName(t *testing.T) {

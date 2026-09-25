@@ -140,8 +140,8 @@ func (s *Store) CreateUpstream(u *model.Upstream) error {
 	return s.CreateUpstreamWithEndpoints(context.Background(), u, canonicalEndpointBundle(u))
 }
 
-// UpdateUpstream 全量更新。APIKey 为空表示「不改 key」——
-// 因为 GET 返回的是脱敏值，前端把它原样提交回来时不能当作真 key 写入，
+// UpdateUpstream 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
+// GET/list 回显的是脱敏值，前端把它原样提交回来时不能当作真 key 写入，
 // 否则一次编辑就会把 key 破坏成 "sk-abcd…wxyz"。
 func (s *Store) UpdateUpstream(u *model.Upstream) error {
 	current, err := s.GetUpstream(u.ID)
@@ -185,6 +185,10 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 		if err := validateRouteEndpointCompleteness(tx, upstream.ID); err != nil {
 			return err
 		}
+	}
+	// 脱敏回显与空串都归一成「不改」；只有真正的新明文才换钥。
+	if upstream.APIKey == "" || (current.APIKey != "" && upstream.APIKey == MaskKey(current.APIKey)) {
+		upstream.APIKey = ""
 	}
 	credentialChanged := upstream.APIKey != "" && upstream.APIKey != current.APIKey
 	networkChanged := upstream.BaseURL != current.BaseURL || upstream.ProxyURL != current.ProxyURL ||

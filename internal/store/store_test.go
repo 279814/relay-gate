@@ -85,6 +85,28 @@ func TestUpstreamCRUD(t *testing.T) {
 		t.Errorf("显式传入新 key 时应更新，得到 %q", rotated.APIKey)
 	}
 
+	// GET 回显的 MaskKey 原样 PUT 回来时绝不能覆盖真钥（与空串同属「不改」）。
+	maskedEcho := MaskKey(rotated.APIKey)
+	rotated.Name = "sta-mask-echo"
+	rotated.APIKey = maskedEcho
+	if err := st.UpdateUpstream(rotated); err != nil {
+		t.Fatal(err)
+	}
+	afterMask, err := st.GetUpstream(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterMask.Name != "sta-mask-echo" {
+		t.Errorf("name 应仍可更新：%q", afterMask.Name)
+	}
+	if afterMask.APIKey != "sk-rotated-key-value" {
+		t.Errorf("回写脱敏值不得覆盖真钥，得到 %q（mask=%q）", afterMask.APIKey, maskedEcho)
+	}
+	if afterMask.CredentialRevision != rotated.CredentialRevision {
+		t.Errorf("脱敏回写不应 bump credential_revision：got %d want %d",
+			afterMask.CredentialRevision, rotated.CredentialRevision)
+	}
+
 	if err := st.DeleteUpstream(u.ID); err != nil {
 		t.Fatal(err)
 	}

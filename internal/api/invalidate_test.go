@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -86,6 +87,72 @@ func TestInvalidate_CreateRouteTriggersProbe(t *testing.T) {
 	if routes != 1 {
 		t.Errorf("新建 Route 应触发 1 次探活，得到 %d", routes)
 	}
+}
+
+func TestInvalidate_UpstreamMaskedKeyEchoKeepsSecret(t *testing.T) {
+	// GET 回显的 api_key 是 MaskKey 结果；PUT 原样带回时绝不能覆盖密文，
+	// 也不能当成「key 变了」去触发整站重探。
+	s, h := newTestServer(t)
+	const plain = "sk-aaaaaaaaaaaa"
+	id := mkUpstreamViaAPI(t, h,
+		`{"name":"u1","base_url":"https://a.example.com","api_key":"`+plain+`"}`)
+
+	get := do(t, h, "GET", "/admin/api/upstreams/"+itoa(id), "", true)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET: %d %s", get.Code, get.Body.String())
+	}
+	var before struct {
+		APIKey             string `json:"api_key"`
+		APIKeyIsSet        bool   `json:"api_key_is_set"`
+		CredentialRevision int64  `json:"credential_revision"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &before); err != nil {
+		t.Fatal(err)
+	}
+	if before.APIKey == "" || before.APIKey == plain || !before.APIKeyIsSet {
+		t.Fatalf("GET 应回脱敏值且 is_set：%+v", before)
+	}
+
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
+		`{"name":"u1-renamed","api_key":`+mustJSON(t, before.APIKey)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT masked echo: %d %s", rec.Code, rec.Body.String())
+	}
+	var after struct {
+		Name               string `json:"name"`
+		APIKey             string `json:"api_key"`
+		APIKeyIsSet        bool   `json:"api_key_is_set"`
+		CredentialRevision int64  `json:"credential_revision"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Name != "u1-renamed" || after.APIKey != before.APIKey || !after.APIKeyIsSet {
+		t.Fatalf("响应应保留脱敏回显且改名成功：%+v", after)
+	}
+	if after.CredentialRevision != before.CredentialRevision {
+		t.Fatalf("脱敏回写不应 bump credential_revision：got %d want %d",
+			after.CredentialRevision, before.CredentialRevision)
+	}
+	if strings.Contains(rec.Body.String(), plain) {
+		t.Fatal("写响应不得回显明文 api_key")
+	}
+	got, err := s.st.GetUpstream(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIKey != plain {
+		t.Fatalf("库中真钥被覆盖成 %q", got.APIKey)
+	}
+}
+
+func mustJSON(t *testing.T, v string) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestInvalidate_UpstreamKeyChangeTriggersProbe(t *testing.T) {
