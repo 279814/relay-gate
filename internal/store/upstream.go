@@ -372,6 +372,14 @@ func (s *Store) DeleteUpstream(id int64) (err error) {
 		return err
 	}
 
+	// probe_cost_daily has no FK; ListProbeCostDaily filters by bare ids.
+	// Drop rollups for this Upstream and its child Routes in the same
+	// transaction so a reused id cannot inherit the previous station's totals.
+	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE upstream_id=?
+		OR route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id, id); err != nil {
+		return err
+	}
+
 	res, err := tx.Exec(`DELETE FROM upstream WHERE id=?`, id)
 	if err != nil {
 		return err
