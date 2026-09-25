@@ -8,11 +8,13 @@ import (
 
 func TestRedactHeaders_MasksCredentialsKeepsStructure(t *testing.T) {
 	const key = "sk-ant-api03-real-secret-value-here"
+	const adminPW = "super-secret-admin-password-value"
 	in := http.Header{}
 	in.Set("Authorization", "Bearer "+key)
 	in.Set("X-Api-Key", key)
 	in.Set("Api-Key", key)
 	in.Set("Cookie", "session="+key)
+	in.Set("X-Admin-Password", adminPW)
 	in.Set("User-Agent", "claude-cli/2.1.220 (external, sdk-cli)")
 	in.Set("Anthropic-Version", "2023-06-01")
 
@@ -21,10 +23,13 @@ func TestRedactHeaders_MasksCredentialsKeepsStructure(t *testing.T) {
 	// 凭据一个字都不能留
 	for k, vs := range out {
 		for _, v := range vs {
-			if strings.Contains(v, key) {
-				t.Errorf("头 %s 里残留了完整 key: %q", k, v)
+			if strings.Contains(v, key) || strings.Contains(v, adminPW) {
+				t.Errorf("头 %s 里残留了完整凭据: %q", k, v)
 			}
 		}
+	}
+	if out.Get("X-Admin-Password") == "" || out.Get("X-Admin-Password") == adminPW {
+		t.Errorf("X-Admin-Password 应脱敏保留头名，得到 %q", out.Get("X-Admin-Password"))
 	}
 	// 但结构必须保留：调探活时要知道 key 放在哪个头、什么格式（§3.6.3b）
 	if got := out.Get("Authorization"); !strings.HasPrefix(got, "Bearer ") {
