@@ -4,6 +4,8 @@
 package security
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"net/url"
 	"regexp"
 	"strings"
@@ -62,7 +64,7 @@ func (c *Center) Record(f Finding) Finding {
 	defer c.mu.Unlock()
 	c.seq++
 	if f.ID == "" {
-		f.ID = time.Now().UTC().Format("20060102T150405") + "-" + itoa(c.seq)
+		f.ID = newFindingID(time.Now().UTC(), c.seq)
 	}
 	if f.AtMS == 0 {
 		f.AtMS = time.Now().UnixMilli()
@@ -75,6 +77,24 @@ func (c *Center) Record(f Finding) Finding {
 		c.findings = c.findings[:c.limit]
 	}
 	return f
+}
+
+// newFindingID builds a durable finding id. The second-granularity clock plus
+// per-process seq alone collide across restarts in the same UTC second
+// (seq resets to 1); a random suffix keeps INSERT OR REPLACE from wiping an
+// older security_finding row. Existing YYYYMMDDTHHMMSS-N ids remain valid.
+func newFindingID(now time.Time, seq uint64) string {
+	return now.UTC().Format("20060102T150405") + "-" + itoa(seq) + "-" + findingIDSuffix()
+}
+
+func findingIDSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Entropy failure is rare; nanoseconds still differ across process
+		// restarts in the same wall-clock second for practical purposes.
+		return itoa(uint64(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // List returns newest-first findings, optionally filtered by severity.
