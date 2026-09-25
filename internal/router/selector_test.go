@@ -997,3 +997,100 @@ func TestWeightTotal_MaxIntPairScales(t *testing.T) {
 		t.Fatalf("total=%d 应等于 %d+%d", total, w0, w1)
 	}
 }
+
+// 名称已命中但候选全是短 api_key 时，不得落到前缀或兜底（与停用精确名同口径）。
+// 同名长钥兄弟仍可选；未配置名仍走兜底；启用精确仍优于前缀。
+func TestSelect_ShortKeyMatchDoesNotFallToPrefixOrFallback(t *testing.T) {
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	long := strings.Repeat("y", model.MinRedactableKeyLen)
+
+	mns := []*model.ModelName{
+		{ID: 1, Name: "claude-opus-5", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, Enabled: true},
+		{ID: 2, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 9, Name: "catch-all", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, IsFallback: true, Enabled: true},
+	}
+	ups := []*model.Upstream{
+		{ID: 10, Name: "exact-short", APIKey: short, Enabled: true},
+		{ID: 20, Name: "prefix-long", APIKey: long, Enabled: true},
+		{ID: 90, Name: "fb-long", APIKey: long, Enabled: true},
+	}
+	rts := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 900, ModelNameID: 9, UpstreamID: 90, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snap := BuildSnapshot(mns, ups, rts)
+	hv := newFakeHealth()
+
+	if _, err := Select(snap, hv, "claude-opus-5", model.ProtoAnthropic); !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("exact all-short must not use prefix/fallback, got %v", err)
+	}
+
+	// 同名长钥兄弟：短钥跳过，长钥可用。
+	upsLongSibling := []*model.Upstream{
+		{ID: 10, Name: "exact-short", APIKey: short, Enabled: true},
+		{ID: 11, Name: "exact-long", APIKey: long, Enabled: true},
+		{ID: 20, Name: "prefix-long", APIKey: long, Enabled: true},
+	}
+	rtsSibling := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 101, ModelNameID: 1, UpstreamID: 11, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snapSib := BuildSnapshot(mns[:2], upsLongSibling, rtsSibling)
+	c, err := Select(snapSib, hv, "claude-opus-5", model.ProtoAnthropic)
+	if err != nil || c.Route.ID != 101 {
+		t.Fatalf("long sibling on exact must win, got %+v err=%v", c, err)
+	}
+	c.Release()
+
+	// 未配置名仍走兜底。
+	c, err = Select(snap, hv, "never-configured", model.ProtoAnthropic)
+	if err != nil || c.Route.ID != 900 {
+		t.Fatalf("unknown name should use fallback route 900, got %+v err=%v", c, err)
+	}
+	c.Release()
+
+	// 更长前缀全短钥 → 不得落到更短前缀或兜底。
+	mnsPref := []*model.ModelName{
+		{ID: 2, Name: "claude-opus", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 3, Name: "claude-", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchPrefix, Enabled: true},
+		{ID: 9, Name: "catch-all", Protocol: model.ProtoAnthropic,
+			MatchMode: model.MatchExact, IsFallback: true, Enabled: true},
+	}
+	upsPref := []*model.Upstream{
+		{ID: 20, Name: "long-prefix-short-key", APIKey: short, Enabled: true},
+		{ID: 30, Name: "short-prefix-long-key", APIKey: long, Enabled: true},
+		{ID: 90, Name: "fb-long", APIKey: long, Enabled: true},
+	}
+	rtsPref := []*model.Route{
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 300, ModelNameID: 3, UpstreamID: 30, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 900, ModelNameID: 9, UpstreamID: 90, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snapPref := BuildSnapshot(mnsPref, upsPref, rtsPref)
+	if _, err := Select(snapPref, hv, "claude-opus-5-thinking", model.ProtoAnthropic); !errors.Is(err, ErrNoRouteAvailable) {
+		t.Fatalf("all-short longer prefix must not use shorter prefix/fallback, got %v", err)
+	}
+
+	// 精确长钥仍优于前缀。
+	upsExactLong := []*model.Upstream{
+		{ID: 10, Name: "exact-long", APIKey: long, Enabled: true},
+		{ID: 20, Name: "prefix-long", APIKey: long, Enabled: true},
+	}
+	rtsExactLong := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 1, Enabled: true},
+		{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 1, Enabled: true},
+	}
+	snapEL := BuildSnapshot(mns[:2], upsExactLong, rtsExactLong)
+	c, err = Select(snapEL, hv, "claude-opus-5", model.ProtoAnthropic)
+	if err != nil || c.Route.ID != 100 {
+		t.Fatalf("exact long must beat prefix, got %+v err=%v", c, err)
+	}
+	c.Release()
+}

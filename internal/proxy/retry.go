@@ -294,14 +294,14 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 				cand.Release()
 				continue
 			}
-			// 脏行/历史短 api_key：当作 config_error 跳过，不占出站、不换站重试额度。
+			// 脏行/历史短 api_key：SelectExcluding 已按短钥剔除并阻断前缀/兜底回落。
+			// 若仍选出，fail closed，不得再 exclude 后跨 ModelName 重选。
 			if model.APIKeyTooShortForOutbound(cand.Upstream.APIKey) {
-				h.log.Warn("上游 api_key 短于脱敏下限，跳过本 Route",
+				h.log.Warn("上游 api_key 短于脱敏下限，拒绝出站",
 					"upstream", cand.Upstream.ID, "route", cand.Route.ID,
 					"min_len", model.MinRedactableKeyLen, "got_len", len(cand.Upstream.APIKey))
-				exclude[cand.Route.ID] = true
 				cand.Release()
-				continue
+				return nil, false, fmt.Errorf("%w: 上游 api_key 短于脱敏下限", router.ErrNoRouteAvailable)
 			}
 			wrapped, ok := h.wrapRecoveryIfNeeded(cand)
 			if ok {

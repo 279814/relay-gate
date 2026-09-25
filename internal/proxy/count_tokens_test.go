@@ -800,6 +800,50 @@ func TestCountTokens_ShortKeySkippedNoOutbound(t *testing.T) {
 	}
 }
 
+// 精确名已命中且候选全短钥时，count_tokens 不得打到前缀/兜底上游（本地粗算可）。
+func TestCountTokens_ShortKeyExactDoesNotHitPrefixOrFallback(t *testing.T) {
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	long := strings.Repeat("y", model.MinRedactableKeyLen)
+
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"input_tokens":99}`))
+	})
+	exact := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	prefix := &model.ModelName{ID: 2, Name: "claude-",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchPrefix, Enabled: true}
+	fallback := &model.ModelName{ID: 9, Name: "catch-all",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, IsFallback: true, Enabled: true}
+	upShort := &model.Upstream{ID: 10, Name: "exact-short", BaseURL: hs.up.URL,
+		APIKey: short, AuthStyle: model.AuthAuto, Enabled: true}
+	upLong := &model.Upstream{ID: 20, Name: "other-long", BaseURL: hs.up.URL,
+		APIKey: long, AuthStyle: model.AuthAuto, Enabled: true}
+	hs.cfg.snap = router.BuildSnapshot(
+		[]*model.ModelName{exact, prefix, fallback},
+		[]*model.Upstream{upShort, upLong},
+		[]*model.Route{
+			{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
+			{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true},
+			{ID: 900, ModelNameID: 9, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true},
+		},
+	)
+
+	rec := hs.serve(hs.countTokensRequest(
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (local estimate)", rec.Code)
+	}
+	if rec.Header().Get("X-Relay-Count-Tokens") != "estimated" {
+		t.Fatalf("want local estimate header, got %q", rec.Header().Get("X-Relay-Count-Tokens"))
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("short-key exact must not RoundTrip prefix/fallback, hits=%d", n)
+	}
+}
+
 // 上游未配 key 时必须 fail closed，且降级路径仍能作答。
 //
 // 行为在 P0-04 变了，而新行为是对的：旧的 injectAuth 在 key 为空时静默

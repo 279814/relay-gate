@@ -2,10 +2,13 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/router"
 )
 
 // 脏行/历史短 api_key：不得被选中出站；仅候选为短钥时回无可用 Route；
@@ -96,4 +99,76 @@ func TestSelect_SkipsShortUpstreamAPIKey(t *testing.T) {
 			t.Fatalf("出站 key = %q, want long key", gotKey)
 		}
 	})
+}
+
+// 精确名已命中且候选全是短 api_key 时，不得落到前缀或兜底上游（零 RoundTrip）。
+// messages / responses / chat completions 共用 selectFor，一并钉住。
+func TestSelect_ShortKeyExactDoesNotHitPrefixOrFallback(t *testing.T) {
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	long := strings.Repeat("y", model.MinRedactableKeyLen)
+
+	cases := []struct {
+		name  string
+		path  string
+		proto model.Protocol
+	}{
+		{"messages", "/v1/messages", model.ProtoAnthropic},
+		{"responses", "/v1/responses", model.ProtoOpenAIResponses},
+		{"chat", "/v1/chat/completions", model.ProtoOpenAIChat},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var hits atomic.Int32
+			hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"id":"ok"}`))
+			})
+			exact := &model.ModelName{ID: 1, Name: "claude-opus-5",
+				Protocol: c.proto, MatchMode: model.MatchExact, Enabled: true}
+			prefix := &model.ModelName{ID: 2, Name: "claude-",
+				Protocol: c.proto, MatchMode: model.MatchPrefix, Enabled: true}
+			fallback := &model.ModelName{ID: 9, Name: "catch-all",
+				Protocol: c.proto, MatchMode: model.MatchExact, IsFallback: true, Enabled: true}
+			upShort := &model.Upstream{ID: 10, Name: "exact-short", BaseURL: hs.up.URL,
+				APIKey: short, AuthStyle: model.AuthAuto, Enabled: true}
+			upLong := &model.Upstream{ID: 20, Name: "other-long", BaseURL: hs.up.URL,
+				APIKey: long, AuthStyle: model.AuthAuto, Enabled: true}
+			hs.cfg.snap = router.BuildSnapshot(
+				[]*model.ModelName{exact, prefix, fallback},
+				[]*model.Upstream{upShort, upLong},
+				[]*model.Route{
+					{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
+					{ID: 200, ModelNameID: 2, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true},
+					{ID: 900, ModelNameID: 9, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true},
+				},
+			)
+
+			r := httptest.NewRequest("POST", c.path,
+				strings.NewReader(`{"model":"claude-opus-5","messages":[]}`))
+			r.Header.Set("X-Api-Key", hs.relayPW)
+			r.Header.Set("Content-Type", "application/json")
+			rec := hs.serve(r)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d want 503 body=%s", rec.Code, rec.Body.String())
+			}
+			if n := hits.Load(); n != 0 {
+				t.Fatalf("short-key exact must not RoundTrip prefix/fallback, hits=%d", n)
+			}
+
+			// 未配置名仍可走兜底。
+			hits.Store(0)
+			r = httptest.NewRequest("POST", c.path,
+				strings.NewReader(`{"model":"never-configured","messages":[]}`))
+			r.Header.Set("X-Api-Key", hs.relayPW)
+			r.Header.Set("Content-Type", "application/json")
+			rec = hs.serve(r)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unknown via fallback status=%d want 200 body=%s", rec.Code, rec.Body.String())
+			}
+			if n := hits.Load(); n != 1 {
+				t.Fatalf("unknown fallback RoundTrips=%d want 1", n)
+			}
+		})
+	}
 }
