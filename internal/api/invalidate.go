@@ -106,23 +106,57 @@ func (s *SemanticConfigInvalidator) InvalidateModelNameDeleted(modelNameID int64
 	}
 }
 
+// ConfigPublisher 发布 livecfg 同代 routing + Probe 快照（§4.9）。
+//
+// livecfg.Source 实现本接口。删除路径必须在 SQL 成功后 Invalidate+Refresh，
+// 否则 2s TTL 内下一次 preamble/Select 仍可能选到已删行。
+type ConfigPublisher interface {
+	Invalidate()
+	Refresh() error
+}
+
 // WithInvalidator 接上配置变更钩子（§4.5）。
 //
 // ── 为什么这个钩子不违反 livecfg 的「不做写后失效」原则 ──
 //
 // livecfg/source.go 明确拒绝了写后失效通知，理由是「钩子漏一处就是
-// 改了不生效」。那个判断没有变，这里也没有推翻它：
+// 改了不生效」。那个判断对 create/update 没有变，这里也没有推翻它：
 //
-//   - 配置**生效**仍然只靠 livecfg 的 2s TTL。这个钩子一行配置都不刷新，
+//   - create/update 的配置生效仍靠 livecfg 的 2s TTL。本钩子一行都不刷新，
 //     漏调它不会让任何配置失效延迟哪怕一毫秒。
 //   - 钩子只做一件事：把探活的预占时间清零，让下一个 tick 立刻重探。
 //     漏调的后果是「等下一个探活周期」—— 也就是退回到 M3/M4 的现状，
 //     一个纯粹的时间差，不是错误状态。
 //
+// 删除是例外：成功 DELETE 后必须经 ConfigPublisher 立刻刷掉 routing
+// 快照（见 publishAfterSuccessfulDelete），不能把「已删行仍可被选」
+// 留给 TTL。
+//
 // 两者的代价完全不对称，所以能挂钩子的地方就是这里、而不是缓存层。
 func (s *Server) WithInvalidator(inv ConfigInvalidator) *Server {
 	s.invalidator = inv
 	return s
+}
+
+// WithConfigPublisher wires livecfg publish-after-delete (§4.9).
+func (s *Server) WithConfigPublisher(p ConfigPublisher) *Server {
+	s.publisher = p
+	return s
+}
+
+// publishAfterSuccessfulDelete forces the next select/preamble snapshot to
+// omit rows just removed from SQL. Only call after Delete* succeeded.
+//
+// Refresh errors are logged but do not change the HTTP outcome: Invalidate
+// already cleared the TTL window so the next Snapshot() reloads from Store.
+func (s *Server) publishAfterSuccessfulDelete() {
+	if s == nil || s.publisher == nil {
+		return
+	}
+	s.publisher.Invalidate()
+	if err := s.publisher.Refresh(); err != nil && s.log != nil {
+		s.log.Error("删除后刷新配置快照失败", "err", err)
+	}
 }
 
 // 下面三个是各写入路径的调用点。集中在这里而不是散在
