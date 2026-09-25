@@ -57,7 +57,7 @@ func PrepareOutboundHeaders(in http.Header, proto model.Protocol) http.Header {
 
 	// 2. 全量复制，只跳过必须删的。
 	//    用 textproto 的规范形式做比较，避免大小写导致漏删。
-	skip := make(map[string]bool, len(hopByHopHeaders)+len(model.AuthHeaders)+2)
+	skip := make(map[string]bool, len(hopByHopHeaders)+len(model.AuthHeaders)+3)
 	for _, h := range hopByHopHeaders {
 		skip[http.CanonicalHeaderKey(h)] = true
 	}
@@ -70,6 +70,10 @@ func PrepareOutboundHeaders(in http.Header, proto model.Protocol) http.Header {
 	// 客户端显式塞了 Host 头）。Content-Length 由 http 库按新 body 重算。
 	skip["Host"] = true
 	skip["Content-Length"] = true
+	// 管理口令只属于本进程的 /admin/api（bearerOK），绝不能随 /v1/* 出站。
+	// 不放进 AuthHeaders：那份清单是 upstream API key 位置，ApplyAuth 会
+	// 按它重写；管理口令不是上游凭据，只删不写。
+	skip["X-Admin-Password"] = true
 
 	for k, vs := range in {
 		ck := http.CanonicalHeaderKey(k)

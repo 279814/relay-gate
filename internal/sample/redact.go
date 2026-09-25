@@ -31,6 +31,8 @@ var sensitiveHeaders = func() map[string]bool {
 		"Proxy-Authorization": true,
 		"Cookie":              true,
 		"Set-Cookie":          true,
+		// 管理口令：若误带到 /v1 样本入站头，值绝不能明文落库。
+		"X-Admin-Password": true,
 	}
 	for _, h := range model.AuthHeaders {
 		m[http.CanonicalHeaderKey(h)] = true

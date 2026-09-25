@@ -280,6 +280,32 @@ func TestPrepareOutboundHeaders_ForwardsAcceptEncoding(t *testing.T) {
 }
 
 // 管理会话 Cookie 绝不能随 /v1/messages 透传到上游；其它 Cookie 与业务头照常转发。
+// 管理口令只服务 /admin/api，绝不能随 /v1/* 出站。
+func TestPrepareOutboundHeaders_StripsAdminPassword(t *testing.T) {
+	const adminPW = "super-secret-admin-password-value"
+	in := claudeCodeHeaders()
+	in.Set("X-Admin-Password", adminPW)
+
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
+	if got := out.Get("X-Admin-Password"); got != "" {
+		t.Errorf("X-Admin-Password 绝不能到达上游，得到 %q", got)
+	}
+	for k, vs := range out {
+		for _, v := range vs {
+			if strings.Contains(v, adminPW) {
+				t.Errorf("管理口令泄漏到出站头 %s: %q", k, v)
+			}
+		}
+	}
+	// 非秘密的端到端头必须保留（黑名单剥离不能误伤）。
+	if out.Get("Anthropic-Version") != in.Get("Anthropic-Version") {
+		t.Errorf("Anthropic-Version 应原样转发，得到 %q", out.Get("Anthropic-Version"))
+	}
+	if out.Get("Anthropic-Beta") != in.Get("Anthropic-Beta") {
+		t.Errorf("Anthropic-Beta 应原样转发，得到 %q", out.Get("Anthropic-Beta"))
+	}
+}
+
 func TestPrepareOutboundHeaders_StripsGatewaySessionCookie(t *testing.T) {
 	const sessionTok = "admin-session-token-must-not-leak"
 	in := claudeCodeHeaders()

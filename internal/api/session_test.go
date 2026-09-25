@@ -94,6 +94,18 @@ func TestAuth_BearerStillWorks(t *testing.T) {
 	}
 }
 
+func TestAuth_AdminPasswordHeaderStillWorks(t *testing.T) {
+	// 出站路径会剥掉 X-Admin-Password，但管理端 bearerOK 仍须认它。
+	_, h := newTestServer(t)
+	req := httptest.NewRequest("GET", "/admin/api/upstreams", nil)
+	req.Header.Set("X-Admin-Password", testAdminPW)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("X-Admin-Password 应放行管理路由，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAuth_WrongBearerIsUnauthorized(t *testing.T) {
 	_, h := newTestServer(t)
 	req := httptest.NewRequest("GET", "/admin/api/upstreams", nil)
