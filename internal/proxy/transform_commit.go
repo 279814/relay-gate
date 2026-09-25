@@ -84,9 +84,62 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		return at.commitBodyOverLimit(w, compiled, record, f, body)
 	}
 
+	policy := compiled.Version.ResFailPolicy
+	if policy == "" {
+		policy = transform.FailOpen
+	}
+	decodedFromEncoding := false
+	enc := normalizeContentEncoding(at.resp.Header.Get("Content-Encoding"))
+	if responseRulesTouchBody(compiled) && enc != "" {
+		if !contentEncodingDecodable(enc) {
+			err := fmt.Errorf("cannot transform response with Content-Encoding %q", enc)
+			if record != nil {
+				record(transform.ExecutionRecord{
+					Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
+					InputHash: transform.HashBytes(body),
+				})
+			}
+			if policy == transform.FailClosed {
+				res.Err = err
+				if res.DoneAt.IsZero() {
+					res.DoneAt = time.Now()
+				}
+				return res
+			}
+			// fail_open: refuse body transform; pass original encoded bytes + encoding.
+			return at.commitEncodedPassthrough(w, f, body)
+		}
+		decoded, derr := decodeTransformBody(enc, body, transform.MaxBodyBuffer)
+		if derr != nil {
+			if record != nil {
+				record(transform.ExecutionRecord{
+					Phase: "response", OK: false, Error: derr.Error(), FailPolicyUsed: policy,
+					InputHash: transform.HashBytes(body),
+				})
+			}
+			if policy == transform.FailClosed {
+				res.Err = derr
+				if res.DoneAt.IsZero() {
+					res.DoneAt = time.Now()
+				}
+				return res
+			}
+			return at.commitEncodedPassthrough(w, f, body)
+		}
+		body = decoded
+		decodedFromEncoding = true
+	}
+
+	inHdr := at.resp.Header.Clone()
+	if decodedFromEncoding {
+		// Decoded bytes are no longer encoded; drop wire-body validators too.
+		inHdr.Del("Content-Encoding")
+		inHdr.Del("Content-MD5")
+		inHdr.Del("ETag")
+	}
 	in := transform.ResponseInput{
 		Status: at.resp.StatusCode,
-		Header: at.resp.Header.Clone(),
+		Header: inHdr,
 		Body:   body,
 	}
 	out := compiled.ApplyResponse(in)
@@ -124,11 +177,9 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	// Protect layer: length from final body, not upstream.
 	dst.Del("Content-Length")
-	// Transform operates on raw upstream bytes (no decompress). If the body
-	// changed, an upstream Content-Encoding (gzip/deflate/br) would lie about
-	// the bytes we are about to write — clients would try to decode them.
-	// Content-MD5 / ETag likewise describe the upstream body, so drop them too.
-	if !bytes.Equal(out.Body, body) {
+	// Body transform or decode-before-transform: upstream Content-Encoding /
+	// Content-MD5 / ETag describe the wire body, not what we are writing.
+	if decodedFromEncoding || !bytes.Equal(out.Body, body) {
 		dst.Del("Content-Encoding")
 		dst.Del("Content-MD5")
 		dst.Del("ETag")
@@ -215,16 +266,112 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 	return res
 }
 
+// commitEncodedPassthrough writes the original encoded body and upstream headers
+// without body transform. Used when Content-Encoding cannot be decoded safely
+// under fail_open (client keeps a consistent encoding + unmodified bytes).
+func (at *Attempt) commitEncodedPassthrough(w http.ResponseWriter, f *Forwarder, body []byte) *Result {
+	res := at.res
+	dst := w.Header()
+	for k, vs := range at.resp.Header {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
+	w.WriteHeader(at.resp.StatusCode)
+	res.HeadersSent = true
+	res.Status = at.resp.StatusCode
+	res.RespHeaders = at.resp.Header.Clone()
+
+	n, werr := w.Write(body)
+	res.BytesWritten = int64(n)
+	if f.RespTee != nil && n > 0 {
+		_, _ = f.RespTee.Write(body[:n])
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	now := time.Now()
+	if n > 0 && res.FirstByteAt.IsZero() {
+		res.FirstByteAt = now
+	}
+	if werr != nil && res.Err == nil {
+		res.Err = werr
+	}
+	res.DoneAt = now
+	return res
+}
+
 func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled,
 	record func(transform.ExecutionRecord)) *Result {
 
 	res, f := at.res, at.f
+	policy := compiled.Version.ResFailPolicy
+	if policy == "" {
+		policy = transform.FailOpen
+	}
+
+	var src io.Reader = at.resp.Body
+	if len(at.peeked) > 0 {
+		src = io.MultiReader(bytes.NewReader(at.peeked), at.resp.Body)
+	}
+
+	enc := normalizeContentEncoding(at.resp.Header.Get("Content-Encoding"))
+	decodedFromEncoding := false
+	if enc != "" {
+		if !responseRulesTouchSSE(compiled) {
+			// Header/status-only: do not frame or re-encode; keep compressed bytes + CE.
+			return at.commitSSEEncodedPassthrough(w, compiled, record, src)
+		}
+		if !contentEncodingDecodable(enc) {
+			err := fmt.Errorf("cannot transform SSE with Content-Encoding %q", enc)
+			if record != nil {
+				record(transform.ExecutionRecord{
+					Phase: "sse", OK: false, Error: err.Error(), FailPolicyUsed: policy,
+				})
+			}
+			if policy == transform.FailClosed {
+				res.Err = err
+				return res
+			}
+			return at.commitSSEEncodedPassthrough(w, compiled, record, src)
+		}
+		dec, derr := newContentEncodingStream(enc, src)
+		if derr != nil {
+			if record != nil {
+				record(transform.ExecutionRecord{
+					Phase: "sse", OK: false, Error: derr.Error(), FailPolicyUsed: policy,
+				})
+			}
+			if policy == transform.FailClosed {
+				res.Err = derr
+				return res
+			}
+			// Reconstruct src — peek was already consumed into MultiReader; for
+			// fail_open after NewReader failure, gzip/zlib may have read a few
+			// header bytes. Refuse partial decode: stream nothing and keep CE
+			// only if we can rebuild. Safest fail_open: passthrough via original
+			// body is unsafe after a failed decoder peek. Fall closed on stream
+			// setup failure even under fail_open when peeked bytes may be lost.
+			res.Err = derr
+			return res
+		}
+		defer dec.Close()
+		src = dec
+		decodedFromEncoding = true
+	}
+
 	// Header/status rules before any client byte; body left empty so
 	// replace_bytes / json pointer are no-ops on the SSE wire.
 	hdrIn := transform.ResponseInput{
 		Status: at.resp.StatusCode,
 		Header: at.resp.Header.Clone(),
 		Body:   nil,
+	}
+	if decodedFromEncoding {
+		hdrIn.Header.Del("Content-Encoding")
+		hdrIn.Header.Del("Content-MD5")
+		hdrIn.Header.Del("ETag")
 	}
 	hdrOut := compiled.ApplyResponse(hdrIn)
 	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
@@ -258,15 +405,6 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	res.Status = hdrOut.Status
 	res.RespHeaders = hdrOut.Header.Clone()
 
-	var src io.Reader = at.resp.Body
-	if len(at.peeked) > 0 {
-		src = io.MultiReader(bytes.NewReader(at.peeked), at.resp.Body)
-	}
-
-	policy := compiled.Version.ResFailPolicy
-	if policy == "" {
-		policy = transform.FailOpen
-	}
 	scanner := &transform.SSEScanner{}
 	buf := make([]byte, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
@@ -389,6 +527,52 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	}
 	res.BytesWritten = total
 	res.DoneAt = time.Now()
+	return res
+}
+
+// commitSSEEncodedPassthrough applies header/status rules only and streams the
+// original encoded body with Content-Encoding kept. Used when SSE rewrite would
+// otherwise parse compressed bytes, or when decoding is unavailable under fail_open.
+func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *transform.Compiled,
+	record func(transform.ExecutionRecord), src io.Reader) *Result {
+
+	res, f := at.res, at.f
+	hdrIn := transform.ResponseInput{
+		Status: at.resp.StatusCode,
+		Header: at.resp.Header.Clone(),
+		Body:   nil,
+	}
+	hdrOut := compiled.ApplyResponse(hdrIn)
+	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
+		res.Err = hdrOut.Err
+		if record != nil {
+			record(transform.ExecutionRecord{
+				Phase: "response", OK: false, Error: hdrOut.Err.Error(),
+				FailPolicyUsed: hdrOut.PolicyUsed, HitRules: hdrOut.HitRules,
+			})
+		}
+		return res
+	}
+
+	dst := w.Header()
+	for k, vs := range hdrOut.Header {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
+	// Keep Content-Encoding / Content-MD5 / ETag: body bytes are unmodified wire.
+	w.WriteHeader(hdrOut.Status)
+	res.HeadersSent = true
+	res.Status = hdrOut.Status
+	res.RespHeaders = hdrOut.Header.Clone()
+
+	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	res.BytesWritten = n
+	res.DoneAt = time.Now()
+	if werr != nil && res.Err == nil {
+		res.Err = werr
+	}
 	return res
 }
 
