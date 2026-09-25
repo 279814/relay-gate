@@ -22,7 +22,7 @@ func TestBaseURLRejectsPath(t *testing.T) {
 	}
 	for _, u := range bad {
 		t.Run(u, func(t *testing.T) {
-			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k"}
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: ""}
 			up.Defaults()
 			if err := up.Validate(); err == nil {
 				t.Fatalf("%q 应被拒绝", u)
@@ -38,7 +38,7 @@ func TestBaseURLRejectsPath(t *testing.T) {
 	}
 	for _, u := range good {
 		t.Run(u, func(t *testing.T) {
-			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k"}
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: ""}
 			up.Defaults()
 			if err := up.Validate(); err != nil {
 				t.Fatalf("%q 应被接受，却报错：%v", u, err)
@@ -61,7 +61,7 @@ func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
 	}
 	for _, u := range good {
 		t.Run(u, func(t *testing.T) {
-			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k", FullURLMode: true}
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: "", FullURLMode: true}
 			up.Defaults()
 			if err := up.Validate(); err != nil {
 				t.Fatalf("full_url_mode 下 %q 应被接受，却报错：%v", u, err)
@@ -83,7 +83,7 @@ func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
 	}
 	for _, u := range bad {
 		t.Run("bad/"+u, func(t *testing.T) {
-			up := &Upstream{Name: "t", BaseURL: u, APIKey: "k", FullURLMode: true}
+			up := &Upstream{Name: "t", BaseURL: u, APIKey: "", FullURLMode: true}
 			up.Defaults()
 			if err := up.Validate(); err == nil {
 				t.Fatalf("full_url_mode 也不该放过 %q", u)
@@ -92,7 +92,7 @@ func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
 	}
 
 	// 没开 full_url_mode 时仍要挡住带路径的，且错误信息要指向那个开关
-	up := &Upstream{Name: "t", BaseURL: "https://api.example.com/v1", APIKey: "k"}
+	up := &Upstream{Name: "t", BaseURL: "https://api.example.com/v1", APIKey: ""}
 	up.Defaults()
 	err := up.Validate()
 	if err == nil {
@@ -107,7 +107,7 @@ func TestBaseURLAllowsPathInFullURLMode(t *testing.T) {
 func TestProbeHeadersRejectAuth(t *testing.T) {
 	for _, h := range []string{"Authorization", "authorization", "x-api-key", "X-API-Key", "api-key"} {
 		up := &Upstream{
-			Name: "t", BaseURL: "https://a.com", APIKey: "k",
+			Name: "t", BaseURL: "https://a.com", APIKey: "",
 			ProbeHeaders: map[string]string{h: "sk-whatever"},
 		}
 		up.Defaults()
@@ -122,7 +122,7 @@ func TestProbeHeadersRejectAuth(t *testing.T) {
 
 	// 非鉴权头必须放行——这正是该字段存在的目的（应对 UA 白名单站）
 	up := &Upstream{
-		Name: "t", BaseURL: "https://a.com", APIKey: "k",
+		Name: "t", BaseURL: "https://a.com", APIKey: "",
 		ProbeHeaders: map[string]string{"user-agent": "claude-cli/2.1.220 (external, sdk-cli)"},
 	}
 	up.Defaults()
@@ -147,7 +147,7 @@ func TestProbeHeadersRejectCRLFOrNUL(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			up := &Upstream{
-				Name: "t", BaseURL: "https://a.com", APIKey: "k",
+				Name: "t", BaseURL: "https://a.com", APIKey: "",
 				ProbeHeaders: tc.hdrs,
 			}
 			up.Defaults()
@@ -159,13 +159,35 @@ func TestProbeHeadersRejectCRLFOrNUL(t *testing.T) {
 }
 
 func TestUpstreamDefaults(t *testing.T) {
-	u := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: "k"}
+	u := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: ""}
 	u.Defaults()
 	if u.AuthStyle != AuthAuto {
 		t.Errorf("auth_style 默认应为 auto（M0 实测各站两种头都通），得到 %q", u.AuthStyle)
 	}
 	if u.L1Path != "/v1/models" {
 		t.Errorf("l1_path 默认应为 /v1/models，得到 %q", u.L1Path)
+	}
+}
+
+// 短于 MinRedactableKeyLen 的非空 api_key 不得通过 Validate：
+// RedactText 不会在 Location 等 URI 头里遮住它。空串仍合法（更新=不改）。
+func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
+	short := strings.Repeat("x", MinRedactableKeyLen-1)
+	up := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: short}
+	up.Defaults()
+	if err := up.Validate(); err == nil {
+		t.Fatal("短于下限的 api_key 应被拒绝")
+	}
+
+	exact := strings.Repeat("y", MinRedactableKeyLen)
+	up.APIKey = exact
+	if err := up.Validate(); err != nil {
+		t.Fatalf("恰好下限长度应接受：%v", err)
+	}
+
+	up.APIKey = ""
+	if err := up.Validate(); err != nil {
+		t.Fatalf("空 api_key（更新不改）应接受：%v", err)
 	}
 }
 

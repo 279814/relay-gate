@@ -153,9 +153,6 @@ func (s *Store) UpdateUpstream(u *model.Upstream) error {
 
 func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) (err error) {
 	upstream.Defaults()
-	if err := upstream.Validate(); err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -187,8 +184,13 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 		}
 	}
 	// 脱敏回显与空串都归一成「不改」；只有真正的新明文才换钥。
+	// 必须在 Validate 之前：MaskKey 回显通常短于 MinRedactableKeyLen，
+	// 否则前端把脱敏值原样提交会被误判成「短 key」。
 	if upstream.APIKey == "" || (current.APIKey != "" && upstream.APIKey == MaskKey(current.APIKey)) {
 		upstream.APIKey = ""
+	}
+	if err := upstream.Validate(); err != nil {
+		return err
 	}
 	credentialChanged := upstream.APIKey != "" && upstream.APIKey != current.APIKey
 	networkChanged := upstream.BaseURL != current.BaseURL || upstream.ProxyURL != current.ProxyURL ||

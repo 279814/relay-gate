@@ -127,11 +127,58 @@ func TestUpstreamRequiresKey(t *testing.T) {
 	}
 }
 
+// 短于 MinRedactableKeyLen 的非空 api_key 不得落库：RedactText 不会遮 Location。
+// min-1 拒绝且原 key 不变；恰好 min 接受。
+func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
+	st := testStore(t)
+	const prev = "sk-previous-ok12" // 16 bytes
+	u := &model.Upstream{Name: "short-key", BaseURL: "https://a.com", APIKey: prev, Enabled: true}
+	if err := st.CreateUpstream(u); err != nil {
+		t.Fatal(err)
+	}
+
+	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
+	u.APIKey = short
+	err := st.UpdateUpstream(u)
+	if err == nil {
+		t.Fatal("短于下限的 api_key 应被拒绝")
+	}
+	if !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
+	}
+	got, err := st.GetUpstream(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIKey != prev {
+		t.Fatalf("拒绝后原 key 应不变，got %q want %q", got.APIKey, prev)
+	}
+
+	exact := strings.Repeat("y", model.MinRedactableKeyLen)
+	u.APIKey = exact
+	if err := st.UpdateUpstream(u); err != nil {
+		t.Fatalf("恰好下限长度应接受：%v", err)
+	}
+	got, err = st.GetUpstream(u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIKey != exact {
+		t.Fatalf("got %q want %q", got.APIKey, exact)
+	}
+
+	if err := st.CreateUpstream(&model.Upstream{
+		Name: "short-create", BaseURL: "https://b.com", APIKey: short, Enabled: true,
+	}); err == nil {
+		t.Fatal("创建短 key 应被拒绝")
+	}
+}
+
 func TestDuplicateNamesRejected(t *testing.T) {
 	st := testStore(t)
 	mkUpstream(t, st, "dup")
 
-	u2 := &model.Upstream{Name: "dup", BaseURL: "https://other.com", APIKey: "k", Enabled: true}
+	u2 := &model.Upstream{Name: "dup", BaseURL: "https://other.com", APIKey: "sk-dup-other-key", Enabled: true}
 	err := st.CreateUpstream(u2)
 	if !errors.Is(err, model.ErrValidation) {
 		t.Fatalf("重名应报校验错误（可读信息），得到 %v", err)

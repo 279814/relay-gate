@@ -110,8 +110,7 @@ func TestL2_UpstreamKeyNotLeakedFromHTTPError(t *testing.T) {
 // 短 key 同样不能漏。
 //
 // sample.RedactBodyKeys 有 12 字符下限（短于此不脱敏），所以这里必须走
-// RedactDiagnostic。而短 key 是真实可达的配置 —— 上游 api_key 没有
-// 长度校验（model.Validate 只要求非空）。
+// RedactDiagnostic。写入路径已拒绝短上游 api_key；本用例覆盖脏行/历史数据。
 func TestL1_ShortUpstreamKeyStillRedacted(t *testing.T) {
 	const upKey = "sk-short1" // 9 字符，短于 12
 

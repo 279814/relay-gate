@@ -13,7 +13,7 @@ import (
 func TestLegacyCreateUpstreamAtomicallyCreatesCanonicalEndpoints(t *testing.T) {
 	store := testStore(t)
 	upstream := &model.Upstream{
-		Name: "bundle", BaseURL: "https://bundle.example", APIKey: "sk-bundle", Enabled: true,
+		Name: "bundle", BaseURL: "https://bundle.example", APIKey: "sk-bundle-ok12", Enabled: true,
 		AuthStyle: model.AuthBearer,
 	}
 	if err := store.CreateUpstream(upstream); err != nil {
@@ -52,7 +52,7 @@ func TestLegacyCreateUpstreamAtomicallyCreatesCanonicalEndpoints(t *testing.T) {
 
 func TestCreateUpstreamWithEndpointsRollsBackWholeBundle(t *testing.T) {
 	store := testStore(t)
-	upstream := &model.Upstream{Name: "rollback", BaseURL: "https://rollback.example", APIKey: "sk-rollback", Enabled: true}
+	upstream := &model.Upstream{Name: "rollback", BaseURL: "https://rollback.example", APIKey: "sk-rollback-ok", Enabled: true}
 	endpoints := canonicalEndpointBundle(upstream)
 	endpoints[3].Kind = model.EndpointKind("invalid")
 	if err := store.CreateUpstreamWithEndpoints(context.Background(), upstream, endpoints); !errors.Is(err, model.ErrValidation) {
@@ -108,7 +108,7 @@ func TestEndpointUpdateUsesRevisionCAS(t *testing.T) {
 func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 	store := testStore(t)
 	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry",
-		APIKey: "sk-1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
+		APIKey: "sk-fullurl-ok1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
 		L1Path: "/status", Enabled: false}
 	if err := store.CreateUpstream(upstream); err != nil {
 		t.Fatal(err)
@@ -141,7 +141,7 @@ func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 // 通常都是空、压根没变。
 func TestUpdateUpstreamDoesNotBumpUnchangedEndpointOverrides(t *testing.T) {
 	store := testStore(t)
-	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com", APIKey: "sk-1",
+	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com", APIKey: "sk-update-ok12",
 		AuthStyle: model.AuthXAPIKey, L1Path: "/v1/models", Enabled: false}
 	if err := store.CreateUpstream(upstream); err != nil {
 		t.Fatal(err)
@@ -181,7 +181,7 @@ func TestUpdateUpstreamDoesNotBumpUnchangedEndpointOverrides(t *testing.T) {
 // 与上一条互为对照 —— 少了它，「一律不更新」也能让上一条通过。
 func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
 	store := testStore(t)
-	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com", APIKey: "sk-1",
+	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com", APIKey: "sk-rewrite-ok1",
 		AuthStyle: model.AuthXAPIKey, L1Path: "/status", Enabled: false}
 	if err := store.CreateUpstream(upstream); err != nil {
 		t.Fatal(err)

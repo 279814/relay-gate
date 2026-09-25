@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 // naiveTail 是尾缓冲的朴素参照实现：直接留全量，取最后 n 字节。
@@ -499,7 +501,7 @@ func TestPrepareBody_KeyStraddlingTruncationPoint(t *testing.T) {
 			t.Errorf("off=%d：完整 key 明文留存\n%q", off, out)
 		}
 		// 半截也不行：检查 key 的任何长前缀都没留下
-		for n := len(key); n >= minRedactableKey; n-- {
+		for n := len(key); n >= model.MinRedactableKeyLen; n-- {
 			if bytes.Contains(out, []byte(key[:n])) {
 				t.Errorf("off=%d：key 的前 %d 字节明文留存\n%q", off, n, out)
 				break
