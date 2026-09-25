@@ -75,7 +75,15 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	found := security.ScanText(body.Text, "admin_scan")
+	// When the admin names an existing upstream, pass its stored API key into
+	// ScanText so redactSecrets can strip it from Detail — same contract as
+	// traffic scan's credentialsOf → ObserveJob.Keys. Unnamed / unknown
+	// upstreams have no stored key to add; do not invent one.
+	var keys []string
+	if key := s.upstreamAPIKeyForScan(body.Upstream); key != "" {
+		keys = append(keys, key)
+	}
+	found := security.ScanText(body.Text, "admin_scan", keys...)
 	out := make([]security.Finding, 0, len(found))
 	for _, f := range found {
 		f.Upstream = body.Upstream
@@ -86,6 +94,32 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 		out = append(out, s.security.Record(f))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"findings": out, "count": len(out)})
+}
+
+// upstreamAPIKeyForScan resolves body.upstream as id or name and returns the
+// decrypted API key when that upstream exists. Empty name / missing store /
+// unknown target → "" (caller must not invent a key).
+func (s *Server) upstreamAPIKeyForScan(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || s.st == nil {
+		return ""
+	}
+	if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 {
+		up, err := s.st.GetUpstream(id)
+		if err == nil && up != nil {
+			return up.APIKey
+		}
+	}
+	ups, err := s.st.ListUpstreams()
+	if err != nil {
+		return ""
+	}
+	for _, up := range ups {
+		if up != nil && up.Name == ref {
+			return up.APIKey
+		}
+	}
+	return ""
 }
 
 // postSecurityCanary runs a one-shot Active Upstream canary via manual probe (§14.4).
