@@ -95,6 +95,9 @@ func (r *Recorder) Record(s *model.Sample) {
 	select {
 	case r.ch <- s:
 	default:
+		if s != nil {
+			s.ReleaseTempFiles()
+		}
 		n := r.dropped.Add(1)
 		// 只在头几次与每 100 次记一条日志：满队列往往持续一段时间，
 		// 每条都记会把日志刷爆，反而盖掉真正需要看的错误。

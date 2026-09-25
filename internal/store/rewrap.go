@@ -249,7 +249,10 @@ func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
 }
 
 func rewrapSampleField(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
-	if len(raw) == 0 || !IsSampleEnvelope(raw) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	if !IsSampleEnvelope(raw) && !isSampleMultipart(raw) {
 		return raw, nil
 	}
 	plain, err := c.DecryptSampleBlob(raw)

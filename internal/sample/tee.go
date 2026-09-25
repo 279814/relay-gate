@@ -34,8 +34,8 @@ var fullSpillAt = 1 << 20 // 1 MiB
 // **完整模式**（headMax 与 tailMax 都为 0，即当前默认）：一字不差地全收。
 // 留档的价值就在「到底是哪些字节」—— 截断过的样本没法拿去与入站请求逐字段
 // 比对，而那是 §3.6.1 给这个功能定的头号用途。字节先落在有界内存窗口，
-// 超出 fullSpillAt 后落到临时文件，因此峰值 RAM 与响应长度无关；落库时
-// 再读回（仍可到磁盘配额）。
+// 超出 fullSpillAt 后落到临时文件，因此峰值 RAM 与响应长度无关；落库走
+// DetachBody，由 store 按同样窗口分块写入，绝不把 spill 整段拼回一个 []byte。
 //
 // **有界模式**（任一为正）：留头 + 留尾，中间省略。
 // 为什么不能只留头：SSE 的诊断信息分布在两端 —— 头部有错误信息与首个 delta，
@@ -145,7 +145,39 @@ func (h *HeadTail) SpillBytes() int64 {
 	return h.spillSize
 }
 
-// Close 释放 spill 临时文件。Bytes 成功读回后也会清掉；
+// SpillMemLimit 返回完整模式内存窗口（字节）。落库分块与之对齐；测试可调低 fullSpillAt。
+func SpillMemLimit() int {
+	if fullSpillAt < 1 {
+		return 1
+	}
+	return fullSpillAt
+}
+
+// DetachBody 交出完整模式正文：有 spill 时关闭句柄但**不删除**文件，
+// 调用方（recordSample → Insert）负责成功落库、配额跳过或队列丢弃后删除。
+// 无 spill 时返回内存缓冲。与 Bytes/bytesFull 不同：绝不把 spill 整段读进一个 []byte。
+func (h *HeadTail) DetachBody() (mem []byte, spillPath string) {
+	if h == nil {
+		return nil, ""
+	}
+	if h.spill != nil {
+		if len(h.head) > 0 {
+			h.appendSpill(h.head)
+			h.head = nil
+		}
+		path := h.spillPath
+		_ = h.spill.Close()
+		h.spill = nil
+		h.spillPath = ""
+		h.spillSize = 0
+		return nil, path
+	}
+	mem = h.head
+	h.head = nil
+	return mem, ""
+}
+
+// Close 释放 spill 临时文件。DetachBody 已移交的文件不会在这里删；
 // 被丢弃的尝试（重试换站）必须显式 Close，否则临时文件会泄漏。
 func (h *HeadTail) Close() {
 	if h == nil {
@@ -487,6 +519,7 @@ func (h *HeadTail) bytesFull() []byte {
 	if h.spill == nil {
 		return h.head
 	}
+	// 测试与诊断用：生产落库走 DetachBody，避免把可到磁盘配额的 spill 整段进 RAM。
 	out := make([]byte, 0, int(h.spillSize)+len(h.head))
 	if h.spillSize > 0 {
 		buf := make([]byte, h.spillSize)
