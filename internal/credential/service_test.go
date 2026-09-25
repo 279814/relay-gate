@@ -1,14 +1,18 @@
 package credential
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestRelayRotateGraceAndRevoke(t *testing.T) {
 	s := New()
-	s.SetActiveRelayKey("rk_old")
+	if err := s.SetActiveRelayKey("rk_old"); err != nil {
+		t.Fatal(err)
+	}
 	newKey, grace, err := s.RotateRelayKey()
 	if err != nil || newKey == "" || grace != 600 {
 		t.Fatalf("new=%q grace=%d err=%v", newKey, grace, err)
@@ -29,7 +33,9 @@ func TestRelayGraceExpiry(t *testing.T) {
 	s := New()
 	now := time.Now()
 	s.WithNow(func() time.Time { return now })
-	s.SetActiveRelayKey("rk_old")
+	if err := s.SetActiveRelayKey("rk_old"); err != nil {
+		t.Fatal(err)
+	}
 	newKey, _, err := s.RotateRelayKey()
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +54,9 @@ func TestRelayGraceExpiry(t *testing.T) {
 
 func TestRelayAlsoKeysSurviveRotate(t *testing.T) {
 	s := New()
-	s.SetActiveRelayKeys([]string{"rk_a", "rk_b"})
+	if err := s.SetActiveRelayKeys([]string{"rk_a", "rk_b"}); err != nil {
+		t.Fatal(err)
+	}
 	newKey, _, err := s.RotateRelayKey()
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +84,9 @@ func TestRelayDigestSnapshotAuth(t *testing.T) {
 
 	const raw = "rk_digest_primary"
 	s := New()
-	s.SetActiveRelayKeys([]string{raw, "rk_also"})
+	if err := s.SetActiveRelayKeys([]string{raw, "rk_also"}); err != nil {
+		t.Fatal(err)
+	}
 	if !s.ValidRelayKey(raw) {
 		t.Fatal("correct key must be accepted")
 	}
@@ -124,5 +134,57 @@ func TestMasterRevealWindow(t *testing.T) {
 	now = now.Add(2 * time.Second)
 	if _, err := s.TakeMasterReveal(); !errors.Is(err, ErrReauthRequired) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+type memEnvelope struct {
+	plain string
+}
+
+func (m *memEnvelope) EncryptEnvelope(plain string) (string, error) {
+	m.plain = plain
+	return "v1:test:" + plain, nil
+}
+
+func (m *memEnvelope) DecryptEnvelope(encoded string) (string, error) {
+	const p = "v1:test:"
+	if !strings.HasPrefix(encoded, p) {
+		return "", errors.New("bad envelope")
+	}
+	return strings.TrimPrefix(encoded, p), nil
+}
+
+func TestRevealActiveRelayKey_SealedBesideDigest(t *testing.T) {
+	env := &memEnvelope{}
+	s := New().WithEnvelope(env)
+	const raw = "rk_sealed_primary"
+	if err := s.SetActiveRelayKey(raw); err != nil {
+		t.Fatal(err)
+	}
+	if env.plain != raw {
+		t.Fatalf("envelope seal want %q got %q", raw, env.plain)
+	}
+	st := s.Status()
+	rawJSON, _ := json.Marshal(st)
+	if strings.Contains(string(rawJSON), raw) || strings.Contains(string(rawJSON), "v1:test:") {
+		t.Fatalf("Status must not leak key or ciphertext: %s", rawJSON)
+	}
+	got, err := s.RevealActiveRelayKey()
+	if err != nil || got != raw {
+		t.Fatalf("reveal=%q err=%v", got, err)
+	}
+	if !s.ValidRelayKey(got) {
+		t.Fatal("revealed key must still authorize")
+	}
+	newKey, _, err := s.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s.RevealActiveRelayKey()
+	if err != nil || got2 != newKey {
+		t.Fatalf("after rotate reveal=%q want %q err=%v", got2, newKey, err)
+	}
+	if !s.ValidRelayKey(got2) {
+		t.Fatal("rotated revealed key must authorize")
 	}
 }

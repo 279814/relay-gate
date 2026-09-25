@@ -120,8 +120,10 @@ type errBody struct {
 // 吞掉它们会让配置出错时只剩一个无信息的 400。
 func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, credential.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errBody{"not found"})
+	case errors.Is(err, credential.ErrRevealUnavailable):
+		writeJSON(w, http.StatusNotFound, errBody{err.Error()})
 	case errors.Is(err, model.ErrValidation):
 		msg := strings.TrimPrefix(err.Error(), "validation: ")
 		writeJSON(w, http.StatusBadRequest, errBody{msg})
