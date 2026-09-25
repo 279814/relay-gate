@@ -96,6 +96,7 @@ func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, smp)
 }
 
+// pinSample 置顶/取消置顶。§5.4：置顶未脱敏样本需重新认证（与查看同级）。
 func (s *Server) pinSample(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -103,10 +104,15 @@ func (s *Server) pinSample(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Pinned bool `json:"pinned"`
+		Pinned   bool   `json:"pinned"`
+		Password string `json:"password"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
+		return
+	}
+	if !s.passwordOK(body.Password) {
+		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
 		return
 	}
 	if err := s.st.SetSamplePinned(id, body.Pinned); err != nil {
@@ -118,7 +124,23 @@ func (s *Server) pinSample(w http.ResponseWriter, r *http.Request) {
 
 // clearSamples 是 UI 的「一键清空」（§3.6.3d）。
 // 默认保留置顶的 —— 置顶正是「这条我要留着」的意思，一键清空不该无视它。
+// §5.4：批量删除未脱敏样本需重新认证。
 func (s *Server) clearSamples(w http.ResponseWriter, r *http.Request) {
+	password := ""
+	if r.Body != nil && r.ContentLength != 0 {
+		var body struct {
+			Password string `json:"password"`
+		}
+		if err := decodeJSON(r, &body); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		password = body.Password
+	}
+	if !s.passwordOK(password) {
+		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
+		return
+	}
 	keepPinned := r.URL.Query().Get("keep_pinned") != "false"
 	n, err := s.st.ClearSamples(keepPinned)
 	if err != nil {
