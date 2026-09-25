@@ -261,8 +261,8 @@ func runServer() error {
 		return fmt.Errorf("绑定 synthetic controller: %w", err)
 	}
 	runCtrl.BindWarmupSource(tracker)
-	// §12.7：key_activated 等仍需 hold 的阶段在此进入 maintenance（db_committed
-	// 已在打开 Store 前前滚完成，holdMaint 为 false）。
+	// §12.7：仍需 hold 的未完成阶段在此进入 maintenance（prepared/db_committed/
+	// key_activated 已在打开 Store 前恢复完成时 holdMaint 为 false）。
 	if holdMaint {
 		if err := runCtrl.EnterMaintenance("master_key_rotation_incomplete"); err != nil {
 			return fmt.Errorf("未完成 Master Key 轮换，进入 maintenance: %w", err)
