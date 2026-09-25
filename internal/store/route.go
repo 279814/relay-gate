@@ -297,6 +297,13 @@ func (s *Store) DeleteRoute(id int64) (err error) {
 		return err
 	}
 
+	// §15: transform bindings are keyed by numeric route id. Drop them in this
+	// same transaction so a later row that reuses the id cannot inherit a
+	// published transform, and a failed delete rolls the detach back.
+	if _, err = tx.Exec(`DELETE FROM transform_binding WHERE route_id=?`, id); err != nil {
+		return err
+	}
+
 	res, err := tx.Exec(`DELETE FROM route WHERE id=?`, id)
 	if err != nil {
 		return err

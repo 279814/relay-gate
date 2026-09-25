@@ -214,6 +214,56 @@ func TestDetachEndpointBindingsAround_RestoresOnFailureKeepsPostCommitAttach(t *
 	}
 }
 
+func TestDetachRouteBindingsAround_RestoresOnFailureKeepsPostCommitAttach(t *testing.T) {
+	reg := NewRegistry(10)
+	set, err := reg.CreateSet("route-around")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.UpdateDraft(set.ID, []Rule{{Kind: KindReplaceBytes, From: "a", To: "b"}}, FailClosed, FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 9, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 10, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := errors.New("delete failed")
+	if err := reg.DetachRouteBindingsAround([]int64{9}, func() error { return boom }); !errors.Is(err, boom) {
+		t.Fatalf("error=%v want boom", err)
+	}
+	c, _, err := reg.PublishedCompiled(9, 2)
+	if err != nil || c == nil {
+		t.Fatalf("failed delete must restore binding: c=%v err=%v", c != nil, err)
+	}
+	cSibling, _, err := reg.PublishedCompiled(10, 2)
+	if err != nil || cSibling == nil {
+		t.Fatalf("sibling must stay through failed around: c=%v err=%v", cSibling != nil, err)
+	}
+
+	if err := reg.DetachRouteBindingsAround([]int64{9}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err = reg.PublishedCompiled(9, 2)
+	if err != nil || c != nil {
+		t.Fatalf("successful delete must drop in-memory binding: c=%v err=%v", c != nil, err)
+	}
+	cSibling, _, err = reg.PublishedCompiled(10, 2)
+	if err != nil || cSibling == nil {
+		t.Fatalf("sibling must remain after success: c=%v err=%v", cSibling != nil, err)
+	}
+
+	if _, _, err := reg.PublishSnapshot(set.ID, 9, 2); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err = reg.PublishedCompiled(9, 2)
+	if err != nil || c == nil {
+		t.Fatalf("post-commit attach must remain: c=%v err=%v", c != nil, err)
+	}
+}
+
 func TestPublishShadowRollback(t *testing.T) {
 	reg := NewRegistry(50)
 	set, err := reg.CreateSet("demo")

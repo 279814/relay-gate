@@ -321,6 +321,51 @@ func (r *Registry) DetachEndpointBindingsAround(endpointID int64, fn func() erro
 	return nil
 }
 
+// DetachRouteBindingsAround removes in-memory bindings for the given route IDs,
+// runs fn, and restores them if fn fails. Durable transform_binding rows must be
+// deleted inside the store delete transaction; callers must not bare-id detach
+// again after fn succeeds (SQLite id reuse race).
+func (r *Registry) DetachRouteBindingsAround(routeIDs []int64, fn func() error) error {
+	if r == nil {
+		return fn()
+	}
+	if fn == nil {
+		return nil
+	}
+	if len(routeIDs) == 0 {
+		return fn()
+	}
+	want := make(map[int64]struct{}, len(routeIDs))
+	for _, id := range routeIDs {
+		if id > 0 {
+			want[id] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return fn()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	saved := make(map[string]*Binding)
+	for key, b := range r.bindings {
+		if b != nil {
+			if _, ok := want[b.RouteID]; ok {
+				saved[key] = b
+				delete(r.bindings, key)
+			}
+		}
+	}
+	if err := fn(); err != nil {
+		for key, b := range saved {
+			r.bindings[key] = b
+		}
+		return err
+	}
+	// Success: SQL detach already committed with the route row(s). Do not
+	// flush or re-detach by bare id — a concurrent create may have reused it.
+	return nil
+}
+
 // GetBinding returns the binding for route+endpoint.
 func (r *Registry) GetBinding(routeID, endpointID int64) (*Binding, bool) {
 	r.mu.RLock()

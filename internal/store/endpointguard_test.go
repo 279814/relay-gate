@@ -202,6 +202,15 @@ func countTransformBindings(t *testing.T, store *Store, endpointID int64) int {
 	return n
 }
 
+func countTransformBindingsByRoute(t *testing.T, store *Store, routeID int64) int {
+	t.Helper()
+	var n int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM transform_binding WHERE route_id=?`, routeID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 func insertTransformBinding(t *testing.T, store *Store, routeID, endpointID, setID int64) {
 	t.Helper()
 	if _, err := store.db.Exec(`INSERT OR IGNORE INTO transform_set (id, name, created_at, draft_json) VALUES (?,?,?,?)`,
@@ -254,6 +263,170 @@ func TestDeleteEndpoint_DetachesTransformBindingsInSameTx(t *testing.T) {
 	// There must be no finishing bare-id detach that would strip it.
 	insertTransformBinding(t, store, 200, target.ID, 50)
 	if got := countTransformBindings(t, store, target.ID); got != 1 {
+		t.Fatalf("post-commit binding must remain: got %d", got)
+	}
+}
+
+// DeleteRoute must drop transform_binding rows in the same transaction as the
+// route row. A failed delete rolls the detach back; a sibling route's bindings
+// stay. Callers must not bare-id detach again after commit.
+func TestDeleteRoute_DetachesTransformBindingsInSameTx(t *testing.T) {
+	store := testStore(t)
+	up := mkUpstream(t, store, "xform-rt-detach-u")
+	upSibling := mkUpstream(t, store, "xform-rt-detach-u2")
+	mn := mkModelName(t, store, "xform-rt-detach-m", model.ProtoAnthropic)
+	target := &model.Route{ModelNameID: mn.ID, UpstreamID: up.ID}
+	target.Defaults()
+	if err := store.CreateRoute(target); err != nil {
+		t.Fatal(err)
+	}
+	sibling := &model.Route{ModelNameID: mn.ID, UpstreamID: upSibling.ID}
+	sibling.Defaults()
+	if err := store.CreateRoute(sibling); err != nil {
+		t.Fatal(err)
+	}
+
+	const endpointID int64 = 1
+	insertTransformBinding(t, store, target.ID, endpointID, 60)
+	insertTransformBinding(t, store, sibling.ID, endpointID, 60)
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("setup target bindings=%d", got)
+	}
+
+	// calibration_run RESTRICT blocks route delete after transform detach —
+	// the whole transaction (including detach) must roll back.
+	if _, err := store.db.Exec(`INSERT INTO calibration_run (id,route_id,endpoint,state,created_at)
+		VALUES ('xform-rt-cal',?,'models','planned',?)`, target.ID, nowMS()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRoute(target.ID); err == nil {
+		t.Fatal("DeleteRoute must fail while calibration_run pins the route")
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("failed delete must keep bindings: got %d", got)
+	}
+	if got := countTransformBindingsByRoute(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay after failed delete: got %d", got)
+	}
+
+	if _, err := store.db.Exec(`DELETE FROM calibration_run WHERE id='xform-rt-cal'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRoute(target.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 0 {
+		t.Fatalf("successful delete must detach bindings: got %d", got)
+	}
+	if got := countTransformBindingsByRoute(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay: got %d", got)
+	}
+
+	insertTransformBinding(t, store, target.ID, endpointID, 60)
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("post-commit binding must remain: got %d", got)
+	}
+}
+
+// DeleteUpstream must drop child-route transform_binding rows in the same
+// transaction (CASCADE skips DeleteRoute). A sibling upstream's route bindings
+// stay; post-commit binds for a reused id must survive.
+func TestDeleteUpstream_DetachesChildRouteTransformBindingsInSameTx(t *testing.T) {
+	store := testStore(t)
+	targetUp := mkUpstream(t, store, "xform-up-detach-u")
+	siblingUp := mkUpstream(t, store, "xform-up-detach-u2")
+	mn := mkModelName(t, store, "xform-up-detach-m", model.ProtoAnthropic)
+	target := &model.Route{ModelNameID: mn.ID, UpstreamID: targetUp.ID}
+	target.Defaults()
+	if err := store.CreateRoute(target); err != nil {
+		t.Fatal(err)
+	}
+	sibling := &model.Route{ModelNameID: mn.ID, UpstreamID: siblingUp.ID}
+	sibling.Defaults()
+	if err := store.CreateRoute(sibling); err != nil {
+		t.Fatal(err)
+	}
+
+	const endpointID int64 = 1
+	insertTransformBinding(t, store, target.ID, endpointID, 70)
+	insertTransformBinding(t, store, sibling.ID, endpointID, 70)
+
+	if err := store.DeleteUpstream(0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing upstream error=%v want ErrNotFound", err)
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("failed delete must keep bindings: got %d", got)
+	}
+
+	if err := store.DeleteUpstream(targetUp.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 0 {
+		t.Fatalf("successful delete must detach child bindings: got %d", got)
+	}
+	if got := countTransformBindingsByRoute(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay: got %d", got)
+	}
+
+	insertTransformBinding(t, store, target.ID, endpointID, 70)
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("post-commit binding must remain: got %d", got)
+	}
+}
+
+// DeleteModelName must drop child-route transform_binding rows in the same
+// transaction. A failed delete rolls the detach back; a sibling model_name's
+// route bindings stay.
+func TestDeleteModelName_DetachesChildRouteTransformBindingsInSameTx(t *testing.T) {
+	store := testStore(t)
+	up := mkUpstream(t, store, "xform-mn-detach-u")
+	upSibling := mkUpstream(t, store, "xform-mn-detach-u2")
+	targetMN := mkModelName(t, store, "xform-mn-detach-m", model.ProtoAnthropic)
+	siblingMN := mkModelName(t, store, "xform-mn-detach-m2", model.ProtoAnthropic)
+	target := &model.Route{ModelNameID: targetMN.ID, UpstreamID: up.ID}
+	target.Defaults()
+	if err := store.CreateRoute(target); err != nil {
+		t.Fatal(err)
+	}
+	sibling := &model.Route{ModelNameID: siblingMN.ID, UpstreamID: upSibling.ID}
+	sibling.Defaults()
+	if err := store.CreateRoute(sibling); err != nil {
+		t.Fatal(err)
+	}
+
+	const endpointID int64 = 1
+	insertTransformBinding(t, store, target.ID, endpointID, 80)
+	insertTransformBinding(t, store, sibling.ID, endpointID, 80)
+
+	if _, err := store.db.Exec(`INSERT INTO calibration_run (id,route_id,endpoint,state,created_at)
+		VALUES ('xform-mn-cal',?,'models','planned',?)`, target.ID, nowMS()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteModelName(targetMN.ID); err == nil {
+		t.Fatal("DeleteModelName must fail while calibration_run pins the route")
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
+		t.Fatalf("failed delete must keep bindings: got %d", got)
+	}
+	if got := countTransformBindingsByRoute(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay after failed delete: got %d", got)
+	}
+
+	if _, err := store.db.Exec(`DELETE FROM calibration_run WHERE id='xform-mn-cal'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteModelName(targetMN.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 0 {
+		t.Fatalf("successful delete must detach child bindings: got %d", got)
+	}
+	if got := countTransformBindingsByRoute(t, store, sibling.ID); got != 1 {
+		t.Fatalf("sibling bindings must stay: got %d", got)
+	}
+
+	insertTransformBinding(t, store, target.ID, endpointID, 80)
+	if got := countTransformBindingsByRoute(t, store, target.ID); got != 1 {
 		t.Fatalf("post-commit binding must remain: got %d", got)
 	}
 }

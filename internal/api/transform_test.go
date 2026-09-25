@@ -157,12 +157,13 @@ func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
 	}
 }
 
-// DeleteRoute must detach published transform bindings. After delete + SQLite
-// rowid reuse, the reincarnated id must stay passthrough unless it publishes
-// anew. A live sibling route must keep its binding.
+// DeleteRoute must detach published transform bindings inside the SQL
+// transaction (and around it for in-memory state). A failed delete keeps
+// bindings; after a successful delete commits, bindings attached for a reused
+// id must survive. A live sibling route must keep its binding.
 func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	s, _ := newTestServer(t)
-	reg := transform.NewRegistry(20)
+	reg := transform.NewRegistry(20).WithPersist(s.st)
 	h := s.WithTransformRegistry(reg).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"xform-reuse-u","base_url":"https://x.example.com","api_key":"sk-xxxxxxxxxxxx"}`)
@@ -210,6 +211,16 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("sibling publish: %d %s", rec.Code, rec.Body.String())
 	}
 
+	// Failed delete (missing id) must keep bindings for the live route.
+	rec = do(t, h, "DELETE", "/admin/api/routes/999999", "", true)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("missing route must reject delete")
+	}
+	c, _, err := reg.PublishedCompiled(routeID, endpointID)
+	if err != nil || c == nil {
+		t.Fatalf("failed delete must keep target binding: c=%v err=%v", c != nil, err)
+	}
+
 	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(routeID), "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete route: %d %s", rec.Code, rec.Body.String())
@@ -244,6 +255,16 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	c, vid, err = reg.PublishedCompiled(reusedID, endpointID)
 	if err != nil || c != nil || vid != 0 {
 		t.Fatalf("reused id must stay passthrough: c=%v id=%d err=%v", c != nil, vid, err)
+	}
+
+	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
+		`{"route_id":`+itoa(reusedID)+`,"endpoint_id":`+itoa(endpointID)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish reused: %d %s", rec.Code, rec.Body.String())
+	}
+	c, _, err = reg.PublishedCompiled(reusedID, endpointID)
+	if err != nil || c == nil {
+		t.Fatalf("bindings attached after delete commits must remain: c=%v err=%v", c != nil, err)
 	}
 }
 
