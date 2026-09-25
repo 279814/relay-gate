@@ -555,6 +555,37 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 	return nil
 }
 
+// halfOpenStillEnabled is the pre-send gate for an armed §4.4c half-open:
+// re-read the live Snapshot so a disable published after RecoveryGate
+// acquire cannot RoundTrip. Does not schedule a replacement probe.
+func (h *Handler) halfOpenStillEnabled(routeID, upstreamID int64) bool {
+	snap, err := h.cfg.Snapshot()
+	if err != nil || snap == nil {
+		return false
+	}
+	up := snap.Upstreams[upstreamID]
+	if up == nil || !up.Enabled {
+		return false
+	}
+	for _, rts := range snap.RoutesByModelName {
+		for _, rt := range rts {
+			if rt.ID != routeID {
+				continue
+			}
+			if !rt.Enabled || rt.UpstreamID != upstreamID {
+				return false
+			}
+			for _, mn := range snap.ModelNames {
+				if mn.ID == rt.ModelNameID {
+					return mn.Enabled
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
 // writeForwardError 把转发失败翻译成客户端能理解的 HTTP 错误。
 //
 // 只在响应头尚未发出时可用 —— 已经发出后状态码就定死了，
