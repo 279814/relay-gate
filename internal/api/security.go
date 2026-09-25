@@ -228,7 +228,9 @@ func (s *Server) postSMTPTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.mailer.SendTest(""); err != nil {
-		writeJSON(w, http.StatusBadGateway, errBody{err.Error()})
+		// Dial/auth failures are uncontrolled I/O text (host, path, etc.).
+		// Route through writeErr so unknowns become fixed "internal error".
+		s.writeErr(w, err)
 		return
 	}
 	if s.security != nil {
