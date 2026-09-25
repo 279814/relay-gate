@@ -181,3 +181,29 @@ func TestRedactBodyKeys_Edges(t *testing.T) {
 		t.Errorf("空 key 应被跳过，得到 %s", got)
 	}
 }
+
+// Location / Content-Location / Refresh 可能回显带 ?key= 的出站 URL。
+// 只替凭据值，不动无关 query；其它头不碰。
+func TestRedactCredentialURLHeaders(t *testing.T) {
+	const secret = "sk-upstream-secret-in-query-hdr"
+	h := http.Header{}
+	h.Set("Location", "https://a.example/x?key="+secret+"&beta=true")
+	h.Add("Location", "https://b.example/y?token="+secret)
+	h.Set("X-Request-Id", "keep")
+
+	RedactCredentialURLHeaders(h, []string{secret})
+
+	for _, v := range h.Values("Location") {
+		if strings.Contains(v, secret) {
+			t.Errorf("Location 残留完整 key：%q", v)
+		}
+	}
+	if !strings.Contains(h.Get("Location"), "beta=true") {
+		t.Errorf("无关 query 应保留：%q", h.Get("Location"))
+	}
+	if h.Get("X-Request-Id") != "keep" {
+		t.Error("非 URL 头不得改写")
+	}
+	RedactCredentialURLHeaders(nil, []string{secret}) // 不得 panic
+	RedactCredentialURLHeaders(h, nil)                // 空 keys 空操作
+}

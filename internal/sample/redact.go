@@ -168,6 +168,35 @@ func RedactText(s string, keys []string) string {
 	return s
 }
 
+// urlCarryingResponseHeaders 是响应里可能携带完整 URL 的头。
+// 上游若把出站请求 URL（含 FixedQueryTemplate / legacy_exact 里的 key）
+// 回显到这些头，原样透传就把上游 key 交给了外部客户端。
+var urlCarryingResponseHeaders = []string{
+	"Location",
+	"Content-Location",
+	"Refresh",
+}
+
+// RedactCredentialURLHeaders 就地脱敏响应头里 URL 携带的已知 Secret。
+//
+// 只用 RedactText：只替凭据值，不动状态码、路径与无关 query（如 beta=true）。
+// keys 为空时是空操作。原 header 可能已经抄进 ResponseWriter，必须原地改。
+func RedactCredentialURLHeaders(h http.Header, keys []string) {
+	if h == nil || len(keys) == 0 {
+		return
+	}
+	for _, name := range urlCarryingResponseHeaders {
+		vals := h.Values(name)
+		if len(vals) == 0 {
+			continue
+		}
+		h.Del(name)
+		for _, v := range vals {
+			h.Add(name, RedactText(v, keys))
+		}
+	}
+}
+
 // RedactDiagnostic 脱敏一段要进日志/UI/落库的上游原文。
 //
 // 与 RedactBodyKeys 的区别只有一条：**不设长度下限**，短 key 也脱敏。

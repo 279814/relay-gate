@@ -121,7 +121,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 			dst.Add(k, v)
 		}
 	}
-	FinalizeClientResponseHeaders(dst)
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	// Protect layer: length from final body, not upstream.
 	dst.Del("Content-Length")
 	w.WriteHeader(out.Status)
@@ -189,7 +189,7 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 			dst.Add(k, v)
 		}
 	}
-	FinalizeClientResponseHeaders(dst)
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	w.WriteHeader(at.resp.StatusCode)
 	res.HeadersSent = true
 	res.Status = at.resp.StatusCode
@@ -235,7 +235,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			dst.Add(k, v)
 		}
 	}
-	FinalizeClientResponseHeaders(dst)
+	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	dst.Del("Content-Length")
 	w.WriteHeader(hdrOut.Status)
 	res.HeadersSent = true

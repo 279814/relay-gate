@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -53,5 +54,52 @@ func TestErrorResponse_NeverEchoesUpstreamKeyFromURL(t *testing.T) {
 	}
 	if body := rec.Body.String(); strings.Contains(body, secret) {
 		t.Errorf("错误响应体回显了上游 key：%q", body)
+	}
+}
+
+// 上游 302 把出站 URL（含 FixedQueryTemplate 里的 key）放进 Location 时，
+// 客户端拿到的 Location 绝不能含上游 key；beta=true 与 3xx 状态码保留。
+// 样本 / 日志已脱敏，但客户端响应头此前原样透传 —— 那是外部调用方。
+func TestRedirectLocation_NeverEchoesUpstreamKeyFromQuery(t *testing.T) {
+	const secret = "sk-upstream-secret-in-location"
+
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		// 回显本次请求 URL（含固定 query 里的 key + 入站 beta）。
+		loc := "http://up.example" + r.URL.RequestURI()
+		w.Header().Set("Location", loc)
+		w.Header().Set("Content-Location", loc)
+		w.Header().Set("Refresh", "0; url="+loc)
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte(`{"redirect":true}`))
+	})
+	up := hs.cfg.snap.Upstreams[10]
+	up.APIKey = secret
+	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
+
+	r := httptest.NewRequest("POST",
+		"/v1/messages?beta=true",
+		strings.NewReader(`{"model":"claude-opus-5"}`))
+	r.Header = claudeCodeHeaders()
+	r.Header.Set("X-Api-Key", hs.relayPW)
+
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	hs.h.Routes(mux)
+	mux.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("状态码应仍是 302，got %d body=%q", rec.Code, rec.Body.String())
+	}
+	for _, name := range []string{"Location", "Content-Location", "Refresh"} {
+		got := rec.Header().Get(name)
+		if got == "" {
+			t.Fatalf("%s 应透传给客户端", name)
+		}
+		if strings.Contains(got, secret) {
+			t.Errorf("%s 回显了上游 key：%q", name, got)
+		}
+		if !strings.Contains(got, "beta=true") {
+			t.Errorf("%s 不应丢掉无关 query：%q", name, got)
+		}
 	}
 }
