@@ -147,16 +147,23 @@ func (s *Server) WithConfigPublisher(p ConfigPublisher) *Server {
 // publishAfterSuccessfulDelete forces the next select/preamble snapshot to
 // omit rows just removed from SQL. Only call after Delete* succeeded.
 //
-// Refresh errors are logged but do not change the HTTP outcome: Invalidate
-// already cleared the TTL window so the next Snapshot() reloads from Store.
-func (s *Server) publishAfterSuccessfulDelete() {
+// On Refresh failure the HTTP delete must not return success: a failed
+// Refresh stamps lastAttempt while leaving the pre-delete routing pointer,
+// so the next Snapshot() would keep serving the removed row for another TTL
+// window. Re-Invalidate keeps that window forced open for the next get().
+func (s *Server) publishAfterSuccessfulDelete() error {
 	if s == nil || s.publisher == nil {
-		return
+		return nil
 	}
 	s.publisher.Invalidate()
-	if err := s.publisher.Refresh(); err != nil && s.log != nil {
-		s.log.Error("删除后刷新配置快照失败", "err", err)
+	if err := s.publisher.Refresh(); err != nil {
+		s.publisher.Invalidate()
+		if s.log != nil {
+			s.log.Error("删除后刷新配置快照失败", "err", err)
+		}
+		return err
 	}
+	return nil
 }
 
 // 下面三个是各写入路径的调用点。集中在这里而不是散在
