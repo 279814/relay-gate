@@ -334,6 +334,35 @@ func TestStripHopByHopResponse(t *testing.T) {
 	}
 }
 
+// §10.4：X-Relay-Count-Tokens 只出现在网关生成的本地估算；上游同名头必须丢掉。
+// 其它端到端头与其它 X-Relay-* 名保留（不在此路径批量剥离）。
+func TestFinalizeClientResponseHeaders_DropsUpstreamCountTokens(t *testing.T) {
+	h := http.Header{}
+	h.Set(headerRelayCountTokens, "estimated")
+	h.Set("X-Relay-Attempts", "2") // 不得因剥 Count-Tokens 而误删
+	h.Set("X-Request-Id", "req-keep")
+	h.Set("Content-Type", "application/json")
+	h.Set("Connection", "close")
+
+	FinalizeClientResponseHeaders(h)
+
+	if got := h.Get(headerRelayCountTokens); got != "" {
+		t.Fatalf("X-Relay-Count-Tokens = %q, want stripped", got)
+	}
+	if h.Get("X-Relay-Attempts") != "2" {
+		t.Error("其它 X-Relay-* 头不得被剥离")
+	}
+	if h.Get("X-Request-Id") != "req-keep" {
+		t.Error("普通端到端头应保留")
+	}
+	if h.Get("Content-Type") != "application/json" {
+		t.Error("Content-Type 应保留")
+	}
+	if h.Get("Connection") != "" {
+		t.Error("逐跳头仍应被清理")
+	}
+}
+
 // 上游 Set-Cookie 不能覆盖管理会话；其它 Set-Cookie 继续透传。
 // 匹配与出站 Cookie 剥离相同：cookie 名大小写敏感全等，不看 value。
 func TestFinalizeClientResponseHeaders_DropsGatewaySessionSetCookie(t *testing.T) {

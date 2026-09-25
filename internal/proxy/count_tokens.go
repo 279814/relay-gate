@@ -278,7 +278,7 @@ func (h *Handler) localCountTokens(w http.ResponseWriter, body []byte) {
 
 	// 标出这是估算值。客户端不会读它，但排查「预算怎么算的」时，
 	// 一眼能看出这次走的是兜底而不是上游的真实 tokenizer。
-	w.Header().Set("X-Relay-Count-Tokens", "estimated")
+	w.Header().Set(headerRelayCountTokens, "estimated")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]int{"input_tokens": n})

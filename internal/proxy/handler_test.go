@@ -810,6 +810,30 @@ func TestHandler_PassesUpstreamErrorThrough(t *testing.T) {
 	}
 }
 
+// §10.4：messages 成功透传不得带 X-Relay-Count-Tokens；上游若发了只剥这一个名。
+func TestHandler_StripsUpstreamCountTokensOnMessages(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(headerRelayCountTokens, "estimated")
+		w.Header().Set("X-Request-Id", "msg-up-1")
+		w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	})
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != 200 {
+		t.Fatalf("期望 200，得到 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if v := rec.Header().Get(headerRelayCountTokens); v != "" {
+		t.Errorf("messages 客户端仍见 X-Relay-Count-Tokens = %q", v)
+	}
+	if rec.Header().Get("X-Request-Id") != "msg-up-1" {
+		t.Error("其它端到端头应保留")
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"message"`) {
+		t.Errorf("上游 body 应透传，得到 %s", rec.Body.String())
+	}
+}
+
 // 上游不能通过 Set-Cookie 覆盖管理会话；其它 Set-Cookie 仍透传。
 // 登录发会话 Cookie 走 api 包，不经本路径（见 TestLogin_CorrectPasswordSetsHttpOnlyCookie）。
 func TestHandler_DropsUpstreamGatewaySessionSetCookie(t *testing.T) {
