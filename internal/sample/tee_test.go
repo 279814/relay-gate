@@ -530,3 +530,85 @@ func TestPrepareBody_RespectsLimitAfterRedaction(t *testing.T) {
 		t.Errorf("留档内容 %d 字节，超过 limit=%d：%q", idx, limit, out)
 	}
 }
+
+// 完整模式不得把整段响应（可到磁盘配额）攒在 RAM 里。
+// 超过 fullSpillAt 后必须落到临时文件；MemBytes 远小于总长，而 Bytes 仍完整。
+func TestHeadTail_FullModeSpillsLargeBody(t *testing.T) {
+	prev := fullSpillAt
+	fullSpillAt = 4 << 10 // 4 KiB，远小于下面的流长
+	defer func() { fullSpillAt = prev }()
+
+	const total = 200 << 10 // 200 KiB
+	ht := NewHeadTail(0, 0)
+	defer ht.Close()
+
+	var want []byte
+	chunk := bytes.Repeat([]byte("abcdefghij"), 100) // 1 KiB
+	for len(want) < total {
+		ht.Write(chunk)
+		want = append(want, chunk...)
+		if ht.MemBytes() > fullSpillAt {
+			t.Fatalf("完整模式驻留内存 %d 超过 spill 阈值 %d（total 已写 %d）",
+				ht.MemBytes(), fullSpillAt, len(want))
+		}
+	}
+	if ht.SpillBytes() == 0 {
+		t.Fatal("大包应已 spill 到临时文件，否则峰值 RAM 仍会涨到磁盘配额")
+	}
+	if ht.SpillBytes() < int64(total-fullSpillAt) {
+		t.Fatalf("spill 应承接绝大部分字节，got spill=%d total=%d", ht.SpillBytes(), total)
+	}
+	if ht.Truncated() {
+		t.Fatal("完整模式未超配额时不应截断")
+	}
+	got := ht.Bytes()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("spill 后仍应完整留档，want %d 字节 got %d", len(want), len(got))
+	}
+	if ht.SpillBytes() != 0 {
+		t.Fatal("Bytes 读回后应清理临时文件")
+	}
+}
+
+// 短响应仍整段进内存、不建临时文件 —— 默认路径不能被 spill 拖慢。
+func TestHeadTail_FullModeShortStaysInMemory(t *testing.T) {
+	ht := NewHeadTail(0, 0)
+	defer ht.Close()
+	const data = `{"id":"msg_small","ok":true}`
+	ht.Write([]byte(data))
+	if ht.SpillBytes() != 0 {
+		t.Fatalf("短响应不应 spill，got spill=%d", ht.SpillBytes())
+	}
+	if string(ht.Bytes()) != data {
+		t.Fatalf("短响应应完整保留，got %q", ht.Bytes())
+	}
+}
+
+// 超配额切换时，即便已 spill，也只把头尾种子载入 RAM，不得把预算内全文读回。
+func TestHeadTail_QuotaOverflowAfterSpillKeepsMemBounded(t *testing.T) {
+	prev := fullSpillAt
+	fullSpillAt = 2 << 10
+	defer func() { fullSpillAt = prev }()
+
+	const budget = 50 << 10 // 50 KiB
+	const overflowHead, overflowTail = 64, 64
+	ht := NewHeadTail(0, 0).LimitToRemaining(budget, overflowHead, overflowTail)
+	defer ht.Close()
+
+	chunk := bytes.Repeat([]byte("x"), 1024)
+	for i := 0; i < 80; i++ { // 80 KiB > budget，触发溢出
+		ht.Write(chunk)
+		if ht.MemBytes() > fullSpillAt+overflowHead+overflowTail+1024 {
+			t.Fatalf("溢出路径驻留内存过大：mem=%d spillThresh=%d", ht.MemBytes(), fullSpillAt)
+		}
+	}
+	if !ht.QuotaOverflow() || !ht.Truncated() {
+		t.Fatal("超配额应溢出并截断")
+	}
+	if ht.MemBytes() > overflowHead+overflowTail {
+		t.Fatalf("溢出后内存应 ≤ 头+尾（%d），got %d", overflowHead+overflowTail, ht.MemBytes())
+	}
+	if ht.SpillBytes() != 0 {
+		t.Fatal("切到头尾后 spill 应已清理")
+	}
+}

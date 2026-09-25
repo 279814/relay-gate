@@ -3,6 +3,8 @@ package sample
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"os"
 )
 
 // ellipsisFmt 是截断处的省略标记。
@@ -12,12 +14,20 @@ import (
 // 用注释风格的标记，人一眼能看懂，机器也不会当成数据。
 const ellipsisFmt = "\n/* …relay-gate: 省略 %d 字节… */\n"
 
+// fullSpillAt 是完整模式下内存缓冲的上限：超过后溢出到临时文件。
+//
+// 必须远小于默认 sample_disk_quota_bytes（5 GiB）。否则「不截断」会变成
+// 「在 RAM 里攒到配额」—— 单条多 GB 上游响应就能把进程撑爆，而磁盘
+// 配额本来只该约束落库体积。这不是操作员旋钮；测试可临时调低。
+var fullSpillAt = 1 << 20 // 1 MiB
+
 // HeadTail 是响应体的收集器，用于 SSE 响应体（§3.6.3c）。有两种模式：
 //
 // **完整模式**（headMax 与 tailMax 都为 0，即当前默认）：一字不差地全收。
 // 留档的价值就在「到底是哪些字节」—— 截断过的样本没法拿去与入站请求逐字段
-// 比对，而那是 §3.6.1 给这个功能定的头号用途。代价是内存占用等于响应大小，
-// 且**由上游决定**：每个在途请求都会在 RAM 里攒一份完整副本。
+// 比对，而那是 §3.6.1 给这个功能定的头号用途。字节先落在有界内存窗口，
+// 超出 fullSpillAt 后落到临时文件，因此峰值 RAM 与响应长度无关；落库时
+// 再读回（仍可到磁盘配额）。
 //
 // **有界模式**（任一为正）：留头 + 留尾，中间省略。
 // 为什么不能只留头：SSE 的诊断信息分布在两端 —— 头部有错误信息与首个 delta，
@@ -48,6 +58,11 @@ type HeadTail struct {
 	overflowHead  int // 配置的头上限（SampleRespHeadBytes）；0 保持 0，不另造长度
 	overflowTail  int
 	quotaOverflow bool // 是否因配额从完整模式切到了头尾
+
+	// spill：完整模式超出 fullSpillAt 后的落盘。只在 full 时使用。
+	spill     *os.File
+	spillPath string
+	spillSize int64
 }
 
 // NewHeadTail 构造收集器。headMax 与 tailMax **同时为 0** 表示完整保留；
@@ -95,7 +110,7 @@ func (h *HeadTail) LimitToRemaining(remaining int64, overflowHead, overflowTail 
 	h.overflowHead = overflowHead
 	h.overflowTail = overflowTail
 	if remaining == 0 {
-		h.switchFromFull(nil)
+		h.transitionFromFull()
 	}
 	return h
 }
@@ -103,6 +118,32 @@ func (h *HeadTail) LimitToRemaining(remaining int64, overflowHead, overflowTail 
 // QuotaOverflow 表示是否因剩余磁盘配额从完整模式切到了头尾（§5.4）。
 func (h *HeadTail) QuotaOverflow() bool {
 	return h != nil && h.quotaOverflow
+}
+
+// MemBytes 返回当前驻留内存的采集缓冲大小（不含 spill 文件）。
+// 完整模式下应远小于磁盘配额；测试用它断言大包不会整段进 RAM。
+func (h *HeadTail) MemBytes() int {
+	if h == nil {
+		return 0
+	}
+	return len(h.head) + h.tailLen
+}
+
+// SpillBytes 返回已写入临时文件的字节数；未溢出时为 0。
+func (h *HeadTail) SpillBytes() int64 {
+	if h == nil {
+		return 0
+	}
+	return h.spillSize
+}
+
+// Close 释放 spill 临时文件。Bytes 成功读回后也会清掉；
+// 被丢弃的尝试（重试换站）必须显式 Close，否则临时文件会泄漏。
+func (h *HeadTail) Close() {
+	if h == nil {
+		return
+	}
+	h.closeSpill()
 }
 
 // Write 收下一段字节。永不返回错误 —— 采集是旁路，
@@ -114,15 +155,80 @@ func (h *HeadTail) Write(p []byte) (int, error) {
 
 	h.total += int64(len(p))
 
-	// 完整模式：全部进 head，tail 不用。Bytes 与 Truncated 的既有公式
-	// （head 已含全文 → 直接返回、不算截断）正好覆盖这一支，不需要特例。
 	if h.full {
-		h.head = append(h.head, p...)
+		h.writeFull(p)
 		return len(p), nil
 	}
 
 	h.writeBounded(p)
 	return len(p), nil
+}
+
+// writeFull 完整模式写入：先填有界内存窗口，超出则落到临时文件。
+func (h *HeadTail) writeFull(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	// 已在 spill：新字节直接落盘，不再进 head。
+	if h.spill != nil {
+		h.appendSpill(p)
+		return
+	}
+	limit := fullSpillAt
+	if limit < 1 {
+		limit = 1
+	}
+	if len(h.head)+len(p) <= limit {
+		h.head = append(h.head, p...)
+		return
+	}
+	// 打开 spill，把已有 head 与本段都写出，然后清空 head。
+	if !h.openSpill() {
+		// 建临时文件失败时退回纯内存，语义仍正确，只是峰值 RAM 退化。
+		h.head = append(h.head, p...)
+		return
+	}
+	if len(h.head) > 0 {
+		h.appendSpill(h.head)
+		h.head = h.head[:0]
+	}
+	h.appendSpill(p)
+}
+
+func (h *HeadTail) openSpill() bool {
+	if h.spill != nil {
+		return true
+	}
+	f, err := os.CreateTemp("", "relay-gate-sample-*.tmp")
+	if err != nil {
+		return false
+	}
+	h.spill = f
+	h.spillPath = f.Name()
+	return true
+}
+
+func (h *HeadTail) appendSpill(p []byte) {
+	if h.spill == nil || len(p) == 0 {
+		return
+	}
+	n, err := h.spill.Write(p)
+	h.spillSize += int64(n)
+	if err != nil || n < len(p) {
+		// 旁路：写盘失败不回传；已写入的前缀仍可留档。
+		return
+	}
+}
+
+func (h *HeadTail) closeSpill() {
+	if h.spill == nil {
+		return
+	}
+	_ = h.spill.Close()
+	_ = os.Remove(h.spillPath)
+	h.spill = nil
+	h.spillPath = ""
+	h.spillSize = 0
 }
 
 // writeOverBudget 在完整模式撞上剩余配额时切到头尾，再写入本段。
@@ -140,12 +246,13 @@ func (h *HeadTail) writeOverBudget(p []byte) (int, error) {
 			fit = p
 		}
 	}
-	already := make([]byte, 0, len(h.head)+len(fit))
-	already = append(already, h.head...)
-	already = append(already, fit...)
+	if len(fit) > 0 {
+		h.total += int64(len(fit))
+		h.writeFull(fit)
+	}
 	rest := p[len(fit):]
 
-	h.switchFromFull(already)
+	h.transitionFromFull()
 	if len(rest) > 0 {
 		h.total += int64(len(rest))
 		h.writeBounded(rest)
@@ -153,22 +260,38 @@ func (h *HeadTail) writeOverBudget(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// switchFromFull 丢掉完整缓冲，改成有界头尾并回放已收下的前缀。
-func (h *HeadTail) switchFromFull(already []byte) {
+// transitionFromFull 丢掉完整缓冲（含 spill），改成有界头尾。
+// 只从 spill/head 读回配置长度的头尾，不把整段预算内容再载入 RAM。
+func (h *HeadTail) transitionFromFull() {
 	headMax, tailMax := h.overflowHead, h.overflowTail
-	budget := len(already)
+	stored := h.fullStoredLen()
+	budget := stored
 	if h.budgetOn && int(h.budget) < budget {
 		budget = int(h.budget)
 	}
 	// 0/0 保持 0：§5.4 要的是「可配置的头尾」，未配置时不发明长度。
 	if headMax > 0 || tailMax > 0 {
 		if budget > 0 && headMax+tailMax > budget {
-			// 配置头尾之和大于剩余配额时，按比例压进配额内。
 			total := headMax + tailMax
 			headMax = budget * headMax / total
 			tailMax = budget - headMax
 		}
 	}
+
+	var headSeed, tailSeed []byte
+	if headMax > 0 {
+		headSeed = h.copyFullRange(0, headMax)
+	}
+	if tailMax > 0 {
+		start := stored - tailMax
+		if start < 0 {
+			start = 0
+		}
+		tailSeed = h.copyFullRange(start, stored-start)
+	}
+
+	prevTotal := h.total
+	h.closeSpill()
 
 	h.quotaOverflow = true
 	h.full = false
@@ -178,10 +301,54 @@ func (h *HeadTail) switchFromFull(already []byte) {
 	h.tail = make([]byte, tailMax)
 	h.tailPos, h.tailLen = 0, 0
 	h.total = 0
-	if len(already) > 0 {
-		h.total += int64(len(already))
-		h.writeBounded(already)
+	if len(headSeed) > 0 {
+		h.writeBounded(headSeed)
 	}
+	if len(tailSeed) > 0 {
+		h.writeBounded(tailSeed)
+	}
+	// writeBounded 只看到头尾种子；流经总长仍是切模式前的字节数
+	// （加上 writeOverBudget 稍后写入的 rest）。
+	h.total = prevTotal
+}
+
+func (h *HeadTail) fullStoredLen() int {
+	n := len(h.head)
+	if h.spillSize > 0 {
+		// spillSize 在 int 范围内；完整模式受磁盘配额约束（默认 5 GiB）。
+		n += int(h.spillSize)
+	}
+	return n
+}
+
+func (h *HeadTail) copyFullRange(off, n int) []byte {
+	if n <= 0 || off < 0 {
+		return nil
+	}
+	out := make([]byte, 0, n)
+	spillLen := int(h.spillSize)
+	if off < spillLen && h.spill != nil {
+		toRead := n
+		if off+toRead > spillLen {
+			toRead = spillLen - off
+		}
+		buf := make([]byte, toRead)
+		if _, err := h.spill.ReadAt(buf, int64(off)); err != nil && err != io.EOF {
+			// 旁路：读失败则尽已读前缀
+		}
+		out = append(out, buf...)
+		n -= toRead
+		off = spillLen
+	}
+	memOff := off - spillLen
+	if n > 0 && memOff >= 0 && memOff < len(h.head) {
+		end := memOff + n
+		if end > len(h.head) {
+			end = len(h.head)
+		}
+		out = append(out, h.head[memOff:end]...)
+	}
+	return out
 }
 
 func (h *HeadTail) writeBounded(p []byte) {
@@ -220,7 +387,11 @@ func (h *HeadTail) Total() int64 { return h.total }
 //
 // 判据是「头 + 尾覆盖不住全长」。头尾**重叠**时不算截断：
 // 那种情况下全文都在手上，只是分散在两个缓冲里（见 Bytes）。
+// 完整模式（含 spill）永不截断 —— 全文都在 spill 和/或 head 里。
 func (h *HeadTail) Truncated() bool {
+	if h.full {
+		return false
+	}
 	return h.total > int64(len(h.head))+int64(h.tailLen)
 }
 
@@ -249,6 +420,10 @@ func (h *HeadTail) tailBytes() []byte {
 //
 // 前两种情形绝不插标记：否则短响应的样本也被污染，无法与真实字节比对。
 func (h *HeadTail) Bytes() []byte {
+	if h.full {
+		return h.bytesFull()
+	}
+
 	if int64(len(h.head)) >= h.total {
 		return h.head
 	}
@@ -268,6 +443,26 @@ func (h *HeadTail) Bytes() []byte {
 	fmt.Fprintf(&buf, ellipsisFmt, omitted)
 	buf.Write(tail)
 	return buf.Bytes()
+}
+
+func (h *HeadTail) bytesFull() []byte {
+	if h.spill == nil {
+		return h.head
+	}
+	out := make([]byte, 0, int(h.spillSize)+len(h.head))
+	if h.spillSize > 0 {
+		buf := make([]byte, h.spillSize)
+		if _, err := h.spill.ReadAt(buf, 0); err != nil && err != io.EOF {
+			// 旁路：尽已读
+		}
+		out = append(out, buf...)
+	}
+	out = append(out, h.head...)
+	// 内容已在 out；立刻丢掉 spill，避免临时文件拖到 GC。
+	// head 改挂 out，便于 Bytes 被再次读取时仍完整。
+	h.closeSpill()
+	h.head = out
+	return out
 }
 
 // PrepareBody 把一份 body 处理成可落库的形式：按上限截断 + 脱敏。
