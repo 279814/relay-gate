@@ -3,11 +3,13 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/smtp"
 	"strings"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -38,6 +40,66 @@ func TestAPI_SecurityScanAndLazyCanaryRejected(t *testing.T) {
 	rec3 := do(t, h, "GET", "/admin/api/security/findings", "", true)
 	if rec3.Code != 200 {
 		t.Fatalf("findings %d", rec3.Code)
+	}
+}
+
+// Naming an existing upstream must feed its stored API key into ScanText so
+// a pasted key cannot land in finding Detail or the HTTP scan response.
+func TestAPI_SecurityScan_NamedUpstreamRedactsAPIKey(t *testing.T) {
+	const key = "sk-ADMIN-SCAN-REDACT-KEY-7e4d9a2c"
+	s, _ := newTestServer(t)
+	up := &model.Upstream{
+		Name: "scan-redact-up", BaseURL: "https://scan-redact.example",
+		APIKey: key, Enabled: true,
+	}
+	up.Defaults()
+	if err := s.st.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	h := s.WithSecurityCenter(security.NewCenter(50)).Routes(testAdminPW)
+
+	text := `<script>x</script> token=` + key + ` trailer`
+	payload := fmt.Sprintf(`{"text":%q,"upstream":%q}`, text, up.Name)
+	rec := do(t, h, "POST", "/admin/api/security/scan", payload, true)
+	if rec.Code != 200 {
+		t.Fatalf("scan by name status %d %s", rec.Code, rec.Body.String())
+	}
+	assertScanResponseOmitsKey(t, rec.Body.String(), key)
+
+	payloadID := fmt.Sprintf(`{"text":%q,"upstream":%q}`, text, itoa(up.ID))
+	rec2 := do(t, h, "POST", "/admin/api/security/scan", payloadID, true)
+	if rec2.Code != 200 {
+		t.Fatalf("scan by id status %d %s", rec2.Code, rec2.Body.String())
+	}
+	assertScanResponseOmitsKey(t, rec2.Body.String(), key)
+
+	listed := s.security.List("", 50)
+	for _, f := range listed {
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("stored finding Detail still contains upstream API key: %q", f.Detail)
+		}
+	}
+}
+
+func assertScanResponseOmitsKey(t *testing.T, body, key string) {
+	t.Helper()
+	if strings.Contains(body, key) {
+		t.Fatalf("scan HTTP response echoed upstream API key: %s", body)
+	}
+	var scan struct {
+		Findings []security.Finding `json:"findings"`
+		Count    int                `json:"count"`
+	}
+	if err := json.Unmarshal([]byte(body), &scan); err != nil {
+		t.Fatalf("parse scan response: %v", err)
+	}
+	if scan.Count < 1 || len(scan.Findings) < 1 {
+		t.Fatalf("expected findings, body=%s", body)
+	}
+	for _, f := range scan.Findings {
+		if strings.Contains(f.Detail, key) {
+			t.Fatalf("finding Detail still contains upstream API key: %q", f.Detail)
+		}
 	}
 }
 
