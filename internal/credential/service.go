@@ -246,6 +246,31 @@ func (s *Service) RevealActiveRelayKey() (string, error) {
 	return plain, nil
 }
 
+// ResealActiveRelayEnvelope re-encrypts the in-memory Relay Key under the
+// current EnvelopeCipher active master (§12.7 after ActivateMaster). No-op
+// when no envelope is wired or no sealed copy exists.
+func (s *Service) ResealActiveRelayEnvelope() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.envelope == nil || s.relayActiveEnc == "" {
+		return nil
+	}
+	plain, err := s.envelope.DecryptEnvelope(s.relayActiveEnc)
+	if err != nil {
+		return fmt.Errorf("解密 Relay Key: %w", err)
+	}
+	if digestRelayKey(plain) != s.relayActive {
+		return errors.New("Relay Key 密文与摘要不一致")
+	}
+	enc, err := s.envelope.EncryptEnvelope(plain)
+	if err != nil {
+		return fmt.Errorf("加密 Relay Key: %w", err)
+	}
+	s.relayActiveEnc = enc
+	s.noteLocked("relay_reseal", "envelope rewrapped under new master")
+	return nil
+}
+
 // RevokeGrace drops the overlapping old relay key immediately.
 func (s *Service) RevokeGrace() {
 	s.mu.Lock()
