@@ -847,4 +847,3 @@ func TestInsertSampleWithinQuota_SkipRemovesSpillFile(t *testing.T) {
 		t.Fatalf("跳过后 spill 应已删除，stat=%v", err)
 	}
 }
-
