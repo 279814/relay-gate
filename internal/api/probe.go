@@ -155,7 +155,10 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	// URL 路径上的 id / 库中的 upstream_id 不可被 body 改写：否则会校验到别的站、
+	// 或把 Invalidate 打到错误 Upstream（store UPDATE 本身不写 upstream_id 列）。
 	body.ID = id
+	body.UpstreamID = cur.UpstreamID
 	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, body.UpstreamEndpoint)
 	if err != nil {
 		s.writeErr(w, err)

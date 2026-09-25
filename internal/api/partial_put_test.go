@@ -168,3 +168,63 @@ func TestPartialPUT_EndpointOmitsKeepStoredFields(t *testing.T) {
 		t.Fatalf("rejected update changed row: before=%+v after=%+v", before, after)
 	}
 }
+
+// Body id / upstream_id must not retarget the write: URL path id is the row,
+// and the stored upstream ownership stays put (validation + response + invalidate).
+func TestPartialPUT_EndpointIgnoresBodyIDAndUpstreamID(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
+
+	upA := mkUpstreamViaAPI(t, h, `{"name":"partial-ep-a","base_url":"https://partial-a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
+	upB := mkUpstreamViaAPI(t, h, `{"name":"partial-ep-b","base_url":"https://partial-b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
+
+	rec := do(t, h, "GET", "/admin/api/upstream-endpoints?upstream_id="+itoa(upA), "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list A: %d %s", rec.Code, rec.Body.String())
+	}
+	pageA := decodeBody[model.Page[model.UpstreamEndpoint]](t, rec)
+	if len(pageA.Items) < 2 {
+		t.Fatal("expected auto-created endpoints on A")
+	}
+	target := pageA.Items[0]
+	otherOnA := pageA.Items[1]
+
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints?upstream_id="+itoa(upB), "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list B: %d %s", rec.Code, rec.Body.String())
+	}
+	pageB := decodeBody[model.Page[model.UpstreamEndpoint]](t, rec)
+	if len(pageB.Items) == 0 {
+		t.Fatal("expected auto-created endpoints on B")
+	}
+
+	override := "https://partial-a.example.com/v1/retarget-check"
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(target.ID),
+		`{"id":`+itoa(otherOnA.ID)+`,"upstream_id":`+itoa(upB)+
+			`,"url_override":`+mustJSON(t, override)+
+			`,"expected_revision":`+itoa(target.Revision)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT with forged id/upstream_id: %d %s", rec.Code, rec.Body.String())
+	}
+	got := decodeBody[model.UpstreamEndpoint](t, rec)
+	if got.ID != target.ID {
+		t.Fatalf("body id retargeted write: got id=%d want %d", got.ID, target.ID)
+	}
+	if got.UpstreamID != upA {
+		t.Fatalf("body upstream_id moved ownership: got upstream_id=%d want %d", got.UpstreamID, upA)
+	}
+	if got.URLOverride != override {
+		t.Fatalf("url_override=%q want %q", got.URLOverride, override)
+	}
+
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints/"+itoa(target.ID), "", true)
+	persisted := decodeBody[model.UpstreamEndpoint](t, rec)
+	if persisted.UpstreamID != upA || persisted.URLOverride != override {
+		t.Fatalf("persisted row wrong: %+v", persisted)
+	}
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints/"+itoa(otherOnA.ID), "", true)
+	untouched := decodeBody[model.UpstreamEndpoint](t, rec)
+	if untouched.URLOverride != otherOnA.URLOverride || untouched.Revision != otherOnA.Revision {
+		t.Fatalf("forged id mutated sibling row: before=%+v after=%+v", otherOnA, untouched)
+	}
+}
