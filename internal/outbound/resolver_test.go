@@ -309,7 +309,7 @@ func TestResolve_DropsIncomingCredentialQueryParam(t *testing.T) {
 		got := resolve(t, ResolveInput{
 			Upstream: testUpstream(), Endpoint: endpoint,
 			IncomingRawQuery: "token=client-token&flag=1",
-			Values: staticValues{"SECRET:site-token": {Plain: []byte("site-secret"), Revision: 1}},
+			Values:           staticValues{"SECRET:site-token": {Plain: []byte("site-secret"), Revision: 1}},
 		})
 		want := "token=site-secret&beta=true&flag=1"
 		if got.URL.RawQuery != want {
