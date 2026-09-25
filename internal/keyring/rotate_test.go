@@ -143,3 +143,42 @@ func TestRecoverUnfinished_DBCommittedActivatesForward(t *testing.T) {
 		t.Fatal("must not keep old master as sole decryptor after db_committed")
 	}
 }
+
+// §12.7：key_activated 须 MarkCleaned（与在线轮换 activate 后相同）；新 active
+// 不变；不得因未清理而永久 hold maintenance。
+func TestRecoverUnfinished_KeyActivatedMarksCleaned(t *testing.T) {
+	const newMaster = "bbbbbbbbbbbbbbbb"
+	f := Open(t.TempDir())
+	if err := f.EnsureInitialized("mk_a", "aaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	rid, err := f.BeginRotation(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MarkDBCommitted(rid); err != nil {
+		t.Fatal(err)
+	}
+	newID, err := f.ActivatePending(rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hold, st, err := f.RecoverUnfinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hold {
+		t.Fatal("key_activated MarkCleaned finished; must not keep maintenance hold")
+	}
+	if st.Phase != PhaseCleaned {
+		t.Fatalf("phase=%s want cleaned", st.Phase)
+	}
+	if st.RotationID != "" {
+		t.Fatalf("rotation_id must clear after cleaned: %+v", st)
+	}
+	id, active, err := f.LoadActive()
+	if err != nil || active != newMaster || id != newID {
+		t.Fatalf("active key must stay new: id=%s want=%s active=%q err=%v", id, newID, active, err)
+	}
+}
