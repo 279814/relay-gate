@@ -141,14 +141,21 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
-	var body struct {
+	// 以库中现值为基底：PUT 未提供的字段保持原样（与 updateRoute / updateModelName 一致）。
+	cur, err := s.probeAdmin.GetEndpoint(r.Context(), id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	body := struct {
 		model.UpstreamEndpoint
 		ExpectedRevision int64 `json:"expected_revision"`
-	}
+	}{UpstreamEndpoint: cur}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	body.ID = id
 	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, body.UpstreamEndpoint)
 	if err != nil {
 		s.writeErr(w, err)
