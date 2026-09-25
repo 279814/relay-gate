@@ -55,6 +55,13 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// Settings live in the same livecfg PublishedConfig preamble reads
+	// (timeouts, retry_policy, sample knobs). Without Invalidate+Refresh the
+	// next new request can keep the pre-write values for up to DefaultTTL.
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	s.log.Info("更新全局设置", "real_first_token_sec", cur.RealFirstTokenSec,
 		"sample_enabled", cur.SampleEnabled)
 	writeJSON(w, http.StatusOK, cur)

@@ -515,3 +515,125 @@ func TestWrite_EndpointDeleteFailedStoreDoesNotPublish(t *testing.T) {
 			beforeInv, afterInv, beforeRef, afterRef)
 	}
 }
+
+// Settings (timeouts, retry_policy, sample knobs) live in the same livecfg
+// PublishedConfig preamble reads via ConfigSource.Settings(). A successful
+// PUT must Invalidate+Refresh so the next Settings()/preamble sees the new
+// values within TTL.
+func TestWrite_SettingsVisibleBeforeHandlerReturns(t *testing.T) {
+	_, h, src, pub := newLivecfgServer(t)
+
+	warm, err := src.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warm.RetryPolicy != model.RetryPolicyBalanced {
+		t.Fatalf("warm retry_policy=%q want balanced", warm.RetryPolicy)
+	}
+	if !warm.SampleEnabled {
+		t.Fatal("warm sample_enabled should be true")
+	}
+
+	beforeInv, beforeRef := pub.counts()
+	rec := do(t, h, "PUT", "/admin/api/settings",
+		`{"retry_policy":"aggressive","sample_enabled":false}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update settings: %d %s", rec.Code, rec.Body.String())
+	}
+	assertPublished(t, pub, beforeInv, beforeRef)
+
+	got, err := src.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetryPolicy != model.RetryPolicyAggressive {
+		t.Fatalf("retry_policy still %q within TTL, want aggressive", got.RetryPolicy)
+	}
+	if got.SampleEnabled {
+		t.Fatal("sample_enabled still true within TTL, want false")
+	}
+
+	// Validation failure must leave the published snapshot unchanged.
+	beforeInv, beforeRef = pub.counts()
+	rec = do(t, h, "PUT", "/admin/api/settings",
+		`{"retry_policy":"not-a-policy"}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("invalid retry_policy must be rejected")
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("validation failure must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
+	}
+	still, err := src.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.RetryPolicy != model.RetryPolicyAggressive || still.SampleEnabled {
+		t.Fatalf("rejected write changed settings: %+v", still)
+	}
+}
+
+func TestWrite_SettingsRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T) {
+	_, h, src, pub := newLivecfgServer(t)
+
+	warm, err := src.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warm.RetryPolicy != model.RetryPolicyBalanced {
+		t.Fatalf("warm retry_policy=%q want balanced", warm.RetryPolicy)
+	}
+
+	pub.mu.Lock()
+	pub.refreshErr = errRefreshBoom
+	pub.skipInnerRefresh = true
+	pub.mu.Unlock()
+
+	beforeInv, beforeRef := pub.counts()
+	rec := do(t, h, "PUT", "/admin/api/settings",
+		`{"retry_policy":"aggressive"}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("Refresh failure must not return 200 while Settings may be stale")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
+		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
+	}
+
+	// Re-Invalidate forces get() to reload SQL: new retry_policy must appear.
+	got, err := src.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetryPolicy != model.RetryPolicyAggressive {
+		t.Fatalf("after Refresh failure + re-Invalidate want aggressive, got %q", got.RetryPolicy)
+	}
+}
+
+func TestWrite_SettingsFailedStoreDoesNotPublish(t *testing.T) {
+	s, h, _, pub := newLivecfgServer(t)
+
+	// First PUT inserts the settings row; subsequent PUTs UPDATE it.
+	rec := do(t, h, "PUT", "/admin/api/settings",
+		`{"retry_policy":"safe"}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed settings: %d %s", rec.Code, rec.Body.String())
+	}
+
+	beforeInv, beforeRef := pub.counts()
+	forceTableUpdateFail(t, s, "setting")
+	rec = do(t, h, "PUT", "/admin/api/settings",
+		`{"retry_policy":"aggressive"}`, true)
+	if rec.Code == http.StatusOK {
+		t.Fatal("expected settings update failure, got 200")
+	}
+	afterInv, afterRef := pub.counts()
+	if afterInv != beforeInv || afterRef != beforeRef {
+		t.Fatalf("failed settings update must not publish: inv=%d→%d ref=%d→%d",
+			beforeInv, afterInv, beforeRef, afterRef)
+	}
+}
