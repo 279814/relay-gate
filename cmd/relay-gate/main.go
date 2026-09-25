@@ -165,6 +165,14 @@ func runServer() error {
 	// 放在 Shutdown 之后收尾：关闭前那几条样本往往正是故障现场。
 	defer recorder.Close()
 
+	// 完整模式 spill 落在 TempDir（relay-gate-sample-*.tmp）。崩溃跳过
+	// closeSpill 时残留仍含响应字节；接流量前按前缀清掉，不动已落库样本。
+	if n, err := sample.RemoveOrphanSpills(""); err != nil {
+		log.Warn("清理残留样本 spill 失败", "err", err)
+	} else if n > 0 {
+		log.Info("已清理崩溃残留的样本 spill", "files", n)
+	}
+
 	// 请求日志（M6）：每次尝试一行，含被重试丢弃的那些。
 	//
 	// 与样本各是一套独立的旋钮（开关、保留策略、队列都分开）。样本可以关，
