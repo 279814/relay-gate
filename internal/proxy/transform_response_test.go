@@ -46,6 +46,92 @@ func TestResponseTransform_AppliesPublishedBinding(t *testing.T) {
 	}
 }
 
+// When replace_bytes changes the body, Content-Encoding must not still claim
+// the upstream coding — the client would gunzip/inflate the transformed bytes.
+func TestResponseTransform_DropsContentEncodingWhenBodyChanges(t *testing.T) {
+	for _, coding := range []string{"gzip", "deflate", "br"} {
+		coding := coding
+		t.Run(coding, func(t *testing.T) {
+			hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Encoding", coding)
+				w.WriteHeader(200)
+				// Plaintext body with a stale encoding claim (transform does not decompress).
+				w.Write([]byte(`{"ok":true,"note":"upstream"}`))
+			})
+			reg := transform.NewRegistry(4)
+			set, err := reg.CreateSet("enc-" + coding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules := []transform.Rule{
+				{Kind: transform.KindReplaceBytes, From: `"note":"upstream"`, To: `"note":"gateway"`},
+			}
+			if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+				t.Fatal(err)
+			}
+			hs.h.WithTransforms(reg)
+
+			rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+			if rec.Code != 200 {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Encoding"); got != "" {
+				t.Fatalf("Content-Encoding=%q want cleared after body transform", got)
+			}
+			if rec.Header().Get("Content-Length") != "" {
+				t.Fatal("Content-Length must stay deleted on transform commit")
+			}
+			if !strings.Contains(rec.Body.String(), `"note":"gateway"`) {
+				t.Fatalf("body not transformed: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// Header-only response rules leave the body untouched, so upstream
+// Content-Encoding must remain (passthrough of the original coding).
+func TestResponseTransform_KeepsContentEncodingWhenBodyUnchanged(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"ok":true}`))
+	})
+	reg := transform.NewRegistry(4)
+	set, err := reg.CreateSet("hdr-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{
+		{Kind: transform.KindSetHeader, Name: "X-Transformed", Value: "1"},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-Transformed") != "1" {
+		t.Fatalf("missing transform header: %v", rec.Header())
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding=%q want gzip when body unchanged", got)
+	}
+	if rec.Body.String() != `{"ok":true}` {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
 func TestResponseTransform_UnboundPassthrough(t *testing.T) {
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -140,6 +226,40 @@ func TestSSETransform_AppliesEventsAndSyntheticEnd(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("missing synthetic end: %s", body)
+	}
+}
+
+// SSE commit re-encodes frames; a stale Content-Encoding must not survive.
+func TestSSETransform_DropsContentEncoding(t *testing.T) {
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		fl := w.(http.Flusher)
+		w.Write([]byte("event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n"))
+		fl.Flush()
+	})
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("sse-enc")
+	rules := []transform.Rule{
+		{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "hi", To: "hello"},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding=%q want cleared on SSE transform commit", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"delta":"hello"`) {
+		t.Fatalf("sse data not transformed: %s", rec.Body.String())
 	}
 }
 

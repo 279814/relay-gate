@@ -124,6 +124,12 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	// Protect layer: length from final body, not upstream.
 	dst.Del("Content-Length")
+	// Transform operates on raw upstream bytes (no decompress). If the body
+	// changed, an upstream Content-Encoding (gzip/deflate/br) would lie about
+	// the bytes we are about to write — clients would try to decode them.
+	if !bytes.Equal(out.Body, body) {
+		dst.Del("Content-Encoding")
+	}
 	w.WriteHeader(out.Status)
 	res.HeadersSent = true
 	res.Status = out.Status
@@ -237,6 +243,10 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	}
 	FinalizeClientResponseHeaders(dst, f.RedactSecrets)
 	dst.Del("Content-Length")
+	// ApplySSEEvent always re-encodes event.Raw via encodeSSE, so the wire
+	// body is not the upstream byte stream. A leftover Content-Encoding
+	// (gzip/deflate/br) would ask the client to decode transformed frames.
+	dst.Del("Content-Encoding")
 	w.WriteHeader(hdrOut.Status)
 	res.HeadersSent = true
 	res.Status = hdrOut.Status
