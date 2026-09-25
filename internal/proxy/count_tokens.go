@@ -320,7 +320,7 @@ func estimateInputTokens(body []byte) (int, error) {
 	return n + perMessageOverhead*len(req.Messages), nil
 }
 
-// estimateJSONTokens 递归走一段 JSON，累加其中所有字符串的估算值。
+// estimateJSONTokens 走一段 JSON，累加其中所有字符串的估算值。
 //
 // 不按字段名区分是刻意的：要算的文本散落在 text block 的 text、
 // tool_use 的 input、tools 的 schema description 等处，形状各不相同。
@@ -340,26 +340,31 @@ func estimateJSONTokens(raw json.RawMessage) int {
 	return walkJSONTokens(v)
 }
 
+// walkJSONTokens 迭代遍历已解码的 JSON 值树，累加字符串估算。
+// 必须用显式栈而不是递归：encoding/json 允许约 10000 层嵌套，
+// 递归会在 goroutine 栈上炸开（§ 请求体深度）。
 func walkJSONTokens(v any) int {
-	switch t := v.(type) {
-	case string:
-		return estimateTokens(t)
-	case []any:
-		n := 0
-		for _, e := range t {
-			n += walkJSONTokens(e)
+	n := 0
+	stack := []any{v}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch t := cur.(type) {
+		case string:
+			n += estimateTokens(t)
+		case []any:
+			for _, e := range t {
+				stack = append(stack, e)
+			}
+		case map[string]any:
+			for _, e := range t {
+				stack = append(stack, e)
+			}
 		}
-		return n
-	case map[string]any:
-		n := 0
-		for _, e := range t {
-			n += walkJSONTokens(e)
-		}
-		return n
+		// 数字、bool、null 在真实 tokenizer 里各占 1–2 个。
+		// 相对于文本的量级可以忽略，不值得为此引入一堆 +1。
 	}
-	// 数字、bool、null 在真实 tokenizer 里各占 1–2 个。
-	// 相对于文本的量级可以忽略，不值得为此引入一堆 +1。
-	return 0
+	return n
 }
 
 // estimateTokens 粗算一段文本的 token 数。
