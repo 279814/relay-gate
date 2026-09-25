@@ -2,12 +2,50 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/andybalholm/brotli"
+
 	"github.com/279814/relay-gate/internal/transform"
 )
+
+func gzipBody(t *testing.T, plain []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func deflateBody(t *testing.T, plain []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func brotliBody(plain []byte) []byte {
+	var buf bytes.Buffer
+	zw := brotli.NewWriter(&buf)
+	_, _ = zw.Write(plain)
+	_ = zw.Close()
+	return buf.Bytes()
+}
 
 func TestResponseTransform_AppliesPublishedBinding(t *testing.T) {
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -46,18 +84,92 @@ func TestResponseTransform_AppliesPublishedBinding(t *testing.T) {
 	}
 }
 
-// When replace_bytes changes the body, Content-Encoding must not still claim
-// the upstream coding — the client would gunzip/inflate the transformed bytes.
+// Gzip upstream body must be decoded before replace_bytes; the client receives
+// the transformed plaintext and must not see Content-Encoding.
+func TestResponseTransform_DecodesGzipBeforeBodyTransform(t *testing.T) {
+	plain := []byte(`{"ok":true,"note":"upstream"}`)
+	compressed := gzipBody(t, plain)
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+		w.Write(compressed)
+	})
+	reg := transform.NewRegistry(4)
+	set, err := reg.CreateSet("gzip-decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{
+		{Kind: transform.KindReplaceBytes, From: `"note":"upstream"`, To: `"note":"gateway"`},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding=%q want cleared after decode+transform", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), []byte(`{"ok":true,"note":"gateway"}`)) {
+		t.Fatalf("body=%q want transformed decoded plaintext", rec.Body.Bytes())
+	}
+}
+
+// Unbound passthrough must not decompress: gzip bytes and Content-Encoding stay.
+func TestResponseTransform_UnboundPassthroughKeepsGzip(t *testing.T) {
+	plain := []byte(`{"ok":true}`)
+	compressed := gzipBody(t, plain)
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(compressed)
+	})
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("unused-gzip")
+	_, _ = reg.UpdateDraft(set.ID, []transform.Rule{
+		{Kind: transform.KindReplaceBytes, From: `"ok":true`, To: `"ok":false`},
+	}, transform.FailClosed, transform.FailOpen, "")
+	_, _, _ = reg.PublishSnapshot(set.ID, 999, 999)
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","max_tokens":1}`))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding=%q want gzip on unbound passthrough", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), compressed) {
+		t.Fatalf("body mutated on unbound passthrough")
+	}
+}
+
+// When replace_bytes changes a decoded body, Content-Encoding must be cleared
+// for gzip / deflate / br upstream responses.
 func TestResponseTransform_DropsContentEncodingWhenBodyChanges(t *testing.T) {
-	for _, coding := range []string{"gzip", "deflate", "br"} {
-		coding := coding
+	plain := []byte(`{"ok":true,"note":"upstream"}`)
+	want := []byte(`{"ok":true,"note":"gateway"}`)
+	bodies := map[string][]byte{
+		"gzip":    gzipBody(t, plain),
+		"deflate": deflateBody(t, plain),
+		"br":      brotliBody(plain),
+	}
+	for coding, compressed := range bodies {
+		coding, compressed := coding, compressed
 		t.Run(coding, func(t *testing.T) {
 			hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Content-Encoding", coding)
 				w.WriteHeader(200)
-				// Plaintext body with a stale encoding claim (transform does not decompress).
-				w.Write([]byte(`{"ok":true,"note":"upstream"}`))
+				w.Write(compressed)
 			})
 			reg := transform.NewRegistry(4)
 			set, err := reg.CreateSet("enc-" + coding)
@@ -85,8 +197,8 @@ func TestResponseTransform_DropsContentEncodingWhenBodyChanges(t *testing.T) {
 			if rec.Header().Get("Content-Length") != "" {
 				t.Fatal("Content-Length must stay deleted on transform commit")
 			}
-			if !strings.Contains(rec.Body.String(), `"note":"gateway"`) {
-				t.Fatalf("body not transformed: %s", rec.Body.String())
+			if !bytes.Equal(rec.Body.Bytes(), want) {
+				t.Fatalf("body=%q want %q", rec.Body.Bytes(), want)
 			}
 		})
 	}
@@ -322,13 +434,16 @@ func TestSSETransform_AppliesEventsAndSyntheticEnd(t *testing.T) {
 	}
 }
 
-// SSE commit re-encodes frames; a stale Content-Encoding must not survive.
+// SSE commit re-encodes frames after decoding gzip; a stale Content-Encoding
+// must not survive, and match rules must see decoded event text.
 func TestSSETransform_DropsContentEncoding(t *testing.T) {
+	plain := []byte("event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n")
+	compressed := gzipBody(t, plain)
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Content-Encoding", "gzip")
 		fl := w.(http.Flusher)
-		w.Write([]byte("event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n"))
+		w.Write(compressed)
 		fl.Flush()
 	})
 	reg := transform.NewRegistry(4)
