@@ -6,15 +6,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 // Persisted is the on-disk credential material under data/secrets/ (§12.3 / §12.8).
 // Admin password is stored only as Argon2id; never recoverable plaintext.
+// RelayGraceDigest is the SHA-256 hex of the previous active key during overlap;
+// never store the previous raw key. RelayGraceUntil is RFC3339Nano UTC.
 type Persisted struct {
 	FormatVersion     int    `json:"format_version"`
 	AdminPasswordHash string `json:"admin_password_hash"`
 	RelayKey          string `json:"relay_key"`
+	RelayGraceDigest  string `json:"relay_grace_digest,omitempty"`
+	RelayGraceUntil   string `json:"relay_grace_until,omitempty"`
 	MasterKeyID       string `json:"master_key_id"`
 	UpdatedAt         string `json:"updated_at"`
 }
@@ -123,5 +128,52 @@ func WritePersisted(dataDir string, doc Persisted) error {
 	if doc.UpdatedAt == "" {
 		doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	return writeJSON0600(CredentialsFile(dataDir), doc)
+}
+
+// ReplaceRelayRotation updates the active relay plaintext and optional grace
+// digest/deadline after UI rotate (§12.6). Preserves admin hash and master id.
+// graceDigest must be the irreversible hex digest (never raw previous key).
+func ReplaceRelayRotation(dataDir, newRelayKey, graceDigest string, graceUntil time.Time) error {
+	if strings.TrimSpace(newRelayKey) == "" {
+		return errors.New("relay key 不能为空")
+	}
+	doc, err := LoadPersistedFile(dataDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		doc = Persisted{FormatVersion: 1}
+	}
+	if doc.FormatVersion == 0 {
+		doc.FormatVersion = 1
+	}
+	doc.RelayKey = newRelayKey
+	if graceDigest != "" && !graceUntil.IsZero() {
+		doc.RelayGraceDigest = graceDigest
+		doc.RelayGraceUntil = graceUntil.UTC().Format(time.RFC3339Nano)
+	} else {
+		doc.RelayGraceDigest = ""
+		doc.RelayGraceUntil = ""
+	}
+	doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	return writeJSON0600(CredentialsFile(dataDir), doc)
+}
+
+// ClearPersistedRelayGrace drops overlapping grace fields after revoke or expiry.
+func ClearPersistedRelayGrace(dataDir string) error {
+	doc, err := LoadPersistedFile(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if doc.RelayGraceDigest == "" && doc.RelayGraceUntil == "" {
+		return nil
+	}
+	doc.RelayGraceDigest = ""
+	doc.RelayGraceUntil = ""
+	doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return writeJSON0600(CredentialsFile(dataDir), doc)
 }

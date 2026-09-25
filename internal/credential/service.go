@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,11 @@ type Service struct {
 	graceUntil time.Time
 	graceSec   int
 
+	// dataDir, when set, persists active relay + grace digest/deadline into
+	// bootstrap-credentials.json on rotate/revoke so unexpired grace survives
+	// process restart (§12.6). Empty keeps in-memory-only behavior (unit tests).
+	dataDir string
+
 	audit []AuditEvent
 	max   int
 	now   func() time.Time
@@ -86,6 +92,14 @@ func (s *Service) WithEnvelope(e EnvelopeCipher) *Service {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.envelope = e
+	return s
+}
+
+// WithDataDir enables persisting relay rotate/revoke into secrets/ under dataDir.
+func (s *Service) WithDataDir(dataDir string) *Service {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dataDir = dataDir
 	return s
 }
 
@@ -202,6 +216,8 @@ func (s *Service) ActiveRelayKeys() []string {
 // The returned newKey is plaintext for one-time admin display; the hot-path
 // snapshot keeps only the digest, and (when EnvelopeCipher is wired) an
 // envelope of the new active key for later re-auth reveal (§12.6).
+// When dataDir is set, the new active plaintext plus grace digest/deadline are
+// written to bootstrap-credentials.json before the in-memory snapshot flips.
 func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -216,10 +232,19 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 			return "", 0, fmt.Errorf("加密 Relay Key: %w", err)
 		}
 	}
+	nextGrace := ""
+	var nextUntil time.Time
 	if s.relayActive != "" {
-		s.relayGrace = s.relayActive
-		s.graceUntil = s.now().Add(time.Duration(s.graceSec) * time.Second)
+		nextGrace = s.relayActive
+		nextUntil = s.now().Add(time.Duration(s.graceSec) * time.Second)
 	}
+	if s.dataDir != "" {
+		if err := ReplaceRelayRotation(s.dataDir, newKey, nextGrace, nextUntil); err != nil {
+			return "", 0, fmt.Errorf("持久化 Relay Key 轮换: %w", err)
+		}
+	}
+	s.relayGrace = nextGrace
+	s.graceUntil = nextUntil
 	s.relayActive = digestRelayKey(newKey)
 	s.relayActiveEnc = enc
 	s.noteLocked("relay_rotate", "new active; old in grace")
@@ -272,12 +297,60 @@ func (s *Service) ResealActiveRelayEnvelope() error {
 }
 
 // RevokeGrace drops the overlapping old relay key immediately.
-func (s *Service) RevokeGrace() {
+// When dataDir is set, clears persisted grace fields before the live snapshot.
+func (s *Service) RevokeGrace() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dataDir != "" {
+		if err := ClearPersistedRelayGrace(s.dataDir); err != nil {
+			return fmt.Errorf("持久化撤销 Relay grace: %w", err)
+		}
+	}
 	s.relayGrace = ""
 	s.graceUntil = time.Time{}
 	s.noteLocked("relay_revoke_grace", "old key revoked")
+	return nil
+}
+
+// RestorePersistedGrace reloads an unexpired grace digest/deadline from the
+// secrets file after SetActiveRelayKeys (which clears in-memory grace on
+// startup). Expired or missing fields leave grace empty so the previous key
+// stays rejected.
+func (s *Service) RestorePersistedGrace(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	doc, err := LoadPersistedFile(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return s.applyPersistedGrace(doc.RelayGraceDigest, doc.RelayGraceUntil)
+}
+
+func (s *Service) applyPersistedGrace(digest, untilRFC string) error {
+	digest = strings.TrimSpace(digest)
+	untilRFC = strings.TrimSpace(untilRFC)
+	if digest == "" || untilRFC == "" {
+		return nil
+	}
+	until, err := time.Parse(time.RFC3339Nano, untilRFC)
+	if err != nil {
+		until, err = time.Parse(time.RFC3339, untilRFC)
+		if err != nil {
+			return fmt.Errorf("解析 relay_grace_until: %w", err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.now().Before(until) {
+		return nil
+	}
+	s.relayGrace = digest
+	s.graceUntil = until
+	return nil
 }
 
 // BeginMasterReveal stores plaintext for a short window after re-auth (§12.4).
