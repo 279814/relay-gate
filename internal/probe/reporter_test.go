@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -88,6 +89,52 @@ func TestClassifyReal_HTTP200EmptyIsFakeAlive(t *testing.T) {
 	out := classifyReal(&proxy.ResultView{Status: 200, BytesWritten: 0})
 	if out.Verdict != health.VerdictUnavailable {
 		t.Fatalf("empty 200 should be unavailable, got %s", out.Verdict)
+	}
+}
+
+// Real-traffic 401/403 is an auth outcome for that request — not RouteHealth
+// dead, not cooldown, and not a single-shot config_error.
+func TestReportResult_Live401403DoesNotMarkDeadOrCooldown(t *testing.T) {
+	for _, code := range []int{401, 403} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			tr := health.NewTracker(nil)
+			caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+			rep := NewReporter(tr).WithCapabilityRegistry(caps)
+			gen := tr.EnsureGeneration(5)
+
+			// Seed alive so a mistaken Fatal/Unavailable would be visible.
+			tr.Report(health.Report{
+				RouteID: 5, Generation: gen, Verdict: health.VerdictOK, Source: health.SourceReal,
+			})
+			if tr.State(5) != model.StateAlive {
+				t.Fatalf("setup: state=%s want alive", tr.State(5))
+			}
+
+			body := []byte(`{"error":{"type":"authentication_error","message":"bad key"}}`)
+			rep.ReportResult(5, gen, &proxy.ResultView{
+				Status:       code,
+				ErrBody:      body,
+				Endpoint:     model.EndpointMessages,
+				BytesWritten: int64(len(body)),
+			})
+
+			if tr.State(5) == model.StateDead {
+				t.Fatalf("HTTP %d must not move Route to StateDead", code)
+			}
+			if tr.State(5) != model.StateAlive {
+				t.Fatalf("HTTP %d must leave Route alive, got %s", code, tr.State(5))
+			}
+			st := tr.Status(5)
+			if st.CooldownUntil != 0 {
+				t.Fatalf("HTTP %d must not start cooldown, cooldown_until=%d", code, st.CooldownUntil)
+			}
+			if st.ConsecutiveFail != 0 {
+				t.Fatalf("HTTP %d must not count as reachability failure, fail=%d", code, st.ConsecutiveFail)
+			}
+			if got := caps.Effective(model.RecipeScopeRoute, 5, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+				t.Fatalf("single live %d must not write config_error, got %s", code, got)
+			}
+		})
 	}
 }
 
