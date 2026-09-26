@@ -1,8 +1,15 @@
 package api
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // 管理端 body 只允许一个 JSON 值。Decoder.Decode 会读完第一个对象就停，
@@ -64,5 +71,49 @@ func TestDecodeJSON_SingleObjectStillSaves(t *testing.T) {
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("valid create = %d: %s (body=%q)", rec.Code, rec.Body.String(), body)
 		}
+	}
+}
+
+// Decode failures must use a fixed message: decoder errors can embed request
+// values (unknown field names, UnmarshalTypeError.Value for numbers, etc.).
+func TestDecodeJSON_ErrorOmitsBodySecret(t *testing.T) {
+	const fixtureSecret = "sk-FIXTURE-DECODE-SECRET-99"
+
+	c, err := store.NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "decode-secret.db"), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := New(st, log)
+	h := s.Routes(testAdminPW)
+
+	// Unknown field name equals the fixture secret so a naive "%v"/err.Error()
+	// wrap would echo it into the 400 body (DisallowUnknownFields).
+	body := `{"name":"x","base_url":"https://x.example.com","api_key":"sk-ok-key-1234","auth_style":"bearer","` +
+		fixtureSecret + `":true}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/upstreams", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAdminPW)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	resp := rec.Body.String()
+	if strings.Contains(resp, fixtureSecret) {
+		t.Fatalf("response leaked fixture secret")
+	}
+	if !strings.Contains(resp, "请求体不是合法 JSON") {
+		t.Fatalf("response missing fixed decode message (len=%d)", len(resp))
+	}
+	if strings.Contains(logBuf.String(), fixtureSecret) {
+		t.Fatalf("log leaked fixture secret")
 	}
 }

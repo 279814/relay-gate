@@ -150,13 +150,16 @@ func decodeJSON(r *http.Request, dst any) error {
 	// 静默忽略会让人以为设置生效了，实际是默认值在跑。
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		return model.WrapValidation("请求体不是合法 JSON: %v", err)
+		// 固定文案，不附带 decoder 错误：UnmarshalTypeError 的 Value、
+		// DisallowUnknownFields 的字段名等都可能来自请求体（含 api_key /
+		// password / proxy userinfo / probe secret），经 writeErr 会回给客户端。
+		return model.WrapValidation("请求体不是合法 JSON")
 	}
 	// Decode 只消费第一个 JSON 值。若不挡尾随内容，
 	// {"name":"ok"}{"name":"evil"} 会静默采纳第一个并写入 store。
 	// More 会跳过空白，因此对象后的空白是允许的。
 	if dec.More() {
-		return model.WrapValidation("请求体不是合法 JSON: %v", errors.New("trailing data after first JSON value"))
+		return model.WrapValidation("请求体不是合法 JSON")
 	}
 	return nil
 }
