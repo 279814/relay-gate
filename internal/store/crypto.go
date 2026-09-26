@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -184,4 +185,23 @@ func MaskKey(key string) string {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:keep] + "…" + key[len(key)-keep:]
+}
+
+// MaskProxyURL 去掉 proxy_url 里的 password，用于管理 API 回显。
+//
+// docs/01 允许代理 userinfo，但明文密码不得进 API 响应。host/port 与用户名保留；
+// 解析失败则返回空串（net/url 的错误文本会附上完整 URL）。
+// 前端把脱敏值原样 PUT 回来时，UpdateUpstream 必须识别并保留真 password。
+func MaskProxyURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if parsed.User == nil {
+		return parsed.String()
+	}
+	return parsed.Redacted()
 }

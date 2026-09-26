@@ -143,6 +143,7 @@ func (s *Store) CreateUpstream(u *model.Upstream) error {
 // UpdateUpstream 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
 // GET/list 回显的是脱敏值，前端把它原样提交回来时不能当作真 key 写入，
 // 否则一次编辑就会把 key 破坏成 "sk-abcd…wxyz"。
+// proxy_url 同理：回显经 MaskProxyURL 去掉 password，原样提交必须保留库中真凭据。
 func (s *Store) UpdateUpstream(u *model.Upstream) error {
 	current, err := s.GetUpstream(u.ID)
 	if err != nil {
@@ -188,6 +189,11 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	// 否则前端把脱敏值原样提交会被误判成「短 key」。
 	if upstream.APIKey == "" || (current.APIKey != "" && upstream.APIKey == MaskKey(current.APIKey)) {
 		upstream.APIKey = ""
+	}
+	// GET 回显的 proxy_url 已去掉 password（MaskProxyURL）；前端原样提交时
+	// 不能把 "user:xxxxx@host" 当真凭据写入，否则一次编辑就毁掉代理认证。
+	if current.ProxyURL != "" && upstream.ProxyURL == MaskProxyURL(current.ProxyURL) {
+		upstream.ProxyURL = current.ProxyURL
 	}
 	if err := upstream.Validate(); err != nil {
 		return err

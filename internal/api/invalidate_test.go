@@ -147,6 +147,74 @@ func TestInvalidate_UpstreamMaskedKeyEchoKeepsSecret(t *testing.T) {
 	}
 }
 
+// proxy_url 允许 user:password，但管理 API 回显与校验错误不得含 password。
+func TestUpstream_ProxyURLPasswordNotInAPI(t *testing.T) {
+	s, h := newTestServer(t)
+	const pass = "secret"
+	proxy := "http://user:" + pass + "@127.0.0.1:8888"
+	id := mkUpstreamViaAPI(t, h,
+		`{"name":"proxy-u","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa","proxy_url":`+mustJSON(t, proxy)+`}`)
+
+	get := do(t, h, "GET", "/admin/api/upstreams/"+itoa(id), "", true)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET: %d %s", get.Code, get.Body.String())
+	}
+	if strings.Contains(get.Body.String(), pass) {
+		t.Fatal("GET must not echo proxy password")
+	}
+	var before struct {
+		ProxyURL        string `json:"proxy_url"`
+		NetworkRevision int64  `json:"network_revision"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &before); err != nil {
+		t.Fatal(err)
+	}
+	if before.ProxyURL == "" || before.ProxyURL == proxy || !strings.Contains(before.ProxyURL, "127.0.0.1:8888") {
+		t.Fatalf("GET should return host-visible redacted proxy_url, got %q", before.ProxyURL)
+	}
+
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
+		`{"name":"proxy-u-renamed","proxy_url":`+mustJSON(t, before.ProxyURL)+`}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT masked proxy echo: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), pass) {
+		t.Fatal("PUT response must not echo proxy password")
+	}
+	var after struct {
+		Name            string `json:"name"`
+		ProxyURL        string `json:"proxy_url"`
+		NetworkRevision int64  `json:"network_revision"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Name != "proxy-u-renamed" || after.ProxyURL != before.ProxyURL {
+		t.Fatalf("response should keep redacted proxy_url and rename: %+v", after)
+	}
+	if after.NetworkRevision != before.NetworkRevision {
+		t.Fatalf("masked proxy echo must not bump network_revision: got %d want %d",
+			after.NetworkRevision, before.NetworkRevision)
+	}
+	got, err := s.st.GetUpstream(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyURL != proxy {
+		t.Fatalf("stored proxy_url overwritten: got %q", got.ProxyURL)
+	}
+
+	bad := do(t, h, "POST", "/admin/api/upstreams",
+		`{"name":"bad-proxy","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb","proxy_url":`+
+			mustJSON(t, "http://user:"+pass+"@[%")+`}`, true)
+	if bad.Code == http.StatusCreated || bad.Code == http.StatusOK {
+		t.Fatalf("invalid proxy_url must be rejected, got %d", bad.Code)
+	}
+	if strings.Contains(bad.Body.String(), pass) {
+		t.Fatal("validation error body must not contain proxy password")
+	}
+}
+
 func mustJSON(t *testing.T, v string) string {
 	t.Helper()
 	b, err := json.Marshal(v)

@@ -163,6 +163,30 @@ func TestMaskKey(t *testing.T) {
 	}
 }
 
+func TestMaskProxyURL(t *testing.T) {
+	const pass = "secret"
+	raw := "http://user:" + pass + "@127.0.0.1:8888"
+	got := MaskProxyURL(raw)
+	if strings.Contains(got, pass) {
+		t.Fatalf("MaskProxyURL must not keep password; got %q", got)
+	}
+	if !strings.Contains(got, "127.0.0.1:8888") {
+		t.Fatalf("host/port must remain visible; got %q", got)
+	}
+	if got != "http://user:xxxxx@127.0.0.1:8888" {
+		t.Fatalf("MaskProxyURL = %q, want redacted userinfo form", got)
+	}
+	if MaskProxyURL("") != "" {
+		t.Fatal("empty stays empty")
+	}
+	if MaskProxyURL("http://127.0.0.1:8888") != "http://127.0.0.1:8888" {
+		t.Fatal("no-userinfo URL must pass through")
+	}
+	if MaskProxyURL("http://user:"+pass+"@[%") != "" {
+		t.Fatal("unparseable proxy_url must not echo raw input")
+	}
+}
+
 func TestCipherDomainSeparatedFingerprints(t *testing.T) {
 	c, err := NewCipher("manifest-key-test")
 	if err != nil {
