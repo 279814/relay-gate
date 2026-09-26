@@ -43,6 +43,12 @@ func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, fmt.Errorf("%w: 未知的 outcome：%q", model.ErrValidation, f.Outcome))
 		return
 	}
+	pageLimit, err := store.NormalizePageLimit(f.Limit)
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
+		return
+	}
+	f.Limit = pageLimit
 
 	list, err := s.st.ListSamples(f)
 	if err != nil {
