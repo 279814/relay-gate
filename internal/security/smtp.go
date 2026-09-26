@@ -104,10 +104,10 @@ func sanitizeSMTPField(s string) string {
 
 // BuildAlertMessage builds a metadata-only MIME message (no response/conversation body).
 func BuildAlertMessage(from string, to []string, f Finding, adminURL string) []byte {
-	subj := fmt.Sprintf("[relay-gate] %s %s", f.Severity, sanitizeSMTPField(f.Category))
+	subj := fmt.Sprintf("[relay-gate] %s %s", sanitizeSMTPField(string(f.Severity)), sanitizeSMTPField(f.Category))
 	body := strings.Builder{}
 	body.WriteString("relay-gate security alert (metadata only; no conversation body)\r\n\r\n")
-	body.WriteString(fmt.Sprintf("severity: %s\r\n", f.Severity))
+	body.WriteString(fmt.Sprintf("severity: %s\r\n", sanitizeSMTPField(string(f.Severity))))
 	body.WriteString(fmt.Sprintf("category: %s\r\n", sanitizeSMTPField(f.Category)))
 	body.WriteString(fmt.Sprintf("summary: %s\r\n", sanitizeSMTPField(clip(f.Summary, 200))))
 	body.WriteString(fmt.Sprintf("upstream: %s\r\n", sanitizeSMTPField(f.Upstream)))
@@ -131,7 +131,7 @@ func BuildDigestMessage(from string, to []string, items []digestItem, adminURL s
 	for i, it := range items {
 		f := it.finding
 		body.WriteString(fmt.Sprintf("--- item %d (count=%d) ---\r\n", i+1, it.count))
-		body.WriteString(fmt.Sprintf("severity: %s\r\n", f.Severity))
+		body.WriteString(fmt.Sprintf("severity: %s\r\n", sanitizeSMTPField(string(f.Severity))))
 		body.WriteString(fmt.Sprintf("category: %s\r\n", sanitizeSMTPField(f.Category)))
 		body.WriteString(fmt.Sprintf("summary: %s\r\n", sanitizeSMTPField(clip(f.Summary, 200))))
 		body.WriteString(fmt.Sprintf("upstream: %s\r\n", sanitizeSMTPField(f.Upstream)))
