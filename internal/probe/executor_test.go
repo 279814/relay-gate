@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -355,6 +356,33 @@ func TestExecutor_TransportFailure(t *testing.T) {
 
 // §8.6：dial/connection refused（GotConn 未到）不得加 token；任意 HTTP 响应
 // （含 401）已写出请求，内置估算必须加一次。
+// RoundTrip 失败时 Outcome.Err 不得携带请求 URL：net/http 的 *url.Error 会把
+// 完整 URL（含 fixed_query Secret）拼进 Error()，Scheduler 会把它打进失败日志。
+func TestExecutor_TransportFailure_OmitsRequestURLFromOutcomeErr(t *testing.T) {
+	const leakURL = "https://example.test/v1/messages?api_key=sk-fixture-query-secret"
+	rt := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "Post", URL: leakURL, Err: errors.New("connection refused")}
+	}}
+	up := upstreamFor("https://example.test")
+	exec := newTestExecutorFor(up, rt, &captureRecorder{}, AlwaysOpenAdmission(), WallClock())
+
+	result, err := exec.Execute(context.Background(), l2RequestFor(up))
+	if err != nil {
+		t.Fatalf("传输失败是站点结果，不该是 Go error: %v", err)
+	}
+	if result.Decision.RedactedDetail != "transport_failure" {
+		t.Fatalf("RedactedDetail=%q, want transport_failure", result.Decision.RedactedDetail)
+	}
+	if result.Outcome.Err == nil {
+		t.Fatal("传输失败应带 Outcome.Err")
+	}
+	got := result.Outcome.Err.Error()
+	if strings.Contains(got, leakURL) || strings.Contains(got, "sk-fixture-query-secret") ||
+		strings.Contains(got, "example.test") {
+		t.Fatalf("Outcome.Err must not carry request URL or query secret: %q", got)
+	}
+}
+
 func TestExecutor_PreWriteDialDoesNotCharge_HTTP401ChargesOnce(t *testing.T) {
 	t.Run("connection_refused", func(t *testing.T) {
 		up := upstreamFor("http://127.0.0.1:1")
