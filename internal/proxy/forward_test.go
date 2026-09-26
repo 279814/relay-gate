@@ -340,14 +340,9 @@ func TestStreamBody_IdleFiredButClientGoneIsCanceled(t *testing.T) {
 	if _, err := pw.Write(semantic); err != nil {
 		t.Fatalf("write semantic: %v", err)
 	}
-	// 等首语义处理完、Idle 已武装，再取消客户端。
-	deadline := time.Now().Add(2 * time.Second)
-	for !res.SemanticSeen {
-		if time.Now().After(deadline) {
-			t.Fatal("semantic never seen")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// 给 streamBody 一点时间处理首语义并武装 Idle。不能轮询
+	// res.SemanticSeen：那是 streamBody 在写、测试在读，-race 会抓。
+	time.Sleep(50 * time.Millisecond)
 	clientCancel()
 
 	select {
