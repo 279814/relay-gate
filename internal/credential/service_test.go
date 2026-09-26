@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -305,6 +307,111 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	}
 	if !s5.ValidRelayKey(newKey) {
 		t.Fatal("active key must remain after revoke restart")
+	}
+}
+
+// TestResealActiveRelayUnder_BeforeActivateSurvivesRecovery pins §12.7: the
+// persisted Relay Key must be resealed under pending before ActivatePending
+// drops the old active key. Crash at db_committed + RecoverUnfinished must
+// still open bootstrap-credentials.json with only the new master.
+func TestResealActiveRelayUnder_BeforeActivateSurvivesRecovery(t *testing.T) {
+	const (
+		oldMaster = "old-master-relay-reseal-aaa"
+		newMaster = "new-master-relay-reseal-bbb"
+		rawRelay  = "rk_fixture_master_rot_relay_32"
+	)
+	dir := t.TempDir()
+	oldCipher, err := store.NewCipher(oldMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedOld, err := oldCipher.EncryptEnvelope(rawRelay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePersisted(dir, Persisted{
+		FormatVersion: 1, AdminPasswordHash: "hash", MasterKeyID: "mk_old",
+		RelayKey: sealedOld,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	creds := New().WithEnvelope(oldCipher).WithDataDir(dir)
+	if err := creds.SetActiveRelayKey(rawRelay); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsRelayKeyEnvelope(doc.RelayKey) {
+		t.Fatal("setup: want sealed relay_key")
+	}
+	// Old master alone opens; new master alone must not (precondition).
+	if got, err := OpenPersistedRelayKey(doc.RelayKey, oldCipher); err != nil || got != rawRelay {
+		t.Fatalf("old open=%q err=%v", got, err)
+	}
+	newOnly, err := store.NewCipher(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenPersistedRelayKey(doc.RelayKey, newOnly); err == nil {
+		t.Fatal("precondition: new master must not open old envelope")
+	}
+
+	kr := keyring.Open(filepath.Join(dir, "kr"))
+	if err := kr.EnsureInitialized("mk_old", oldMaster); err != nil {
+		t.Fatal(err)
+	}
+	rid, err := kr.BeginRotation(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// §12.7 step 7 order: reseal under pending while old active still present.
+	if err := creds.ResealActiveRelayUnder(func(plain string) (string, error) {
+		return store.SealEnvelopeUnder(newMaster, plain)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kr.MarkDBCommitted(rid); err != nil {
+		t.Fatal(err)
+	}
+	// Crash window: db_committed, then RecoverUnfinished → ActivatePending
+	// drops old active. Persisted relay must already be under new.
+	hold, st, err := kr.RecoverUnfinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hold {
+		t.Fatalf("recovery hold=%v status=%+v", hold, st)
+	}
+	if st.Phase != keyring.PhaseKeyActivated {
+		t.Fatalf("db_committed recovery must activate forward, phase=%q", st.Phase)
+	}
+	kid, active, err := kr.LoadActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != newMaster {
+		t.Fatalf("active after recovery must be new master (kid=%s)", kid)
+	}
+
+	restartCipher, err := store.NewCipher(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := OpenPersistedRelayKey(after.RelayKey, restartCipher)
+	if err != nil {
+		t.Fatalf("new master alone must open resealed relay: %v", err)
+	}
+	if got != rawRelay {
+		t.Fatalf("relay after recovery=%q want %q", got, rawRelay)
+	}
+	if strings.Contains(after.RelayKey, rawRelay) {
+		t.Fatal("must not persist relay plaintext")
 	}
 }
 
