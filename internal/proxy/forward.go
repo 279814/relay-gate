@@ -419,10 +419,10 @@ func (at *Attempt) Peek() []byte {
 	at.peekBroke = true
 	res.DoneAt = time.Now()
 	switch {
-	case timedOut.Load():
-		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.peekWaitOrFirstToken())
 	case at.clientCtx.Err() != nil:
 		res.Err = fmt.Errorf("%w: %v", ErrCanceled, err)
+	case timedOut.Load():
+		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.peekWaitOrFirstToken())
 	case at.ctx.Err() != nil:
 		res.Err = fmt.Errorf("%w: 超过总时限 %v", ErrTotalTimeout, f.Timeouts.Total)
 	default:
@@ -690,6 +690,13 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 			if errors.Is(err, io.EOF) {
 				return total, nil
 			}
+			// 只有**客户端**取消才是非上游故障。必须先判 clientCtx：
+			// 客户端断开会连带取消 ctx，先判 ctx 会把两者混为一谈；
+			// 也必须先于 idle / 首 Token 超时：断开与超时可能同时成立，
+			// 先报静默/首 Token 会把客户端离开误记成上游故障、计入路由。
+			if clientCtx.Err() != nil {
+				return total, fmt.Errorf("%w: %v", ErrCanceled, err)
+			}
 			// 区分「首语义超时」与「流内静默超时」：前者说明站没吐语义，
 			// 后者说明流中断了。两者对健康状态的含义不同（§4.3）。
 			switch {
@@ -697,11 +704,6 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 				return total, fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.FirstToken)
 			case timedOut.Load():
 				return total, fmt.Errorf("%w: 流内静默超过 %v", ErrStreamStalled, f.Timeouts.Idle)
-			}
-			// 只有**客户端**取消才是非上游故障。必须先判 clientCtx：
-			// 客户端断开会连带取消 ctx，先判 ctx 会把两者混为一谈。
-			if clientCtx.Err() != nil {
-				return total, fmt.Errorf("%w: %v", ErrCanceled, err)
 			}
 			// 走到这里说明是我们自己的总超时到期 —— 上游拖过了 Total，
 			// 算上游的账（默认 30 分钟，正常长思考远到不了）。
