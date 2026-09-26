@@ -823,31 +823,39 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 		}
 		return
 	}
-	if name != "content_block_delta" {
+	if name == "content_block_delta" {
+		var delta map[string]json.RawMessage
+		if json.Unmarshal(object["delta"], &delta) != nil {
+			return
+		}
+		deltaType := stringField(delta, "type")
+		var field string
+		switch deltaType {
+		case "text_delta":
+			field = "text"
+			event.SemanticKind = "text"
+		case "thinking_delta":
+			field = "thinking"
+			event.SemanticKind = "thinking"
+		case "input_json_delta":
+			field = "partial_json"
+			event.SemanticKind = "input_json"
+		case "tool_use_delta":
+			field = "partial_json"
+			event.SemanticKind = "tool"
+		}
+		if field != "" && nonEmptyString(delta[field]) {
+			event.Semantic = true
+		}
 		return
 	}
-	var delta map[string]json.RawMessage
-	if json.Unmarshal(object["delta"], &delta) != nil {
-		return
-	}
-	deltaType := stringField(delta, "type")
-	var field string
-	switch deltaType {
-	case "text_delta":
-		field = "text"
-		event.SemanticKind = "text"
-	case "thinking_delta":
-		field = "thinking"
-		event.SemanticKind = "thinking"
-	case "input_json_delta":
-		field = "partial_json"
-		event.SemanticKind = "input_json"
-	case "tool_use_delta":
-		field = "partial_json"
-		event.SemanticKind = "tool"
-	}
-	if field != "" && nonEmptyString(delta[field]) {
-		event.Semantic = true
+	// 非流式 message 正文：text 在 content 块数组里，不是字符串字段。
+	// 与真实流量 HasSemanticEvidence 共用 semanticevidence.AnthropicContentSemantic。
+	if name == "message" || name == "" {
+		if kind, ok := semanticevidence.AnthropicContentSemantic(object["content"]); ok {
+			event.Semantic = true
+			event.SemanticKind = kind
+		}
 	}
 }
 
@@ -878,6 +886,14 @@ func classifyResponses(event *ProtocolEvent, name string, object map[string]json
 					}
 				}
 			}
+		}
+	}
+	// 非流式响应：text 在 output[].content[] 里。与真实流量共用
+	// semanticevidence.ResponsesOutputSemantic，避免数组正文被当成「无语义」。
+	if name == "response" || name == "" {
+		if kind, ok := semanticevidence.ResponsesOutputSemantic(object["output"]); ok {
+			event.Semantic = true
+			event.SemanticKind = kind
 		}
 	}
 }
