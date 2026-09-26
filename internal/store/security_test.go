@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -33,5 +35,47 @@ func TestInsertSecurityFinding_OmitsMatchedSecret(t *testing.T) {
 	}
 	if strings.Contains(detail, key) {
 		t.Fatalf("stored security_finding.detail contains raw secret: %q", detail)
+	}
+}
+
+// TestListSecurityFindings_PageLimitDefaultAndCap pins the shared admin-list
+// page contract: omitted/zero limit → defaultPageLimit; over MaximumPageLimit
+// is rejected so limit=1e8 cannot load an unbounded SQL result.
+func TestListSecurityFindings_PageLimitDefaultAndCap(t *testing.T) {
+	st := testStore(t)
+	const n = 60
+	for i := 0; i < n; i++ {
+		f := security.Finding{
+			ID:       fmt.Sprintf("page-limit-%d", i),
+			AtMS:     int64(n - i),
+			Severity: security.SeverityLow,
+			Category: "xss_pattern",
+			Summary:  "page limit fixture",
+			Source:   "passive",
+		}
+		if err := st.InsertSecurityFinding(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	def, err := st.ListSecurityFindings("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(def) != defaultPageLimit {
+		t.Fatalf("omitted/zero limit: got %d findings, want default %d", len(def), defaultPageLimit)
+	}
+
+	_, err = st.ListSecurityFindings("", 100_000_000)
+	if !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("huge limit error = %v, want ErrInvalidCursor (cap %d)", err, MaximumPageLimit)
+	}
+
+	atMax, err := st.ListSecurityFindings("", MaximumPageLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atMax) != n {
+		t.Fatalf("limit=MaximumPageLimit: got %d, want all %d fixtures", len(atMax), n)
 	}
 }

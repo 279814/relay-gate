@@ -20,6 +20,9 @@ const (
 	maximumPageLimit  = 200
 )
 
+// MaximumPageLimit is the shared hard cap for admin list page sizes.
+const MaximumPageLimit = maximumPageLimit
+
 type pageCursor struct {
 	Version           int      `json:"v"`
 	Resource          string   `json:"resource"`
@@ -39,6 +42,12 @@ func normalizePageLimit(limit int) (int, error) {
 		return 0, fmt.Errorf("%w: limit 必须在 1..%d", ErrInvalidCursor, maximumPageLimit)
 	}
 	return limit, nil
+}
+
+// NormalizePageLimit is the shared admin-list page-size normalizer:
+// omitted/zero → defaultPageLimit; values outside 1..MaximumPageLimit error.
+func NormalizePageLimit(limit int) (int, error) {
+	return normalizePageLimit(limit)
 }
 
 func encodePageCursor(resource string, filter any, keys ...string) (string, error) {

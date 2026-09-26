@@ -37,12 +37,14 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, fmt.Errorf("%w: limit", model.ErrValidation))
 		return
 	}
-	if r.URL.Query().Get("limit") == "" {
-		limit = 50
+	pageLimit, err := store.NormalizePageLimit(int(limit))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
+		return
 	}
 	// Prefer durable store when available; fall back to in-memory center.
 	if s.st != nil {
-		list, err := s.st.ListSecurityFindings(string(sev), int(limit))
+		list, err := s.st.ListSecurityFindings(string(sev), pageLimit)
 		if err == nil {
 			total, _ := s.st.CountSecurityFindings()
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -56,7 +58,7 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"findings": []any{}, "total": 0})
 		return
 	}
-	list := s.security.List(sev, int(limit))
+	list := s.security.List(sev, pageLimit)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"findings": s.redactFindingsForAPI(list),
 		"total":    s.security.Count(),

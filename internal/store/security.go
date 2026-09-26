@@ -31,8 +31,9 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 	if s == nil {
 		return nil, fmt.Errorf("store nil")
 	}
-	if limit <= 0 {
-		limit = 50
+	limit, err := normalizePageLimit(limit)
+	if err != nil {
+		return nil, err
 	}
 	q := `SELECT id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
 		scanner_version, rule_version, bytes_scanned, incomplete_reason
