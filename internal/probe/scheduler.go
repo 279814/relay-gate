@@ -96,10 +96,10 @@ type Scheduler struct {
 
 	// busyUp 保证同一 Upstream 的 L2 串行（§4.6）。
 	// 一个站下挂 5 个模型时，同时探 5 个几乎必然吃 429。
-	mu          sync.Mutex
-	busyUp      map[int64]bool
-	inflightL1  map[int64]bool
-	inflightL2  map[int64]bool
+	mu         sync.Mutex
+	busyUp     map[int64]bool
+	inflightL1 map[int64]bool
+	inflightL2 map[int64]bool
 	// l2Inflight 是当前已占用的全局 L2 名额。上限每次 beginL2 从
 	// Settings.GlobalL2Concurrency 现读（§4.3 Settings 快照；改值无需重启），
 	// 在途占用自然收尾，不因缩容而提前释放。
