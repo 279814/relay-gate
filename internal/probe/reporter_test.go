@@ -92,6 +92,22 @@ func TestClassifyReal_HTTP200EmptyIsFakeAlive(t *testing.T) {
 	}
 }
 
+// §6.7 / §6.8：上游 302 原样可见，但不得记为真实流量成功 / piggyback。
+func TestClassifyReal_HTTP302NotOK(t *testing.T) {
+	out := classifyReal(&proxy.ResultView{
+		Status:       http.StatusFound,
+		BytesWritten: 64,
+		SemanticSeen: true,
+		ErrBody:      []byte(`{"redirect":true}`),
+	})
+	if out.Verdict == health.VerdictOK {
+		t.Fatalf("302 must not be VerdictOK, got %s", out.Verdict)
+	}
+	if out.Verdict != health.VerdictUnavailable {
+		t.Fatalf("302 verdict=%s want unavailable", out.Verdict)
+	}
+}
+
 // Real-traffic 401/403 is an auth outcome for that request — not RouteHealth
 // dead, not cooldown, and not a single-shot config_error.
 func TestReportResult_Live401403DoesNotMarkDeadOrCooldown(t *testing.T) {

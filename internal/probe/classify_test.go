@@ -40,6 +40,12 @@ func TestClassifyHTTP(t *testing.T) {
 		// 未预料到的 4xx 保守归到累计类：探活请求是我们构造的，
 		// 一个意外的 400 更可能是「这站参数要求特殊」而非「站坏了」
 		{"意外的 400", 400, `{"error":"missing field foo"}`, health.VerdictUnavailable, "missing field foo"},
+
+		// 3xx：Transport 不跟随；成功只认 2xx，不得 VerdictOK
+		{"302 不得算成功", 302, `{"redirect":true}`, health.VerdictUnavailable, ""},
+		{"301 不得算成功", 301, ``, health.VerdictUnavailable, ""},
+		{"307 不得算成功", 307, ``, health.VerdictUnavailable, ""},
+		{"308 不得算成功", 308, ``, health.VerdictUnavailable, ""},
 	}
 
 	for _, tc := range tests {

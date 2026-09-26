@@ -169,6 +169,16 @@ func ClassifyHTTP(status int, header http.Header, body []byte) Outcome {
 			Err:     errFromBody(status, body),
 			Status:  status,
 		}
+
+	// 3xx：Transport 不跟随重定向（§6.7），探活按该次响应分类。
+	// 成功只认 2xx（§6.8）；不得把 301/302/… 落成 VerdictOK。
+	// 归 Unavailable（与意外 4xx 同软路径），不 Fatal→dead。
+	case status >= 300 && status < 400:
+		return Outcome{
+			Verdict: health.VerdictUnavailable,
+			Err:     errFromBody(status, body),
+			Status:  status,
+		}
 	}
 
 	return Outcome{Verdict: health.VerdictOK, Status: status}
