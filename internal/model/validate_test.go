@@ -230,6 +230,23 @@ func TestProxyURLRejectsDisallowedSchemes(t *testing.T) {
 	}
 }
 
+// 非法 proxy_url 的校验错误不得附上 net/url 原文（其中可含 user:password）。
+func TestProxyURLParseErrorOmitsPassword(t *testing.T) {
+	const pass = "secret"
+	up := &Upstream{
+		Name: "t", BaseURL: "https://a.com", APIKey: "",
+		ProxyURL: "http://user:" + pass + "@[%",
+	}
+	up.Defaults()
+	err := up.Validate()
+	if err == nil {
+		t.Fatal("非法 proxy_url 应被拒绝")
+	}
+	if strings.Contains(err.Error(), pass) {
+		t.Fatal("validation error must not contain proxy password")
+	}
+}
+
 func TestAPIKeyTooShortForOutbound(t *testing.T) {
 	if APIKeyTooShortForOutbound("") {
 		t.Fatal("空串不是「过短」—— 出站按未配置处理")

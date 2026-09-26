@@ -169,7 +169,9 @@ func validateProxyURL(raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return invalid("proxy_url 不是合法 URL: %v", err)
+		// 不带 err 文本：net/url 的错误会附上完整 URL，而 proxy_url
+		// 可以带 user:password。校验失败会经管理 API 回给客户端。
+		return invalid("proxy_url 不是合法 URL")
 	}
 	if !AllowedProxyURLScheme(u.Scheme) {
 		return invalid("proxy_url 必须是 http(s):// 代理，收到 scheme %q", u.Scheme)

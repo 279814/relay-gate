@@ -11,6 +11,7 @@ import (
 //
 // 单独定义而不是直接序列化 model.Upstream，为的是**结构性地**保证 key 不会回显：
 // 出站类型里根本没有明文 key 字段，就不存在「某个分支忘了脱敏」的可能。
+// proxy_url 的 password 同样在 maskUpstream 里经 MaskProxyURL 去掉后再序列化。
 type upstreamOut struct {
 	*model.Upstream
 	APIKey      string `json:"api_key"`        // 覆盖父结构，始终是脱敏值
@@ -22,6 +23,7 @@ func maskUpstream(u *model.Upstream) upstreamOut {
 	isSet := u.APIKey != ""
 	cp := *u
 	cp.APIKey = ""
+	cp.ProxyURL = store.MaskProxyURL(u.ProxyURL)
 	return upstreamOut{Upstream: &cp, APIKey: masked, APIKeyIsSet: isSet}
 }
 
