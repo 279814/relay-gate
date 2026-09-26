@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"runtime/debug"
 
@@ -98,14 +99,30 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 	if err = insertProbeExecutionTx(ctx, tx, &execution); err != nil {
 		return result, err
 	}
-	if err = recordExecutionCostTx(ctx, tx, execution); err != nil {
-		return result, err
-	}
 	result.ExecutionStored = true
 	if err = tx.Commit(); err != nil {
 		return result, err
 	}
+	// Cost is best-effort after the observation commits. A probe_cost_* write
+	// failure must not roll capability/reachability back to the pre-probe state.
+	if costErr := store.recordExecutionCostAfterCommit(ctx, execution); costErr != nil {
+		slog.Default().Error("探活成本落库失败", "err", costErr, "execution_id", execution.ID)
+	}
 	return result, nil
+}
+
+// recordExecutionCostAfterCommit writes probe_cost_event/daily in its own
+// transaction so observation commit success is independent of cost flush.
+func (store *Store) recordExecutionCostAfterCommit(ctx context.Context, execution model.ProbeExecution) error {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := recordExecutionCostTx(ctx, tx, execution); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func validateProbeExecutionEnvelope(execution model.ProbeExecution) error {
