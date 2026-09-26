@@ -201,6 +201,9 @@ func TestL1_DoesNotFollowRedirect(t *testing.T) {
 	if otherHits != 0 {
 		t.Fatalf("Location 主机不得收到任何请求，hits=%d", otherHits)
 	}
+	if out.Verdict == health.VerdictOK {
+		t.Fatalf("302 不得记为探活成功，verdict=%s", out.Verdict)
+	}
 }
 
 // L1 必须带上鉴权与 Claude Code 指纹。M0 实测有站按 UA 白名单拦截，

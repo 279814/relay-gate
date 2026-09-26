@@ -954,7 +954,7 @@ func (e *Executor) l1Outcome(decision Decision) Outcome {
 		return Outcome{Verdict: health.VerdictUnavailable, Status: decision.StatusCode, Err: detailErr(decision)}
 	case decision.StatusCode == http.StatusNotFound || decision.StatusCode == http.StatusMethodNotAllowed:
 		return Outcome{Verdict: health.VerdictOK, Status: decision.StatusCode}
-	case decision.StatusCode >= 200 && decision.StatusCode < 400:
+	case decision.StatusCode >= 200 && decision.StatusCode < 300:
 		return Outcome{Verdict: health.VerdictOK, Status: decision.StatusCode}
 	default:
 		return Outcome{Verdict: health.VerdictUnavailable, Status: decision.StatusCode, Err: detailErr(decision)}

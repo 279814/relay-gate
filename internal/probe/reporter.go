@@ -108,7 +108,9 @@ func classifyReal(res *proxy.ResultView) Outcome {
 		return Outcome{Verdict: health.VerdictIgnore, Status: res.Status, TTFT: res.TTFT}
 	}
 
-	if res.Status >= 400 {
+	// 非 2xx（含 3xx）：不得走下面的 SemanticSeen → VerdictOK 路径。
+	// ClassifyHTTP 把 3xx 归 Unavailable；4xx/5xx 按原规则细分。
+	if res.Status < 200 || res.Status >= 300 {
 		out := ClassifyHTTP(res.Status, res.Header, res.ErrBody)
 		out.TTFT = res.TTFT
 		return out

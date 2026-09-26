@@ -261,7 +261,10 @@ func (classifier *ResponseClassifier) classify(readErr, cancelCause error) Decis
 		}
 	}
 	if errors.Is(cancelCause, ErrProbeCanceledAfterSemantic) && classifier.semanticSeen {
-		return classifier.success()
+		if classifier.isSuccessStatus() {
+			return classifier.success()
+		}
+		return classifier.failure(readErr)
 	}
 	if classifier.status <= 0 {
 		return Decision{
@@ -284,10 +287,15 @@ func (classifier *ResponseClassifier) classify(readErr, cancelCause error) Decis
 			RedactedDetail:       classifier.partialDetail(readErr),
 		}
 	}
-	if classifier.readyToFinish() {
+	if classifier.readyToFinish() && classifier.isSuccessStatus() {
 		return classifier.success()
 	}
 	return classifier.failure(readErr)
+}
+
+// isSuccessStatus 成功只认 2xx（§6.8）。3xx 不跟随（§6.7），不得 Success。
+func (classifier *ResponseClassifier) isSuccessStatus() bool {
+	return classifier.status >= 200 && classifier.status < 300
 }
 
 func (classifier *ResponseClassifier) isIgnoredCause(cause error) bool {
@@ -369,6 +377,13 @@ func (classifier *ResponseClassifier) failure(readErr error) Decision {
 	case classifier.status >= 500:
 		decision.Capability = model.CapabilityTransientError
 		decision.ErrorClass = model.ErrorTransient
+
+	// 3xx：不跟随重定向（§6.7）；成功只认 2xx（§6.8）。
+	// 与 5xx 同归 transient（软失败累计），不 auth/config fatal。
+	case classifier.status >= 300 && classifier.status < 400:
+		decision.Capability = model.CapabilityTransientError
+		decision.ErrorClass = model.ErrorTransient
+		decision.RedactedDetail = "redirect_status"
 
 	case classifier.remoteError != nil:
 		classifier.applyRemoteError(&decision)

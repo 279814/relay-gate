@@ -224,7 +224,8 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		headerCancel()
 	}()
 
-	if resp.StatusCode >= 400 {
+	// 非 2xx（含 3xx）不得进 scanStream 后判 OK：成功只认 2xx（§6.8）。
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxClassifyBody))
 		out := ClassifyHTTP(resp.StatusCode, resp.Header, errBody)
 		out.TTFT = time.Since(start)

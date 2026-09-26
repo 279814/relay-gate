@@ -106,6 +106,12 @@ func TestStatusCodesMapToTheSpecifiedCapability(t *testing.T) {
 		{502, model.CapabilityTransientError, model.ErrorTransient},
 		{503, model.CapabilityTransientError, model.ErrorTransient},
 		{504, model.CapabilityTransientError, model.ErrorTransient},
+		// 3xx：不跟随；成功只认 2xx，归 soft transient（非 Success）
+		{301, model.CapabilityTransientError, model.ErrorTransient},
+		{302, model.CapabilityTransientError, model.ErrorTransient},
+		{303, model.CapabilityTransientError, model.ErrorTransient},
+		{307, model.CapabilityTransientError, model.ErrorTransient},
+		{308, model.CapabilityTransientError, model.ErrorTransient},
 	}
 	for _, tc := range tests {
 		decision := modelsClassifier(tc.status, nil).Finish(nil, nil)
