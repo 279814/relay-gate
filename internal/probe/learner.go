@@ -133,7 +133,10 @@ func materializeLearnedBodyTemplate(endpoint model.EndpointKind) []byte {
 	}
 }
 
-// filterLearnedHeaders 排除认证头与 Cookie（含 relay_session）。
+// filterLearnedHeaders 排除认证头与 Cookie（含 relay_session），并对非认证头
+// 的值跑与 recipe 入库相同的高置信凭据前缀门禁（rejectLiteralCredentials /
+// rejectCredentialPrefix）。头名不是 AuthHeaders 仍可能把 sk-ant-… 写进
+// SafeHeaders；query 路径已有同类扫描，头不能留旁路。占位符与协议常量保留。
 //
 // 清单复用 sample.IsSensitiveHeader（由 model.AuthHeaders 派生，另含 Cookie /
 // Proxy-Authorization），与样本导出探活头同一道门 —— 两处各抄一份会分叉。
@@ -149,12 +152,47 @@ func filterLearnedHeaders(headers []model.HeaderTemplate) []model.HeaderTemplate
 		if cookieValuesContainGatewaySession(header) {
 			continue
 		}
+		kept := filterLearnedHeaderValues(header.Values)
+		if len(kept) == 0 {
+			continue
+		}
 		out = append(out, model.HeaderTemplate{
 			Name:   header.Name,
-			Values: append([]string(nil), header.Values...),
+			Values: kept,
 		})
 	}
 	return out
+}
+
+// filterLearnedHeaderValues 丢掉命中高置信凭据前缀的值；占位符与普通常量保留。
+func filterLearnedHeaderValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	kept := make([]string, 0, len(values))
+	for _, value := range values {
+		if learnedHeaderValueHasLiteralCredential(value) {
+			continue
+		}
+		kept = append(kept, value)
+	}
+	return kept
+}
+
+// learnedHeaderValueHasLiteralCredential 复用 recipe 凭据门禁判字面 key。
+//
+// 用非认证头名走 ScanRequiredSecrets，只触发 rejectCredentialPrefix（§8.5），
+// 不走认证头「必须是占位符」那条，也不用 RejectLiteralAuthFieldValue。
+// 与 filterLearnedQuery 相反：头里的 {{UPSTREAM_API_KEY}} / {{SECRET:name}}
+// 是合法指纹，必须保留。
+func learnedHeaderValueHasLiteralCredential(value string) bool {
+	_, err := probetemplate.ScanRequiredSecrets(model.EndpointModels, probetemplate.TemplateContent{
+		Method: "GET",
+		Headers: []model.HeaderTemplate{
+			{Name: "X-Learned", Values: []string{value}},
+		},
+	})
+	return err != nil
 }
 
 // cookieValuesContainGatewaySession 是纵深防御：IsSensitiveHeader 已整头丢
