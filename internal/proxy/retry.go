@@ -61,8 +61,8 @@ type forwardOutcome struct {
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
 	attempts int
-	// halfOpen 表示最终这次尝试是 §4.4c 半开试探。只用于网关自生成
-	// 错误响应上的 X-Relay-Half-Open；成功的上游响应不得带该头（§2.3）。
+	// halfOpen 表示最终这次尝试是 §4.4c 半开试探（且 Route 即闸持有者）。
+	// 只用于网关自生成错误响应上的 X-Relay-Half-Open；成功的上游响应不得带该头（§2.3）。
 	halfOpen bool
 	// reqID 把这次客户端请求的样本与它的多行日志串起来。
 	reqID string
@@ -142,9 +142,19 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		h.writeSelectError(w, err, proto, pre.inModel)
 		return nil, false
 	}
-	// 半开之后不会有重试：半开的前提是全部 Route 都 dead，而重试用的
-	// SelectExcluding 只挑非 dead 的，必然选不到。也就是说 §4.4c 的
-	// 「放行一次」是结构上保证的，不需要额外的开关去限制它。
+	// halfOpenRouteID is the Route that Claimed RecoveryGate for this §4.4c
+	// probe. HalfOpen must not follow a request-scoped bool onto a sibling
+	// Route (failover / route-local skip) or a later attempt.
+	var halfOpenRouteID int64
+	if halfOpen && cand != nil && cand.Route != nil {
+		halfOpenRouteID = cand.Route.ID
+	}
+	armedHalfOpen := func(routeID int64, attempt int) bool {
+		return halfOpenRouteID != 0 && routeID == halfOpenRouteID && attempt == 1
+	}
+	// 半开之后通常不会有重试：半开的前提是 SelectExcluding 当时选不到站。
+	// 若同请求里稍后又选到 sibling（例如 recovering 的 RecoveryGate 已释放），
+	// HalfOpen 仍只属于 halfOpenRouteID（见 armedHalfOpen）。
 	//
 	// X-Relay-Half-Open / X-Relay-Attempts 不得写在这里：Commit 会把上游
 	// 响应原样交给客户端，§2.3 禁止成功（及任何透传）上游响应新增网关
@@ -221,8 +231,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
 				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
-				res: la.at.Result(), attempts: attempt, halfOpen: halfOpen,
-				reqID: reqID,
+				res: la.at.Result(), attempts: attempt,
+				halfOpen: armedHalfOpen(la.cand.Route.ID, attempt),
+				reqID:    reqID,
 			}
 			if la.at.CanCommit() {
 				oc.res = h.commitLive(w, la)
@@ -245,7 +256,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			// 最后一行日志要在 Commit **之后**记：BytesWritten 与 DoneAt
 			// 都是流式写完才有的，提前记会把每个成功响应的字节数记成 0。
 			oc.logs = append(logs, h.attemptLog(la, pre, proto, reqID,
-				attempt, halfOpen && attempt == 1, false, oc.res, recvAt))
+				attempt, armedHalfOpen(la.cand.Route.ID, attempt), false, oc.res, recvAt))
 
 			// attempts 到这一刻才知道。逐行写的话前面几行只能填一个
 			// 猜的值 —— 而列表页正是靠它显示「这次试了 3 个站」。
@@ -279,11 +290,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		finishObserver(la, health.AttemptFinish{})
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
-			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
+			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
 		if h.reporter != nil {
 			ep, _ := proto.Endpoint()
 			view := viewOf(la.at.Result(), la.keys, ep)
-			view.HalfOpen = halfOpen && attempt == 1
+			view.HalfOpen = armedHalfOpen(la.cand.Route.ID, attempt)
 			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, view)
 		}
 		la.cand.Release()
