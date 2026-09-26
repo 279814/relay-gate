@@ -85,6 +85,50 @@ func TestReachabilityTracker_DifferentTokenLowerOrderReplaces(t *testing.T) {
 	}
 }
 
+// Empty ObservationToken must not clobber a non-empty revision token even
+// with a higher UnixMilli order. Non-empty still replaces an empty placeholder.
+func TestReachabilityTracker_EmptyTokenDoesNotClobberNonEmpty(t *testing.T) {
+	settings := model.DefaultSettings()
+	tracker := NewReachabilityTracker(staticSettings{settings})
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	policy, err := revisioncodec.BuildReachabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := revisioncodec.ReachabilitySettingsFingerprint(policy)
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 7, PolicySelector: selector, State: model.ReachabilityReachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "revision-token", LastObservationOrder: 42,
+	})
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 7, PolicySelector: selector, State: model.ReachabilityUnreachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "", LastObservationOrder: 1_700_000_000_000,
+	})
+	got := tracker.Snapshot(7)
+	if got == nil || got.ObservationToken != "revision-token" || got.LastObservationOrder != 42 ||
+		got.State != model.ReachabilityReachable {
+		t.Fatalf("empty token must not clobber non-empty: %+v", got)
+	}
+
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 8, PolicySelector: selector, State: model.ReachabilityUnreachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "", LastObservationOrder: 1_700_000_000_000,
+	})
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 8, PolicySelector: selector, State: model.ReachabilityReachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "revision-token", LastObservationOrder: 42,
+	})
+	got = tracker.Snapshot(8)
+	if got == nil || got.ObservationToken != "revision-token" || got.LastObservationOrder != 42 ||
+		got.State != model.ReachabilityReachable {
+		t.Fatalf("non-empty must still replace empty placeholder: %+v", got)
+	}
+}
+
 func TestReachabilityTracker_DNSFailureThenHTTPRecovery(t *testing.T) {
 	settings := model.DefaultSettings()
 	tracker := NewReachabilityTracker(staticSettings{settings})

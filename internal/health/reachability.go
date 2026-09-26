@@ -36,6 +36,8 @@ func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 // 也不能让旧行盖住新行。token 不同表示新 incarnation（含 Mark* 等用
 // UnixMilli 占位 order 的旁路写入之后，sequencer 提交的新 token），即使
 // order 更低也必须替换，否则新行会输给上一 incarnation 留下的更高 order。
+// 空 ObservationToken 的旁路占位不得覆盖已有非空 token；非空 token 仍可
+// 替换空占位。
 func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachability) {
 	if tracker == nil || row == nil || row.UpstreamID <= 0 {
 		return
@@ -43,6 +45,9 @@ func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachabili
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	current := tracker.rows[row.UpstreamID]
+	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
+		return
+	}
 	if current != nil && current.ObservationToken == row.ObservationToken &&
 		current.LastObservationOrder >= row.LastObservationOrder {
 		return
