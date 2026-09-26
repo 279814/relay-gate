@@ -29,6 +29,11 @@ func MaybeBootstrap(dataDir string, out io.Writer) error {
 	if out == nil {
 		out = io.Discard
 	}
+	// Tighten even when bootstrap is already complete: MkdirAll alone leaves a
+	// pre-existing broader mode (e.g. 0755) unchanged.
+	if err := ensureSecretsDir(dataDir); err != nil {
+		return err
+	}
 	b := &Bootstrap{DataDir: dataDir, Out: out}
 	phase, err := b.Phase()
 	if err != nil {

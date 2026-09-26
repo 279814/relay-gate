@@ -29,6 +29,17 @@ func SecretsDir(dataDir string) string {
 	return filepath.Join(dataDir, "secrets")
 }
 
+// ensureSecretsDir creates dataDir/secrets at 0700. MkdirAll does not change the
+// mode of an existing directory, so always Chmod afterward (even on Windows,
+// where the bits may not be enforced).
+func ensureSecretsDir(dataDir string) error {
+	dir := SecretsDir(dataDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
 // CredentialsFile returns the path of bootstrap/migration credential material.
 func CredentialsFile(dataDir string) string {
 	return filepath.Join(SecretsDir(dataDir), "bootstrap-credentials.json")

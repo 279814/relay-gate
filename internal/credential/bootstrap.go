@@ -114,7 +114,7 @@ func (b *Bootstrap) Run() (Displayed, error) {
 	if b.Out == nil {
 		b.Out = io.Discard
 	}
-	if err := os.MkdirAll(b.secretsDir(), 0o700); err != nil {
+	if err := ensureSecretsDir(b.DataDir); err != nil {
 		return Displayed{}, err
 	}
 	unlock, err := b.acquireLock()

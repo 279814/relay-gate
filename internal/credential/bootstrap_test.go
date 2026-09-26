@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -182,6 +183,56 @@ func TestBootstrapSecretsDirPermissions(t *testing.T) {
 		if filepath.Separator == '/' {
 			t.Fatalf("secrets dir should be 0700, got %v", info.Mode())
 		}
+	}
+}
+
+// TestEnsureSecretsDirTightensExistingMode covers MkdirAll's pitfall: an
+// already-present directory keeps its mode. ensureSecretsDir must Chmod 0700.
+func TestEnsureSecretsDirTightensExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSecretsDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("secrets dir mode = %04o, want 0700", got)
+	}
+}
+
+// TestMaybeBootstrapTightensExistingSecretsDirMode: after bootstrap is complete,
+// a later startup must still tighten a widened secrets directory.
+func TestMaybeBootstrapTightensExistingSecretsDirMode(t *testing.T) {
+	dir := t.TempDir()
+	b := &Bootstrap{DataDir: dir, Out: ioDiscard{}}
+	if _, err := b.Run(); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.Chmod(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaybeBootstrap(dir, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("secrets dir mode = %04o, want 0700", got)
 	}
 }
 
