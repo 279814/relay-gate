@@ -10,7 +10,15 @@ import (
 )
 
 // RedactBodyFile 按窗口流式脱敏 spill 文件；无命中时不改文件。
-// 峰值缓冲约 SpillMemLimit + 最长 key，绝不整文件读进一个 []byte。
+// 峰值缓冲约 SpillMemLimit + 最长 needle（含 JSON \u 形态），
+// 绝不整文件读进一个 []byte。
+//
+// 与 finding Detail / RedactBodyKeys / RedactDiagnostic 共用
+// security.RedactSecrets：原文、url.QueryEscape、小写 hex 百分号编码、
+// 以及 JSON \uXXXX（hex 大小写不敏感）一并遮掉。命中检测与改写都走
+// RedactBodyKeys，不能只做原文 Contains / ReplaceAll，否则仅编码形态
+// 会漏进 spill。短于 MinRedactableKeyLen 的 needle 跳过。
+// 只改落库 spill；live 客户端字节不经此路径。
 func RedactBodyFile(path string, keys []string) error {
 	if path == "" || len(keys) == 0 {
 		return nil
@@ -22,8 +30,9 @@ func RedactBodyFile(path string, keys []string) error {
 			continue
 		}
 		usable = append(usable, k)
-		if len(k) > maxK {
-			maxK = len(k)
+		// Longest RedactSecrets needle is JSON \u00XX-per-byte (6× raw).
+		if n := len(k) * 6; n > maxK {
+			maxK = n
 		}
 	}
 	if len(usable) == 0 {
@@ -53,10 +62,10 @@ func fileContainsAny(path string, keys []string, maxK int) (bool, error) {
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			work := append(carry, buf[:n]...)
-			for _, k := range keys {
-				if bytes.Contains(work, []byte(k)) {
-					return true, nil
-				}
+			// Same rules as rewrite: RedactBodyKeys → RedactSecrets covers
+			// raw + QueryEscape + lower-%XX + JSON \u forms.
+			if !bytes.Equal(RedactBodyKeys(work, keys), work) {
+				return true, nil
 			}
 			if len(work) > overlap {
 				carry = append(carry[:0], work[len(work)-overlap:]...)
@@ -78,10 +87,10 @@ func rewriteRedactedFile(path string, keys []string, maxK int) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
 
 	out, err := os.CreateTemp(filepath.Dir(path), "relay-gate-sample-redact-*.tmp")
 	if err != nil {
+		_ = in.Close()
 		return err
 	}
 	outPath := out.Name()
@@ -99,35 +108,38 @@ func rewriteRedactedFile(path string, keys []string, maxK int) error {
 	}
 	buf := make([]byte, SpillMemLimit())
 	carry := []byte(nil)
-	for {
+	var copyErr error
+	for copyErr == nil {
 		n, readErr := in.Read(buf)
 		if n > 0 {
 			work := RedactBodyKeys(append(carry, buf[:n]...), keys)
 			if readErr == io.EOF {
-				if _, err := out.Write(work); err != nil {
-					return err
-				}
+				_, copyErr = out.Write(work)
 				carry = nil
 			} else if len(work) > overlap {
-				if _, err := out.Write(work[:len(work)-overlap]); err != nil {
-					return err
+				_, copyErr = out.Write(work[:len(work)-overlap])
+				if copyErr == nil {
+					carry = append([]byte(nil), work[len(work)-overlap:]...)
 				}
-				carry = append([]byte(nil), work[len(work)-overlap:]...)
 			} else {
 				carry = work
 			}
 		}
 		if readErr == io.EOF {
-			if len(carry) > 0 {
-				if _, err := out.Write(RedactBodyKeys(carry, keys)); err != nil {
-					return err
-				}
+			if copyErr == nil && len(carry) > 0 {
+				_, copyErr = out.Write(RedactBodyKeys(carry, keys))
 			}
 			break
 		}
 		if readErr != nil {
-			return readErr
+			copyErr = readErr
+			break
 		}
+	}
+	// Windows cannot replace path while the source handle is still open.
+	_ = in.Close()
+	if copyErr != nil {
+		return copyErr
 	}
 	if err := out.Close(); err != nil {
 		return err
