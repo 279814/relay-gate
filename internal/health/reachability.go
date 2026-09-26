@@ -32,7 +32,10 @@ func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
 //
-// CAS：同 token 且 order 更大才覆盖；回调返回顺序反转也不能让旧行盖住新行。
+// CAS：同 token 时只接受更大（或相等时保留已有）order，回调返回顺序反转
+// 也不能让旧行盖住新行。token 不同表示新 incarnation（含 Mark* 等用
+// UnixMilli 占位 order 的旁路写入之后，sequencer 提交的新 token），即使
+// order 更低也必须替换，否则新行会输给上一 incarnation 留下的更高 order。
 func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachability) {
 	if tracker == nil || row == nil || row.UpstreamID <= 0 {
 		return
@@ -40,14 +43,9 @@ func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachabili
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	current := tracker.rows[row.UpstreamID]
-	if current != nil {
-		if current.ObservationToken == row.ObservationToken &&
-			current.LastObservationOrder >= row.LastObservationOrder {
-			return
-		}
-		if current.LastObservationOrder > row.LastObservationOrder {
-			return
-		}
+	if current != nil && current.ObservationToken == row.ObservationToken &&
+		current.LastObservationOrder >= row.LastObservationOrder {
+		return
 	}
 	copyValue := *row
 	tracker.rows[row.UpstreamID] = &copyValue
