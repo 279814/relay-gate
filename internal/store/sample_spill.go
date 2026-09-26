@@ -24,6 +24,10 @@ func isSampleMultipart(raw []byte) bool {
 // encryptSampleBodyFile 把明文 spill 按 sampleBlobChunk 分块封成信封文件。
 // 单块不超过窗口时仍写单个 v1: 信封；多块写 v1m: 分帧，避免整文件进一个 []byte。
 func (s *Store) encryptSampleBodyFile(srcPath string) (encPath string, err error) {
+	srcPath, err = model.ConfinedSpillPath(srcPath)
+	if err != nil {
+		return "", err
+	}
 	fi, err := os.Stat(srcPath)
 	if err != nil {
 		return "", err
@@ -34,7 +38,7 @@ func (s *Store) encryptSampleBodyFile(srcPath string) (encPath string, err error
 	}
 	defer src.Close()
 
-	dst, err := os.CreateTemp("", "relay-gate-sample-enc-*.tmp")
+	dst, err := os.CreateTemp(model.SpillDir(), "relay-gate-sample-enc-*.tmp")
 	if err != nil {
 		return "", err
 	}

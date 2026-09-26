@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 // ellipsisFmt 是截断处的省略标记。
@@ -239,7 +241,7 @@ func (h *HeadTail) openSpill() bool {
 	if h.spill != nil {
 		return true
 	}
-	f, err := os.CreateTemp("", spillTempGlob)
+	f, err := os.CreateTemp(model.SpillDir(), spillTempGlob)
 	if err != nil {
 		return false
 	}
@@ -250,12 +252,13 @@ func (h *HeadTail) openSpill() bool {
 
 // RemoveOrphanSpills 删除 dir 下匹配 spillTempGlob 的残留临时文件。
 //
-// dir 为空时用 os.TempDir()（与 openSpill 一致）。崩溃跳过 closeSpill 时，
+// dir 为空时用 SpillDir（与 openSpill 一致）。崩溃跳过 closeSpill 时，
 // 这些文件仍可读到响应正文；下次启动必须在接流量前清掉。
 // 只按 spill 前缀删，不碰已落库样本与其它临时文件。
+// Glob 命中若越出 dir（不应发生）则跳过，绝不删 spill 树外文件。
 func RemoveOrphanSpills(dir string) (int, error) {
 	if dir == "" {
-		dir = os.TempDir()
+		dir = model.SpillDir()
 	}
 	matches, err := filepath.Glob(filepath.Join(dir, spillTempGlob))
 	if err != nil {
@@ -264,7 +267,11 @@ func RemoveOrphanSpills(dir string) (int, error) {
 	var n int
 	var first error
 	for _, p := range matches {
-		if err := os.Remove(p); err != nil {
+		confined, err := model.ConfinedSpillPathIn(dir, p)
+		if err != nil {
+			continue
+		}
+		if err := os.Remove(confined); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -295,7 +302,9 @@ func (h *HeadTail) closeSpill() {
 		return
 	}
 	_ = h.spill.Close()
-	_ = os.Remove(h.spillPath)
+	if p, err := model.ConfinedSpillPath(h.spillPath); err == nil {
+		model.RemoveSpillFile(p)
+	}
 	h.spill = nil
 	h.spillPath = ""
 	h.spillSize = 0

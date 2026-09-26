@@ -23,6 +23,10 @@ func RedactBodyFile(path string, keys []string) error {
 	if path == "" || len(keys) == 0 {
 		return nil
 	}
+	confined, err := model.ConfinedSpillPath(path)
+	if err != nil {
+		return err
+	}
 	usable := make([]string, 0, len(keys))
 	maxK := 0
 	for _, k := range keys {
@@ -38,11 +42,11 @@ func RedactBodyFile(path string, keys []string) error {
 	if len(usable) == 0 {
 		return nil
 	}
-	hit, err := fileContainsAny(path, usable, maxK)
+	hit, err := fileContainsAny(confined, usable, maxK)
 	if err != nil || !hit {
 		return err
 	}
-	return rewriteRedactedFile(path, usable, maxK)
+	return rewriteRedactedFile(confined, usable, maxK)
 }
 
 func fileContainsAny(path string, keys []string, maxK int) (bool, error) {

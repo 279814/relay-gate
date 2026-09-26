@@ -673,7 +673,7 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		if err := sample.RedactBodyFile(respSpill, keys); err != nil {
 			h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
 				"err", err, "route", cand.Route.ID)
-			_ = os.Remove(respSpill)
+			model.RemoveSpillFile(respSpill)
 			respSpill = ""
 		}
 	} else {
@@ -695,8 +695,10 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		// 采集是旁路，只记日志，绝不回写或中断已完成的转发。
 		kept := len(respSafe)
 		if respSpill != "" {
-			if fi, err := os.Stat(respSpill); err == nil {
-				kept = int(fi.Size())
+			if p, err := model.ConfinedSpillPath(respSpill); err == nil {
+				if fi, err := os.Stat(p); err == nil {
+					kept = int(fi.Size())
+				}
 			}
 		}
 		h.log.Warn("样本响应超过剩余磁盘配额，已改留头尾",
