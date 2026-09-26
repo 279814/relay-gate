@@ -962,8 +962,12 @@ func (e *Executor) l1Outcome(decision Decision) Outcome {
 }
 
 // transportOutcome 给「拿不到响应头」的情形定 Verdict。
+//
+// Outcome.Err 只带 Decision 的脱敏详情，绝不包装 RoundTrip 原文：
+// net/http 的 *url.Error 会把完整请求 URL（含 fixed_query 里的 Secret）
+// 拼进 Error()，而 Scheduler 会把 out.Err 打进「上游 L1 失败」等日志。
 func (e *Executor) transportOutcome(ctx context.Context, req ExecutionRequest, decision Decision,
-	rtErr error, headerTimedOut bool) Outcome {
+	_ error, headerTimedOut bool) Outcome {
 
 	if decision.ErrorClass == model.ErrorIgnored || ctx.Err() != nil {
 		return Outcome{Verdict: health.VerdictIgnore}
@@ -972,8 +976,7 @@ func (e *Executor) transportOutcome(ctx context.Context, req ExecutionRequest, d
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("%w: 响应头未按时返回", ErrProbeSemanticTimeout)}
 	}
-	return Outcome{Verdict: health.VerdictUnavailable,
-		Err: fmt.Errorf("%w: %v", ErrProbeTransportFailed, rtErr)}
+	return Outcome{Verdict: health.VerdictUnavailable, Err: detailErr(decision)}
 }
 
 // ── 小工具 ────────────────────────────────────────────────

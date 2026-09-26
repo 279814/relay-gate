@@ -123,8 +123,9 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 		if out, ok := ctxOutcome(ctx, err); ok {
 			return out
 		}
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("%w: %v", proxy.ErrConnect, err)}
+		// 不包装 RoundTrip 原文：*url.Error 含完整请求 URL（可带 query Secret），
+		// 会经 Scheduler「上游 L1 失败」日志与 route_health.last_error 外泄。
+		return Outcome{Verdict: health.VerdictUnavailable, Err: proxy.ErrConnect}
 	}
 	defer resp.Body.Close()
 
@@ -213,8 +214,8 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 				Err: fmt.Errorf("%w: 响应头超过 %ds 未返回",
 					proxy.ErrFirstTokenTimeout, s.L2FirstTokenSec)}
 		}
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("%w: %v", proxy.ErrConnect, err)}
+		// 同 L1：不包装 RoundTrip 原文，避免 URL / query Secret 进日志与 last_error。
+		return Outcome{Verdict: health.VerdictUnavailable, Err: proxy.ErrConnect}
 	}
 	// 判定一出就关流，停止消耗上游 token（§4.1）。cancel 也要调 ——
 	// 只 Close 不 cancel 会让 headerCtx 泄漏到 GC 才回收。
