@@ -528,6 +528,11 @@ func parseOrigin(raw, field string) (*url.URL, error) {
 	if parsed.User != nil {
 		return nil, model.WrapValidation("%s 不能包含 userinfo", field)
 	}
+	// base_url / url_override 不得带 query（与 validateBaseURL 同口径）；
+	// legacy exact 可保留已捕获 query（§19.2），不在此挡。
+	if parsed.RawQuery != "" && field != "legacy full URL" {
+		return nil, model.WrapValidation("%s 不能包含 query", field)
+	}
 	if parsed.Fragment != "" || parsed.RawFragment != "" || strings.Contains(raw, "#") {
 		return nil, model.WrapValidation("%s 不能包含 fragment", field)
 	}
@@ -543,7 +548,7 @@ func parseOrigin(raw, field string) (*url.URL, error) {
 // 空 override 表示走 canonical path，直接通过。非空时必须与 base_url 同源，
 // 否则跨 origin 配置会进库、只在真实请求时才炸 —— 管理界面看起来「保存成功」，
 // 出站却全失败。scheme / host / 有效端口任一不同都拒绝；只改 path 的同源
-// override 放行。userinfo / fragment 由 parseOrigin 拒绝（与 base_url 同口径）。
+// override 放行。userinfo / query / fragment 由 parseOrigin 拒绝（与 base_url 同口径）。
 func ValidateURLOverride(baseURL, override string) error {
 	if override == "" {
 		return nil
