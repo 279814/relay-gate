@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,46 @@ type stubProbeSnap struct {
 
 func (s stubProbeSnap) ProbeSnapshot() (*livecfg.ProbeSnapshot, error) {
 	return &livecfg.ProbeSnapshot{Generation: s.gen}, nil
+}
+
+// blockUntilCancelRecorder blocks in Record until ctx is cancelled.
+// Used to prove drainPersist passes Run's ctx, not context.Background().
+type blockUntilCancelRecorder struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (r *blockUntilCancelRecorder) Record(ctx context.Context, _ *model.ProbeObservation) (model.ProbeApplyResult, error) {
+	r.once.Do(func() { close(r.started) })
+	<-ctx.Done()
+	return model.ProbeApplyResult{}, ctx.Err()
+}
+
+func TestDrainPersist_ReturnsWhenContextCancelled(t *testing.T) {
+	started := make(chan struct{})
+	rec := &blockUntilCancelRecorder{started: started}
+	m := NewTrafficObserverManager(stubProbeSnap{}, nil, rec, discardLogger())
+	m.queue <- &model.ProbeObservation{Execution: model.ProbeExecution{UpstreamID: 1}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.drainPersist(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Record did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainPersist did not return after cancel; must not use context.Background()")
+	}
 }
 
 func TestTrafficObserver_CapacityFallsBackWithoutBlocking(t *testing.T) {

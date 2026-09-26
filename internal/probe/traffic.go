@@ -89,10 +89,10 @@ func (m *TrafficObserverManager) Run(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				m.drainPersist()
+				m.drainPersist(ctx)
 				return
 			case <-m.stop:
-				m.drainPersist()
+				m.drainPersist(ctx)
 				return
 			case item := <-m.queue:
 				m.persistOne(ctx, item)
@@ -108,12 +108,14 @@ func (m *TrafficObserverManager) Run(ctx context.Context) {
 	m.wg.Wait()
 }
 
-func (m *TrafficObserverManager) drainPersist() {
+func (m *TrafficObserverManager) drainPersist(ctx context.Context) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case item := <-m.queue:
-			m.persistOne(context.Background(), item)
+			// Pass Run's ctx (may already be cancelled) so an in-flight
+			// insert can abort and bg.Wait is not stuck on Background().
+			m.persistOne(ctx, item)
 		default:
 			return
 		}
