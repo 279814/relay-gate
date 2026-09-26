@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -304,6 +305,64 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	// 差值为 0 是正常的。TTFT 的契约由 TestResult_TTFT 覆盖。
 	if res.TTFT() < 0 {
 		t.Errorf("TTFT 不该为负，得到 %v", res.TTFT())
+	}
+}
+
+// Idle 已开火且 clientCtx 已取消时，必须报 ErrCanceled，不能报 ErrStreamStalled。
+// 否则客户端离开会被记成上游静默、计入路由失败。
+//
+// 用彼此独立的 ctx / clientCtx 调用 streamBody：真实路径里取消客户端会
+// 连带取消内层 ctx 并立刻关流，读往往在 Idle 之前就返回，测不到「两者
+// 同时成立」。这里让 Idle 成为唯一的解锁方，逼出 timedOut∧clientGone。
+func TestStreamBody_IdleFiredButClientGoneIsCanceled(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	defer clientCancel()
+	ctx := context.Background() // 不随 clientCancel 结束
+
+	f := &Forwarder{Timeouts: fastTimeouts()}
+	res := &Result{
+		Status:      200,
+		RespHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	rec := httptest.NewRecorder()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := f.streamBody(ctx, clientCtx, rec, pr, pr, res)
+		errCh <- err
+	}()
+
+	semantic := []byte("event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n")
+	if _, err := pw.Write(semantic); err != nil {
+		t.Fatalf("write semantic: %v", err)
+	}
+	// 等首语义处理完、Idle 已武装，再取消客户端。
+	deadline := time.Now().Add(2 * time.Second)
+	for !res.SemanticSeen {
+		if time.Now().After(deadline) {
+			t.Fatal("semantic never seen")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	clientCancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrCanceled) {
+			t.Fatalf("want ErrCanceled (client gone beats idle), got %v", err)
+		}
+		if errors.Is(err, ErrStreamStalled) {
+			t.Fatalf("must not be ErrStreamStalled when client already canceled: %v", err)
+		}
+		if IsUpstreamFault(err) {
+			t.Errorf("client cancel must not count as upstream fault: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("streamBody did not return after idle")
 	}
 }
 
