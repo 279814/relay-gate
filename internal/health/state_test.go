@@ -202,12 +202,12 @@ func TestReport_DeadRouteRecoversToRecoveringOnFirstSuccess(t *testing.T) {
 		t.Fatal("前置条件：应为 dead")
 	}
 
-	report(tr, 1, VerdictOK, SourceL2)
+	tr.Report(Report{RouteID: 1, Verdict: VerdictOK, Source: SourceL2, HalfOpen: true})
 	if got := tr.State(1); got != model.StateRecovering {
 		t.Errorf("死站首次合成探通应转 recovering，得到 %s", got)
 	}
 
-	report(tr, 1, VerdictOK, SourceL2)
+	tr.Report(Report{RouteID: 1, Verdict: VerdictOK, Source: SourceL2, HalfOpen: true})
 	if got := tr.State(1); got != model.StateAlive {
 		t.Errorf("连续 2 次成功应升 alive，得到 %s", got)
 	}
@@ -227,14 +227,42 @@ func TestReport_RealSuccessPromotesUnknownToAlive(t *testing.T) {
 	}
 }
 
-// §9.1：持 RecoveryGate 的真实成功让 dead 立即 alive。
+// §9.1 / §4.4c：未武装半开的 OK 不得把 dead 拉活或转入 recovering。
+func TestReport_OKOnDeadWithoutHalfOpenStaysDead(t *testing.T) {
+	tr, fs, _ := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	fs.s.OKThreshold = 1
+
+	report(tr, 1, VerdictUnavailable, SourceL2)
+	if tr.State(1) != model.StateDead {
+		t.Fatal("前置条件：应为 dead")
+	}
+
+	if report(tr, 1, VerdictOK, SourceReal) {
+		t.Fatal("无 HalfOpen 的真实 OK 不该改变状态")
+	}
+	if got := tr.State(1); got != model.StateDead {
+		t.Fatalf("无 HalfOpen 的真实 OK 应留在 dead，得到 %s", got)
+	}
+
+	if report(tr, 1, VerdictOK, SourceL2) {
+		t.Fatal("无 HalfOpen 的合成 OK 不该改变状态")
+	}
+	if got := tr.State(1); got != model.StateDead {
+		t.Fatalf("无 HalfOpen 的合成 OK 应留在 dead，得到 %s", got)
+	}
+}
+
+// §9.1：武装半开路径上的真实成功让 dead 立即 alive。
 func TestReport_RealSuccessOnDeadGoesAlive(t *testing.T) {
 	tr, fs, _ := newTestTracker(t)
 	fs.s.FailThreshold = 1
 	fs.s.OKThreshold = 5
 
 	report(tr, 1, VerdictUnavailable, SourceL2)
-	report(tr, 1, VerdictOK, SourceReal)
+	if !tr.Report(Report{RouteID: 1, Verdict: VerdictOK, Source: SourceReal, HalfOpen: true}) {
+		t.Fatal("半开真实成功应改变状态")
+	}
 
 	if got := tr.State(1); got != model.StateAlive {
 		t.Errorf("半开真实成功应立即 alive，得到 %s", got)

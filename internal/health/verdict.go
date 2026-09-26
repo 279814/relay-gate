@@ -72,6 +72,11 @@ type Report struct {
 	// 且真实请求成功会刷新 piggyback 时间戳（§4.6）。
 	Source Source
 
+	// HalfOpen marks an armed §4.4c half-open / recovery Attempt
+	// (RecoveryGate held at select, or a Claimed synthetic probe).
+	// VerdictOK may leave StateDead only when this is set.
+	HalfOpen bool
+
 	// Err 是失败原因，原样存进 last_error 供 UI 展示。
 	Err error
 

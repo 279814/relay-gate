@@ -468,7 +468,9 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
 	if h.reporter != nil {
 		ep, _ := proto.Endpoint()
-		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, viewOf(res, keys, ep))
+		view := viewOf(res, keys, ep)
+		view.HalfOpen = oc.halfOpen
+		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, view)
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。

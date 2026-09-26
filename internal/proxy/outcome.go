@@ -51,6 +51,9 @@ type ResultView struct {
 	BytesWritten int64
 	// SemanticSeen 是 §8.8 判活证据；缺它时 2xx+字节仍不能 piggyback。
 	SemanticSeen bool
+	// HalfOpen marks a §4.4c armed half-open Attempt. Tracker only lets
+	// VerdictOK leave StateDead when this is set.
+	HalfOpen bool
 }
 
 // viewOf 从完整结果里摘出健康判定需要的部分。
