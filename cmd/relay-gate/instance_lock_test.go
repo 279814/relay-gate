@@ -42,6 +42,27 @@ func TestRunServer_LockedDataDirWritesNoBootstrapSecrets(t *testing.T) {
 	}
 }
 
+func TestRunServer_CustomDBStillTakesDataDirLock(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RELAY_DB", filepath.Join(dir, "custom.db"))
+	t.Setenv("RELAY_ADDR", "invalid-listen-address")
+	t.Setenv("ENCRYPTION_KEY", "")
+	t.Setenv("ADMIN_PASSWORD", "")
+	t.Setenv("RELAY_KEYS", "")
+	holdInstanceLock(t, filepath.Join(dir, "relay-gate.db"))
+
+	if err := runServer(); !errors.Is(err, store.ErrInstanceLocked) {
+		t.Fatalf("runServer error = %v, want ErrInstanceLocked", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "secrets"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("server wrote secrets/%s while data dir lock was held", e.Name())
+	}
+}
+
 func TestRunServer_LockedDataDirLeavesRotationUntouched(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "relay-gate.db")
@@ -157,6 +178,61 @@ func TestCredentialsResetAdminCLI_LockedDataDirLeavesSecretsUntouched(t *testing
 		if !bytes.Equal(raw, after[name]) {
 			t.Errorf("reset-admin rewrote secrets/%s while instance lock was held", name)
 		}
+	}
+}
+
+func TestCredentialsCLI_ServerCustomDBLockBlocksDataDirOnlyCLI(t *testing.T) {
+	for _, sub := range []string{"bootstrap", "migrate", "reset-admin"} {
+		t.Run(sub, func(t *testing.T) {
+			dir := t.TempDir()
+			serverDB := filepath.Join(dir, "custom.db")
+			t.Setenv("RELAY_DB", "")
+			t.Setenv("ENCRYPTION_KEY", "legacy-encryption-key-32bytes!!")
+			t.Setenv("ADMIN_PASSWORD", "legacy-admin-password")
+			t.Setenv("RELAY_KEYS", "rk-legacy-cli-key")
+			secretsDir := filepath.Join(dir, "secrets")
+			var stdout, stderr bytes.Buffer
+			if sub == "reset-admin" {
+				if code := runMain([]string{"relay-gate", "credentials", "bootstrap", "--data-dir", dir},
+					strings.NewReader(""), &stdout, &stderr); code != exitOK {
+					t.Fatalf("bootstrap code=%d stderr=%s", code, stderr.String())
+				}
+				stdout.Reset()
+				stderr.Reset()
+			}
+			before := map[string][]byte{}
+			if _, err := os.Stat(secretsDir); err == nil {
+				before = readDirFiles(t, secretsDir)
+			}
+
+			// 与 runServer 相同的取锁：RELAY_DB=<dir>/custom.db。
+			held, err := lockDataDir(dir, serverDB)
+			if err != nil {
+				t.Fatalf("lockDataDir: %v", err)
+			}
+			t.Cleanup(func() { _ = held.Close() })
+
+			code := runMain([]string{"relay-gate", "credentials", sub, "--data-dir", dir},
+				strings.NewReader(""), &stdout, &stderr)
+			if code != exitFail || !strings.Contains(stderr.String(), store.ErrInstanceLocked.Error()) {
+				t.Fatalf("code=%d stderr=%s, want ErrInstanceLocked", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("credentials %s printed output while server held the data dir: %s", sub, stdout.String())
+			}
+			after := map[string][]byte{}
+			if _, err := os.Stat(secretsDir); err == nil {
+				after = readDirFiles(t, secretsDir)
+			}
+			if len(after) != len(before) {
+				t.Fatalf("secrets files before=%d after=%d, credentials %s must not write", len(before), len(after), sub)
+			}
+			for name, raw := range before {
+				if !bytes.Equal(raw, after[name]) {
+					t.Errorf("credentials %s rewrote secrets/%s while server held the data dir", sub, name)
+				}
+			}
+		})
 	}
 }
 

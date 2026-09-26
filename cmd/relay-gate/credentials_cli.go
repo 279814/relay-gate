@@ -160,13 +160,49 @@ func runCredentialsResetAdmin(args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// acquireDataDirLock 取得服务端持有的同一把实例锁：服务端以 RELAY_DB 所在目录为
-// 数据目录，锁按数据库路径取。服务端在跑时这里以 ErrInstanceLocked 失败，不碰 secrets。
-func acquireDataDirLock(dataDir string, dbCandidates ...string) (*store.InstanceLock, error) {
+// acquireDataDirLock 取得服务端持有的同一把数据目录锁（见 lockDataDir）。
+// 服务端在跑时这里以 ErrInstanceLocked 失败，不碰 secrets。
+func acquireDataDirLock(dataDir string, dbCandidates ...string) (*dataDirLock, error) {
+	return lockDataDir(dataDir, instanceDBPath(dataDir, dbCandidates...))
+}
+
+// dataDirLock 是 §12.3 的数据目录独占锁加上数据库自身的实例锁。
+// db 与数据目录锁是同一文件时 db == dir。
+type dataDirLock struct {
+	dir *store.InstanceLock
+	db  *store.InstanceLock
+}
+
+// lockDataDir 先取 <dataDir>/relay-gate.db 的实例锁作为数据目录锁 —— 不论 RELAY_DB
+// 用什么文件名，写同一 dataDir/secrets 的进程都争这一把；dbPath 是另一个文件时再取它的
+// 实例锁（OpenLocked 要求与数据库路径一致）。
+func lockDataDir(dataDir, dbPath string) (*dataDirLock, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据目录 %s: %w", dataDir, err)
 	}
-	return store.AcquireInstanceLock(instanceDBPath(dataDir, dbCandidates...))
+	dirDB := filepath.Join(dataDir, "relay-gate.db")
+	dir, err := store.AcquireInstanceLock(dirDB)
+	if err != nil {
+		return nil, err
+	}
+	l := &dataDirLock{dir: dir, db: dir}
+	if strings.TrimSpace(dbPath) != "" && !samePath(dbPath, dirDB) {
+		db, err := store.AcquireInstanceLock(dbPath)
+		if err != nil {
+			_ = dir.Close()
+			return nil, err
+		}
+		l.db = db
+	}
+	return l, nil
+}
+
+// Close 释放两把锁中尚未移交给 Store 的部分。
+func (l *dataDirLock) Close() error {
+	if l == nil {
+		return nil
+	}
+	return errors.Join(l.db.Close(), l.dir.Close())
 }
 
 // instanceDBPath 选出落在 dataDir 下的数据库路径；都不在时用服务端默认文件名。
@@ -178,16 +214,21 @@ func instanceDBPath(dataDir string, candidates ...string) string {
 			if c == "" {
 				continue
 			}
-			dir, err := filepath.Abs(filepath.Dir(c))
-			if err != nil {
-				continue
-			}
-			if dir == want || (runtime.GOOS == "windows" && strings.EqualFold(dir, want)) {
+			if samePath(filepath.Dir(c), want) {
 				return c
 			}
 		}
 	}
 	return filepath.Join(dataDir, "relay-gate.db")
+}
+
+func samePath(a, b string) bool {
+	a, errA := filepath.Abs(a)
+	b, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return a == b || (runtime.GOOS == "windows" && strings.EqualFold(a, b))
 }
 
 func envOr(k, def string) string {

@@ -93,7 +93,8 @@ func runServer() error {
 	}
 	// 下面的 bootstrap / keyring 恢复与初始化都会写 data/secrets，必须与 SQLite
 	// 同处实例锁之下：第二个进程在这里以 ErrInstanceLocked 失败，不碰 secrets。
-	instanceLock, err := store.AcquireInstanceLock(dbPath)
+	// 数据目录锁与 credentials CLI 共用，自定义 RELAY_DB 文件名也挡得住只带 --data-dir 的 CLI。
+	instanceLock, err := lockDataDir(dataDir, dbPath)
 	if err != nil {
 		return err
 	}
@@ -136,7 +137,7 @@ func runServer() error {
 	if err := credSvc.RestorePersistedGrace(dataDir); err != nil {
 		return fmt.Errorf("恢复 Relay grace: %w", err)
 	}
-	st, err := store.OpenLocked(cfg.DBPath, cipher, instanceLock)
+	st, err := store.OpenLocked(cfg.DBPath, cipher, instanceLock.db)
 	if err != nil {
 		return err
 	}
