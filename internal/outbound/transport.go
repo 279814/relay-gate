@@ -182,9 +182,10 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 
 	ctx, cancel := context.WithCancel(request.Context())
 	timedOut := make(chan struct{})
+	// AfterFunc 在 Stop() 返回 false 时仍可能已经开始跑：GotConn 若已置位，
+	// 绝不能再 cancel，否则会把已建连的 RoundTrip 掐断。
 	timer := time.AfterFunc(transport.connect, func() {
-		close(timedOut)
-		cancel()
+		fireConnectTimeout(&gotConn, timedOut, cancel)
 	})
 
 	// 已有的 trace（调用方装的观测）必须保留：httptrace.WithClientTrace 会
@@ -217,6 +218,20 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 	// 表现为「所有流式响应立刻断开」。释放挂到 body 关闭上。
 	response.Body = &bodyWithCancel{ReadCloser: response.Body, cancel: cancel}
 	return response, nil
+}
+
+// fireConnectTimeout 是 connect 预算到期时 AfterFunc 的身体。
+//
+// timer.Stop() 返回 false 时回调可能已经开跑：若 GotConn 已把 flag 置上，
+// 不能再 close(timedOut)/cancel，否则会误伤已建连的 RoundTrip，也会把
+// 后续失败错判成 connect timeout（connectPhaseTimeout 先看 timedOut）。
+// 仍在建连（flag 未置）时才发信号并 cancel。
+func fireConnectTimeout(gotConn *atomic.Bool, timedOut chan struct{}, cancel context.CancelFunc) {
+	if gotConn.Load() {
+		return
+	}
+	close(timedOut)
+	cancel()
 }
 
 // connectPhaseTimeout 判断这次失败是不是「建连阶段超了预算」。
