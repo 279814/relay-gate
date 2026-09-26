@@ -210,12 +210,13 @@ func parseRetryAfter(h http.Header) time.Duration {
 	if err != nil || n <= 0 {
 		return 0
 	}
-	// 上限保护：一个写错的 Retry-After（比如上游误填了毫秒）会把站
-	// 冷藏几个小时，而它其实早就恢复了。
-	if d := time.Duration(n) * time.Second; d < maxRetryAfter {
-		return d
+	// 先比秒数再乘：n 足够大时 time.Duration(n)*time.Second 会溢出成负数，
+	// 于是一个荒谬的大值会变成「立刻过期 / 负时长」——与它表达的意思正好相反。
+	// 上限保护同时挡住上游误填毫秒把站冷藏几小时的情况。
+	if int64(n) >= int64(maxRetryAfter/time.Second) {
+		return maxRetryAfter
 	}
-	return maxRetryAfter
+	return time.Duration(n) * time.Second
 }
 
 const maxRetryAfter = 30 * time.Minute
