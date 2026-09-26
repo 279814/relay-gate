@@ -365,6 +365,7 @@ func TestStreamBody_IdleFiredButClientGoneIsCanceled(t *testing.T) {
 //
 // 返回 0 而不是负数或 panic 是刻意的：调用方（健康状态机、样本记录）
 // 用 0 表示「没测到」，而未见语义证据的样本正是 FirstSemanticAt 为零的那种。
+// 首语义时间戳早于发出时刻（时钟回拨/乱序）同样归零，避免 TTFTMs 存负数。
 func TestResult_TTFT(t *testing.T) {
 	base := time.Now()
 	cases := []struct {
@@ -374,6 +375,7 @@ func TestResult_TTFT(t *testing.T) {
 	}{
 		{"正常", base, base.Add(3200 * time.Millisecond), 3200 * time.Millisecond},
 		{"同一刻度", base, base, 0},
+		{"首语义早于发出", base.Add(100 * time.Millisecond), base, 0},
 		{"没收到首语义", base, time.Time{}, 0},
 		{"没发出去", time.Time{}, base, 0},
 		{"两个都没有", time.Time{}, time.Time{}, 0},
