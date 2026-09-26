@@ -103,6 +103,11 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 	if err = tx.Commit(); err != nil {
 		return result, err
 	}
+	// Stale / non-applied dispositions must not charge: a config_stale probe
+	// still stores the execution row, but must not insert probe_cost_*.
+	if result.Reachability != model.ApplyCurrent && result.Capability != model.ApplyCurrent {
+		return result, nil
+	}
 	// Cost is best-effort after the observation commits. A probe_cost_* write
 	// failure must not roll capability/reachability back to the pre-probe state.
 	if costErr := store.recordExecutionCostAfterCommit(ctx, execution); costErr != nil {
