@@ -94,13 +94,20 @@ func NetworkFor(upstream *model.ProbeUpstreamConfig, connect time.Duration) Netw
 // 诊断输出与日志里，而 proxy_url 可以带 user:password。既要「改了密码就换池」
 // 又不能把密码写进键，所以凭据走一层 hash。
 func (network NetworkConfig) poolKey() string {
+	return network.networkIdentityPrefix() + "\x00" + network.ConnectTimeout.String()
+}
+
+// networkIdentityPrefix 是池键里与 connect 预算无关的部分。
+//
+// 同一 Upstream 每种 connect 预算各有一个池；换代理 / Host / revision 时要
+// 丢掉**整份**旧身份（含其它 connect 预算），但不能误伤同身份下其它预算。
+func (network NetworkConfig) networkIdentityPrefix() string {
 	parts := []string{
 		strconv.FormatInt(network.UpstreamID, 10),
 		maskProxyForKey(network.ProxyURL),
 		network.TLSServerName,
 		network.RequestHost,
 		strconv.FormatInt(network.NetworkRevision, 10),
-		network.ConnectTimeout.String(),
 	}
 	return strings.Join(parts, "\x00")
 }
@@ -332,6 +339,11 @@ func NewManager() *Manager {
 // 返回 error 而不是静默回落到一个默认池：唯一的失败原因是 proxy_url 解析
 // 不了，而那时静默忽略代理意味着流量直接发往上游 —— 一个配了代理的用户
 // 会以为流量在走代理。
+//
+// 新建池时会丢掉该 Upstream 上网络身份已变的旧池（关空闲连接、从 map
+// 删除）。否则每次改 proxy / Host / revision 都会在 map 里多留一份历史
+// Transport，空闲连接永远不收。同身份下其它 connect 预算的池保留。
+// 在途 RoundTrip 仍持有旧 *Transport 引用，可读完。
 func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 	key := network.poolKey()
 
@@ -343,13 +355,14 @@ func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 	}
 
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	// 双检：可能在等锁期间已被别的请求建好。
 	if existing, ok := manager.pools[key]; ok {
+		manager.mu.Unlock()
 		return existing, nil
 	}
 	transport, err := newTransport(network)
 	if err != nil {
+		manager.mu.Unlock()
 		return nil, err
 	}
 	manager.pools[key] = transport
@@ -359,7 +372,35 @@ func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 		manager.byUpstream[network.UpstreamID] = keys
 	}
 	keys[key] = struct{}{}
+	stale := manager.detachStaleLocked(network)
+	manager.mu.Unlock()
+
+	for _, old := range stale {
+		old.CloseIdleConnections()
+	}
 	return transport, nil
+}
+
+// detachStaleLocked 取出该 Upstream 上网络身份已过期的池，并从 map 删除。
+// 调用方必须已持有 manager.mu 写锁；CloseIdleConnections 由调用方在锁外做。
+func (manager *Manager) detachStaleLocked(network NetworkConfig) []*Transport {
+	keys := manager.byUpstream[network.UpstreamID]
+	if len(keys) == 0 {
+		return nil
+	}
+	prefix := network.networkIdentityPrefix() + "\x00"
+	stale := make([]*Transport, 0)
+	for key := range keys {
+		if strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if transport, ok := manager.pools[key]; ok {
+			stale = append(stale, transport)
+			delete(manager.pools, key)
+		}
+		delete(keys, key)
+	}
+	return stale
 }
 
 // Invalidate 丢弃某个 Upstream 的全部连接池。
@@ -367,8 +408,9 @@ func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 // 关空闲连接、不取消在途请求：在途请求持有自己的 *Transport 引用，
 // 读到底为止都用它。取消它们等于「改一次配置就断掉正在传输的对话」。
 //
-// 常规配置变更**不需要**调它：池键已经含 network_revision，改了会自然换池。
-// 这个方法留给「配置没变但连接池本身要重置」的场景（探活判定整站不可用）。
+// 常规配置变更走 Transport()：池键变了会自然换池，并在建新池时摘掉旧身份。
+// Invalidate 留给「配置没变但连接池本身要重置」（探活判定整站不可用），
+// 以及删站后主动清池（删站不会再有下一次 Transport() 去换键）。
 func (manager *Manager) Invalidate(upstreamID int64) {
 	manager.mu.Lock()
 	keys := manager.byUpstream[upstreamID]

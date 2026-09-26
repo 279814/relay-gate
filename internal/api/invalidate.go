@@ -29,6 +29,10 @@ type SemanticConfigInvalidator struct {
 	Inner             ConfigInvalidator
 	RoutesOfUpstream  func(upstreamID int64) []int64
 	RoutesOfModelName func(modelNameID int64) []int64
+	// DropUpstreamTransports drops outbound connection pools for a deleted
+	// Upstream (close idle + remove map entries). Optional: nil in tests that
+	// do not wire outbound.Manager.
+	DropUpstreamTransports func(upstreamID int64)
 }
 
 func (s *SemanticConfigInvalidator) InvalidateRoute(routeID int64) {
@@ -142,6 +146,9 @@ func (s *SemanticConfigInvalidator) InvalidateUpstreamDeleted(upstreamID int64, 
 	}
 	if s.Inner != nil {
 		s.Inner.InvalidateUpstream(upstreamID)
+	}
+	if s.DropUpstreamTransports != nil {
+		s.DropUpstreamTransports(upstreamID)
 	}
 }
 
