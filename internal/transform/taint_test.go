@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 func TestSecretRef_InjectsAndTaintsDiagnostics(t *testing.T) {
@@ -48,6 +50,31 @@ func TestSecretRef_InjectsAndTaintsDiagnostics(t *testing.T) {
 	}, ResponseInput{}, secrets)
 	if strings.Contains(sum, secret) {
 		t.Fatalf("shadow summary leaked secret: %s", sum)
+	}
+}
+
+// Short needles (< MinRedactableKeyLen, including "") must not be ReplaceAll
+// targets: replacing "key" or "1" would corrupt query URLs in diagnostics.
+// Keys at the floor length still disappear.
+func TestTaintBag_Redact_SkipsShortSecretNeedles(t *testing.T) {
+	const rawURL = "https://example.com/v1/messages?key=1"
+	for _, short := range []string{"key", "1", ""} {
+		var bag TaintBag
+		bag.note([]byte(short))
+		if got := bag.Redact(rawURL); got != rawURL {
+			t.Fatalf("short needle %q must leave URL unchanged: got %q", short, got)
+		}
+	}
+	long := strings.Repeat("y", model.MinRedactableKeyLen)
+	var bag TaintBag
+	bag.note([]byte(long))
+	body := rawURL + "&token=" + long
+	got := bag.Redact(body)
+	if strings.Contains(got, long) {
+		t.Fatalf("12+ char secret must disappear: %q", got)
+	}
+	if !strings.Contains(got, rawURL) {
+		t.Fatalf("URL with short query tokens must stay: %q", got)
 	}
 }
 
