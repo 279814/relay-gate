@@ -116,14 +116,14 @@ func objectHasSemanticEvidence(top map[string]json.RawMessage) bool {
 
 	// Anthropic non-stream message body.
 	if name == "message" || name == "" {
-		if anthropicContentSemantic(top["content"]) {
+		if _, ok := semanticevidence.AnthropicContentSemantic(top["content"]); ok {
 			return true
 		}
 	}
 
 	// OpenAI Responses non-stream: output[].content[].text
 	if name == "response" || name == "" {
-		if responsesOutputSemantic(top["output"]) {
+		if _, ok := semanticevidence.ResponsesOutputSemantic(top["output"]); ok {
 			return true
 		}
 	}
@@ -202,52 +202,6 @@ func chatCallArgsSemantic(raw json.RawMessage) bool {
 	return jsonNonEmptyString(call["arguments"])
 }
 
-func anthropicContentSemantic(raw json.RawMessage) bool {
-	var blocks []map[string]json.RawMessage
-	if json.Unmarshal(raw, &blocks) != nil {
-		return false
-	}
-	for _, block := range blocks {
-		switch jsonStringField(block, "type") {
-		case "text":
-			if jsonNonEmptyString(block["text"]) {
-				return true
-			}
-		case "thinking":
-			if jsonNonEmptyString(block["thinking"]) {
-				return true
-			}
-		case "tool_use", "input_json":
-			if nonEmptyJSONValue(block["input"]) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func responsesOutputSemantic(raw json.RawMessage) bool {
-	var items []map[string]json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
-		return false
-	}
-	for _, item := range items {
-		var content []map[string]json.RawMessage
-		if json.Unmarshal(item["content"], &content) != nil {
-			continue
-		}
-		for _, part := range content {
-			if jsonNonEmptyString(part["text"]) || jsonNonEmptyString(part["refusal"]) {
-				return true
-			}
-		}
-		if jsonNonEmptyString(item["arguments"]) {
-			return true
-		}
-	}
-	return false
-}
-
 func jsonStringField(object map[string]json.RawMessage, name string) string {
 	raw, ok := object[name]
 	if !ok {
@@ -266,15 +220,6 @@ func jsonNonEmptyString(raw json.RawMessage) bool {
 	}
 	var value string
 	return json.Unmarshal(raw, &value) == nil && value != ""
-}
-
-func nonEmptyJSONValue(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	switch string(trimmed) {
-	case "", "null", "false", `""`, "{}", "[]":
-		return false
-	}
-	return true
 }
 
 // streamSemanticSniffer 在 2xx 响应上增量嗅探 §8.8 语义证据。
