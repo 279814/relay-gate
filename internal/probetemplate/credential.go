@@ -79,7 +79,7 @@ func RejectLiteralAuthFieldValue(value string) error {
 	if len(remainder) < minLiteralAuthValue {
 		return rejectCredentialPrefix(value, "认证字段")
 	}
-	return model.WrapValidation("认证字段不能写字面凭据，"+
+	return model.WrapValidation("认证字段不能写字面凭据，" +
 		"请改用 {{UPSTREAM_API_KEY}} 或先创建 Probe Secret 再写 {{SECRET:name}}（§4.5）")
 }
 
