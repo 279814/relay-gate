@@ -177,8 +177,9 @@ func respondOK(text string) http.HandlerFunc {
 }
 
 // §3.5 的可重试清单，逐条验证：换站之后客户端拿到的是好站的响应。
-// 默认 Balanced：仅 §11.2 点名的 429/502/503/504（及载荷侧临时错误）。
-// 通用 5xx（如 500）见 TestRetry_General5xxFailoverOnlyAggressive。
+// 默认 Balanced：仅 §11.2 点名的 429/502/503/504。
+// 通用 5xx（如 500）见 TestRetry_General5xxFailoverOnlyAggressive；
+// 200 结构化流内错误见 TestRetry_200StructuredErrorFailoverOnlyAggressive。
 func TestRetry_RetryableConditionsSwitchStation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -188,16 +189,6 @@ func TestRetry_RetryableConditionsSwitchStation(t *testing.T) {
 		{"503", respondStatus(503, `unavailable`)},
 		{"504", respondStatus(504, `gateway timeout`)},
 		{"429 限流", respondStatus(429, `{"error":{"type":"rate_limit_error"}}`)},
-		{
-			// 200 但流里第一个事件就是 error（§3.5 明确列为可重试）
-			name: "200 但载荷是错误",
-			bad: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Write([]byte("event: error\ndata: {\"type\":\"error\"," +
-					"\"error\":{\"type\":\"overloaded_error\"}}\n\n"))
-				w.(http.Flusher).Flush()
-			},
-		},
 		// 首 Token / Peek 超时不在 Balanced 可重试清单（§11.2 仅 Aggressive）；
 		// 见 TestRetry_FirstTokenTimeoutFailoverOnlyAggressive。
 	}
@@ -559,6 +550,7 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 	hs := newMultiHarness(t,
 		respondStatus(200, `{"type":"error","error":{"type":"server_error","message":"boom"}}`),
 		respondOK(`{"id":"ok"}`))
+	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
 	spy := &multiReporter{}
 	hs.h.WithHealthReporter(spy)
 
@@ -1091,6 +1083,46 @@ func TestRetry_General5xxFailoverOnlyAggressive(t *testing.T) {
 		}
 		hs.assertHits(t, 1, 1)
 	})
+}
+
+// §11.2: HTTP 200 结构化流内错误仅 Aggressive 换站；Safe/Balanced 原样透传。
+func TestRetry_200StructuredErrorFailoverOnlyAggressive(t *testing.T) {
+	sseError := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: error\ndata: {\"type\":\"error\"," +
+			"\"error\":{\"type\":\"overloaded_error\"}}\n\n"))
+		w.(http.Flusher).Flush()
+	}
+	for _, c := range []struct {
+		policy   model.RetryPolicy
+		failover bool
+	}{
+		{model.RetryPolicySafe, false},
+		{model.RetryPolicyBalanced, false},
+		{model.RetryPolicyAggressive, true},
+	} {
+		t.Run(string(c.policy), func(t *testing.T) {
+			hs := newMultiHarness(t, sseError, respondOK(`{"id":"from-good-station"}`))
+			hs.cfg.settings.RealTotalSec = 30
+			hs.cfg.settings.RetryPolicy = c.policy
+
+			rec := hs.serve(hs.req())
+			if rec.Code != 200 {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if c.failover {
+				if !strings.Contains(rec.Body.String(), "from-good-station") {
+					t.Errorf("Aggressive 应换站，得到 %q", rec.Body.String())
+				}
+				hs.assertHits(t, 1, 1)
+				return
+			}
+			if !strings.Contains(rec.Body.String(), "overloaded_error") {
+				t.Errorf("%s 应透传上游 200 错误流，得到 %q", c.policy, rec.Body.String())
+			}
+			hs.assertHits(t, 1, 0)
+		})
+	}
 }
 
 // ── 样本：客户端的一次请求 = 一条样本 ─────────────────────

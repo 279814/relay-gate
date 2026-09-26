@@ -654,10 +654,14 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 	// §11.2: Balanced named HTTP statuses only (429/502/503/504).
 	// General 5xx (500, 501, 529, …) is Aggressive-only. Safe already
 	// blocks status-based retries via safeRetryEvidence (Status > 0).
+	// HTTP 200 structured in-stream errors are Aggressive-only as well.
 	if res := la.at.Result(); res != nil && res.Err == nil {
 		st := la.at.Status()
 		if st >= 500 && !balancedNamedFailoverStatus(st) &&
 			policy != model.RetryPolicyAggressive {
+			return false
+		}
+		if st >= 200 && st < 300 && policy != model.RetryPolicyAggressive {
 			return false
 		}
 	}
@@ -728,8 +732,8 @@ func balancedNamedFailoverStatus(st int) bool {
 // 可重试（base）：连接失败、TLS 失败、首 Token 超时、5xx、429、200 但载荷是错误。
 // 不可重试：4xx（除 429）、客户端自己断开、ErrUpstreamBroke。
 //
-// 策略收窄在 retryableAttempt：§11.2 规定 ErrFirstTokenTimeout 与通用 5xx
-// 仅 Aggressive 换站；Balanced 仅 429/502/503/504（及载荷侧临时错误）。
+// 策略收窄在 retryableAttempt：§11.2 规定 ErrFirstTokenTimeout、通用 5xx 与
+// 200 结构化流内错误仅 Aggressive 换站；Balanced 仅 429/502/503/504。
 // Balanced/Safe 对收窄项的 base 仍为 true（健康回写仍算上游账），但不 failover。
 //
 // 「已写出字节后不得重试」这条不在这里判 —— 结构上到不了：判定发生在
