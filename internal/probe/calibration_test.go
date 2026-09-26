@@ -639,6 +639,58 @@ func TestCalibration_AllAuthRejectedWritesConfigError_NotReachability(t *testing
 	}
 }
 
+// §8.7：前面的候选以 try_next_shape 前进（鉴权已被接受）、最后的候选 401 时，
+// 并非每个候选都 auth_rejected，不得写 Endpoint config_error。
+func TestCalibration_ShapeThenAuthRejectedDoesNotWriteConfigError(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	var calls atomic.Int64
+	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return respFrom(400, "application/json",
+				`{"error":{"type":"invalid_request_error","code":"missing_beta_header"}}`), nil
+		}
+		return respFrom(401, "application/json", `{"error":{"type":"authentication_error"}}`), nil
+	})
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := svc.Start(context.Background(), run.ID, run.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		_ = svc.stepOnce(context.Background())
+		got, _ := st.GetCalibrationRun(context.Background(), started.ID)
+		if got.State == model.CalibrationFailed {
+			break
+		}
+	}
+	final, _ := st.GetCalibrationRun(context.Background(), started.ID)
+	if final.State != model.CalibrationFailed {
+		t.Fatalf("state=%s", final.State)
+	}
+	if counter.count() != len(final.Candidates) {
+		t.Fatalf("RoundTrip=%d candidates=%d", counter.count(), len(final.Candidates))
+	}
+	if final.Candidates[0].Disposition != model.CandidateTryNextShape {
+		t.Fatalf("candidate 0 disposition=%s", final.Candidates[0].Disposition)
+	}
+	caps, err := st.ListCapabilities(context.Background(), model.CapabilityFilter{
+		PageRequest: model.PageRequest{Limit: 20},
+		Endpoint:    model.EndpointMessages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range caps.Items {
+		if row.ScopeID == rt.ID && row.State == model.CapabilityConfigError {
+			t.Fatalf("并非全部候选 auth_rejected，不得写 config_error: %+v", row)
+		}
+	}
+}
+
 func TestCalibration_SendStartedWithoutExecution_Interrupts(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
