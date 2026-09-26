@@ -681,6 +681,12 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 }
 
 // safeRetryEvidence is true only when nothing proves the request reached the upstream (§11.2 Safe).
+//
+// Missing Trace is not proof of a pre-write failure: PrepareAttempt can return
+// nil Trace while Send still runs. Status / Trace GotConn cover the instrumented
+// path; without Trace, a non-zero Result.SentAt means RoundTrip was entered and
+// §11.2 treats that as possibly executed. Pre-connect stays safe when Trace is
+// present and GotConn/headers never arrived (or SentAt was never set).
 func safeRetryEvidence(la *liveAttempt) bool {
 	if la == nil || la.at == nil {
 		return false
@@ -699,6 +705,8 @@ func safeRetryEvidence(la *liveAttempt) bool {
 		if !snap.GotConnAt.IsZero() {
 			return false
 		}
+	} else if res != nil && !res.SentAt.IsZero() {
+		return false
 	}
 	return true
 }

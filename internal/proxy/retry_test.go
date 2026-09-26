@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -836,6 +838,8 @@ func TestRetry_PostWriteConnectDoesNotFailover_PreWriteDialStillDoes(t *testing.
 			respondOK(`{"id":"unreachable-handler"}`),
 			respondOK(`{"id":"from-good-station"}`))
 		hs.cfg.settings.RealTotalSec = 30
+		// Trace records GotConn absence; without it nil-Trace + SentAt is not safe (§11.2).
+		hs.h.WithObservers(traceOnlyFactory{})
 		// Dial never reaches the first listener → no GotConn / write evidence.
 		hs.cfg.snap.Upstreams[10].BaseURL = "http://127.0.0.1:1"
 
@@ -848,6 +852,62 @@ func TestRetry_PostWriteConnectDoesNotFailover_PreWriteDialStillDoes(t *testing.
 			t.Errorf("客户端应拿到好站响应，得到 %q", rec.Body.String())
 		}
 		hs.assertHits(t, 0, 1)
+	})
+}
+
+// traceOnlyFactory returns an AttemptTrace so GotConn absence can prove Safe
+// connect-failure scope. Observer/Retry stay no-op.
+type traceOnlyFactory struct{}
+
+func (traceOnlyFactory) PrepareAttempt(
+	context.Context, health.AttemptTarget, health.AttemptRequestView,
+) health.AttemptInstrumentation {
+	noop := health.NoopInstrumentation()
+	return health.AttemptInstrumentation{
+		Observer: noop.Observer,
+		Retry:    noop.Retry,
+		Trace:    &outbound.AttemptTrace{},
+	}
+}
+
+// §11.2: nil Trace must not make a post-Send attempt look like a safe connect failure.
+func TestSafeRetryEvidence_NilTraceUsesSentAt(t *testing.T) {
+	sent := time.Unix(1, 0)
+
+	t.Run("nil Trace with SentAt is not safe", func(t *testing.T) {
+		la := &liveAttempt{
+			at:    &Attempt{res: &Result{SentAt: sent, Err: ErrConnect}},
+			instr: health.NoopInstrumentation(),
+		}
+		if safeRetryEvidence(la) {
+			t.Fatal("nil Trace after RoundTrip (SentAt set) must not be safe_connect_failure")
+		}
+	})
+
+	t.Run("nil Trace without SentAt stays safe", func(t *testing.T) {
+		la := &liveAttempt{
+			at:    &Attempt{res: &Result{Err: ErrConnect}},
+			instr: health.NoopInstrumentation(),
+		}
+		if !safeRetryEvidence(la) {
+			t.Fatal("pre-Send failure with no status/SentAt/GotConn should stay safe")
+		}
+	})
+
+	t.Run("Trace without GotConn stays safe despite SentAt", func(t *testing.T) {
+		tr := &outbound.AttemptTrace{}
+		tr.MarkSent(sent)
+		la := &liveAttempt{
+			at: &Attempt{res: &Result{SentAt: sent, Err: ErrConnect}},
+			instr: health.AttemptInstrumentation{
+				Observer: health.NoopInstrumentation().Observer,
+				Retry:    health.KeepAttemptDecider{},
+				Trace:    tr,
+			},
+		}
+		if !safeRetryEvidence(la) {
+			t.Fatal("instrumented pre-connect (no GotConn) should stay safe")
+		}
 	})
 }
 
