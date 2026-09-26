@@ -52,8 +52,16 @@ func TestMigrationImportsEnvAsArgon2NoSecretsInOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doc.RelayKey != relay {
-		t.Fatalf("relay=%q", doc.RelayKey)
+	c, err := store.NewCipher(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRelay, err := OpenPersistedRelayKey(doc.RelayKey, c)
+	if err != nil || gotRelay != relay {
+		t.Fatalf("relay open=%q want %q err=%v", gotRelay, relay, err)
+	}
+	if !IsRelayKeyEnvelope(doc.RelayKey) {
+		t.Fatal("migration must persist Master-Key envelope, not plaintext")
 	}
 	kr := keyring.Open(dir)
 	_, master, err := kr.LoadActive()
@@ -64,10 +72,6 @@ func TestMigrationImportsEnvAsArgon2NoSecretsInOutput(t *testing.T) {
 		t.Fatal("ENCRYPTION_KEY must be preserved in keyring (SHA-256 decrypt path)")
 	}
 	// Cipher still decrypts with the same passphrase.
-	c, err := store.NewCipher(enc)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ct, err := c.Encrypt("sk-upstream")
 	if err != nil {
 		t.Fatal(err)

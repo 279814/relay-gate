@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // Bootstrap phases (§12.3).
@@ -179,10 +180,18 @@ func (b *Bootstrap) freshInstall() (Displayed, error) {
 	if err != nil {
 		return Displayed{}, err
 	}
+	cipher, err := store.NewCipher(master)
+	if err != nil {
+		return Displayed{}, err
+	}
+	sealedRelay, err := SealPersistedRelayKey(relay, cipher)
+	if err != nil {
+		return Displayed{}, err
+	}
 	if err := b.writeCredentials(Persisted{
 		FormatVersion:     1,
 		AdminPasswordHash: hash,
-		RelayKey:          relay,
+		RelayKey:          sealedRelay,
 		MasterKeyID:       keyID,
 		UpdatedAt:         b.now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
@@ -226,10 +235,18 @@ func (b *Bootstrap) resumeUndelivered() (Displayed, error) {
 	if err != nil {
 		return Displayed{}, err
 	}
+	cipher, err := store.NewCipher(master)
+	if err != nil {
+		return Displayed{}, err
+	}
+	sealedRelay, err := SealPersistedRelayKey(relay, cipher)
+	if err != nil {
+		return Displayed{}, err
+	}
 	if err := b.writeCredentials(Persisted{
 		FormatVersion:     1,
 		AdminPasswordHash: hash,
-		RelayKey:          relay,
+		RelayKey:          sealedRelay,
 		MasterKeyID:       keyID,
 		UpdatedAt:         b.now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
