@@ -95,28 +95,12 @@ func TestManager_SameConfigSharesPool(t *testing.T) {
 //
 // 「不该换」与「该换」一样要钉住：无谓换池会把一批已建好的连接白扔掉，
 // 而对高延迟公益站，重建它们的代价是每次一次完整 TLS 握手。
+//
+// 留池用例必须先跑：换池会把同 Upstream 上旧网络身份的池从 map 摘掉，
+// 若先换池再留池，baseline 指针已经不在 manager 里。
 func TestManager_PoolIdentityCoversNetworkConfigOnly(t *testing.T) {
 	manager := newTestManager(t)
 	baseline := mustTransport(t, manager, netFor(netUpstream(), 2*time.Second))
-
-	changesPool := []struct {
-		name  string
-		apply func(*model.Upstream)
-	}{
-		{"proxy_url", func(u *model.Upstream) { u.ProxyURL = "http://127.0.0.1:9" }},
-		{"tls_server_name", func(u *model.Upstream) { u.TLSServerName = "sni.example.com" }},
-		{"host_override", func(u *model.Upstream) { u.HostOverride = "real.example.com" }},
-		{"network_revision", func(u *model.Upstream) { u.NetworkRevision = 2 }},
-	}
-	for _, testCase := range changesPool {
-		t.Run("换池/"+testCase.name, func(t *testing.T) {
-			upstream := netUpstream()
-			testCase.apply(upstream)
-			if got := mustTransport(t, manager, netFor(upstream, 2*time.Second)); got == baseline {
-				t.Errorf("改了 %s 必须换池，复用旧池等于该配置对出站流量无效", testCase.name)
-			}
-		})
-	}
 
 	keepsPool := []struct {
 		name  string
@@ -139,6 +123,95 @@ func TestManager_PoolIdentityCoversNetworkConfigOnly(t *testing.T) {
 				t.Errorf("改了 %s 不该换池：这个字段与网络目标无关", testCase.name)
 			}
 		})
+	}
+
+	changesPool := []struct {
+		name  string
+		apply func(*model.Upstream)
+	}{
+		{"proxy_url", func(u *model.Upstream) { u.ProxyURL = "http://127.0.0.1:9" }},
+		{"tls_server_name", func(u *model.Upstream) { u.TLSServerName = "sni.example.com" }},
+		{"host_override", func(u *model.Upstream) { u.HostOverride = "real.example.com" }},
+		{"network_revision", func(u *model.Upstream) { u.NetworkRevision = 2 }},
+	}
+	for _, testCase := range changesPool {
+		t.Run("换池/"+testCase.name, func(t *testing.T) {
+			upstream := netUpstream()
+			testCase.apply(upstream)
+			if got := mustTransport(t, manager, netFor(upstream, 2*time.Second)); got == baseline {
+				t.Errorf("改了 %s 必须换池，复用旧池等于该配置对出站流量无效", testCase.name)
+			}
+		})
+	}
+}
+
+// 网络身份变了之后，旧 Transport 必须从 map 里摘掉：不能只是「下次换一把新的」
+// 却把历史 key 永久留在 pools 里。
+func TestManager_KeyChangeDropsPreviousTransport(t *testing.T) {
+	manager := newTestManager(t)
+	upstream := netUpstream()
+
+	oldL1 := mustTransport(t, manager, netFor(upstream, time.Second))
+	oldL2 := mustTransport(t, manager, netFor(upstream, 3*time.Second))
+	if manager.PoolCount() != 2 {
+		t.Fatalf("准备阶段 PoolCount=%d want 2", manager.PoolCount())
+	}
+
+	changed := netUpstream()
+	changed.ProxyURL = "http://127.0.0.1:9"
+	changed.NetworkRevision = 2
+	fresh := mustTransport(t, manager, netFor(changed, time.Second))
+	if fresh == oldL1 || fresh == oldL2 {
+		t.Fatal("改 proxy_url 后不得再返回旧 Transport")
+	}
+	// 旧身份的两个 connect 预算都应被摘掉；同身份下尚未建的 3s 池不计。
+	if manager.PoolCount() != 1 {
+		t.Fatalf("换身份后应只剩新池，PoolCount=%d want 1", manager.PoolCount())
+	}
+	if again := mustTransport(t, manager, netFor(changed, time.Second)); again != fresh {
+		t.Fatal("同新身份应继续共享刚建的池")
+	}
+	// 旧配置再取一次必须是新实例：旧指针已不在 map。
+	revived := mustTransport(t, manager, netFor(upstream, time.Second))
+	if revived == oldL1 {
+		t.Fatal("旧 Transport 仍留在 map 里")
+	}
+}
+
+func TestManager_HostOverrideChangeDropsPreviousTransport(t *testing.T) {
+	manager := newTestManager(t)
+	upstream := netUpstream()
+	old := mustTransport(t, manager, netFor(upstream, 2*time.Second))
+
+	changed := netUpstream()
+	changed.HostOverride = "real.example.com"
+	changed.NetworkRevision = 2
+	fresh := mustTransport(t, manager, netFor(changed, 2*time.Second))
+	if fresh == old {
+		t.Fatal("改 host_override 后不得再返回旧 Transport")
+	}
+	if manager.PoolCount() != 1 {
+		t.Fatalf("PoolCount=%d want 1", manager.PoolCount())
+	}
+}
+
+func TestManager_KeyChangeKeepsSiblingConnectTimeoutPools(t *testing.T) {
+	manager := newTestManager(t)
+	upstream := netUpstream()
+	upstream.ProxyURL = "http://127.0.0.1:9"
+	upstream.NetworkRevision = 2
+
+	l1 := mustTransport(t, manager, netFor(upstream, time.Second))
+	l2 := mustTransport(t, manager, netFor(upstream, 3*time.Second))
+	again := mustTransport(t, manager, netFor(upstream, time.Second))
+	if again != l1 {
+		t.Fatal("同身份下再建 L1 不得丢掉已有 L1")
+	}
+	if mustTransport(t, manager, netFor(upstream, 3*time.Second)) != l2 {
+		t.Fatal("同身份下再建 L1 不得丢掉兄弟 L2 池")
+	}
+	if manager.PoolCount() != 2 {
+		t.Fatalf("PoolCount=%d want 2", manager.PoolCount())
 	}
 }
 
