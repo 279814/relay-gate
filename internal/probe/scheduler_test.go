@@ -538,6 +538,36 @@ func TestScheduler_EnforcesGlobalL2Limit(t *testing.T) {
 	}
 }
 
+// Settings.GlobalL2Concurrency 现读：改成更小的正值后，后续 claim 必须按新上限，
+// 无需进程重启（§4.3 Settings 快照；docs/01 未要求该值固定在启动时）。
+func TestScheduler_GlobalL2LimitFollowsSettingsUpdate(t *testing.T) {
+	hs := newSchedHarness(t, 2, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	})
+	hs.cfg.settings.GlobalL2Concurrency = 3
+
+	if !hs.sched.beginL2(10, 100) {
+		t.Fatal("limit=3 时应能占用第一个 L2 名额")
+	}
+	if got := hs.sched.l2Limit(); got != 3 {
+		t.Fatalf("limit 应为 3，got %d", got)
+	}
+
+	hs.cfg.settings.GlobalL2Concurrency = 1
+	if got := hs.sched.l2Limit(); got != 1 {
+		t.Fatalf("settings 改为 1 后 limit 应为 1，got %d", got)
+	}
+	if hs.sched.beginL2(20, 200) {
+		t.Fatal("已有 1 个在途且 cap=1 时，新 claim 必须拒绝")
+	}
+
+	hs.sched.endL2(10, 100)
+	if !hs.sched.beginL2(20, 200) {
+		t.Fatal("在途结束后 cap=1 应允许新 claim")
+	}
+	hs.sched.endL2(20, 200)
+}
+
 // 抢不到额度的 Route 要撤掉预占，让下个 tick 重试。
 // 不撤的话它要白等一整个 L2 周期（alive 时是 5 分钟）。
 func TestScheduler_ReleasesClaimWhenRefused(t *testing.T) {

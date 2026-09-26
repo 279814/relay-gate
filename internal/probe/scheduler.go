@@ -94,17 +94,16 @@ type Scheduler struct {
 	// 先要一个号；拿不到号就不发（发出去却没有 order 的结果无法排先后）。
 	sequencer *observationseq.Sequencer
 
-	// l2Sem 是全局 L2 并发闸。L2 消耗 token 且打的是真实模型端点，
-	// 不限并发的话，一次「全部 Route 都到期」会同时向所有站发请求 ——
-	// 那看起来就像一次小型压测，很容易触发站点的限流。
-	l2Sem chan struct{}
-
 	// busyUp 保证同一 Upstream 的 L2 串行（§4.6）。
 	// 一个站下挂 5 个模型时，同时探 5 个几乎必然吃 429。
-	mu          sync.Mutex
-	busyUp      map[int64]bool
-	inflightL1  map[int64]bool
-	inflightL2  map[int64]bool
+	mu         sync.Mutex
+	busyUp     map[int64]bool
+	inflightL1 map[int64]bool
+	inflightL2 map[int64]bool
+	// l2Inflight 是当前已占用的全局 L2 名额。上限每次 beginL2 从
+	// Settings.GlobalL2Concurrency 现读（§4.3 Settings 快照；改值无需重启），
+	// 在途占用自然收尾，不因缩容而提前释放。
+	l2Inflight  int
 	lastRunning store.RunState
 
 	// l1Scheduled 收敛同一轮 tick 内「同时到期」的多条 Route。
@@ -709,37 +708,15 @@ func (s *Scheduler) endL1(upstreamID int64) {
 // beginL2 同时满足三个约束：全局并发上限、同 Upstream 串行、同 Route 不重入。
 func (s *Scheduler) beginL2(upstreamID, routeID int64) bool {
 	s.mu.Lock()
-	if s.busyUp[upstreamID] || s.inflightL2[routeID] {
-		s.mu.Unlock()
-		p := s.ensureP012()
-		p.mu.Lock()
-		p.pendingL2[routeID] = true
-		p.mu.Unlock()
-		return false
-	}
-	sem := s.sem()
-	s.mu.Unlock()
-
-	select {
-	case sem <- struct{}{}:
-	default:
-		p := s.ensureP012()
-		p.mu.Lock()
-		p.pendingL2[routeID] = true
-		p.mu.Unlock()
-		return false
-	}
-
-	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.busyUp[upstreamID] || s.inflightL2[routeID] {
-		<-sem
+	if s.busyUp[upstreamID] || s.inflightL2[routeID] || s.l2Inflight >= s.l2Limit() {
 		p := s.ensureP012()
 		p.mu.Lock()
 		p.pendingL2[routeID] = true
 		p.mu.Unlock()
 		return false
 	}
+	s.l2Inflight++
 	s.busyUp[upstreamID] = true
 	s.inflightL2[routeID] = true
 	return true
@@ -749,29 +726,20 @@ func (s *Scheduler) endL2(upstreamID, routeID int64) {
 	s.mu.Lock()
 	delete(s.busyUp, upstreamID)
 	delete(s.inflightL2, routeID)
-	sem := s.l2Sem
-	s.mu.Unlock()
-	if sem != nil {
-		<-sem
+	if s.l2Inflight > 0 {
+		s.l2Inflight--
 	}
+	s.mu.Unlock()
 	s.noteL2Finished(routeID)
 }
 
-// sem 懒建全局 L2 闸。调用方必须已持有锁。
-//
-// 懒建是因为容量来自配置（global_l2_concurrency），而配置在启动时
-// 未必已经可读（数据库可能还没打开）。改容量需要重启 —— 与
-// sample_queue_size 同理：它是 channel 的容量。
-func (s *Scheduler) sem() chan struct{} {
-	if s.l2Sem != nil {
-		return s.l2Sem
-	}
+// l2Limit 现读全局 L2 并发上限。Settings 不可读或值不大于 0 时回退默认 3。
+func (s *Scheduler) l2Limit() int {
 	n := model.DefaultSettings().GlobalL2Concurrency
 	if settings, err := s.cfg.Settings(); err == nil && settings.GlobalL2Concurrency > 0 {
 		n = settings.GlobalL2Concurrency
 	}
-	s.l2Sem = make(chan struct{}, n)
-	return s.l2Sem
+	return n
 }
 
 // ── 总闸联动（§4.8）─────────────────────────────────────
