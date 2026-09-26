@@ -102,13 +102,18 @@ func TestAdminURL_NoSMTPHeaderInjection(t *testing.T) {
 
 func assertAdminURLNoHeaderInjection(t *testing.T, msg string) {
 	t.Helper()
+	assertNoSMTPHeaderInjection(t, msg)
+}
+
+func assertNoSMTPHeaderInjection(t *testing.T, msg string) {
+	t.Helper()
 	hdrEnd := strings.Index(msg, "\r\n\r\n")
 	if hdrEnd < 0 {
 		t.Fatal("missing header/body separator")
 	}
 	for _, line := range strings.Split(msg[:hdrEnd], "\r\n") {
 		if strings.HasPrefix(strings.ToLower(line), "bcc:") {
-			t.Fatalf("admin URL injected extra header line: %q", line)
+			t.Fatalf("free-text field injected extra header line: %q", line)
 		}
 	}
 	if strings.Contains(msg, "\r\nBcc:") {
@@ -116,6 +121,63 @@ func assertAdminURLNoHeaderInjection(t *testing.T, msg string) {
 	}
 	if strings.Contains(msg, "\x00") {
 		t.Fatal("NUL must not appear in message")
+	}
+}
+
+func TestSummary_NoSMTPHeaderInjection(t *testing.T) {
+	evilSummary := "hit\r\nBcc: x\x00evil"
+	f := security.Finding{
+		ID:       "f1",
+		Severity: security.SeverityCritical,
+		Category: "credential_leak",
+		Summary:  evilSummary,
+		Upstream: "up1",
+		Source:   "passive",
+	}
+
+	alert := string(security.BuildAlertMessage("a@b.c", []string{"x@y.z"}, f, "http://admin/"))
+	assertNoSMTPHeaderInjection(t, alert)
+	if !strings.Contains(alert, "summary: hitBcc: xevil\r\n") {
+		t.Fatalf("CR/LF/NUL must be stripped from summary; got: %s", alert)
+	}
+
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	var captured []string
+	m := security.NewAlertMailer().
+		WithNowForTest(func() time.Time { return now }).
+		WithSendForTest(func(a string, auth smtp.Auth, from string, to []string, msg []byte) error {
+			captured = append(captured, string(msg))
+			return nil
+		})
+	m.SetConfig(security.MailConfig{
+		Enabled:     true,
+		Host:        "smtp.test.local",
+		Port:        587,
+		From:        "relay@test.local",
+		Recipients:  []string{"ops@test.local"},
+		MinSeverity: security.SeverityInfo,
+	})
+	medium := security.Finding{
+		ID:       "m1",
+		Severity: security.SeverityMedium,
+		Category: "xss_pattern",
+		Summary:  evilSummary,
+		Upstream: "up-a",
+		Source:   "passive",
+	}
+	if err := m.MaybeNotify(medium, "http://admin/"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(5 * time.Minute)
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("want one digest; got %d", len(captured))
+	}
+	assertNoSMTPHeaderInjection(t, captured[0])
+	if !strings.Contains(captured[0], "summary: hitBcc: xevil\r\n") {
+		t.Fatalf("digest must strip CR/LF/NUL from summary; got: %s", captured[0])
 	}
 }
 
