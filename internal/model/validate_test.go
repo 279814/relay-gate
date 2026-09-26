@@ -191,6 +191,45 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 	}
 }
 
+// proxy_url 空 = 直连；非空只接受 http(s)（docs/01 §7.3 HTTP 代理 CONNECT）。
+// 凭据文档允许，不因 userinfo 拒绝。file/ftp/socks5 等必须在保存入口挡掉。
+func TestProxyURLRejectsDisallowedSchemes(t *testing.T) {
+	bad := []string{
+		"file://localhost/etc/passwd",
+		"ftp://127.0.0.1:21",
+		"gopher://127.0.0.1:70",
+		"javascript:alert(1)",
+		"data:text/plain,hi",
+		"socks5://127.0.0.1:1080",
+	}
+	for _, proxy := range bad {
+		t.Run(proxy, func(t *testing.T) {
+			up := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: "", ProxyURL: proxy}
+			up.Defaults()
+			if err := up.Validate(); err == nil {
+				t.Fatalf("%q 应被拒绝", proxy)
+			}
+		})
+	}
+
+	good := []string{
+		"", // 直连
+		"http://127.0.0.1:8888",
+		"https://proxy.example.com:443",
+		"HTTP://127.0.0.1:8888", // scheme 大小写不敏感（Parse 会规范化）
+		"http://user:pass@127.0.0.1:8888", // docs/01 允许代理凭据
+	}
+	for _, proxy := range good {
+		t.Run("ok/"+proxy, func(t *testing.T) {
+			up := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: "", ProxyURL: proxy}
+			up.Defaults()
+			if err := up.Validate(); err != nil {
+				t.Fatalf("%q 应被接受，却报错：%v", proxy, err)
+			}
+		})
+	}
+}
+
 func TestAPIKeyTooShortForOutbound(t *testing.T) {
 	if APIKeyTooShortForOutbound("") {
 		t.Fatal("空串不是「过短」—— 出站按未配置处理")

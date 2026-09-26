@@ -571,6 +571,21 @@ func TestManager_RejectsBadProxyURL(t *testing.T) {
 	}
 }
 
+// 出站装池不得把 file:// 等装成 Proxy：保存入口挡不住的脏行也必须 fail closed。
+func TestManager_RejectsDisallowedProxyScheme(t *testing.T) {
+	upstream := netUpstream()
+	upstream.ProxyURL = "file://localhost/etc/passwd"
+	if _, err := newTestManager(t).Transport(netFor(upstream, time.Second)); err == nil {
+		t.Fatal("file:// proxy_url 不得装进 Transport.Proxy")
+	}
+
+	upstream.ProxyURL = "http://127.0.0.1:8888"
+	transport := mustTransport(t, newTestManager(t), netFor(upstream, time.Second))
+	if transport.base.Proxy == nil {
+		t.Fatal("合法 http proxy_url 必须装进 Transport.Proxy")
+	}
+}
+
 func TestNetworkConfig_AppliesTLSSettings(t *testing.T) {
 	upstream := netUpstream()
 	upstream.TLSServerName = "sni.example.com"
