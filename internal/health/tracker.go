@@ -282,8 +282,13 @@ func (t *Tracker) applyOK(rs *routeState, rep Report, s model.Settings, now time
 	}
 
 	switch {
+	case rs.state == model.StateDead && !rep.HalfOpen:
+		// §4.4c / §9.1：未武装的半开/恢复 Attempt 不得把 dead 拉活或转入
+		// recovering。迟到真实成功、旁路 ObserveRealSuccess、以及未 Claim
+		// 的合成 OK 都必须留在 dead。
+
 	case rs.state == model.StateDead && rep.Source == SourceReal:
-		// §9.1：持 RecoveryGate 的真实成功让 dead 立即 alive。
+		// §9.1：持 RecoveryGate 的半开真实成功让 dead 立即 alive。
 		rs.state = model.StateAlive
 
 	case rs.state == model.StateDead:

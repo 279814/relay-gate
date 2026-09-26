@@ -282,7 +282,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			attempt, halfOpen && attempt == 1, true, la.at.Result(), recvAt))
 		if h.reporter != nil {
 			ep, _ := proto.Endpoint()
-			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, viewOf(la.at.Result(), la.keys, ep))
+			view := viewOf(la.at.Result(), la.keys, ep)
+			view.HalfOpen = halfOpen && attempt == 1
+			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, view)
 		}
 		la.cand.Release()
 		cand = next

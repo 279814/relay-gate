@@ -625,7 +625,8 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	changed := s.track.Report(health.Report{
 		RouteID: rt.ID, Generation: generation,
 		Verdict: out.Verdict, Source: health.SourceL2,
-		Err: out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
+		HalfOpen: true, // Claimed L2 is the armed synthetic recovery path (§9.1)
+		Err:      out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
 	})
 
 	// 只在状态变化时记 info，否则每 5 分钟一行「still alive」会把日志刷满。
@@ -880,7 +881,8 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		s.track.Report(health.Report{
 			RouteID: rt.ID, Generation: generation,
 			Verdict: l2.Verdict, Source: health.SourceL2,
-			Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
+			HalfOpen: true, // Claimed / manual L2 may leave StateDead (§9.1)
+			Err:      l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
 		})
 	}
 	return l1, l2, nil

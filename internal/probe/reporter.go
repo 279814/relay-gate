@@ -56,7 +56,8 @@ func (r *Reporter) ReportResult(routeID int64, generation uint64, res *proxy.Res
 	r.track.Report(health.Report{
 		RouteID: routeID, Generation: generation,
 		Verdict: out.Verdict, Source: health.SourceReal,
-		Err: out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
+		HalfOpen: res.HalfOpen,
+		Err:      out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
 	})
 
 	// §8.10：真实成功等价一次 L2 —— lastRealOKAt 已由上面 SourceReal+OK 写入；
