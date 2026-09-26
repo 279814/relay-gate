@@ -56,6 +56,35 @@ func TestReachabilityTracker_CASAndEffectiveUnknown(t *testing.T) {
 	}
 }
 
+// Different ObservationToken is a new incarnation: it must replace a prior
+// registry row even when its LastObservationOrder is lower (e.g. after a
+// placeholder high order from another writer).
+func TestReachabilityTracker_DifferentTokenLowerOrderReplaces(t *testing.T) {
+	settings := model.DefaultSettings()
+	tracker := NewReachabilityTracker(staticSettings{settings})
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	policy, err := revisioncodec.BuildReachabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := revisioncodec.ReachabilitySettingsFingerprint(policy)
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 7, PolicySelector: selector, State: model.ReachabilityUnreachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "old-incarnation", LastObservationOrder: 1_700_000_000_000,
+	})
+	tracker.ApplyCommitted(&model.UpstreamReachability{
+		UpstreamID: 7, PolicySelector: selector, State: model.ReachabilityReachable,
+		ObservedNetworkRevision: 1, SettingsFingerprint: fp,
+		ObservationToken: "new-incarnation", LastObservationOrder: 42,
+	})
+	got := tracker.Snapshot(7)
+	if got == nil || got.ObservationToken != "new-incarnation" || got.LastObservationOrder != 42 ||
+		got.State != model.ReachabilityReachable {
+		t.Fatalf("new token with lower order must replace: %+v", got)
+	}
+}
+
 func TestReachabilityTracker_DNSFailureThenHTTPRecovery(t *testing.T) {
 	settings := model.DefaultSettings()
 	tracker := NewReachabilityTracker(staticSettings{settings})

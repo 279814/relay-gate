@@ -62,8 +62,10 @@ func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
 
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
 //
-// CAS：同 token 且更大 order 才覆盖；强制反转两个已提交结果的返回顺序时，
-// 仍保留 committed row 中 order 最大者。
+// CAS：同 token 时只接受更大（或相等时保留已有）order，强制反转两个已提交
+// 结果的返回顺序时仍保留 order 最大者。token 不同表示新 incarnation（含
+// MarkCountTokens* / real_model_not_found 用 UnixMilli 占位 order 之后，
+// sequencer 提交的新 token），即使 order 更低也必须替换。
 func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability) {
 	if registry == nil || row == nil || row.ScopeID <= 0 || !row.Endpoint.Valid() {
 		return
@@ -72,14 +74,9 @@ func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	current := registry.rows[key]
-	if current != nil {
-		if current.ObservationToken == row.ObservationToken &&
-			current.LastObservationOrder >= row.LastObservationOrder {
-			return
-		}
-		if current.LastObservationOrder > row.LastObservationOrder {
-			return
-		}
+	if current != nil && current.ObservationToken == row.ObservationToken &&
+		current.LastObservationOrder >= row.LastObservationOrder {
+		return
 	}
 	copyValue := *row
 	registry.rows[key] = &copyValue
