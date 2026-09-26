@@ -709,6 +709,48 @@ func TestSSETransform_OversizeEventFailOpenForwardsOriginal(t *testing.T) {
 	}
 }
 
+// docs/01 §15.7 / §6.8: a fail_open overflow still delivers the full upstream
+// stream, so it is a transform failure record, not an upstream fault for health.
+func TestSSETransform_OversizeEventFailOpenNotUpstreamFault(t *testing.T) {
+	oversize := sseOversizeBody()
+	hs := newHarness(t, sseOversizeUpstream(oversize))
+	spy := &capturingReporter{}
+	hs.h.WithHealthReporter(spy)
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("sse-oversize-open-health")
+	rules := []transform.Rule{
+		{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "hi", To: "hello"},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+	if rec.Code != 200 || !bytes.HasSuffix(rec.Body.Bytes(), oversize) {
+		t.Fatalf("fail_open must deliver the full stream: status=%d len=%d", rec.Code, rec.Body.Len())
+	}
+	got := spy.last()
+	if got == nil {
+		t.Fatal("no health report")
+	}
+	if got.Err != nil {
+		t.Fatalf("fail_open overflow reported to health as error %v (IsUpstreamFault=%v)", got.Err, IsUpstreamFault(got.Err))
+	}
+	var failed bool
+	for _, ex := range reg.ListExecutions(0) {
+		if ex.Phase == "sse" && !ex.OK && ex.FailPolicyUsed == transform.FailOpen {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatal("fail_open overflow must still leave a transform failure record")
+	}
+}
+
 func TestSSETransform_OversizeEventFailClosedStops(t *testing.T) {
 	oversize := sseOversizeBody()
 	hs := newHarness(t, sseOversizeUpstream(oversize))

@@ -462,13 +462,15 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		} else if n > 0 {
 			events, ferr := scanner.Feed(buf[:n])
 			if ferr != nil {
-				res.Err = ferr
+				if record != nil {
+					record(transform.ExecutionRecord{
+						Phase: "sse", OK: false, Error: ferr.Error(), FailPolicyUsed: policy,
+					})
+				}
+				// fail_open still delivers the whole stream, so the overflow is a
+				// transform failure only; it must not reach health as res.Err.
 				if policy == transform.FailClosed {
-					if record != nil {
-						record(transform.ExecutionRecord{
-							Phase: "sse", OK: false, Error: ferr.Error(), FailPolicyUsed: policy,
-						})
-					}
+					res.Err = ferr
 					res.BytesWritten = total
 					return res
 				}
