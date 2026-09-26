@@ -36,6 +36,89 @@ func TestBuildAlertMessageOmitsConversationBody(t *testing.T) {
 	}
 }
 
+func TestAdminURL_NoSMTPHeaderInjection(t *testing.T) {
+	normal := "http://10.0.0.1:18787/admin/"
+	evil := "http://10.0.0.1:18787/admin/\r\nBcc: x\x00evil"
+
+	f := security.Finding{
+		ID:       "f1",
+		Severity: security.SeverityCritical,
+		Category: "credential_leak",
+		Summary:  "hit",
+		Upstream: "up1",
+		Source:   "passive",
+	}
+
+	alertNormal := string(security.BuildAlertMessage("a@b.c", []string{"x@y.z"}, f, normal))
+	if !strings.Contains(alertNormal, "admin: "+normal+"\r\n") {
+		t.Fatalf("normal admin URL must be unchanged; got: %s", alertNormal)
+	}
+
+	alertEvil := string(security.BuildAlertMessage("a@b.c", []string{"x@y.z"}, f, evil))
+	assertAdminURLNoHeaderInjection(t, alertEvil)
+	if !strings.Contains(alertEvil, "admin: http://10.0.0.1:18787/admin/Bcc: xevil\r\n") {
+		t.Fatalf("CR/LF/NUL must be stripped from admin URL; got: %s", alertEvil)
+	}
+
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	var captured []string
+	m := security.NewAlertMailer().
+		WithNowForTest(func() time.Time { return now }).
+		WithSendForTest(func(a string, auth smtp.Auth, from string, to []string, msg []byte) error {
+			captured = append(captured, string(msg))
+			return nil
+		})
+	m.SetConfig(security.MailConfig{
+		Enabled:     true,
+		Host:        "smtp.test.local",
+		Port:        587,
+		From:        "relay@test.local",
+		Recipients:  []string{"ops@test.local"},
+		MinSeverity: security.SeverityInfo,
+	})
+	medium := security.Finding{
+		ID:       "m1",
+		Severity: security.SeverityMedium,
+		Category: "xss_pattern",
+		Summary:  "hit",
+		Upstream: "up-a",
+		Source:   "passive",
+	}
+	if err := m.MaybeNotify(medium, evil); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(5 * time.Minute)
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("want one digest; got %d", len(captured))
+	}
+	assertAdminURLNoHeaderInjection(t, captured[0])
+	if !strings.Contains(captured[0], "admin: http://10.0.0.1:18787/admin/Bcc: xevil\r\n") {
+		t.Fatalf("digest must strip CR/LF/NUL from admin URL; got: %s", captured[0])
+	}
+}
+
+func assertAdminURLNoHeaderInjection(t *testing.T, msg string) {
+	t.Helper()
+	hdrEnd := strings.Index(msg, "\r\n\r\n")
+	if hdrEnd < 0 {
+		t.Fatal("missing header/body separator")
+	}
+	for _, line := range strings.Split(msg[:hdrEnd], "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), "bcc:") {
+			t.Fatalf("admin URL injected extra header line: %q", line)
+		}
+	}
+	if strings.Contains(msg, "\r\nBcc:") {
+		t.Fatal("CRLF+Bcc sequence must not appear in message")
+	}
+	if strings.Contains(msg, "\x00") {
+		t.Fatal("NUL must not appear in message")
+	}
+}
+
 func TestAlertMailerSendAgainstFakeSMTP(t *testing.T) {
 	addr, _, closeFn := security.StartFakeSMTP(t)
 	defer closeFn()
