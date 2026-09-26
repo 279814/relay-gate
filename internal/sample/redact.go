@@ -185,6 +185,27 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 	}
 }
 
+// RedactCredentialSetCookie 就地脱敏写给客户端的 Set-Cookie 值里的已知 Secret。
+//
+// 上游可能把上游 key / relay key 写进 cookie value（或整段 Set-Cookie 文本）。
+// 只用 RedactText（→ RedactSecrets）：只替凭据子串，无关 cookie 与 Path/HttpOnly
+// 等属性不动；短于 MinRedactableKeyLen 的 needle 由 RedactSecrets 跳过。
+// 不删整条 Set-Cookie（会话名剥离由 proxy.stripGatewaySessionSetCookie 负责）。
+// keys 为空时是空操作。
+func RedactCredentialSetCookie(h http.Header, keys []string) {
+	if h == nil || len(keys) == 0 {
+		return
+	}
+	vals := h.Values("Set-Cookie")
+	if len(vals) == 0 {
+		return
+	}
+	h.Del("Set-Cookie")
+	for _, v := range vals {
+		h.Add("Set-Cookie", RedactText(v, keys))
+	}
+}
+
 // RedactDiagnostic 脱敏一段要进日志/UI/落库的上游原文。
 //
 // 与 finding Detail / RedactDiagnosticText 共用 security.RedactSecrets：原文、
