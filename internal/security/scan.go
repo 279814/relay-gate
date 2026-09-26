@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 // Severity of a Finding.
@@ -184,11 +186,15 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // Observer scans raw response bytes, so a secret may appear only as those
 // escapes inside a JSON string; the whole document is never decoded.
 //
+// Keys shorter than model.MinRedactableKeyLen (including "") are skipped:
+// using "api", "key", or an empty string as a ReplaceAll needle would corrupt
+// URLs and error text. sample.RedactText / RedactBodyKeys share this floor.
+//
 // Exported so diagnostic error text (sample.RedactDiagnosticText) can reuse
 // the same encoding coverage as finding Detail — do not fork a weaker path.
 func RedactSecrets(s string, keys []string) string {
 	for _, k := range keys {
-		if k == "" {
+		if len(k) < model.MinRedactableKeyLen {
 			continue
 		}
 		masked := maskSecret(k)

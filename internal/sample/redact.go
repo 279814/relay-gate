@@ -207,20 +207,10 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 // 一并遮掉。不能只做原文 ReplaceAll，否则编码形态会漏进 ErrBody / last_error /
 // count_tokens 日志。
 //
-// 与 RedactBodyKeys 的另一条区别：**不设长度下限**，短 key 也脱敏
-// （RedactSecrets 本身不跳过短 key）。
-//
-// 为什么要两个函数而不是一个：MinRedactableKeyLen 那个下限对**样本**是对的 ——
-// 样本存的是完整对话原文，一个 4 字符的 key 会在正文里偶然命中无数次，
-// 把原文打得千疮百孔，反而毁掉样本的诊断价值。
-//
-// 但诊断文本（探活的 last_error、转发失败的日志）不同：进来的只是几百字节
-// 的错误原文，多打几个码无所谓，而漏一个 key 是实实在在的泄露 —— 它会
-// 落进 route_health 表、经 /admin/api/health 显示出来、或者写进日志文件。
-// 两种代价不对称，这里就该按「宁可多打码」取舍。
-//
-// 上游 api_key 写入路径已拒绝短于此下限的非空 key；此处仍处理短 key，
-// 是为了脏行/历史数据与 RELAY_KEYS（仍只校验非空）的纵深防御。
+// 与 RedactBodyKeys / RedactText 一样跳过短于 MinRedactableKeyLen 的 needle
+// （含空串）：把 "api"/"key"/"" 当 ReplaceAll 目标会把 URL 与错误原文打坏。
+// 写入路径已拒绝短上游 api_key；脏行/历史短钥由出站 fail-closed 挡住，
+// 这里不再用短串做子串替换。
 func RedactDiagnostic(body []byte, keys []string) []byte {
 	if len(body) == 0 {
 		return body
@@ -232,7 +222,7 @@ func RedactDiagnostic(body []byte, keys []string) []byte {
 //
 // 与 finding Detail / RedactDiagnostic 共用 security.RedactSecrets：原文、
 // url.QueryEscape、小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）
-// 一并遮掉。
+// 一并遮掉。短于 MinRedactableKeyLen 的 needle（含空串）同样跳过。
 func RedactDiagnosticText(s string, keys []string) string {
 	if s == "" {
 		return s
