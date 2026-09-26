@@ -362,18 +362,18 @@ func TestConnectTimeout_StopsAfterGotConn(t *testing.T) {
 }
 
 // AfterFunc 在 timer.Stop() 返回 false 时仍可能已经开跑。GotConn 若已置位，
-// 那次迟到的回调绝不能 cancel RoundTrip context；仍在建连则必须 cancel。
-// 回调读到 false 之后 GotConn 仍可能置位：cancel 前再读一次，flag 已为 true
-// 则 context 必须保持活跃。
+// 那次迟到的回调绝不能 close timedOut 或 cancel；仍在建连则两者必须一起发生。
+// dialing→timedOut 的 CAS 是单赢家：GotConn 的 dialing→gotConn 不能插在
+// 「最终观察」与 close/cancel 之间。
 func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
 	t.Run("gotConn already set", func(t *testing.T) {
-		var gotConn atomic.Bool
-		gotConn.Store(true)
+		var phase atomic.Uint32
+		phase.Store(connectGotConn)
 		timedOut := make(chan struct{})
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		fireConnectTimeout(&gotConn, timedOut, cancel)
+		fireConnectTimeout(&phase, timedOut, cancel)
 
 		if ctx.Err() != nil {
 			t.Fatal("GotConn 已置位时，迟到的 AfterFunc 不得 cancel context")
@@ -386,11 +386,11 @@ func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
 	})
 
 	t.Run("still dialing", func(t *testing.T) {
-		var gotConn atomic.Bool
+		var phase atomic.Uint32
 		timedOut := make(chan struct{})
 		ctx, cancel := context.WithCancel(context.Background())
 
-		fireConnectTimeout(&gotConn, timedOut, cancel)
+		fireConnectTimeout(&phase, timedOut, cancel)
 
 		if ctx.Err() == nil {
 			t.Fatal("建连中到期必须 cancel context")
@@ -400,21 +400,34 @@ func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
 		default:
 			t.Fatal("建连中到期必须关闭 timedOut")
 		}
+		if phase.Load() != connectTimedOut {
+			t.Fatalf("超时赢家 phase 应为 timedOut，got %d", phase.Load())
+		}
 	})
 
-	t.Run("gotConn wins before cancel", func(t *testing.T) {
-		var gotConn atomic.Bool
-		timedOut := make(chan struct{})
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+	t.Run("close and cancel are one CAS winner", func(t *testing.T) {
+		// 旧缺口：Load 见 false → close(timedOut) → GotConn 置位 → 跳过 cancel。
+		// 不变量：fireConnectTimeout 返回后，timedOut 已关 ⇔ context 已 cancel。
+		for _, start := range []uint32{connectDialing, connectGotConn} {
+			var phase atomic.Uint32
+			phase.Store(start)
+			timedOut := make(chan struct{})
+			ctx, cancel := context.WithCancel(context.Background())
 
-		// 缺口：首次 Load 已见 false，timedOut 已关；cancel 之前 GotConn 置位。
-		close(timedOut)
-		gotConn.Store(true)
-		cancelUnlessGotConn(&gotConn, cancel)
+			fireConnectTimeout(&phase, timedOut, cancel)
 
-		if ctx.Err() != nil {
-			t.Fatal("flag 在 cancel 前已为 true 时，context 必须保持活跃")
+			closed := false
+			select {
+			case <-timedOut:
+				closed = true
+			default:
+			}
+			canceled := ctx.Err() != nil
+			if closed != canceled {
+				t.Fatalf("start=%d: close 与 cancel 必须同胜同负，closed=%v canceled=%v",
+					start, closed, canceled)
+			}
+			cancel()
 		}
 	})
 }
