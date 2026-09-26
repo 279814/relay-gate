@@ -312,7 +312,7 @@ func (s *Service) PlanCalibration(ctx context.Context, routeID int64, endpoint m
 	if s.calibrator == nil {
 		return model.CalibrationRun{}, model.WrapValidation("calibration 未装配")
 	}
-	return s.calibrator.Plan(ctx, routeID, endpoint, CalibrationPlanOptions{})
+	return s.calibrator.Plan(ctx, routeID, endpoint, CalibrationPlanOptions{Manual: true})
 }
 
 func (s *Service) StartCalibration(ctx context.Context, runID string, expectedRevision int64) (model.CalibrationRun, error) {
