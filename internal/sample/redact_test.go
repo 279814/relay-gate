@@ -277,6 +277,37 @@ func TestRedactDiagnostic_RedactsEncodedKeyForms(t *testing.T) {
 	}
 }
 
+// Short needles (< MinRedactableKeyLen, including "") must not be ReplaceAll
+// targets: replacing "key" or "1" would corrupt query URLs in ErrBody / errors.
+// Keys at the floor length still disappear.
+func TestRedactDiagnostic_SkipsShortSecretNeedles(t *testing.T) {
+	const rawURL = "https://example.com/v1/messages?key=1"
+	for _, short := range []string{"key", "1", ""} {
+		if got := string(RedactDiagnostic([]byte(rawURL), []string{short})); got != rawURL {
+			t.Fatalf("short needle %q must leave URL unchanged: got %q", short, got)
+		}
+		if got := RedactDiagnosticText(rawURL, []string{short}); got != rawURL {
+			t.Fatalf("short needle %q must leave error URL unchanged: got %q", short, got)
+		}
+	}
+	const long = "sk-longenough1" // 14 >= MinRedactableKeyLen
+	body := rawURL + "&token=" + long
+	gotBody := string(RedactDiagnostic([]byte(body), []string{long}))
+	if strings.Contains(gotBody, long) {
+		t.Fatalf("12+ char secret must disappear from body: %q", gotBody)
+	}
+	if !strings.Contains(gotBody, rawURL) {
+		t.Fatalf("URL with short query tokens must stay: %q", gotBody)
+	}
+	gotText := RedactDiagnosticText("upstream echo "+body, []string{long})
+	if strings.Contains(gotText, long) {
+		t.Fatalf("12+ char secret must disappear from error text: %q", gotText)
+	}
+	if !strings.Contains(gotText, rawURL) {
+		t.Fatalf("URL with short query tokens must stay in error text: %q", gotText)
+	}
+}
+
 // lowerPercentHexForTest mirrors security.percentEncodingLowerHex for the sample test.
 func lowerPercentHexForTest(s string) string {
 	var b strings.Builder

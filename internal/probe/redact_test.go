@@ -107,32 +107,6 @@ func TestL2_UpstreamKeyNotLeakedFromHTTPError(t *testing.T) {
 	}
 }
 
-// 短 key 同样不能漏。
-//
-// sample.RedactBodyKeys 有 12 字符下限（短于此不脱敏），所以这里必须走
-// RedactDiagnostic。写入路径已拒绝短上游 api_key；本用例覆盖脏行/历史数据。
-func TestL1_ShortUpstreamKeyStillRedacted(t *testing.T) {
-	const upKey = "sk-short1" // 9 字符，短于 12
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"bad key ` + upKey + `"}`))
-	}))
-	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.APIKey = upKey
-
-	out := testProber().L1(context.Background(), up, fastSettings())
-
-	if out.Err == nil {
-		t.Fatal("401 应带上失败原因")
-	}
-	if strings.Contains(out.Err.Error(), upKey) {
-		t.Errorf("短 key 未被脱敏：%q", out.Err)
-	}
-}
-
 // 上游原文里**没有** key 时，错误信息必须一字不改。
 //
 // 这是配对的反面用例：脱敏只该动 key，不该顺手改写别的内容。

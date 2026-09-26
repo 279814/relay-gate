@@ -213,6 +213,26 @@ func TestCenterRingBound(t *testing.T) {
 	}
 }
 
+// Short needles (< MinRedactableKeyLen, including "") must not be used as
+// ReplaceAll targets — they would corrupt URLs like ?key=1.
+func TestRedactSecrets_SkipsShortSecretNeedles(t *testing.T) {
+	const rawURL = "https://example.com/v1/messages?key=1"
+	for _, short := range []string{"key", "1", ""} {
+		if got := RedactSecrets(rawURL, []string{short}); got != rawURL {
+			t.Fatalf("short needle %q must leave URL unchanged: got %q", short, got)
+		}
+	}
+	const long = "sk-longenough1"
+	body := rawURL + "&token=" + long
+	got := RedactSecrets(body, []string{long})
+	if strings.Contains(got, long) {
+		t.Fatalf("12+ char secret must disappear: %q", got)
+	}
+	if !strings.Contains(got, rawURL) {
+		t.Fatalf("URL with short query tokens must stay: %q", got)
+	}
+}
+
 // Restart resets the in-process seq while the wall clock is only second-
 // granular. Two ids with the same timestamp+seq must still differ so
 // InsertSecurityFinding's INSERT OR REPLACE cannot wipe the older row.
