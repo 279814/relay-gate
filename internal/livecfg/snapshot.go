@@ -262,6 +262,10 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	}
 	for _, ep := range bundle.Endpoints {
 		copyEP := *ep
+		// AuthProfile.ManualHeaders 是 slice：浅拷贝会与 bundle 共享 backing。
+		if ep.AuthProfile.ManualHeaders != nil {
+			copyEP.AuthProfile.ManualHeaders = append([]model.HeaderTemplate(nil), ep.AuthProfile.ManualHeaders...)
+		}
 		if probe.Endpoints[ep.UpstreamID] == nil {
 			probe.Endpoints[ep.UpstreamID] = map[model.EndpointKind]*model.UpstreamEndpoint{}
 		}
