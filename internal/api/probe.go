@@ -492,7 +492,10 @@ func (s *Server) cancelCalibration(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ExpectedRevision int64 `json:"expected_revision"`
 	}
-	_ = decodeJSON(r, &body)
+	if err := decodeJSON(r, &body); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	if err := s.probeAdmin.CancelCalibration(r.Context(), r.PathValue("id"), body.ExpectedRevision); err != nil {
 		s.writeErr(w, err)
 		return
