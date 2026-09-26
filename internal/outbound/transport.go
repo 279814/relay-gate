@@ -182,17 +182,21 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 
 	ctx, cancel := context.WithCancel(request.Context())
 	timedOut := make(chan struct{})
+	// phase：GotConn 与 connect-timeout AfterFunc 的单赢家闸门。
+	// Load-then-close-then-re-read 会先关 timedOut 再发现 GotConn，误判成
+	// connect timeout；CAS 让 close/cancel 只在超时赢时一起发生。
+	var phase atomic.Uint32 // connectDialing → connectGotConn | connectTimedOut
 	// AfterFunc 在 Stop() 返回 false 时仍可能已经开始跑：GotConn 若已置位，
 	// 绝不能再 cancel，否则会把已建连的 RoundTrip 掐断。
 	timer := time.AfterFunc(transport.connect, func() {
-		fireConnectTimeout(&gotConn, timedOut, cancel)
+		fireConnectTimeout(&phase, timedOut, cancel)
 	})
 
 	// 已有的 trace（调用方装的观测）必须保留：httptrace.WithClientTrace 会
 	// 把两个 trace 合并（同名回调都调用），所以这里叠加而不是替换。
 	traced := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
-			gotConn.Store(true)
+			phase.CompareAndSwap(connectDialing, connectGotConn)
 			timer.Stop()
 			if tr := TraceFromContext(request.Context()); tr != nil {
 				tr.MarkGotConn(time.Now(), info.Reused)
@@ -206,10 +210,11 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 		cancel()
 		// 区分「我们的 connect 预算到期」与「别的失败」：前者是站级
 		// Reachability 的证据，后者可能只是这一次的问题。
-		if transport.connectPhaseTimeout(request, err, gotConn.Load(), timedOut) {
+		sawConn := phase.Load() == connectGotConn
+		if transport.connectPhaseTimeout(request, err, sawConn, timedOut) {
 			return nil, fmt.Errorf("%w: 超过 %v", ErrConnectTimeout, transport.connect)
 		}
-		if gotConn.Load() {
+		if sawConn {
 			return nil, fmt.Errorf("%w: %w", ErrAfterGotConn, err)
 		}
 		return nil, err
@@ -220,26 +225,23 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 	return response, nil
 }
 
+// connect 阶段与超时回调共享的状态：只有 dialing→X 的 CAS 赢家可生效。
+const (
+	connectDialing uint32 = iota
+	connectGotConn
+	connectTimedOut
+)
+
 // fireConnectTimeout 是 connect 预算到期时 AfterFunc 的身体。
 //
-// timer.Stop() 返回 false 时回调可能已经开跑。仅 Load 一次再 close/cancel
-// 不够：读到 false 之后 GotConn 仍可能 Store(true)，随后 cancel 会掐断已建连
-// 的 RoundTrip。close 之后、cancel 之前必须再读同一 atomic flag；若 Store
-// 已发生则跳过 cancel。仍在建连时才 cancel。
-func fireConnectTimeout(gotConn *atomic.Bool, timedOut chan struct{}, cancel context.CancelFunc) {
-	if gotConn.Load() {
+// timer.Stop() 返回 false 时回调可能已经开跑。Load 再 close/cancel（或
+// close 后再读）都不够：GotConn 的 Store 可插在最终观察与副作用之间。
+// dialing→timedOut 的 CAS 成功才是超时赢家，随后才 close timedOut 并 cancel。
+func fireConnectTimeout(phase *atomic.Uint32, timedOut chan struct{}, cancel context.CancelFunc) {
+	if !phase.CompareAndSwap(connectDialing, connectTimedOut) {
 		return
 	}
 	close(timedOut)
-	cancelUnlessGotConn(gotConn, cancel)
-}
-
-// cancelUnlessGotConn 在 cancel 前再读 gotConn：已发生的 Store(true) 不得
-// 再 cancel body context。这是 GotConn 与迟到 AfterFunc 的单赢家闸门。
-func cancelUnlessGotConn(gotConn *atomic.Bool, cancel context.CancelFunc) {
-	if gotConn.Load() {
-		return
-	}
 	cancel()
 }
 
