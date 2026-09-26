@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -231,10 +232,14 @@ func RedactDiagnostic(body []byte, keys []string) []byte {
 	return out
 }
 
-// RedactDiagnosticText 是 RedactDiagnostic 的 string 版本，供拼错误信息用。
+// RedactDiagnosticText 脱敏拼进错误信息 / 请求日志的文本。
+//
+// 与 finding Detail 共用 security.RedactSecrets：原文、url.QueryEscape、
+// 小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）一并遮掉。
+// 不能只走 RedactDiagnostic 的原文 ReplaceAll，否则编码形态会漏进日志。
 func RedactDiagnosticText(s string, keys []string) string {
 	if s == "" {
 		return s
 	}
-	return string(RedactDiagnostic([]byte(s), keys))
+	return security.RedactSecrets(s, keys)
 }

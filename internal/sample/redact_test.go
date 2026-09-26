@@ -2,6 +2,7 @@ package sample
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -217,4 +218,26 @@ func TestRedactCredentialURLHeaders(t *testing.T) {
 	}
 	RedactCredentialURLHeaders(nil, []string{secret}) // 不得 panic
 	RedactCredentialURLHeaders(h, nil)                // 空 keys 空操作
+}
+
+// RedactDiagnosticText must cover QueryEscape forms the same way finding
+// Detail does (security.RedactSecrets). Raw-only ReplaceAll would leave the
+// encoded key in request-log / probe error text.
+func TestRedactDiagnosticText_RedactsQueryEscapedKey(t *testing.T) {
+	const key = "sk-diag/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	if enc == key {
+		t.Fatal("test key must differ under QueryEscape")
+	}
+	errText := `upstream refused: token=` + enc + ` trail`
+	got := RedactDiagnosticText(errText, []string{key})
+	if strings.Contains(got, enc) {
+		t.Fatalf("stored error still contains query-escaped key: %q", got)
+	}
+	if strings.Contains(got, key) {
+		t.Fatalf("stored error still contains raw key: %q", got)
+	}
+	if !strings.Contains(got, "upstream refused") || !strings.Contains(got, "trail") {
+		t.Fatalf("unrelated error text must stay: %q", got)
+	}
 }
