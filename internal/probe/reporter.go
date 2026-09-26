@@ -3,6 +3,7 @@ package probe
 import (
 	"bytes"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
@@ -98,6 +99,13 @@ func classifyReal(res *proxy.ResultView) Outcome {
 		out.TTFT = res.TTFT
 		out.Status = res.Status
 		return out
+	}
+
+	// 真实流量 401/403 是该次请求的鉴权结果，不是站不可达信号：不得
+	// VerdictFatal→StateDead，也不得走 429 冷却。探活/校准仍用 ClassifyHTTP
+	// 与 ResponseClassifier（auth_rejected）；单次 live 401 也不写 config_error。
+	if res.Status == http.StatusUnauthorized || res.Status == http.StatusForbidden {
+		return Outcome{Verdict: health.VerdictIgnore, Status: res.Status, TTFT: res.TTFT}
 	}
 
 	if res.Status >= 400 {
