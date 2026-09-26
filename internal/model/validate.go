@@ -55,10 +55,8 @@ func (u *Upstream) Validate() error {
 	if u.L1Path != "" && !strings.HasPrefix(u.L1Path, "/") {
 		return invalid("l1_path 必须以 / 开头，收到 %q", u.L1Path)
 	}
-	if u.ProxyURL != "" {
-		if _, err := url.Parse(u.ProxyURL); err != nil {
-			return invalid("proxy_url 不是合法 URL: %v", err)
-		}
+	if err := validateProxyURL(u.ProxyURL); err != nil {
+		return err
 	}
 	// 探活头里不允许出现鉴权头：key 由 Upstream.APIKey 统一注入，
 	// 在这里再写一个会造成「两个 key 来源」，出问题时无从排查。
@@ -150,6 +148,35 @@ func (endpoint *UpstreamEndpoint) Validate() error {
 //
 // query / fragment / userinfo 一律拒绝（docs/01 §5.1、§7.1），与 full_url_mode
 // 无关。固定 query 只进 Endpoint.FixedQueryTemplate；凭据不得写进 URL。
+// AllowedProxyURLScheme 报告 proxy_url 的 scheme 是否允许。
+//
+// docs/01 §7.3 按 HTTP 代理 CONNECT 设计出站建连；空 proxy_url 表示直连，
+// 非空只接受 http / https（大小写不敏感）。socks5 / file / ftp 等一律拒绝。
+// 凭据（userinfo）文档明确允许，本函数不检查。
+func AllowedProxyURLScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+// validateProxyURL 校验上游出站代理。空串 = 直连，合法。
+func validateProxyURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return invalid("proxy_url 不是合法 URL: %v", err)
+	}
+	if !AllowedProxyURLScheme(u.Scheme) {
+		return invalid("proxy_url 必须是 http(s):// 代理，收到 scheme %q", u.Scheme)
+	}
+	return nil
+}
+
 func validateBaseURL(raw string, fullURLMode bool) error {
 	if strings.TrimSpace(raw) == "" {
 		return invalid("base_url 不能为空")

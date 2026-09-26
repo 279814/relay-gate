@@ -437,6 +437,10 @@ func newTransport(network NetworkConfig) (*Transport, error) {
 		if parsed.Scheme == "" || parsed.Host == "" {
 			return nil, model.WrapValidation("proxy_url 必须形如 scheme://host[:port]")
 		}
+		// 与 Upstream.Validate 同口径：只装 http(s) 代理，拒绝 file/ftp/…。
+		if !model.AllowedProxyURLScheme(parsed.Scheme) {
+			return nil, model.WrapValidation("proxy_url 必须是 http(s):// 代理")
+		}
 		base.Proxy = http.ProxyURL(parsed)
 	}
 
