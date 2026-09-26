@@ -241,3 +241,92 @@ func TestRedactDiagnosticText_RedactsQueryEscapedKey(t *testing.T) {
 		t.Fatalf("unrelated error text must stay: %q", got)
 	}
 }
+
+// RedactDiagnostic (ErrBody / last_error / count_tokens slog) must share
+// RedactSecrets encoding coverage — raw ReplaceAll alone leaves QueryEscape,
+// lowercase-%XX, and mixed-case JSON \u00XX forms in stored error bodies.
+func TestRedactDiagnostic_RedactsEncodedKeyForms(t *testing.T) {
+	const key = "sk-diag/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	if enc == key {
+		t.Fatal("test key must differ under QueryEscape")
+	}
+	lower := lowerPercentHexForTest(enc)
+	if lower == enc {
+		t.Fatal("test key QueryEscape form must contain A-F hex digits")
+	}
+	escMixed := mixedCaseJSONByteUnicodeEscapeForTest(key)
+	const unrelatedU = `\u4e2d\u6587`
+	const unrelatedPct = `%2Fkeep`
+	body := `raw=` + key + ` q=` + enc + ` low=` + lower +
+		` u=` + escMixed + ` note=` + unrelatedU + ` pct=` + unrelatedPct + ` trail`
+	got := string(RedactDiagnostic([]byte(body), []string{key}))
+	for _, leak := range []string{key, enc, lower, escMixed} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("ErrBody still contains secret form %q in: %q", leak, got)
+		}
+	}
+	if !strings.Contains(got, unrelatedU) {
+		t.Fatalf("unrelated \\u sequence must stay: %q", got)
+	}
+	if !strings.Contains(got, unrelatedPct) {
+		t.Fatalf("unrelated percent sequence must stay: %q", got)
+	}
+	if !strings.Contains(got, "trail") || !strings.Contains(got, "raw=") {
+		t.Fatalf("unrelated body text must stay: %q", got)
+	}
+}
+
+// lowerPercentHexForTest mirrors security.percentEncodingLowerHex for the sample test.
+func lowerPercentHexForTest(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '%' && i+2 < len(s) && isHexDigitForTest(s[i+1]) && isHexDigitForTest(s[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(toLowerHexDigitForTest(s[i+1]))
+			b.WriteByte(toLowerHexDigitForTest(s[i+2]))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func mixedCaseJSONByteUnicodeEscapeForTest(key string) string {
+	const hex = "0123456789abcdef"
+	var b strings.Builder
+	b.Grow(len(key) * 6)
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		hi, lo := hex[c>>4], hex[c&0xf]
+		if i%2 == 0 {
+			hi = toUpperHexDigitForTest(hi)
+			lo = toUpperHexDigitForTest(lo)
+		}
+		b.WriteString(`\u00`)
+		b.WriteByte(hi)
+		b.WriteByte(lo)
+	}
+	return b.String()
+}
+
+func isHexDigitForTest(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func toLowerHexDigitForTest(c byte) byte {
+	if c >= 'A' && c <= 'F' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+func toUpperHexDigitForTest(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - ('a' - 'A')
+	}
+	return c
+}

@@ -202,7 +202,13 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 
 // RedactDiagnostic 脱敏一段要进日志/UI/落库的上游原文。
 //
-// 与 RedactBodyKeys 的区别只有一条：**不设长度下限**，短 key 也脱敏。
+// 与 finding Detail / RedactDiagnosticText 共用 security.RedactSecrets：原文、
+// url.QueryEscape、小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）
+// 一并遮掉。不能只做原文 ReplaceAll，否则编码形态会漏进 ErrBody / last_error /
+// count_tokens 日志。
+//
+// 与 RedactBodyKeys 的另一条区别：**不设长度下限**，短 key 也脱敏
+// （RedactSecrets 本身不跳过短 key）。
 //
 // 为什么要两个函数而不是一个：MinRedactableKeyLen 那个下限对**样本**是对的 ——
 // 样本存的是完整对话原文，一个 4 字符的 key 会在正文里偶然命中无数次，
@@ -216,27 +222,17 @@ func RedactCredentialURLHeaders(h http.Header, keys []string) {
 // 上游 api_key 写入路径已拒绝短于此下限的非空 key；此处仍处理短 key，
 // 是为了脏行/历史数据与 RELAY_KEYS（仍只校验非空）的纵深防御。
 func RedactDiagnostic(body []byte, keys []string) []byte {
-	out := RedactBodyKeys(body, keys) // 长 key：保留 MaskKey 的部分可辨形式
-	for _, k := range keys {
-		// 长 key 已由上面处理，这里只补它按长度跳过的那些。
-		//
-		// 空 key 显式跳过。当前它其实无害（MaskKey("") 返回空串，于是
-		// ReplaceAll 等于原地不动），但那依赖 MaskKey 的实现细节 ——
-		// 若它日后改成返回固定掩码，空串替换会在**每个字节之间**插入掩码，
-		// 把一段错误原文变成几倍长的乱码。写死这个跳过，不押在别处的行为上。
-		if k == "" || len(k) >= model.MinRedactableKeyLen {
-			continue
-		}
-		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
+	if len(body) == 0 {
+		return body
 	}
-	return out
+	return []byte(security.RedactSecrets(string(body), keys))
 }
 
 // RedactDiagnosticText 脱敏拼进错误信息 / 请求日志的文本。
 //
-// 与 finding Detail 共用 security.RedactSecrets：原文、url.QueryEscape、
-// 小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）一并遮掉。
-// 不能只走 RedactDiagnostic 的原文 ReplaceAll，否则编码形态会漏进日志。
+// 与 finding Detail / RedactDiagnostic 共用 security.RedactSecrets：原文、
+// url.QueryEscape、小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）
+// 一并遮掉。
 func RedactDiagnosticText(s string, keys []string) string {
 	if s == "" {
 		return s
