@@ -210,6 +210,7 @@ func TestResolve_RejectsUnsafeURLForms(t *testing.T) {
 	}{
 		{"fragment", "https://a.example/#x"},
 		{"userinfo", "https://key@a.example"},
+		{"query", "https://a.example?k=v"},
 		{"非 http(s)", "ftp://a.example"},
 		{"空 host", "https:///v1"},
 		{"首尾空白", " https://a.example"},
@@ -368,13 +369,13 @@ func TestResolve_DropsIncomingCredentialQueryParam(t *testing.T) {
 	}
 }
 
-// url_override 带 query 时必须失败：持久化只允许一个固定 query 来源。
+// url_override 带 query 时必须失败：parseOrigin 与 base_url 同口径拒绝 query。
 func TestResolve_RejectsQueryInOverride(t *testing.T) {
 	endpoint := canonicalEndpoint(model.EndpointMessages)
 	endpoint.URLOverride = "https://a.example/custom?key=v"
 	err := resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint})
-	if !strings.Contains(err.Error(), "fixed_query_template") {
-		t.Errorf("错误应指向唯一固定 query 来源，得到 %v", err)
+	if !strings.Contains(err.Error(), "query") {
+		t.Errorf("错误应拒绝 query，得到 %v", err)
 	}
 
 	endpoint.FixedQueryTemplate = "key=v"
