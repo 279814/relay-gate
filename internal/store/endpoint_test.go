@@ -209,6 +209,52 @@ func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
 	}
 }
 
+// manual_headers 入库前必须拒绝纯字面凭据，占位符仍可保存（§7.2 / §8.5）。
+func TestUpdateEndpoint_RejectsLiteralManualHeaderAuth(t *testing.T) {
+	st := testStore(t)
+	upstream := mkUpstream(t, st, "manual-literal")
+	page, err := st.ListEndpointsPage(context.Background(), model.EndpointFilter{
+		UpstreamID: upstream.ID, Endpoint: model.EndpointMessages,
+	})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("list endpoint = %v, err=%v", page.Items, err)
+	}
+	endpoint := page.Items[0]
+	endpoint.LegacyCompatRealOnly = false
+	endpoint.AuthProfile.Mode = model.AuthModeManualHeaders
+	endpoint.AuthProfile.CalibratedMode = ""
+	beforeRev := endpoint.Revision
+
+	endpoint.AuthProfile.ManualHeaders = []model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"sk-live-secret-value-1234"}},
+	}
+	if err := st.UpdateEndpoint(endpoint, beforeRev); !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("literal manual auth error = %v, want validation", err)
+	}
+	got, err := st.GetEndpoint(endpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision != beforeRev || len(got.AuthProfile.ManualHeaders) != 0 {
+		t.Fatalf("literal must not persist: rev=%d headers=%+v", got.Revision, got.AuthProfile.ManualHeaders)
+	}
+
+	endpoint.AuthProfile.ManualHeaders = []model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"{{UPSTREAM_API_KEY}}"}},
+	}
+	if err := st.UpdateEndpoint(endpoint, beforeRev); err != nil {
+		t.Fatalf("placeholder manual auth must save: %v", err)
+	}
+	got, err = st.GetEndpoint(endpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.AuthProfile.ManualHeaders) != 1 ||
+		got.AuthProfile.ManualHeaders[0].Values[0] != "{{UPSTREAM_API_KEY}}" {
+		t.Fatalf("placeholder not stored: %+v", got.AuthProfile.ManualHeaders)
+	}
+}
+
 // 跨 origin 的 url_override 不得入库；同源只改 path 的必须能存，且 Resolve
 // 出站 authority 仍取 base_url（§7.1）。
 func TestUpdateEndpoint_RejectsCrossOriginURLOverride(t *testing.T) {

@@ -55,6 +55,34 @@ const minLiteralAuthValue = 16
 // 的路径，而收窄的代价只是用户把它写成占位符。
 var authSchemes = []string{"bearer", "basic"}
 
+// RejectLiteralAuthFieldValue 拒绝认证字段里的纯字面凭据（§7.2 / §8.5）。
+//
+// 用于 endpoint manual_headers 与探活自定义认证：这些头名故意不是
+// model.AuthHeaders（manual 不得写标准别名），所以 rejectLiteralCredentials
+// 对它们只跑高置信前缀 —— `sk-live-…` 这类非厂商前缀会漏网。本函数补上
+// 「无占位符的长字面值」那条。含 {{UPSTREAM_API_KEY}} / {{SECRET:name}} 的
+// 写法（含 `tok {{UPSTREAM_API_KEY}}` 这类前缀拼法）仍放行；短结构常量
+// （如租户名）放行，除非命中高置信前缀。
+func RejectLiteralAuthFieldValue(value string) error {
+	remainder := strings.TrimSpace(value)
+	if remainder == "" {
+		return nil
+	}
+	_, placeholders, err := splitAuthValue(remainder)
+	if err != nil {
+		// 编译不过的值交给后面的正式编译报错。
+		return nil
+	}
+	if placeholders >= 1 {
+		return nil
+	}
+	if len(remainder) < minLiteralAuthValue {
+		return rejectCredentialPrefix(value, "认证字段")
+	}
+	return model.WrapValidation("认证字段不能写字面凭据，" +
+		"请改用 {{UPSTREAM_API_KEY}} 或先创建 Probe Secret 再写 {{SECRET:name}}（§4.5）")
+}
+
 // rejectLiteralCredentials 是入库前的凭据门禁。
 //
 // 对认证头用「必须是占位符」这条强规则，对其余位置只查高置信前缀：
