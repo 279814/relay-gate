@@ -1261,4 +1261,3 @@ func TestForgetRoute_ClearsL2FlagsForIDReuse(t *testing.T) {
 	}
 	sched.endL2(20, 100, hold2)
 }
-
