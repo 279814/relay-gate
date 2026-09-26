@@ -185,6 +185,35 @@ func TestBootstrapSecretsDirPermissions(t *testing.T) {
 	}
 }
 
+func TestWriteJSON0600SyncsDirectoryAfterRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.json")
+	called := false
+	prev := syncDirAfterJSONRename
+	syncDirAfterJSONRename = func(p string) error {
+		called = true
+		if p != dir {
+			t.Fatalf("sync dir want %q got %q", dir, p)
+		}
+		return prev(p)
+	}
+	defer func() { syncDirAfterJSONRename = prev }()
+
+	if err := writeJSON0600(path, map[string]any{"format_version": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("writeJSON0600 must fsync the parent directory after rename")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"format_version"`)) {
+		t.Fatalf("expected JSON written, got %q", raw)
+	}
+}
+
 func TestWritePersistedRoundTripAndFailedWriteLeavesBytes(t *testing.T) {
 	dir := t.TempDir()
 	first := Persisted{
