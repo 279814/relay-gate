@@ -8,6 +8,23 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
+// manual_headers / 探活自定义认证的头名不是标准 AuthHeaders，厂商前缀门禁
+// 挡不住 `sk-live-…`；本函数补上「无占位符的长字面值」拒绝。
+func TestRejectLiteralAuthFieldValue(t *testing.T) {
+	if err := RejectLiteralAuthFieldValue("sk-live-secret-value-1234"); !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("纯字面凭据必须拒绝，得到 %v", err)
+	}
+	if err := RejectLiteralAuthFieldValue("{{UPSTREAM_API_KEY}}"); err != nil {
+		t.Fatalf("UPSTREAM_API_KEY 占位符必须放行，得到 %v", err)
+	}
+	if err := RejectLiteralAuthFieldValue("tok {{UPSTREAM_API_KEY}}"); err != nil {
+		t.Fatalf("前缀+占位符必须放行，得到 %v", err)
+	}
+	if err := RejectLiteralAuthFieldValue("{{SECRET:tenant}}"); err != nil {
+		t.Fatalf("SECRET 占位符必须放行，得到 %v", err)
+	}
+}
+
 // 认证头里的字面值必须拒绝，只接受占位符（§4.5）。
 //
 // 这是三条写入路径（管理 API、learner、migration）共用的那道门禁。没有它，

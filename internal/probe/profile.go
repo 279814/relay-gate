@@ -145,6 +145,9 @@ func ValidateManualAuthHeaderSecrets(header model.HeaderTemplate) error {
 		return fmt.Errorf("%w: manual_headers 不能写标准认证头 %q", outbound.ErrAuthConfig, name)
 	}
 	for _, raw := range header.Values {
+		if err := probetemplate.RejectLiteralAuthFieldValue(raw); err != nil {
+			return fmt.Errorf("%w: manual headers 认证值必须来自 UPSTREAM_API_KEY 或 Probe Secret", outbound.ErrAuthConfig)
+		}
 		required, err := probetemplate.ScanRequiredSecrets(model.EndpointMessages, probetemplate.TemplateContent{
 			Method:  http.MethodPost,
 			Headers: []model.HeaderTemplate{{Name: name, Values: []string{raw}}},

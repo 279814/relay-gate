@@ -383,6 +383,16 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 }
 
 func replaceEndpointSecretRefs(ctx context.Context, tx *sql.Tx, endpoint *model.UpstreamEndpoint) error {
+	// manual_headers 是认证字段：值必须经占位符门禁（§7.2 / §8.5）。
+	// 头名不是标准 AuthHeaders，ScanRequiredSecrets 对它们只查厂商前缀，
+	// 所以这里显式拦纯字面凭据，避免明文落入 auth_manual_headers_json。
+	for _, header := range endpoint.AuthProfile.ManualHeaders {
+		for _, value := range header.Values {
+			if err := probetemplate.RejectLiteralAuthFieldValue(value); err != nil {
+				return err
+			}
+		}
+	}
 	content := probetemplate.TemplateContent{
 		Method:   endpoint.Kind.Method(),
 		RawQuery: endpoint.FixedQueryTemplate,

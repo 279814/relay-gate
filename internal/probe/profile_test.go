@@ -122,10 +122,22 @@ func TestManualHeaders_SecretsOnlyFromAllowedSources(t *testing.T) {
 		t.Fatalf("允许的占位符应通过: %v", err)
 	}
 	_, err = ManualAuthProfile([]model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"{{UPSTREAM_API_KEY}}"}},
+	}, "upstream_api_key")
+	if err != nil {
+		t.Fatalf("整段 UPSTREAM_API_KEY 占位符应通过: %v", err)
+	}
+	_, err = ManualAuthProfile([]model.HeaderTemplate{
 		{Name: "X-Custom-Auth", Values: []string{"tok {{SECRET:tenant}}"}},
 	}, "upstream_api_key")
 	if err != nil {
 		t.Fatalf("Probe Secret 占位符应通过: %v", err)
+	}
+	_, err = ManualAuthProfile([]model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"sk-live-secret-value-1234"}},
+	}, "upstream_api_key")
+	if err == nil {
+		t.Fatal("纯字面凭据必须拒绝")
 	}
 	_, err = ManualAuthProfile([]model.HeaderTemplate{
 		{Name: "Authorization", Values: []string{"Bearer {{UPSTREAM_API_KEY}}"}},
