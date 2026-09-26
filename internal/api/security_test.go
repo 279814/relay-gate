@@ -310,6 +310,96 @@ func TestAPI_ListSecurityFindings_RedactsLegacyDetailSecret(t *testing.T) {
 	}
 }
 
+// Shared admin-list page contract for findings: omitted limit → default 50;
+// over MaximumPageLimit is rejected so a huge limit cannot load unbounded rows
+// on either the SQL or in-memory list path.
+func TestAPI_ListSecurityFindings_PageLimitDefaultAndCap(t *testing.T) {
+	const n = 60
+	s, _ := newTestServer(t)
+	for i := 0; i < n; i++ {
+		f := security.Finding{
+			ID:       fmt.Sprintf("api-page-limit-%d", i),
+			AtMS:     int64(n - i),
+			Severity: security.SeverityLow,
+			Category: "xss_pattern",
+			Summary:  "api page limit fixture",
+			Source:   "passive",
+		}
+		if err := s.st.InsertSecurityFinding(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := s.Routes(testAdminPW)
+
+	rec := do(t, h, "GET", "/admin/api/security/findings", "", true)
+	if rec.Code != 200 {
+		t.Fatalf("omitted limit status %d %s", rec.Code, rec.Body.String())
+	}
+	var def struct {
+		Findings []security.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &def); err != nil {
+		t.Fatal(err)
+	}
+	if len(def.Findings) != 50 {
+		t.Fatalf("omitted limit: got %d findings, want default 50", len(def.Findings))
+	}
+
+	recHuge := do(t, h, "GET", "/admin/api/security/findings?limit=100000000", "", true)
+	if recHuge.Code != http.StatusBadRequest {
+		t.Fatalf("huge limit status %d, want 400; body=%s", recHuge.Code, recHuge.Body.String())
+	}
+
+	// In-memory path: API must still apply NormalizePageLimit before Center.List
+	// (ring can hold > MaximumPageLimit; see NewPersistentCenter(500)).
+	center := security.NewCenter(500)
+	for i := 0; i < 250; i++ {
+		center.Record(security.Finding{
+			ID:       fmt.Sprintf("mem-page-limit-%d", i),
+			AtMS:     int64(250 - i),
+			Severity: security.SeverityLow,
+			Category: "xss_pattern",
+			Summary:  "mem page limit fixture",
+			Source:   "passive",
+		})
+	}
+	s.st = nil
+	hMem := s.WithSecurityCenter(center).Routes(testAdminPW)
+
+	recMem := do(t, hMem, "GET", "/admin/api/security/findings", "", true)
+	if recMem.Code != 200 {
+		t.Fatalf("in-memory omitted limit status %d %s", recMem.Code, recMem.Body.String())
+	}
+	var memDef struct {
+		Findings []security.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(recMem.Body.Bytes(), &memDef); err != nil {
+		t.Fatal(err)
+	}
+	if len(memDef.Findings) != 50 {
+		t.Fatalf("in-memory omitted limit: got %d, want default 50", len(memDef.Findings))
+	}
+
+	recMemHuge := do(t, hMem, "GET", "/admin/api/security/findings?limit=100000000", "", true)
+	if recMemHuge.Code != http.StatusBadRequest {
+		t.Fatalf("in-memory huge limit status %d, want 400; body=%s", recMemHuge.Code, recMemHuge.Body.String())
+	}
+
+	recMemMax := do(t, hMem, "GET", "/admin/api/security/findings?limit="+itoa(int64(store.MaximumPageLimit)), "", true)
+	if recMemMax.Code != 200 {
+		t.Fatalf("in-memory max limit status %d %s", recMemMax.Code, recMemMax.Body.String())
+	}
+	var memMax struct {
+		Findings []security.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(recMemMax.Body.Bytes(), &memMax); err != nil {
+		t.Fatal(err)
+	}
+	if len(memMax.Findings) != store.MaximumPageLimit {
+		t.Fatalf("in-memory limit=MaximumPageLimit: got %d, want %d", len(memMax.Findings), store.MaximumPageLimit)
+	}
+}
+
 // SMTP dial/auth errors are uncontrolled I/O text. The admin test endpoint
 // must not echo them — writeErr's default maps unknowns to "internal error".
 func TestAPI_SMTPTestDoesNotEchoRawSendError(t *testing.T) {
