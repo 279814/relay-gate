@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -200,15 +201,39 @@ func TestRequestLogPagination(t *testing.T) {
 			t.Errorf("翻页重复了 id=%d", l.ID)
 		}
 	}
+}
 
-	// 超上限应截到上限，而不是掉回默认值 ——
-	// 后者会让 limit=5000 拿到 100 条，翻页逻辑据此以为「到底了」
-	all, err := st.ListRequestLogs(RequestLogFilter{Limit: maxRequestLogLimit + 500})
+// TestListRequestLogs_PageLimitDefaultAndCap pins the shared admin-list page
+// contract on the SQL path: omitted/zero → defaultPageLimit; over
+// MaximumPageLimit is rejected so a huge limit cannot load unbounded rows.
+func TestListRequestLogs_PageLimitDefaultAndCap(t *testing.T) {
+	st := testStore(t)
+	const n = 60
+	for i := 0; i < n; i++ {
+		if err := st.InsertRequestLog(mkLog(fmt.Sprintf("page-%02d", i), 1, 1, model.OutcomeOK)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	def, err := st.ListRequestLogs(RequestLogFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 10 {
-		t.Errorf("超上限应正常返回全部 10 行，得到 %d", len(all))
+	if len(def) != defaultPageLimit {
+		t.Fatalf("omitted/zero limit: got %d logs, want default %d", len(def), defaultPageLimit)
+	}
+
+	_, err = st.ListRequestLogs(RequestLogFilter{Limit: 100_000_000})
+	if !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("huge limit error = %v, want ErrInvalidCursor (cap %d)", err, MaximumPageLimit)
+	}
+
+	atMax, err := st.ListRequestLogs(RequestLogFilter{Limit: MaximumPageLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atMax) != n {
+		t.Fatalf("limit=MaximumPageLimit: got %d, want all %d fixtures", len(atMax), n)
 	}
 }
 

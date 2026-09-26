@@ -47,6 +47,12 @@ func (s *Server) listRequestLogs(w http.ResponseWriter, r *http.Request) {
 			model.ErrValidation, f.Outcome))
 		return
 	}
+	pageLimit, err := store.NormalizePageLimit(f.Limit)
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
+		return
+	}
+	f.Limit = pageLimit
 
 	list, err := s.st.ListRequestLogs(f)
 	if err != nil {
@@ -86,10 +92,15 @@ func (s *Server) recentErrors(w http.ResponseWriter, r *http.Request) {
 			model.ErrValidation, q.Get("upstream_id")))
 		return
 	}
+	pageLimit, err := store.NormalizePageLimit(int(limit))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
+		return
+	}
 	f := store.RequestLogFilter{
 		UpstreamID: upstreamID,
 		OnlyFailed: true,
-		Limit:      int(limit),
+		Limit:      pageLimit,
 		BeforeID:   beforeID,
 	}
 	list, err := s.st.ListRequestLogs(f)
@@ -129,7 +140,7 @@ func countFailedRequestLogs(st failedLogCounter) (int, error) {
 	var before int64
 	for {
 		page, err := st.ListRequestLogs(store.RequestLogFilter{
-			OnlyFailed: true, Limit: 500, BeforeID: before,
+			OnlyFailed: true, Limit: store.MaximumPageLimit, BeforeID: before,
 		})
 		if err != nil {
 			return 0, err
@@ -139,7 +150,7 @@ func countFailedRequestLogs(st failedLogCounter) (int, error) {
 		}
 		n += len(page)
 		before = page[len(page)-1].ID
-		if len(page) < 500 {
+		if len(page) < store.MaximumPageLimit {
 			return n, nil
 		}
 	}

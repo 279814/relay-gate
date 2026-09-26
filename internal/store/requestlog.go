@@ -68,16 +68,16 @@ type RequestLogFilter struct {
 	BeforeID int64
 }
 
-const (
-	defaultRequestLogLimit = 100
-	maxRequestLogLimit     = 1000
-)
-
 // ListRequestLogs 按时间倒序列出日志。
 //
 // 日志行本身只有元数据（没有 body），所以这里返回完整行 ——
 // 与 ListSamples 需要裁掉 body 的情形不同。
 func (s *Store) ListRequestLogs(f RequestLogFilter) ([]*model.RequestLog, error) {
+	limit, err := NormalizePageLimit(f.Limit)
+	if err != nil {
+		return nil, err
+	}
+
 	q := `SELECT ` + requestLogCols + ` FROM request_log WHERE 1=1`
 	args := []any{}
 	if f.RouteID > 0 {
@@ -106,16 +106,6 @@ func (s *Store) ListRequestLogs(f RequestLogFilter) ([]*model.RequestLog, error)
 	if f.BeforeID > 0 {
 		q += ` AND id < ?`
 		args = append(args, f.BeforeID)
-	}
-
-	// 超上限则**截到上限**而不是掉回默认值 —— 后者会让 limit=5000
-	// 拿到 100 条，而翻页逻辑据此以为「到底了」。
-	limit := f.Limit
-	switch {
-	case limit <= 0:
-		limit = defaultRequestLogLimit
-	case limit > maxRequestLogLimit:
-		limit = maxRequestLogLimit
 	}
 
 	// 按 req_id 查整组时按 attempt 升序：详情页要的是「第 1 次试了 A、
