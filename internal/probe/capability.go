@@ -65,7 +65,8 @@ func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
 // CAS：同 token 时只接受更大（或相等时保留已有）order，强制反转两个已提交
 // 结果的返回顺序时仍保留 order 最大者。token 不同表示新 incarnation（含
 // MarkCountTokens* / real_model_not_found 用 UnixMilli 占位 order 之后，
-// sequencer 提交的新 token），即使 order 更低也必须替换。
+// sequencer 提交的新 token），即使 order 更低也必须替换。空 ObservationToken
+// 的旁路占位不得覆盖已有非空 token；非空 token 仍可替换空占位。
 func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability) {
 	if registry == nil || row == nil || row.ScopeID <= 0 || !row.Endpoint.Valid() {
 		return
@@ -74,6 +75,9 @@ func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	current := registry.rows[key]
+	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
+		return
+	}
 	if current != nil && current.ObservationToken == row.ObservationToken &&
 		current.LastObservationOrder >= row.LastObservationOrder {
 		return

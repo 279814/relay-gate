@@ -381,6 +381,51 @@ func TestCapabilityRegistry_DifferentTokenLowerOrderReplaces(t *testing.T) {
 	}
 }
 
+// Empty ObservationToken (MarkCountTokens* / real_model_not_found) must not
+// clobber a non-empty revision token, even with a higher UnixMilli order.
+// Non-empty still replaces an empty placeholder (#281).
+func TestCapabilityRegistry_EmptyTokenDoesNotClobberNonEmpty(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	sel := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	fp := mustCapFP(t, settings, sel)
+	reg.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: 1, Endpoint: model.EndpointModels,
+		PolicySelector: sel, State: model.CapabilitySupported,
+		ObservationToken: "revision-token", ProbeSettingsFingerprint: fp,
+		LastObservationOrder: 42, ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	})
+	reg.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: 1, Endpoint: model.EndpointModels,
+		PolicySelector: sel, State: model.CapabilityUnsupported,
+		ObservationToken: "", ProbeSettingsFingerprint: fp,
+		LastObservationOrder: 1_700_000_000_000, ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	})
+	got := reg.Snapshot(model.RecipeScopeUpstream, 1, model.EndpointModels)
+	if got == nil || got.ObservationToken != "revision-token" || got.LastObservationOrder != 42 ||
+		got.State != model.CapabilitySupported {
+		t.Fatalf("empty token must not clobber non-empty: %+v", got)
+	}
+
+	reg.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: 2, Endpoint: model.EndpointModels,
+		PolicySelector: sel, State: model.CapabilityUnsupported,
+		ObservationToken: "", ProbeSettingsFingerprint: fp,
+		LastObservationOrder: 1_700_000_000_000, ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	})
+	reg.ApplyCommitted(&model.EndpointCapability{
+		ScopeType: model.RecipeScopeUpstream, ScopeID: 2, Endpoint: model.EndpointModels,
+		PolicySelector: sel, State: model.CapabilitySupported,
+		ObservationToken: "revision-token", ProbeSettingsFingerprint: fp,
+		LastObservationOrder: 42, ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	})
+	got = reg.Snapshot(model.RecipeScopeUpstream, 2, model.EndpointModels)
+	if got == nil || got.ObservationToken != "revision-token" || got.LastObservationOrder != 42 ||
+		got.State != model.CapabilitySupported {
+		t.Fatalf("non-empty must still replace empty placeholder: %+v", got)
+	}
+}
+
 func TestCapabilityRegistry_ExpiredDerivedUnknown(t *testing.T) {
 	settings := model.DefaultSettings()
 	now := time.UnixMilli(1_700_000_000_000)
