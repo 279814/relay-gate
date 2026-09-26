@@ -222,15 +222,24 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 
 // fireConnectTimeout 是 connect 预算到期时 AfterFunc 的身体。
 //
-// timer.Stop() 返回 false 时回调可能已经开跑：若 GotConn 已把 flag 置上，
-// 不能再 close(timedOut)/cancel，否则会误伤已建连的 RoundTrip，也会把
-// 后续失败错判成 connect timeout（connectPhaseTimeout 先看 timedOut）。
-// 仍在建连（flag 未置）时才发信号并 cancel。
+// timer.Stop() 返回 false 时回调可能已经开跑。仅 Load 一次再 close/cancel
+// 不够：读到 false 之后 GotConn 仍可能 Store(true)，随后 cancel 会掐断已建连
+// 的 RoundTrip。close 之后、cancel 之前必须再读同一 atomic flag；若 Store
+// 已发生则跳过 cancel。仍在建连时才 cancel。
 func fireConnectTimeout(gotConn *atomic.Bool, timedOut chan struct{}, cancel context.CancelFunc) {
 	if gotConn.Load() {
 		return
 	}
 	close(timedOut)
+	cancelUnlessGotConn(gotConn, cancel)
+}
+
+// cancelUnlessGotConn 在 cancel 前再读 gotConn：已发生的 Store(true) 不得
+// 再 cancel body context。这是 GotConn 与迟到 AfterFunc 的单赢家闸门。
+func cancelUnlessGotConn(gotConn *atomic.Bool, cancel context.CancelFunc) {
+	if gotConn.Load() {
+		return
+	}
 	cancel()
 }
 

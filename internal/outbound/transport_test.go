@@ -363,6 +363,8 @@ func TestConnectTimeout_StopsAfterGotConn(t *testing.T) {
 
 // AfterFunc 在 timer.Stop() 返回 false 时仍可能已经开跑。GotConn 若已置位，
 // 那次迟到的回调绝不能 cancel RoundTrip context；仍在建连则必须 cancel。
+// 回调读到 false 之后 GotConn 仍可能置位：cancel 前再读一次，flag 已为 true
+// 则 context 必须保持活跃。
 func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
 	t.Run("gotConn already set", func(t *testing.T) {
 		var gotConn atomic.Bool
@@ -397,6 +399,22 @@ func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
 		case <-timedOut:
 		default:
 			t.Fatal("建连中到期必须关闭 timedOut")
+		}
+	})
+
+	t.Run("gotConn wins before cancel", func(t *testing.T) {
+		var gotConn atomic.Bool
+		timedOut := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// 缺口：首次 Load 已见 false，timedOut 已关；cancel 之前 GotConn 置位。
+		close(timedOut)
+		gotConn.Store(true)
+		cancelUnlessGotConn(&gotConn, cancel)
+
+		if ctx.Err() != nil {
+			t.Fatal("flag 在 cancel 前已为 true 时，context 必须保持活跃")
 		}
 	})
 }
