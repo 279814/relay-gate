@@ -124,6 +124,42 @@ func assertNoSMTPHeaderInjection(t *testing.T, msg string) {
 	}
 }
 
+func TestSeverity_NoSMTPSubjectHeaderInjection(t *testing.T) {
+	evil := security.Severity("high\r\nBcc: x")
+	f := security.Finding{
+		ID:       "f1",
+		Severity: evil,
+		Category: "credential_leak",
+		Summary:  "hit",
+		Upstream: "up1",
+		Source:   "passive",
+	}
+
+	alert := string(security.BuildAlertMessage("a@b.c", []string{"x@y.z"}, f, "http://admin/"))
+	assertNoSMTPHeaderInjection(t, alert)
+
+	hdrEnd := strings.Index(alert, "\r\n\r\n")
+	if hdrEnd < 0 {
+		t.Fatal("missing header/body separator")
+	}
+	var subject string
+	for _, line := range strings.Split(alert[:hdrEnd], "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), "subject:") {
+			subject = line
+			break
+		}
+	}
+	if subject == "" {
+		t.Fatal("missing Subject header")
+	}
+	if strings.Contains(subject, "\r") || strings.Contains(subject, "\n") {
+		t.Fatalf("Subject must be a single header line; got %q", subject)
+	}
+	if !strings.Contains(subject, "highBcc: x") {
+		t.Fatalf("CR/LF must be stripped from Severity in Subject; got %q", subject)
+	}
+}
+
 func TestSummary_NoSMTPHeaderInjection(t *testing.T) {
 	evilSummary := "hit\r\nBcc: x\x00evil"
 	f := security.Finding{
