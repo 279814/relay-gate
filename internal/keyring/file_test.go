@@ -41,6 +41,44 @@ func TestKeyringRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEnsureInitializedTightensExistingParentMode: MkdirAll leaves a pre-existing
+// broader parent mode unchanged; EnsureInitialized must Chmod 0700.
+func TestEnsureInitializedTightensExistingParentMode(t *testing.T) {
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := Open(dir)
+	if err := f.EnsureInitialized("k1", "master-secret-value-32b!!!!"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("secrets dir mode = %04o, want 0700", got)
+	}
+	// Second call (keyring already present) must still tighten.
+	if err := os.Chmod(secrets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.EnsureInitialized("k2", "other"); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("after re-ensure secrets dir mode = %04o, want 0700", got)
+	}
+}
+
 func TestKeyringMissing(t *testing.T) {
 	f := Open(t.TempDir())
 	if _, _, err := f.LoadActive(); err != ErrNotInitialized {

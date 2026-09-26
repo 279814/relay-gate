@@ -13,7 +13,7 @@ import (
 
 func (b *Bootstrap) acquireLock() (func(), error) {
 	lockPath := filepath.Join(b.secretsDir(), "credentials-bootstrap.lock")
-	if err := os.MkdirAll(b.secretsDir(), 0o700); err != nil {
+	if err := ensureSecretsDir(b.DataDir); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)

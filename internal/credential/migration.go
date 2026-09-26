@@ -103,7 +103,7 @@ func (m *Migration) Run() error {
 	if m.Out == nil {
 		m.Out = io.Discard
 	}
-	if err := os.MkdirAll(m.secretsDir(), 0o700); err != nil {
+	if err := ensureSecretsDir(m.DataDir); err != nil {
 		return err
 	}
 

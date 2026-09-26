@@ -21,7 +21,7 @@ func ResetAdmin(dataDir string, out io.Writer) (newPassword string, err error) {
 	if out == nil {
 		out = io.Discard
 	}
-	if err := os.MkdirAll(SecretsDir(dataDir), 0o700); err != nil {
+	if err := ensureSecretsDir(dataDir); err != nil {
 		return "", err
 	}
 

@@ -55,12 +55,17 @@ func (f *File) previousPath() string {
 func (f *File) EnsureInitialized(keyID, masterKey string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	dir := filepath.Dir(f.path)
 	if _, err := os.Lstat(f.path); err == nil {
-		return nil
+		// Keyring exists: still tighten parent (MkdirAll would not).
+		return os.Chmod(dir, 0o700)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
 	doc := document{
