@@ -39,7 +39,7 @@ func TestP012_LazyZeroSyntheticAcrossTicks(t *testing.T) {
 func TestP012_ScheduleKeyPendingCoalesces(t *testing.T) {
 	sched, track, _ := invHarness()
 	sched.mu.Lock()
-	sched.inflightL2[100] = true
+	sched.inflightL2[100] = 1
 	sched.mu.Unlock()
 	for i := 0; i < 100; i++ {
 		sched.Trigger(ScheduleKey{

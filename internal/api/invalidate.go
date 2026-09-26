@@ -86,6 +86,34 @@ func (s *SemanticConfigInvalidator) ForgetRouteHealth(routeID int64) {
 	}
 }
 
+// ForgetRoute drops Scheduler L2 inflight/pending/busy flags for a deleted Route.
+func (s *SemanticConfigInvalidator) ForgetRoute(routeID int64) {
+	if s == nil || s.Inner == nil {
+		return
+	}
+	if f, ok := s.Inner.(interface{ ForgetRoute(routeID int64) }); ok {
+		f.ForgetRoute(routeID)
+	}
+}
+
+// ForgetUpstream drops Scheduler L1/L2 flags for a deleted Upstream and children.
+func (s *SemanticConfigInvalidator) ForgetUpstream(upstreamID int64, routeIDs []int64) {
+	if s == nil || s.Inner == nil {
+		return
+	}
+	if f, ok := s.Inner.(interface {
+		ForgetUpstream(upstreamID int64, routeIDs []int64)
+	}); ok {
+		f.ForgetUpstream(upstreamID, routeIDs)
+		return
+	}
+	if f, ok := s.Inner.(interface{ ForgetRoute(routeID int64) }); ok {
+		for _, id := range routeIDs {
+			f.ForgetRoute(id)
+		}
+	}
+}
+
 // ForgetUpstreamHealth clears RouteHealth for every known child Route of an
 // Upstream without scheduling probes. Sibling upstreams are untouched.
 func (s *SemanticConfigInvalidator) ForgetUpstreamHealth(upstreamID int64) {
@@ -216,6 +244,49 @@ func (s *Server) forgetHealthOnReEnableRoute(routeID int64) {
 	}
 	if f, ok := s.invalidator.(interface{ ForgetRouteHealth(routeID int64) }); ok {
 		f.ForgetRouteHealth(routeID)
+	}
+}
+
+// forgetRouteSchedulerHolds drops in-memory L2 inflight/pending flags for a
+// deleted Route so a reused SQLite rowid is not skipped as still in flight.
+func (s *Server) forgetRouteSchedulerHolds(routeID int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetRoute(routeID int64) }); ok {
+		f.ForgetRoute(routeID)
+	}
+}
+
+// forgetUpstreamSchedulerHolds drops L1/L2 scheduler flags for a deleted
+// Upstream and its pre-CASCADE child Route ids.
+func (s *Server) forgetUpstreamSchedulerHolds(upstreamID int64, routeIDs []int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if f, ok := s.invalidator.(interface {
+		ForgetUpstream(upstreamID int64, routeIDs []int64)
+	}); ok {
+		f.ForgetUpstream(upstreamID, routeIDs)
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetRoute(routeID int64) }); ok {
+		for _, id := range routeIDs {
+			f.ForgetRoute(id)
+		}
+	}
+}
+
+// forgetRoutesSchedulerHolds drops L2 flags for Routes removed by CASCADE
+// (ModelName delete) without an Upstream-level busy/L1 clear.
+func (s *Server) forgetRoutesSchedulerHolds(routeIDs []int64) {
+	if s.invalidator == nil {
+		return
+	}
+	if f, ok := s.invalidator.(interface{ ForgetRoute(routeID int64) }); ok {
+		for _, id := range routeIDs {
+			f.ForgetRoute(id)
+		}
 	}
 }
 
