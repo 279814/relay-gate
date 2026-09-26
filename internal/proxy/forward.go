@@ -138,11 +138,16 @@ type Result struct {
 const maxErrBodyCapture = 8 << 10
 
 // TTFT 返回首语义 Token 延迟（§8.8）。未见语义证据时返回 0。
+// 时钟回拨或乱序时间戳导致负间隔时同样归零，避免 TTFTMs 写入负数。
 func (r *Result) TTFT() time.Duration {
 	if r.FirstSemanticAt.IsZero() || r.SentAt.IsZero() {
 		return 0
 	}
-	return r.FirstSemanticAt.Sub(r.SentAt)
+	d := r.FirstSemanticAt.Sub(r.SentAt)
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // stampFirstSemantic 在首次 SemanticSeen 时记下时刻，供 TTFT / OnFirstByte。
