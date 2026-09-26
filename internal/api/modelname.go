@@ -112,6 +112,7 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, delErr)
 		return
 	}
+	s.forgetRoutesSchedulerHolds(childRoutes)
 	s.invalidateModelNameDeleted(id, childRoutes)
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)

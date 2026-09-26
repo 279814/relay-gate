@@ -94,12 +94,14 @@ type Scheduler struct {
 	// 先要一个号；拿不到号就不发（发出去却没有 order 的结果无法排先后）。
 	sequencer *observationseq.Sequencer
 
-	// busyUp 保证同一 Upstream 的 L2 串行（§4.6）。
-	// 一个站下挂 5 个模型时，同时探 5 个几乎必然吃 429。
+	// busyUp / inflightL2 的值是 hold token（非 0 = 占用中）。Forget 丢弃
+	// 条目后，迟到的 endL2 必须凭 token 比对，否则同 id 新 Route/Upstream
+	// 的占用会被旧探活偷清（与 RecoveryGate 同构）。
 	mu         sync.Mutex
-	busyUp     map[int64]bool
-	inflightL1 map[int64]bool
-	inflightL2 map[int64]bool
+	busyUp     map[int64]uint64
+	inflightL1 map[int64]uint64
+	inflightL2 map[int64]uint64
+	holdSeq    uint64
 	// l2Inflight 是当前已占用的全局 L2 名额。上限每次 beginL2 从
 	// Settings.GlobalL2Concurrency 现读（§4.3 Settings 快照；改值无需重启），
 	// 在途占用自然收尾，不因缩容而提前释放。
@@ -145,9 +147,9 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 
 	return &Scheduler{
 		cfg: cfg, tr: tr, track: track, gate: gate, log: log,
-		busyUp:      map[int64]bool{},
-		inflightL1:  map[int64]bool{},
-		inflightL2:  map[int64]bool{},
+		busyUp:      map[int64]uint64{},
+		inflightL1:  map[int64]uint64{},
+		inflightL2:  map[int64]uint64{},
 		l1Scheduled: map[int64]bool{},
 		lastRunning: store.StateRunning,
 	}
@@ -426,14 +428,16 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	//
 	// beginL1 有两道闸（见其注释）：l1Scheduled 收本轮 tick 内同时到期的
 	// 多条 Route，inflightL1 收跨 tick 仍在跑的 L1。
-	if _, ok := s.track.ClaimL1(rt.ID); ok && s.beginL1(up.ID) {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer s.endL1(up.ID)
-			defer s.completeL1(rt.ID)
-			s.runL1(ctx, up, settings)
-		}()
+	if _, ok := s.track.ClaimL1(rt.ID); ok {
+		if hold, ok := s.beginL1(up.ID); ok {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer s.endL1(up.ID, hold)
+				defer s.completeL1(rt.ID)
+				s.runL1(ctx, up, settings)
+			}()
+		}
 	}
 
 	// 站级不可达时跳过 L2：站都连不上，探模型纯属浪费 token。
@@ -446,7 +450,8 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	if !ok {
 		return
 	}
-	if !s.beginL2(up.ID, rt.ID) {
+	hold, ok := s.beginL2(up.ID, rt.ID)
+	if !ok {
 		// 抢不到并发额度就把预占撤掉，让下一个 tick 重试。
 		// 不撤的话这个 Route 要白等一整个 L2 周期（alive 时是 5 分钟）。
 		s.track.TriggerL2(rt.ID)
@@ -456,7 +461,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer s.endL2(up.ID, rt.ID)
+		defer s.endL2(up.ID, rt.ID, hold)
 		defer s.completeL2(rt.ID)
 		s.runL2(ctx, up, mn, rt, settings, gen)
 	}()
@@ -687,50 +692,114 @@ func (s *Scheduler) completeL2(routeID int64) {
 //
 // 缺任一道闸都会重复：Issue #21 的根因就是只靠 inflightL1 —— 同一 tick 内
 // 若第一个 L1 先跑完 endL1，后面的 Route 会再抢一次。
-func (s *Scheduler) beginL1(upstreamID int64) bool {
+func (s *Scheduler) beginL1(upstreamID int64) (hold uint64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.l1Scheduled[upstreamID] || s.inflightL1[upstreamID] {
-		return false
+	if s.l1Scheduled[upstreamID] || s.inflightL1[upstreamID] != 0 {
+		return 0, false
 	}
+	s.holdSeq++
+	hold = s.holdSeq
 	s.l1Scheduled[upstreamID] = true
-	s.inflightL1[upstreamID] = true
-	return true
+	s.inflightL1[upstreamID] = hold
+	return hold, true
 }
 
-func (s *Scheduler) endL1(upstreamID int64) {
+func (s *Scheduler) endL1(upstreamID int64, hold uint64) {
 	s.mu.Lock()
-	delete(s.inflightL1, upstreamID)
+	if s.inflightL1[upstreamID] == hold {
+		delete(s.inflightL1, upstreamID)
+	} else {
+		hold = 0
+	}
 	s.mu.Unlock()
-	s.noteL1Finished(upstreamID)
+	if hold != 0 {
+		s.noteL1Finished(upstreamID)
+	}
 }
 
 // beginL2 同时满足三个约束：全局并发上限、同 Upstream 串行、同 Route 不重入。
-func (s *Scheduler) beginL2(upstreamID, routeID int64) bool {
+func (s *Scheduler) beginL2(upstreamID, routeID int64) (hold uint64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.busyUp[upstreamID] || s.inflightL2[routeID] || s.l2Inflight >= s.l2Limit() {
+	if s.busyUp[upstreamID] != 0 || s.inflightL2[routeID] != 0 || s.l2Inflight >= s.l2Limit() {
 		p := s.ensureP012()
 		p.mu.Lock()
 		p.pendingL2[routeID] = true
 		p.mu.Unlock()
-		return false
+		return 0, false
 	}
+	s.holdSeq++
+	hold = s.holdSeq
 	s.l2Inflight++
-	s.busyUp[upstreamID] = true
-	s.inflightL2[routeID] = true
-	return true
+	s.busyUp[upstreamID] = hold
+	s.inflightL2[routeID] = hold
+	return hold, true
 }
 
-func (s *Scheduler) endL2(upstreamID, routeID int64) {
+func (s *Scheduler) endL2(upstreamID, routeID int64, hold uint64) {
 	s.mu.Lock()
-	delete(s.busyUp, upstreamID)
-	delete(s.inflightL2, routeID)
-	if s.l2Inflight > 0 {
-		s.l2Inflight--
+	released := false
+	if s.inflightL2[routeID] == hold {
+		delete(s.inflightL2, routeID)
+		if s.l2Inflight > 0 {
+			s.l2Inflight--
+		}
+		released = true
+	}
+	if s.busyUp[upstreamID] == hold {
+		delete(s.busyUp, upstreamID)
 	}
 	s.mu.Unlock()
-	s.noteL2Finished(routeID)
+	if released {
+		s.noteL2Finished(routeID)
+	}
+}
+
+// ForgetRoute drops L2 scheduler flags for a deleted Route so a reused rowid
+// is not skipped as still inflight/pending. Stale endL2 with the old hold
+// token becomes a no-op (does not clear a new incarnation's hold).
+func (s *Scheduler) ForgetRoute(routeID int64) {
+	if routeID < 1 {
+		return
+	}
+	s.mu.Lock()
+	if hold := s.inflightL2[routeID]; hold != 0 {
+		delete(s.inflightL2, routeID)
+		if s.l2Inflight > 0 {
+			s.l2Inflight--
+		}
+		for upID, tok := range s.busyUp {
+			if tok == hold {
+				delete(s.busyUp, upID)
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	p := s.ensureP012()
+	p.mu.Lock()
+	delete(p.pendingL2, routeID)
+	p.mu.Unlock()
+}
+
+// ForgetUpstream drops L1/L2 scheduler flags for a deleted Upstream and its
+// child Routes (CASCADE skips per-route delete hooks).
+func (s *Scheduler) ForgetUpstream(upstreamID int64, routeIDs []int64) {
+	if upstreamID > 0 {
+		s.mu.Lock()
+		delete(s.inflightL1, upstreamID)
+		delete(s.busyUp, upstreamID)
+		delete(s.l1Scheduled, upstreamID)
+		s.mu.Unlock()
+		p := s.ensureP012()
+		p.mu.Lock()
+		delete(p.pendingL1, upstreamID)
+		p.mu.Unlock()
+	}
+	for _, id := range routeIDs {
+		s.ForgetRoute(id)
+	}
 }
 
 // l2Limit 现读全局 L2 并发上限。Settings 不可读或值不大于 0 时回退默认 3。
@@ -796,6 +865,55 @@ func (s *Scheduler) gcRemoved(snap *router.Snapshot) {
 		ups[id] = true
 	}
 	s.gate.RetainOnly(ups)
+
+	// Scheduler L2/L1 flags are keyed by integer id. Delete hooks Forget them
+	// immediately (id reuse); this sweep covers any missed hook so maps do
+	// not grow for forever-deleted ids.
+	s.mu.Lock()
+	for id, hold := range s.inflightL2 {
+		if routes[id] {
+			continue
+		}
+		delete(s.inflightL2, id)
+		if s.l2Inflight > 0 {
+			s.l2Inflight--
+		}
+		for upID, tok := range s.busyUp {
+			if tok == hold {
+				delete(s.busyUp, upID)
+				break
+			}
+		}
+	}
+	for id := range s.busyUp {
+		if !ups[id] {
+			delete(s.busyUp, id)
+		}
+	}
+	for id := range s.inflightL1 {
+		if !ups[id] {
+			delete(s.inflightL1, id)
+		}
+	}
+	for id := range s.l1Scheduled {
+		if !ups[id] {
+			delete(s.l1Scheduled, id)
+		}
+	}
+	s.mu.Unlock()
+	p := s.ensureP012()
+	p.mu.Lock()
+	for id := range p.pendingL2 {
+		if !routes[id] {
+			delete(p.pendingL2, id)
+		}
+	}
+	for id := range p.pendingL1 {
+		if !ups[id] {
+			delete(p.pendingL1, id)
+		}
+	}
+	p.mu.Unlock()
 }
 
 // ── 即时探活（§4.5）──────────────────────────────────────

@@ -546,7 +546,8 @@ func TestScheduler_GlobalL2LimitFollowsSettingsUpdate(t *testing.T) {
 	})
 	hs.cfg.settings.GlobalL2Concurrency = 3
 
-	if !hs.sched.beginL2(10, 100) {
+	hold1, ok := hs.sched.beginL2(10, 100)
+	if !ok {
 		t.Fatal("limit=3 时应能占用第一个 L2 名额")
 	}
 	if got := hs.sched.l2Limit(); got != 3 {
@@ -557,15 +558,16 @@ func TestScheduler_GlobalL2LimitFollowsSettingsUpdate(t *testing.T) {
 	if got := hs.sched.l2Limit(); got != 1 {
 		t.Fatalf("settings 改为 1 后 limit 应为 1，got %d", got)
 	}
-	if hs.sched.beginL2(20, 200) {
+	if _, ok := hs.sched.beginL2(20, 200); ok {
 		t.Fatal("已有 1 个在途且 cap=1 时，新 claim 必须拒绝")
 	}
 
-	hs.sched.endL2(10, 100)
-	if !hs.sched.beginL2(20, 200) {
+	hs.sched.endL2(10, 100, hold1)
+	hold2, ok := hs.sched.beginL2(20, 200)
+	if !ok {
 		t.Fatal("在途结束后 cap=1 应允许新 claim")
 	}
-	hs.sched.endL2(20, 200)
+	hs.sched.endL2(20, 200, hold2)
 }
 
 // 抢不到额度的 Route 要撤掉预占，让下个 tick 重试。
@@ -1197,4 +1199,65 @@ func TestL1StationEffectDoesNotSpreadConfigErrors(t *testing.T) {
 	if !apply || !reachable {
 		t.Fatalf("503 has response headers and must not kill every route: reachable=%v apply=%v", reachable, apply)
 	}
+}
+
+// Delete must drop inflightL2 / pendingL2 / busyUp for that id. Otherwise a
+// reused SQLite rowid is skipped as still in flight until the stale endL2.
+func TestForgetRoute_ClearsL2FlagsForIDReuse(t *testing.T) {
+	sched := NewScheduler(&fakeCfg{state: store.StateRunning, settings: fastSettings()},
+		newFakeTransport(), newRecordingTracker(), health.NewUpstreamGate(), discardLogger())
+
+	hold, ok := sched.beginL2(10, 100)
+	if !ok {
+		t.Fatal("setup: beginL2")
+	}
+	// Simulate a blocked sibling that left pendingL2 set.
+	if _, ok := sched.beginL2(10, 101); ok {
+		t.Fatal("setup: same upstream must refuse second L2")
+	}
+
+	sched.ForgetRoute(100)
+
+	sched.mu.Lock()
+	inflight := sched.inflightL2[100] != 0
+	busy := sched.busyUp[10] != 0
+	l2n := sched.l2Inflight
+	sched.mu.Unlock()
+	p := sched.ensureP012()
+	p.mu.Lock()
+	pending100 := p.pendingL2[100]
+	pending101 := p.pendingL2[101]
+	p.mu.Unlock()
+	if inflight {
+		t.Fatal("ForgetRoute must clear inflightL2[route]")
+	}
+	if busy {
+		t.Fatal("ForgetRoute must clear busyUp held by that L2")
+	}
+	if l2n != 0 {
+		t.Fatalf("ForgetRoute must release global L2 slot, l2Inflight=%d", l2n)
+	}
+	if pending100 {
+		t.Fatal("ForgetRoute must clear pendingL2[route]")
+	}
+	if !pending101 {
+		t.Fatal("sibling pendingL2 must stay until its own finish/forget")
+	}
+
+	// Reused route id must be able to claim immediately.
+	hold2, ok := sched.beginL2(20, 100)
+	if !ok {
+		t.Fatal("reused route id must not be skipped as still inflight")
+	}
+
+	// Stale endL2 of the deleted incarnation must not clear the new hold.
+	sched.endL2(10, 100, hold)
+	sched.mu.Lock()
+	still := sched.inflightL2[100] != 0
+	busyNew := sched.busyUp[20] != 0
+	sched.mu.Unlock()
+	if !still || !busyNew {
+		t.Fatal("stale endL2 must not clear the reused id's new L2 hold")
+	}
+	sched.endL2(20, 100, hold2)
 }

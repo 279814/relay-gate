@@ -152,6 +152,7 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, delErr)
 		return
 	}
+	s.forgetUpstreamSchedulerHolds(id, childRoutes)
 	s.invalidateUpstreamDeleted(id, childRoutes)
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)

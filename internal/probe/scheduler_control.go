@@ -130,8 +130,8 @@ func (s *Scheduler) Trigger(key ScheduleKey, reason ScheduleReason) {
 	}
 	p := s.ensureP012()
 	s.mu.Lock()
-	inflightL1 := s.inflightL1[key.UpstreamID]
-	inflightL2 := key.ScopeID > 0 && s.inflightL2[key.ScopeID]
+	inflightL1 := s.inflightL1[key.UpstreamID] != 0
+	inflightL2 := key.ScopeID > 0 && s.inflightL2[key.ScopeID] != 0
 	s.mu.Unlock()
 
 	p.mu.Lock()
@@ -178,7 +178,7 @@ func (s *Scheduler) InvalidateUpstream(upstreamID int64) {
 func (s *Scheduler) InvalidateRoute(routeID int64) {
 	p := s.ensureP012()
 	s.mu.Lock()
-	inflight := s.inflightL2[routeID]
+	inflight := s.inflightL2[routeID] != 0
 	s.mu.Unlock()
 	if inflight {
 		p.mu.Lock()
