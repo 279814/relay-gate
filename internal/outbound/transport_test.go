@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -358,6 +359,46 @@ func TestConnectTimeout_StopsAfterGotConn(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Errorf("status want 200 got %d", response.StatusCode)
 	}
+}
+
+// AfterFunc 在 timer.Stop() 返回 false 时仍可能已经开跑。GotConn 若已置位，
+// 那次迟到的回调绝不能 cancel RoundTrip context；仍在建连则必须 cancel。
+func TestFireConnectTimeout_RespectsGotConnFlag(t *testing.T) {
+	t.Run("gotConn already set", func(t *testing.T) {
+		var gotConn atomic.Bool
+		gotConn.Store(true)
+		timedOut := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		fireConnectTimeout(&gotConn, timedOut, cancel)
+
+		if ctx.Err() != nil {
+			t.Fatal("GotConn 已置位时，迟到的 AfterFunc 不得 cancel context")
+		}
+		select {
+		case <-timedOut:
+			t.Fatal("GotConn 已置位时不得关闭 timedOut（否则会误判成 connect timeout）")
+		default:
+		}
+	})
+
+	t.Run("still dialing", func(t *testing.T) {
+		var gotConn atomic.Bool
+		timedOut := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+
+		fireConnectTimeout(&gotConn, timedOut, cancel)
+
+		if ctx.Err() == nil {
+			t.Fatal("建连中到期必须 cancel context")
+		}
+		select {
+		case <-timedOut:
+		default:
+			t.Fatal("建连中到期必须关闭 timedOut")
+		}
+	})
 }
 
 // 计划第 5 条后半：trace sink 拿到握手时间点；复用连接不继承上一次的 TLS 时间。
