@@ -102,3 +102,51 @@ func TestCommitProbeObservation_RecordsCostAfterObservationCommit(t *testing.T) 
 		t.Fatalf("expected one cost event after successful observation, got %d", costEvents)
 	}
 }
+
+// A mismatched revision is ApplyConfigStale: execution may still be stored, but
+// probe_cost_event / probe_cost_daily must not be charged.
+func TestCommitProbeObservation_ConfigStaleSkipsCost(t *testing.T) {
+	store := testStore(t)
+	upstream := mkUpstream(t, store, "observation-cost-stale")
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	policy, err := revisioncodec.BuildReachabilityEvidencePolicy(model.DefaultSettings(), selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := model.ReachabilityRevision{
+		NetworkRevision:     upstream.NetworkRevision,
+		CreatedAt:           upstream.CreatedAt,
+		SettingsFingerprint: revisioncodec.ReachabilitySettingsFingerprint(policy),
+	}
+	expectation := &model.ReachabilityExpectation{
+		UpstreamID: upstream.ID, PolicySelector: selector, Revision: revision,
+		ObservationToken: revisioncodec.NewReachabilityToken(revision),
+	}
+	execution := minimalReachabilityExecution(t, store, upstream, expectation, "exec-cost-stale", "evidence-cost-stale", 1)
+
+	// Bump network revision so the expectation no longer matches current config.
+	if _, err := store.db.Exec(`UPDATE upstream SET network_revision=network_revision+1 WHERE id=?`, upstream.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.CommitProbeObservation(context.Background(), &model.ProbeObservation{
+		Execution: execution, ReachabilityExpectation: expectation, ReachabilityPolicy: &policy.State,
+	}, &fakeStateReducer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reachability != model.ApplyConfigStale {
+		t.Fatalf("disposition=%s want config_stale", result.Reachability)
+	}
+
+	var costEvents, costDaily int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM probe_cost_event WHERE event_id=?`, "execution:"+execution.ID).Scan(&costEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM probe_cost_daily WHERE upstream_id=?`, upstream.ID).Scan(&costDaily); err != nil {
+		t.Fatal(err)
+	}
+	if costEvents != 0 || costDaily != 0 {
+		t.Fatalf("stale probe must not charge cost: events=%d daily=%d", costEvents, costDaily)
+	}
+}
