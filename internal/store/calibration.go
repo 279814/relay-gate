@@ -728,6 +728,14 @@ func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.C
 	endpoint.Revision = currentEndpoint.Revision + 1
 	endpoint.AuthProfile.Revision = currentEndpoint.AuthProfile.Revision + 1
 	endpoint.UpdatedAt = nowMS()
+	// 本路径也写 auth_manual_headers_json，须与 UpdateEndpoint 同门禁（§7.2 / §8.5）。
+	for _, header := range endpoint.AuthProfile.ManualHeaders {
+		for _, value := range header.Values {
+			if err = probetemplate.RejectLiteralAuthFieldValue(value); err != nil {
+				return nil, err
+			}
+		}
+	}
 	manualJSON, err := json.Marshal(endpoint.AuthProfile.ManualHeaders)
 	if err != nil {
 		return nil, err
