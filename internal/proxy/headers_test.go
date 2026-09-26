@@ -435,6 +435,46 @@ func TestFinalizeClientResponseHeaders_DropsGatewaySessionSetCookie(t *testing.T
 	}
 }
 
+// 上游 Set-Cookie 若把已知上游/relay key 写进 value，绝不能原样到客户端；
+// 无 key 的 cookie 原样保留；relay_session 仍被剥离（不靠脱敏）。
+func TestFinalizeClientResponseHeaders_RedactsSecretsInSetCookie(t *testing.T) {
+	const secret = "sk-upstream-secret-in-cookie"
+	h := http.Header{}
+	h.Add("Set-Cookie", "session="+secret+"; Path=/; HttpOnly")
+	h.Add("Set-Cookie", "other=harmless; Path=/")
+	h.Add("Set-Cookie", gatewaySessionCookie+"=evil-from-upstream; Path=/")
+
+	FinalizeClientResponseHeaders(h, []string{secret})
+
+	got := h.Values("Set-Cookie")
+	var sawSession, sawOther bool
+	for _, line := range got {
+		first, _, _ := strings.Cut(line, ";")
+		name, _, _ := strings.Cut(first, "=")
+		if strings.TrimSpace(name) == gatewaySessionCookie {
+			t.Fatalf("客户端响应仍含会话 Set-Cookie: %q", line)
+		}
+		if strings.Contains(line, secret) {
+			t.Fatalf("Set-Cookie 回显了上游 key：%q", line)
+		}
+		if strings.HasPrefix(line, "session=") {
+			sawSession = true
+			if !strings.Contains(line, "Path=/") || !strings.Contains(line, "HttpOnly") {
+				t.Errorf("脱敏不应丢掉 cookie 属性：%q", line)
+			}
+		}
+		if line == "other=harmless; Path=/" {
+			sawOther = true
+		}
+	}
+	if !sawSession {
+		t.Fatalf("含 key 的 Set-Cookie 应保留（仅脱敏），得到 %v", got)
+	}
+	if !sawOther {
+		t.Fatalf("无 key 的 Set-Cookie 应原样保留，得到 %v", got)
+	}
+}
+
 // 上游 3xx Location（及 Content-Location / Refresh / Link）若回显出站 URL，
 // FixedQueryTemplate 里的上游 key 绝不能原样到客户端；beta=true、rel= 等无关
 // 参数与头本身必须保留。
