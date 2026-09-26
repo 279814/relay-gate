@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // Migration journal phases (§12.8). Independent from bootstrap journal.
@@ -199,10 +200,18 @@ func (m *Migration) importLegacy() error {
 	if err != nil {
 		return err
 	}
+	cipher, err := store.NewCipher(enc)
+	if err != nil {
+		return err
+	}
+	sealedRelay, err := SealPersistedRelayKey(relay, cipher)
+	if err != nil {
+		return err
+	}
 	if err := WritePersisted(m.DataDir, Persisted{
 		FormatVersion:     1,
 		AdminPasswordHash: hash,
-		RelayKey:          relay,
+		RelayKey:          sealedRelay,
 		MasterKeyID:       keyID,
 		UpdatedAt:         m.now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {

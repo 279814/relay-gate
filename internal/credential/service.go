@@ -216,8 +216,9 @@ func (s *Service) ActiveRelayKeys() []string {
 // The returned newKey is plaintext for one-time admin display; the hot-path
 // snapshot keeps only the digest, and (when EnvelopeCipher is wired) an
 // envelope of the new active key for later re-auth reveal (§12.6).
-// When dataDir is set, the new active plaintext plus grace digest/deadline are
-// written to bootstrap-credentials.json before the in-memory snapshot flips.
+// When dataDir is set, the Master-Key envelope plus grace digest/deadline are
+// written to bootstrap-credentials.json before the in-memory snapshot flips
+// (§2.4: persisted Relay Key must not be recoverable plaintext).
 func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -239,7 +240,10 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 		nextUntil = s.now().Add(time.Duration(s.graceSec) * time.Second)
 	}
 	if s.dataDir != "" {
-		if err := ReplaceRelayRotation(s.dataDir, newKey, nextGrace, nextUntil); err != nil {
+		if enc == "" {
+			return "", 0, errors.New("持久化 Relay Key 轮换需要 Master Key 信封")
+		}
+		if err := ReplaceRelayRotation(s.dataDir, enc, nextGrace, nextUntil); err != nil {
 			return "", 0, fmt.Errorf("持久化 Relay Key 轮换: %w", err)
 		}
 	}
@@ -272,8 +276,10 @@ func (s *Service) RevealActiveRelayKey() (string, error) {
 }
 
 // ResealActiveRelayEnvelope re-encrypts the in-memory Relay Key under the
-// current EnvelopeCipher active master (§12.7 after ActivateMaster). No-op
-// when no envelope is wired or no sealed copy exists.
+// current EnvelopeCipher active master (§12.7 after ActivateMaster). When
+// dataDir is set, also rewrites the on-disk relay_key envelope so restart
+// under only the new master still loads. No-op when no envelope is wired or
+// no sealed copy exists.
 func (s *Service) ResealActiveRelayEnvelope() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -290,6 +296,11 @@ func (s *Service) ResealActiveRelayEnvelope() error {
 	enc, err := s.envelope.EncryptEnvelope(plain)
 	if err != nil {
 		return fmt.Errorf("加密 Relay Key: %w", err)
+	}
+	if s.dataDir != "" {
+		if err := ReplacePersistedRelayKey(s.dataDir, enc); err != nil {
+			return fmt.Errorf("持久化 Relay Key 重封: %w", err)
+		}
 	}
 	s.relayActiveEnc = enc
 	s.noteLocked("relay_reseal", "envelope rewrapped under new master")

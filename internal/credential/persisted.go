@@ -12,8 +12,11 @@ import (
 
 // Persisted is the on-disk credential material under data/secrets/ (§12.3 / §12.8).
 // Admin password is stored only as Argon2id; never recoverable plaintext.
-// RelayGraceDigest is the SHA-256 hex of the previous active key during overlap;
-// never store the previous raw key. RelayGraceUntil is RFC3339Nano UTC.
+// RelayKey is a Master-Key envelope (v1:…) of the active Relay Key plaintext
+// (§2.4 / §12.6); legacy installs may still hold recoverable plaintext until
+// the next rotate/bootstrap rewrite. RelayGraceDigest is the SHA-256 hex of
+// the previous active key during overlap; never store the previous raw key.
+// RelayGraceUntil is RFC3339Nano UTC.
 type Persisted struct {
 	FormatVersion     int    `json:"format_version"`
 	AdminPasswordHash string `json:"admin_password_hash"`
@@ -22,6 +25,42 @@ type Persisted struct {
 	RelayGraceUntil   string `json:"relay_grace_until,omitempty"`
 	MasterKeyID       string `json:"master_key_id"`
 	UpdatedAt         string `json:"updated_at"`
+}
+
+// relayKeyEnvelopePrefix matches store.Cipher EncryptEnvelope (§12.4).
+const relayKeyEnvelopePrefix = "v1:"
+
+// IsRelayKeyEnvelope reports whether relay_key holds a Master-Key envelope.
+func IsRelayKeyEnvelope(stored string) bool {
+	return strings.HasPrefix(strings.TrimSpace(stored), relayKeyEnvelopePrefix)
+}
+
+// OpenPersistedRelayKey returns plaintext from an envelope or legacy plaintext
+// dual-read (§2.4). Envelope rows require enc; legacy plaintext returns as-is.
+func OpenPersistedRelayKey(stored string, enc EnvelopeCipher) (string, error) {
+	stored = strings.TrimSpace(stored)
+	if stored == "" {
+		return "", nil
+	}
+	if !IsRelayKeyEnvelope(stored) {
+		return stored, nil
+	}
+	if enc == nil {
+		return "", errors.New("Relay Key 密文需要 Master Key 解密")
+	}
+	return enc.DecryptEnvelope(stored)
+}
+
+// SealPersistedRelayKey encrypts Relay Key plaintext for the relay_key field.
+func SealPersistedRelayKey(plain string, enc EnvelopeCipher) (string, error) {
+	plain = strings.TrimSpace(plain)
+	if plain == "" {
+		return "", errors.New("relay key 不能为空")
+	}
+	if enc == nil {
+		return "", errors.New("持久化 Relay Key 需要 Master Key 信封")
+	}
+	return enc.EncryptEnvelope(plain)
 }
 
 // SecretsDir returns dataDir/secrets.
@@ -142,11 +181,13 @@ func WritePersisted(dataDir string, doc Persisted) error {
 	return writeJSON0600(CredentialsFile(dataDir), doc)
 }
 
-// ReplaceRelayRotation updates the active relay plaintext and optional grace
-// digest/deadline after UI rotate (§12.6). Preserves admin hash and master id.
-// graceDigest must be the irreversible hex digest (never raw previous key).
-func ReplaceRelayRotation(dataDir, newRelayKey, graceDigest string, graceUntil time.Time) error {
-	if strings.TrimSpace(newRelayKey) == "" {
+// ReplaceRelayRotation updates the active relay_key envelope and optional grace
+// digest/deadline after UI rotate (§12.6). sealedRelayKey must be a Master-Key
+// envelope (or, for tests only, a value already prepared for the field).
+// Preserves admin hash and master id. graceDigest must be the irreversible hex
+// digest (never raw previous key).
+func ReplaceRelayRotation(dataDir, sealedRelayKey, graceDigest string, graceUntil time.Time) error {
+	if strings.TrimSpace(sealedRelayKey) == "" {
 		return errors.New("relay key 不能为空")
 	}
 	doc, err := LoadPersistedFile(dataDir)
@@ -159,7 +200,7 @@ func ReplaceRelayRotation(dataDir, newRelayKey, graceDigest string, graceUntil t
 	if doc.FormatVersion == 0 {
 		doc.FormatVersion = 1
 	}
-	doc.RelayKey = newRelayKey
+	doc.RelayKey = sealedRelayKey
 	if graceDigest != "" && !graceUntil.IsZero() {
 		doc.RelayGraceDigest = graceDigest
 		doc.RelayGraceUntil = graceUntil.UTC().Format(time.RFC3339Nano)
@@ -167,6 +208,21 @@ func ReplaceRelayRotation(dataDir, newRelayKey, graceDigest string, graceUntil t
 		doc.RelayGraceDigest = ""
 		doc.RelayGraceUntil = ""
 	}
+	doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	return writeJSON0600(CredentialsFile(dataDir), doc)
+}
+
+// ReplacePersistedRelayKey rewrites only the sealed active Relay Key (Master
+// Key rotation reseal). Preserves grace fields, admin hash, and master id.
+func ReplacePersistedRelayKey(dataDir, sealedRelayKey string) error {
+	if strings.TrimSpace(sealedRelayKey) == "" {
+		return errors.New("relay key 不能为空")
+	}
+	doc, err := LoadPersistedFile(dataDir)
+	if err != nil {
+		return err
+	}
+	doc.RelayKey = sealedRelayKey
 	doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return writeJSON0600(CredentialsFile(dataDir), doc)
 }

@@ -3,9 +3,12 @@ package credential
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/279814/relay-gate/internal/store"
 )
 
 func TestRelayRotateGraceAndRevoke(t *testing.T) {
@@ -199,13 +202,14 @@ func TestRevealActiveRelayKey_SealedBesideDigest(t *testing.T) {
 func TestRelayGraceSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	const oldKey = "rk_grace_restart_old"
+	env := &memEnvelope{}
 	if err := WritePersisted(dir, Persisted{
 		FormatVersion: 1, AdminPasswordHash: "hash", RelayKey: oldKey, MasterKeyID: "kid",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
-	s1 := New().WithDataDir(dir).WithNow(func() time.Time { return now })
+	s1 := New().WithEnvelope(env).WithDataDir(dir).WithNow(func() time.Time { return now })
 	if err := s1.SetActiveRelayKey(oldKey); err != nil {
 		t.Fatal(err)
 	}
@@ -217,8 +221,12 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doc.RelayKey != newKey {
-		t.Fatalf("persisted active=%q want %q", doc.RelayKey, newKey)
+	gotActive, err := OpenPersistedRelayKey(doc.RelayKey, env)
+	if err != nil || gotActive != newKey {
+		t.Fatalf("persisted active open=%q want %q err=%v", gotActive, newKey, err)
+	}
+	if !IsRelayKeyEnvelope(doc.RelayKey) {
+		t.Fatal("rotate must persist envelope, not plaintext")
 	}
 	if doc.RelayGraceDigest != digestRelayKey(oldKey) {
 		t.Fatalf("persisted grace digest=%q", doc.RelayGraceDigest)
@@ -231,8 +239,8 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	}
 
 	// Simulate process restart: SetActiveRelayKeys clears grace; restore reloads it.
-	s2 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(2 * time.Minute) })
-	if err := s2.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+	s2 := New().WithEnvelope(env).WithDataDir(dir).WithNow(func() time.Time { return now.Add(2 * time.Minute) })
+	if err := s2.SetActiveRelayKeys([]string{gotActive}); err != nil {
 		t.Fatal(err)
 	}
 	if s2.ValidRelayKey(oldKey) {
@@ -249,8 +257,8 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	}
 
 	// Deadline already passed stays rejected.
-	s3 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(11 * time.Minute) })
-	if err := s3.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+	s3 := New().WithEnvelope(env).WithDataDir(dir).WithNow(func() time.Time { return now.Add(11 * time.Minute) })
+	if err := s3.SetActiveRelayKeys([]string{gotActive}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s3.RestorePersistedGrace(dir); err != nil {
@@ -264,8 +272,8 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	}
 
 	// Revoke before restart stays revoked after restart.
-	s4 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(3 * time.Minute) })
-	if err := s4.SetActiveRelayKeys([]string{doc.RelayKey}); err != nil {
+	s4 := New().WithEnvelope(env).WithDataDir(dir).WithNow(func() time.Time { return now.Add(3 * time.Minute) })
+	if err := s4.SetActiveRelayKeys([]string{gotActive}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s4.RestorePersistedGrace(dir); err != nil {
@@ -281,8 +289,12 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	if afterRevoke.RelayGraceDigest != "" || afterRevoke.RelayGraceUntil != "" {
 		t.Fatal("revoke must clear persisted grace fields")
 	}
-	s5 := New().WithDataDir(dir).WithNow(func() time.Time { return now.Add(4 * time.Minute) })
-	if err := s5.SetActiveRelayKeys([]string{afterRevoke.RelayKey}); err != nil {
+	activeAfter, err := OpenPersistedRelayKey(afterRevoke.RelayKey, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s5 := New().WithEnvelope(env).WithDataDir(dir).WithNow(func() time.Time { return now.Add(4 * time.Minute) })
+	if err := s5.SetActiveRelayKeys([]string{activeAfter}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s5.RestorePersistedGrace(dir); err != nil {
@@ -293,5 +305,57 @@ func TestRelayGraceSurvivesRestart(t *testing.T) {
 	}
 	if !s5.ValidRelayKey(newKey) {
 		t.Fatal("active key must remain after revoke restart")
+	}
+}
+
+// TestRotateRelayKey_PersistsEnvelopeNotPlaintext is the focused §2.4 writer
+// check: ReplaceRelayRotation via RotateRelayKey must seal relay_key under the
+// Master Key and keep dual-read of legacy plaintext on load.
+func TestRotateRelayKey_PersistsEnvelopeNotPlaintext(t *testing.T) {
+	dir := t.TempDir()
+	const legacy = "rk_legacy_plain_on_disk"
+	if err := WritePersisted(dir, Persisted{
+		FormatVersion: 1, AdminPasswordHash: "hash", RelayKey: legacy, MasterKeyID: "kid",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Dual-read: legacy plaintext field still opens without decrypt.
+	gotLegacy, err := OpenPersistedRelayKey(legacy, nil)
+	if err != nil || gotLegacy != legacy {
+		t.Fatalf("legacy dual-read=%q err=%v", gotLegacy, err)
+	}
+
+	c, err := store.NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New().WithEnvelope(c).WithDataDir(dir)
+	if err := s.SetActiveRelayKey(legacy); err != nil {
+		t.Fatal(err)
+	}
+	newKey, _, err := s.RotateRelayKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsRelayKeyEnvelope(doc.RelayKey) {
+		t.Fatalf("want v1 envelope, got %q", doc.RelayKey)
+	}
+	if strings.Contains(doc.RelayKey, newKey) || strings.Contains(doc.RelayKey, legacy) {
+		t.Fatal("recoverable plaintext must not remain in relay_key")
+	}
+	opened, err := OpenPersistedRelayKey(doc.RelayKey, c)
+	if err != nil || opened != newKey {
+		t.Fatalf("open=%q want %q err=%v", opened, newKey, err)
+	}
+	raw, err := os.ReadFile(CredentialsFile(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), newKey) || strings.Contains(string(raw), legacy) {
+		t.Fatal("credentials file must not contain relay plaintext after rotate")
 	}
 }

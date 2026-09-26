@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 func TestHashAdminPasswordRoundTrip(t *testing.T) {
@@ -56,8 +57,19 @@ func TestBootstrapFreshDisplayOnce(t *testing.T) {
 	if !VerifyAdminPassword(d.AdminPassword, persisted.AdminPasswordHash) {
 		t.Fatal("persisted hash must match displayed admin password")
 	}
-	if persisted.RelayKey != d.RelayKey {
-		t.Fatal("persisted relay mismatch")
+	c, err := store.NewCipher(d.MasterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRelay, err := OpenPersistedRelayKey(persisted.RelayKey, c)
+	if err != nil || gotRelay != d.RelayKey {
+		t.Fatalf("persisted relay open=%q want %q err=%v", gotRelay, d.RelayKey, err)
+	}
+	if !IsRelayKeyEnvelope(persisted.RelayKey) {
+		t.Fatal("bootstrap must persist Master-Key envelope, not plaintext")
+	}
+	if strings.Contains(persisted.RelayKey, d.RelayKey) {
+		t.Fatal("plaintext relay must not appear in sealed field")
 	}
 	_, err = b.Run()
 	if !errors.Is(err, ErrBootstrapComplete) {

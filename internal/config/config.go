@@ -11,6 +11,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 type Config struct {
@@ -84,7 +85,13 @@ func (c *Config) fillFromSecretsArtifacts() error {
 		doc, err := credential.LoadPersistedFile(dataDir)
 		switch {
 		case err == nil && strings.TrimSpace(doc.RelayKey) != "":
-			c.RelayKeys = []string{strings.TrimSpace(doc.RelayKey)}
+			plain, err := openPersistedRelay(doc.RelayKey, c.EncKey)
+			if err != nil {
+				return fmt.Errorf("解密 bootstrap-credentials Relay Key 失败（未回显密钥）: %w", err)
+			}
+			if plain != "" {
+				c.RelayKeys = []string{plain}
+			}
 		case err == nil:
 			// empty relay: leave unset
 		case errors.Is(err, os.ErrNotExist):
@@ -94,6 +101,22 @@ func (c *Config) fillFromSecretsArtifacts() error {
 		}
 	}
 	return nil
+}
+
+// openPersistedRelay dual-reads Master-Key envelopes and legacy plaintext
+// relay_key values (§2.4). Encrypted rows need encKey from keyring/env.
+func openPersistedRelay(stored, encKey string) (string, error) {
+	if !credential.IsRelayKeyEnvelope(stored) {
+		return strings.TrimSpace(stored), nil
+	}
+	if strings.TrimSpace(encKey) == "" {
+		return "", errors.New("Relay Key 密文需要 ENCRYPTION_KEY / keyring")
+	}
+	cipher, err := store.NewCipher(encKey)
+	if err != nil {
+		return "", err
+	}
+	return credential.OpenPersistedRelayKey(stored, cipher)
 }
 
 // validate 对三项凭据强制要求。
