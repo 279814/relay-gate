@@ -10,8 +10,59 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
+	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
+
+// Shared admin-list page contract for transform executions: omitted limit →
+// default 50; over MaximumPageLimit is rejected so a huge limit cannot dump
+// the whole in-memory ring (production NewRegistry(500) > MaximumPageLimit).
+func TestAPI_ListTransformExecutions_PageLimitDefaultAndCap(t *testing.T) {
+	reg := transform.NewRegistry(500)
+	for i := 0; i < 250; i++ {
+		reg.RecordExecution(transform.ExecutionRecord{
+			RouteID:    1,
+			EndpointID: 1,
+			Mode:       "published",
+			Phase:      "request",
+			OK:         true,
+		})
+	}
+	h := New(nil, nil).WithTransformRegistry(reg).Routes(testAdminPW)
+
+	rec := do(t, h, "GET", "/admin/api/transform-executions", "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("omitted limit status %d %s", rec.Code, rec.Body.String())
+	}
+	var def struct {
+		Executions []transform.ExecutionRecord `json:"executions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &def); err != nil {
+		t.Fatal(err)
+	}
+	if len(def.Executions) != 50 {
+		t.Fatalf("omitted limit: got %d executions, want default 50", len(def.Executions))
+	}
+
+	recHuge := do(t, h, "GET", "/admin/api/transform-executions?limit=100000000", "", true)
+	if recHuge.Code != http.StatusBadRequest {
+		t.Fatalf("huge limit status %d, want 400; body=%s", recHuge.Code, recHuge.Body.String())
+	}
+
+	recMax := do(t, h, "GET", "/admin/api/transform-executions?limit="+itoa(int64(store.MaximumPageLimit)), "", true)
+	if recMax.Code != http.StatusOK {
+		t.Fatalf("max limit status %d %s", recMax.Code, recMax.Body.String())
+	}
+	var atMax struct {
+		Executions []transform.ExecutionRecord `json:"executions"`
+	}
+	if err := json.Unmarshal(recMax.Body.Bytes(), &atMax); err != nil {
+		t.Fatal(err)
+	}
+	if len(atMax.Executions) != store.MaximumPageLimit {
+		t.Fatalf("limit=MaximumPageLimit: got %d, want %d", len(atMax.Executions), store.MaximumPageLimit)
+	}
+}
 
 func TestTransformAPI_PublishPreview(t *testing.T) {
 	reg := transform.NewRegistry(20)
