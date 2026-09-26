@@ -170,6 +170,22 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 	return out
 }
 
+// RedactFindingForRead applies RedactSecrets to free-text finding fields
+// before they leave the process via the admin API (§2.4 / §14.5). ScanText
+// already redacts Detail before Record; this covers legacy rows and any
+// caller that stored plaintext. It does not mutate the persisted row.
+func RedactFindingForRead(f Finding, keys []string) Finding {
+	if len(keys) == 0 {
+		return f
+	}
+	f.Summary = RedactSecrets(f.Summary, keys)
+	f.Detail = RedactSecrets(f.Detail, keys)
+	f.IncompleteReason = RedactSecrets(f.IncompleteReason, keys)
+	f.ReqID = RedactSecrets(f.ReqID, keys)
+	f.Upstream = RedactSecrets(f.Upstream, keys)
+	return f
+}
+
 // RedactSecrets replaces known credential values in evidence text.
 // Keep behavior aligned with store.MaskKey (security cannot import store:
 // store already imports this package).
