@@ -237,6 +237,13 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	routingUpstreams := make([]*model.Upstream, 0, len(bundle.Upstreams))
 	for _, up := range bundle.Upstreams {
 		copyUp := *up
+		// ProbeHeaders 是 map：浅拷贝会与 bundle 共享 backing，发布后写一边会脏另一边。
+		if up.ProbeHeaders != nil {
+			copyUp.ProbeHeaders = make(map[string]string, len(up.ProbeHeaders))
+			for k, v := range up.ProbeHeaders {
+				copyUp.ProbeHeaders[k] = v
+			}
+		}
 		// routing 快照保留解密后的 APIKey 供真实出站鉴权；Probe 只用 ProbeConfig（无明文）。
 		routingUpstreams = append(routingUpstreams, &copyUp)
 		probe.Upstreams[up.ID] = up.ProbeConfig()
