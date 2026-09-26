@@ -186,6 +186,34 @@ func TestCalibration_LazyRejectsAutomaticPlan(t *testing.T) {
 	}
 }
 
+// §8.7：Lazy 只允许用户明确点击后运行一次 —— 管理端 PlanCalibration 就是那次点击。
+func TestService_PlanCalibrationAcceptsExplicitLazyStart(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	up.ProbeMode = model.ProbeModeLazy
+	if err := st.UpdateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	cal, _ := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		t.Fatal("Plan 不应出网")
+		return nil, nil
+	})
+	svc := NewService(st, nil, cal, settingsSnap{}, nil, nil)
+
+	run, err := svc.PlanCalibration(context.Background(), rt.ID, model.EndpointMessages)
+	if err != nil {
+		t.Fatalf("Lazy 上管理端明确启动的校准必须被接受: %v", err)
+	}
+	if run.State != model.CalibrationPlanned || run.RouteID != rt.ID {
+		t.Fatalf("run=%+v", run)
+	}
+
+	_, err = cal.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{})
+	if err == nil || !strings.Contains(err.Error(), "手动") {
+		t.Fatalf("Lazy 非手动 Plan 仍必须拒绝: %v", err)
+	}
+}
+
 func TestCalibration_RejectsDisabledUpstream(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
