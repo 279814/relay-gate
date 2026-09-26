@@ -147,27 +147,82 @@ func locateTopLevelModel(body []byte) (start, end int, err error) {
 		}
 		// Continue scanning for a second top-level "model" (§6.2). Trailing
 		// invalid JSON after the first model must not fail ExtractModel —
-		// body validity is the upstream's job (§3.3); we only reject duplicates.
+		// body validity is the upstream's job (§3.3). But a lenient upstream
+		// parser (NaN, trailing commas) may still see a later "model" in that
+		// invalid remainder and pick it, so fall back to a lexical key scan.
 		for dec.More() {
 			keyTok, err := dec.Token()
 			if err != nil {
-				return start, end, nil
+				return lexicalDuplicateCheck(body, start, end)
 			}
 			k, ok := keyTok.(string)
 			if !ok {
-				return start, end, nil
+				return lexicalDuplicateCheck(body, start, end)
 			}
 			if k == "model" {
 				return 0, 0, ErrDuplicateModel
 			}
 			var skip json.RawMessage
 			if err := dec.Decode(&skip); err != nil {
-				return start, end, nil
+				return lexicalDuplicateCheck(body, start, end)
 			}
 		}
 		return start, end, nil
 	}
 	return 0, 0, ErrNoModelField
+}
+
+func lexicalDuplicateCheck(body []byte, start, end int) (int, int, error) {
+	if countTopLevelModelKeys(body) > 1 {
+		return 0, 0, ErrDuplicateModel
+	}
+	return start, end, nil
+}
+
+// countTopLevelModelKeys counts string literals directly inside the top-level
+// object that are followed by ':' and decode to "model". It tolerates invalid
+// values, so it only tracks string boundaries and bracket depth.
+func countTopLevelModelKeys(body []byte) int {
+	depth, count := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth <= 0 {
+				return count
+			}
+		case '"':
+			j := i + 1
+			for j < len(body) && body[j] != '"' {
+				if body[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			if j >= len(body) {
+				return count
+			}
+			lit := body[i : j+1]
+			i = j
+			if depth != 1 {
+				continue
+			}
+			k := j + 1
+			for k < len(body) && (body[k] == ' ' || body[k] == '\t' || body[k] == '\n' || body[k] == '\r') {
+				k++
+			}
+			if k >= len(body) || body[k] != ':' {
+				continue
+			}
+			var s string
+			if json.Unmarshal(lit, &s) == nil && s == "model" {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // encodeJSONString 把字符串编码成 JSON 字符串字面量，且**不做 HTML 转义**。

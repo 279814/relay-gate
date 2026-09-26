@@ -387,6 +387,34 @@ func TestExtractModel_DuplicateTopLevelRejected(t *testing.T) {
 	}
 }
 
+// 首个 model 之后的剩余部分非法时，仍要识别顶层重复 model；
+// 但嵌套 model、字符串里的 "model": 与单一 model 的非法尾部照旧放行（§3.3）。
+func TestExtractModel_DuplicateAfterInvalidRemainder(t *testing.T) {
+	dup := []string{
+		`{"model":"a","x":NaN,"model":"b"}`,
+		`{"model":"a","x":[1,],"model":"b"}`,
+		`{"model":"a",,"mod\u0065l" : "b"}`,
+		`{"model":"a","x":NaN,"metadata":{"model":"y"},"model":"b"}`,
+	}
+	for _, in := range dup {
+		if _, err := ExtractModel([]byte(in)); !errors.Is(err, ErrDuplicateModel) {
+			t.Errorf("%s: err = %v, want ErrDuplicateModel", in, err)
+		}
+	}
+	ok := []string{
+		`{"model":"a","messages":[}`,
+		`{"model":"a","x":NaN,"metadata":{"model":"y"}}`,
+		`{"model":"a","x":NaN,"s":"\"model\":\"b\""}`,
+		`{"model":"a","x":NaN,"arr":["model",{"model":1}]}`,
+	}
+	for _, in := range ok {
+		got, err := ExtractModel([]byte(in))
+		if err != nil || got != "a" {
+			t.Errorf("%s: got (%q, %v), want (\"a\", nil)", in, got, err)
+		}
+	}
+}
+
 // HTML 转义必须关闭：json.Marshal 默认把 < > & 写成 < > &，
 // 虽然 JSON 合法且语义相同，但字节不同。对以字节保真为目的的网关不合适。
 func TestEncodeJSONStringNoHTMLEscape(t *testing.T) {
