@@ -229,10 +229,12 @@ func (s *Server) listTransformExecutions(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, fmt.Errorf("%w: limit", model.ErrValidation))
 		return
 	}
-	if r.URL.Query().Get("limit") == "" {
-		limit = 50
+	pageLimit, err := store.NormalizePageLimit(int(limit))
+	if err != nil {
+		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": s.transforms.ListExecutions(int(limit))})
+	writeJSON(w, http.StatusOK, map[string]any{"executions": s.transforms.ListExecutions(pageLimit)})
 }
 
 func (s *Server) getTransformBudgets(w http.ResponseWriter, r *http.Request) {
