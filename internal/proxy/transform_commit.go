@@ -478,14 +478,14 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			for _, ev := range events {
 				out, hits, _, aerr := compiled.ApplySSEEvent(ev)
 				if aerr != nil {
+					if record != nil {
+						record(transform.ExecutionRecord{
+							Phase: "sse", OK: false, Error: aerr.Error(),
+							FailPolicyUsed: policy, HitRules: hits,
+						})
+					}
 					if policy == transform.FailClosed {
 						res.Err = aerr
-						if record != nil {
-							record(transform.ExecutionRecord{
-								Phase: "sse", OK: false, Error: aerr.Error(),
-								FailPolicyUsed: policy, HitRules: hits,
-							})
-						}
 						res.BytesWritten = total
 						return res
 					}
@@ -519,14 +519,14 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	}
 	if ev, ok := scanner.Flush(); ok {
 		out, hits, _, aerr := compiled.ApplySSEEvent(ev)
+		if aerr != nil && record != nil {
+			record(transform.ExecutionRecord{
+				Phase: "sse", OK: false, Error: aerr.Error(),
+				FailPolicyUsed: policy, HitRules: hits,
+			})
+		}
 		if aerr != nil && policy == transform.FailClosed {
 			res.Err = aerr
-			if record != nil {
-				record(transform.ExecutionRecord{
-					Phase: "sse", OK: false, Error: aerr.Error(),
-					FailPolicyUsed: policy, HitRules: hits,
-				})
-			}
 			res.BytesWritten = total
 			return res
 		}

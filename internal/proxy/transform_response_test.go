@@ -751,6 +751,62 @@ func TestSSETransform_OversizeEventFailOpenNotUpstreamFault(t *testing.T) {
 	}
 }
 
+// docs/01 §15.7: an ApplySSEEvent failure under fail_open forwards the original
+// event, is not an upstream fault, and still leaves one failure record — both in
+// the read loop and for the trailing event drained by scanner.Flush.
+func TestSSETransform_ApplyEventFailOpenRecordsFailure(t *testing.T) {
+	cases := []struct {
+		name  string
+		event string
+	}{
+		{"loop", "event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n"},
+		{"flush", "event: content_block_delta\ndata: {\"delta\":\"hi\"}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Write([]byte(tc.event))
+			})
+			spy := &capturingReporter{}
+			hs.h.WithHealthReporter(spy)
+			reg := transform.NewRegistry(4)
+			set, _ := reg.CreateSet("sse-apply-open-" + tc.name)
+			rules := []transform.Rule{
+				{Kind: transform.KindSSEMatch, Match: "content_block_delta", Value: strings.Repeat("x", transform.MaxSSEEventBytes+1)},
+			}
+			if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+				t.Fatal(err)
+			}
+			hs.h.WithTransforms(reg)
+
+			rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+			if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`{"delta":"hi"}`)) || bytes.Contains(rec.Body.Bytes(), []byte("xxxx")) {
+				t.Fatalf("fail_open must forward the original event: status=%d body=%q", rec.Code, rec.Body.Bytes()[:min(rec.Body.Len(), 120)])
+			}
+			got := spy.last()
+			if got == nil {
+				t.Fatal("no health report")
+			}
+			if got.Err != nil {
+				t.Fatalf("fail_open apply error reported to health as %v", got.Err)
+			}
+			failed := 0
+			for _, ex := range reg.ListExecutions(0) {
+				if ex.Phase == "sse" && !ex.OK && ex.FailPolicyUsed == transform.FailOpen {
+					failed++
+				}
+			}
+			if failed != 1 {
+				t.Fatalf("want exactly one fail_open sse failure record, got %d", failed)
+			}
+		})
+	}
+}
+
 func TestSSETransform_OversizeEventFailClosedStops(t *testing.T) {
 	oversize := sseOversizeBody()
 	hs := newHarness(t, sseOversizeUpstream(oversize))
