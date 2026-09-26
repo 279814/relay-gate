@@ -12,6 +12,7 @@ import (
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
@@ -156,7 +157,10 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		// 会把 fmt.Errorf("%w", …) 外层的 SQL/驱动碎片回给客户端。
 		writeJSON(w, http.StatusConflict, errBody{conflictClientMessage(err)})
 	default:
-		s.log.Error("内部错误", "err", err)
+		// §2.4：包装错误可能带出站 API key / proxy userinfo；客户端仍回固定文案，
+		// 日志属性必须先过 RedactDiagnosticText（已知凭据来自 upstream 行）。
+		safeErr := sample.RedactDiagnosticText(err.Error(), s.knownUpstreamRedactKeys())
+		s.log.Error("内部错误", "err", safeErr)
 		writeJSON(w, http.StatusInternalServerError, errBody{"internal error"})
 	}
 }
