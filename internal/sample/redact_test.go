@@ -121,6 +121,72 @@ func TestRedactHeaders_ScansKnownKeysInNonAuthHeaders(t *testing.T) {
 	}
 }
 
+// Stored sample headers (RedactHeaders → RedactText) must share RedactSecrets
+// encoding coverage — raw ReplaceAll alone leaves QueryEscape, lowercase-%XX,
+// and mixed-case JSON \u00XX forms in X-Custom / Referer. Live RoundTrip
+// header map stays unredacted (RedactHeaders returns a copy).
+func TestRedactHeaders_RedactsEncodedKeyForms_LiveUntouched(t *testing.T) {
+	const key = "sk-hdr/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	if enc == key {
+		t.Fatal("test key must differ under QueryEscape")
+	}
+	lower := lowerPercentHexForTest(enc)
+	if lower == enc {
+		t.Fatal("test key QueryEscape form must contain A-F hex digits")
+	}
+	escMixed := mixedCaseJSONByteUnicodeEscapeForTest(key)
+	const unrelatedU = `\u4e2d\u6587`
+	const unrelatedPct = `%2Fkeep`
+
+	// Live auth header for RoundTrip still carries the raw key.
+	live := http.Header{}
+	live.Set("Authorization", "Bearer "+key)
+
+	in := http.Header{}
+	in.Set("X-Custom", "token="+enc+" low="+lower+" u="+escMixed+
+		" note="+unrelatedU+" pct="+unrelatedPct+" trail")
+	in.Set("Referer", "https://example.com/page?q="+enc+"&keep=1")
+	in.Set("Authorization", "Bearer "+key)
+
+	out := RedactHeaders(in, []string{key})
+	for _, name := range []string{"X-Custom", "Referer"} {
+		got := out.Get(name)
+		for _, leak := range []string{key, enc, lower, escMixed} {
+			if strings.Contains(got, leak) {
+				t.Fatalf("stored %s still contains secret form %q in: %q", name, leak, got)
+			}
+		}
+	}
+	custom := out.Get("X-Custom")
+	if !strings.Contains(custom, unrelatedU) {
+		t.Fatalf("unrelated \\u sequence must stay: %q", custom)
+	}
+	if !strings.Contains(custom, unrelatedPct) {
+		t.Fatalf("unrelated percent sequence must stay: %q", custom)
+	}
+	if !strings.Contains(custom, "trail") {
+		t.Fatalf("unrelated header text must stay: %q", custom)
+	}
+	if !strings.Contains(out.Get("Referer"), "keep=1") {
+		t.Fatalf("unrelated Referer query must stay: %q", out.Get("Referer"))
+	}
+	if strings.Contains(out.Get("Authorization"), key) {
+		t.Fatalf("stored auth header still has raw key: %q", out.Get("Authorization"))
+	}
+
+	// Live RoundTrip map must remain untouched (copy semantics).
+	if live.Get("Authorization") != "Bearer "+key {
+		t.Fatalf("live RoundTrip auth header lost raw key: %q", live.Get("Authorization"))
+	}
+	if in.Get("Authorization") != "Bearer "+key {
+		t.Fatalf("RedactHeaders mutated input auth header: %q", in.Get("Authorization"))
+	}
+	if in.Get("X-Custom") == out.Get("X-Custom") {
+		t.Fatal("expected stored copy to differ from live input after redaction")
+	}
+}
+
 func TestRedactBodyKeys(t *testing.T) {
 	const key = "sk-body-embedded-secret-key"
 	body := []byte(`{"model":"m","api_key":"` + key + `","system":"hello"}`)
