@@ -91,6 +91,13 @@ func runServer() error {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("创建数据目录 %s: %w", dataDir, err)
 	}
+	// 下面的 bootstrap / keyring 恢复与初始化都会写 data/secrets，必须与 SQLite
+	// 同处实例锁之下：第二个进程在这里以 ErrInstanceLocked 失败，不碰 secrets。
+	instanceLock, err := store.AcquireInstanceLock(dbPath)
+	if err != nil {
+		return err
+	}
+	defer instanceLock.Close()
 	if err := credential.MaybeBootstrap(dataDir, os.Stdout); err != nil {
 		return fmt.Errorf("首次凭据: %w", err)
 	}
@@ -129,7 +136,7 @@ func runServer() error {
 	if err := credSvc.RestorePersistedGrace(dataDir); err != nil {
 		return fmt.Errorf("恢复 Relay grace: %w", err)
 	}
-	st, err := store.Open(cfg.DBPath, cipher)
+	st, err := store.OpenLocked(cfg.DBPath, cipher, instanceLock)
 	if err != nil {
 		return err
 	}

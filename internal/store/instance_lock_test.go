@@ -31,6 +31,49 @@ func TestInstanceLockIsExclusiveAndReleased(t *testing.T) {
 	}
 }
 
+func TestOpenLockedTakesOverHeldLock(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "relay.db")
+	cipher, err := NewCipher("test-passphrase-at-least-16-chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := AcquireInstanceLock(databasePath)
+	if err != nil {
+		t.Fatalf("AcquireInstanceLock: %v", err)
+	}
+	defer held.Close()
+
+	if _, err := Open(databasePath, cipher); !errors.Is(err, ErrInstanceLocked) {
+		t.Fatalf("Open while held error = %v, want ErrInstanceLocked", err)
+	}
+	if _, err := OpenLocked(filepath.Join(directory, "other.db"), cipher, held); !errors.Is(err, ErrUnsafeLockPath) {
+		t.Fatalf("OpenLocked other path error = %v, want ErrUnsafeLockPath", err)
+	}
+
+	st, err := OpenLocked(databasePath, cipher, held)
+	if err != nil {
+		t.Fatalf("OpenLocked: %v", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatalf("Close after handoff: %v", err)
+	}
+	if _, err := AcquireInstanceLock(databasePath); !errors.Is(err, ErrInstanceLocked) {
+		t.Fatalf("lock after handoff error = %v, want ErrInstanceLocked (Store must own it)", err)
+	}
+	if _, err := OpenLocked(databasePath, cipher, held); !errors.Is(err, ErrUnsafeLockPath) {
+		t.Fatalf("reuse handed-off lock error = %v, want ErrUnsafeLockPath", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := AcquireInstanceLock(databasePath)
+	if err != nil {
+		t.Fatalf("lock after Store.Close: %v", err)
+	}
+	_ = again.Close()
+}
+
 func TestInstanceLockRejectsSymlinkLockFile(t *testing.T) {
 	directory := t.TempDir()
 	target := filepath.Join(directory, "target")
