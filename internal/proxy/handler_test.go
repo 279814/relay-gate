@@ -708,6 +708,49 @@ func TestHandler_ExtractModelErrorDoesNotEchoBodySecret(t *testing.T) {
 	}
 }
 
+// 顶层重复 model 必须 400 且零上游（§6.2）。第二个 model 藏在非法值之后也一样：
+// 宽松的上游解析器（NaN、尾逗号）仍会看到它并取后者，与网关选路的 model 不一致。
+// 嵌套在对象/数组里的 model 不算重复。
+func TestHandler_DuplicateTopLevelModelZeroUpstream(t *testing.T) {
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+
+	rejected := []string{
+		`{"model":"claude-opus-5","model":"other"}`,
+		`{"model":"claude-opus-5","mod\u0065l":"other"}`,
+		`{"model":"claude-opus-5","x":NaN,"model":"other"}`,
+		`{"model":"claude-opus-5","x":[1,],"model":"other"}`,
+		`{"model":"claude-opus-5",,"model":"other"}`,
+	}
+	for _, body := range rejected {
+		hits.Store(0)
+		rec := hs.serve(hs.anthropicRequest(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status=%d want 400 body=%s", body, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid_request_error") {
+			t.Errorf("%s: 响应应含 invalid_request_error，得到 %s", body, rec.Body.String())
+		}
+		if n := hits.Load(); n != 0 {
+			t.Errorf("%s: RoundTrips=%d want 0", body, n)
+		}
+	}
+
+	hits.Store(0)
+	nested := `{"model":"claude-opus-5","messages":[{"model":"x"}],"metadata":{"model":"y"},"max_tokens":1}`
+	rec := hs.serve(hs.anthropicRequest(nested))
+	if rec.Code != 200 {
+		t.Fatalf("nested model status=%d want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("nested model RoundTrips=%d want 1", n)
+	}
+}
+
 // 点名已配置但停用的精确 ModelName 时，不得落到兜底上游（零 RoundTrip）。
 // 从未配置的名字仍可走兜底；启用精确名仍正常转发。
 func TestHandler_DisabledExactModelNameZeroUpstream(t *testing.T) {
