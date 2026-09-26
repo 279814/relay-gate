@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,6 +208,98 @@ func (g *gatingConfig) Snapshot() (*router.Snapshot, error) {
 }
 func (g *gatingConfig) Settings() (model.Settings, error) { return g.inner.Settings() }
 func (g *gatingConfig) RunState() (store.RunState, error) { return g.inner.RunState() }
+
+// HalfOpen on ResultView / request_log must stay on the Route that claimed
+// RecoveryGate. A sibling tried in the same client request (failover after
+// the claimed Route fails) must not inherit the request-scoped flag.
+func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
+	var releaseB func()
+	hs := newMultiHarness(t,
+		func(w http.ResponseWriter, r *http.Request) {
+			// Free recovering sibling so nextCandidate can pick it.
+			if releaseB != nil {
+				releaseB()
+			}
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte(`half-open probe down`))
+		},
+		respondOK(`{"id":"from-sibling","type":"message"}`),
+	)
+	hs.cfg.settings.HalfOpenEnabled = true
+	hs.cfg.settings.RetryMaxAttempts = 2
+	hs.cfg.settings.RealTotalSec = 30
+	hs.health.dead[100] = true
+	hs.health.recovering[200] = true
+
+	var ok bool
+	releaseB, ok = hs.h.recovery.TryAcquire(200)
+	if !ok {
+		t.Fatal("pre-hold RecoveryGate on recovering sibling")
+	}
+
+	rep := &halfOpenRouteReporter{}
+	hs.h.WithHealthReporter(rep)
+
+	rec := hs.serve(hs.req())
+	if rec.Code != 200 {
+		t.Fatalf("want failover to sibling, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	hs.assertHits(t, 1, 1)
+
+	got := rep.all()
+	if len(got) < 2 {
+		t.Fatalf("want reports for claimed + sibling, got %v", got)
+	}
+	var sawClaimed, sawSibling bool
+	for _, g := range got {
+		switch g.routeID {
+		case 100:
+			sawClaimed = true
+			if !g.halfOpen {
+				t.Error("claimed half-open Route 100 must report HalfOpen true")
+			}
+		case 200:
+			sawSibling = true
+			if g.halfOpen {
+				t.Error("sibling Route 200 must not inherit HalfOpen true")
+			}
+		}
+	}
+	if !sawClaimed {
+		t.Error("missing report for claimed Route 100")
+	}
+	if !sawSibling {
+		t.Error("missing report for sibling Route 200")
+	}
+}
+
+type halfOpenRouteReporter struct {
+	mu  sync.Mutex
+	got []halfOpenReport
+}
+
+type halfOpenReport struct {
+	routeID  int64
+	halfOpen bool
+}
+
+func (r *halfOpenRouteReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ho := false
+	if res != nil {
+		ho = res.HalfOpen
+	}
+	r.got = append(r.got, halfOpenReport{routeID: routeID, halfOpen: ho})
+}
+
+func (r *halfOpenRouteReporter) TriggerProbe(int64) {}
+
+func (r *halfOpenRouteReporter) all() []halfOpenReport {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]halfOpenReport(nil), r.got...)
+}
 
 // Armed half-open must not RoundTrip after the Route is disabled between
 // RecoveryGate acquire and send. Re-enable does not replay the skipped send.
