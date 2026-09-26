@@ -2,7 +2,6 @@ package model
 
 import (
 	"net/http"
-	"os"
 )
 
 // Outcome 是一次转发的结果分类（§3.6.2）。
@@ -102,10 +101,11 @@ type Sample struct {
 }
 
 // ReleaseTempFiles 删除样本持有的 spill 临时文件。可重复调用。
+// 越出 SpillDir 的路径拒删，避免毒化的 RespBodyFile 删到 spill 树外。
 func (s *Sample) ReleaseTempFiles() {
 	if s == nil || s.RespBodyFile == "" {
 		return
 	}
-	_ = os.Remove(s.RespBodyFile)
+	RemoveSpillFile(s.RespBodyFile)
 	s.RespBodyFile = ""
 }

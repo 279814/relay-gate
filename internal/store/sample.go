@@ -106,7 +106,7 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 				return true, err
 			}
 			_ = os.Remove(encPath)
-			_ = os.Remove(smp.RespBodyFile)
+			model.RemoveSpillFile(smp.RespBodyFile)
 			smp.RespBodyFile = ""
 			smp.Truncated |= model.TruncRespBody
 			droppedForQuota = true
@@ -128,7 +128,7 @@ func (s *Store) InsertSampleWithinQuota(smp *model.Sample, maxBytes int64) (inse
 		case len(smp.RespBody) > 0 || smp.RespBodyFile != "":
 			smp.RespBody = nil
 			if smp.RespBodyFile != "" {
-				_ = os.Remove(smp.RespBodyFile)
+				model.RemoveSpillFile(smp.RespBodyFile)
 				smp.RespBodyFile = ""
 			}
 			smp.Truncated |= model.TruncRespBody
@@ -178,8 +178,10 @@ func plainSampleBodyBytes(smp *model.Sample) int64 {
 	}
 	n := int64(len(smp.InBody) + len(smp.OutBody) + len(smp.RespBody))
 	if smp.RespBodyFile != "" {
-		if fi, err := os.Stat(smp.RespBodyFile); err == nil {
-			n += fi.Size()
+		if p, err := model.ConfinedSpillPath(smp.RespBodyFile); err == nil {
+			if fi, err := os.Stat(p); err == nil {
+				n += fi.Size()
+			}
 		}
 	}
 	return n
@@ -209,19 +211,25 @@ func truncateSamplePlainBodies(smp *model.Sample, rem int64) {
 		rem -= int64(len(smp.OutBody))
 	}
 	if smp.RespBodyFile != "" {
-		fi, err := os.Stat(smp.RespBodyFile)
+		p, err := model.ConfinedSpillPath(smp.RespBodyFile)
 		if err != nil {
-			_ = os.Remove(smp.RespBodyFile)
+			smp.RespBodyFile = ""
+			smp.Truncated |= model.TruncRespBody
+			return
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			model.RemoveSpillFile(p)
 			smp.RespBodyFile = ""
 			smp.Truncated |= model.TruncRespBody
 			return
 		}
 		if fi.Size() > rem {
 			if rem <= 0 {
-				_ = os.Remove(smp.RespBodyFile)
+				model.RemoveSpillFile(p)
 				smp.RespBodyFile = ""
-			} else if err := os.Truncate(smp.RespBodyFile, rem); err != nil {
-				_ = os.Remove(smp.RespBodyFile)
+			} else if err := os.Truncate(p, rem); err != nil {
+				model.RemoveSpillFile(p)
 				smp.RespBodyFile = ""
 			}
 			smp.Truncated |= model.TruncRespBody
