@@ -342,8 +342,9 @@ func NewManager() *Manager {
 //
 // 新建池时会丢掉该 Upstream 上网络身份已变的旧池（关空闲连接、从 map
 // 删除）。否则每次改 proxy / Host / revision 都会在 map 里多留一份历史
-// Transport，空闲连接永远不收。同身份下其它 connect 预算的池保留。
-// 在途 RoundTrip 仍持有旧 *Transport 引用，可读完。
+// Transport，空闲连接永远不收。同身份下其它 connect 预算的池保留，但数量
+// 以 maxConnectTimeoutSiblings 为上限，避免改 *connect_sec 后每个历史值
+// 永久占一个池。在途 RoundTrip 仍持有旧 *Transport 引用，可读完。
 func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 	key := network.poolKey()
 
@@ -381,17 +382,29 @@ func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
 	return transport, nil
 }
 
+// maxConnectTimeoutSiblings 是同一网络身份下允许多少个不同 connect 预算的池。
+//
+// 生产同时只用 real / L1 / L2 / count_tokens 四档；保留兄弟池是为了它们能
+// 并存。超过这个数只可能来自 *connect_sec 设置被反复改写后的历史值——
+// 「保留兄弟」不得变成「每个旧秒数永远占一个 Transport」。
+const maxConnectTimeoutSiblings = 4
+
 // detachStaleLocked 取出该 Upstream 上网络身份已过期的池，并从 map 删除。
-// 调用方必须已持有 manager.mu 写锁；CloseIdleConnections 由调用方在锁外做。
+// 同身份下 connect 预算兄弟超过 maxConnectTimeoutSiblings 的也摘掉（保留
+// 刚请求的那一个）。调用方必须已持有 manager.mu 写锁；CloseIdleConnections
+// 由调用方在锁外做。
 func (manager *Manager) detachStaleLocked(network NetworkConfig) []*Transport {
 	keys := manager.byUpstream[network.UpstreamID]
 	if len(keys) == 0 {
 		return nil
 	}
 	prefix := network.networkIdentityPrefix() + "\x00"
+	currentKey := network.poolKey()
 	stale := make([]*Transport, 0)
+	sameIdentity := make([]string, 0)
 	for key := range keys {
 		if strings.HasPrefix(key, prefix) {
+			sameIdentity = append(sameIdentity, key)
 			continue
 		}
 		if transport, ok := manager.pools[key]; ok {
@@ -399,6 +412,22 @@ func (manager *Manager) detachStaleLocked(network NetworkConfig) []*Transport {
 			delete(manager.pools, key)
 		}
 		delete(keys, key)
+	}
+	if excess := len(sameIdentity) - maxConnectTimeoutSiblings; excess > 0 {
+		for _, key := range sameIdentity {
+			if excess == 0 {
+				break
+			}
+			if key == currentKey {
+				continue
+			}
+			if transport, ok := manager.pools[key]; ok {
+				stale = append(stale, transport)
+				delete(manager.pools, key)
+			}
+			delete(keys, key)
+			excess--
+		}
 	}
 	return stale
 }
