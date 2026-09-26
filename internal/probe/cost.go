@@ -21,7 +21,8 @@ import (
 // 计数器比没有计数器更糟。
 type Cost struct {
 	mu sync.Mutex
-	// day 是当前累计的日期（本地时区 YYYY-MM-DD）。跨天时归零重开。
+	// day 是当前累计的 UTC 日期（YYYY-MM-DD），与 probe_cost_daily.day_utc
+	// 及 CostPersister.restoreFromDaily 一致。跨 UTC 日时归零重开。
 	day string
 	// perRoute 是各 Route 明细，§5.2d 明确要求「各 Route 明细」。
 	perRoute map[int64]*RouteCost
@@ -30,6 +31,11 @@ type Cost struct {
 	perUpstream map[int64]*UpstreamCost
 
 	now func() time.Time // 测试注入时钟
+}
+
+// utcDay 与 restoreFromDaily / day_utc 同一套日期键。
+func utcDay(t time.Time) string {
+	return t.UTC().Format("2006-01-02")
 }
 
 // RouteCost 是单个 Route 的 L2 开销。
@@ -100,7 +106,7 @@ func (c *Cost) AddL2(routeID int64, ok bool, estTokens int) {
 	rc.LastL2At = c.now().UnixMilli()
 }
 
-// rollLocked 跨天时清零，并在首次调用时把 day 初始化成今天。
+// rollLocked 跨 UTC 日时清零，并在首次调用时把 day 初始化成今天（UTC）。
 // 调用方必须已持有锁。
 //
 // 每个读写入口都必须先调它，两个理由：
@@ -109,10 +115,10 @@ func (c *Cost) AddL2(routeID int64, ok bool, estTokens int) {
 //   - day 的零值是空串，与任何日期都不相等，所以首次调用会走清零分支，
 //     顺带完成初始化。少调一处就是「计数永远是 0」
 //
-// 按本地时区分天而不是 UTC：看这个数字的人是按自己的一天来判断
-// 「今天探了多少次」的。
+// 按 UTC 分天：GET /admin/api/probe-cost 的「今日」必须与 probe_cost_daily.day_utc
+// 对齐；本地时区跨日晚于 UTC 时，否则 Snapshot 会在 UTC 日切换后仍带着昨天的总量。
 func (c *Cost) rollLocked() {
-	today := c.now().Format("2006-01-02")
+	today := utcDay(c.now())
 	if c.day == today {
 		return
 	}
@@ -173,7 +179,7 @@ func (c *Cost) Restore(snap CostSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if snap.Day != c.now().Format("2006-01-02") {
+	if snap.Day != utcDay(c.now()) {
 		return
 	}
 	c.day = snap.Day

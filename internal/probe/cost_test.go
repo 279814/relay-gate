@@ -8,7 +8,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
-// atDay 造一个时钟固定在某天的 Cost。
+// atDay 造一个时钟固定在某 UTC 日的 Cost。
 func atDay(day string) (*Cost, func(string)) {
 	c := NewCost()
 	cur := mustParseDay(day)
@@ -17,7 +17,7 @@ func atDay(day string) (*Cost, func(string)) {
 }
 
 func mustParseDay(day string) time.Time {
-	t, err := time.ParseInLocation("2006-01-02 15:04", day, time.Local)
+	t, err := time.ParseInLocation("2006-01-02 15:04", day, time.UTC)
 	if err != nil {
 		panic(err)
 	}
@@ -72,7 +72,7 @@ func TestCost_TracksFailuresSeparately(t *testing.T) {
 }
 
 func TestCost_RollsOverAtMidnight(t *testing.T) {
-	// 「今日」必须真的是今日。跨天不清零的话，这个数字会一直涨，
+	// 「今日」必须真的是今日（UTC）。跨 UTC 日不清零的话，这个数字会一直涨，
 	// 「今天探了 4300 次」就成了「自上次重启以来探了 4300 次」——
 	// 两者对「策略是否过激」的判断完全不同。
 	c, setDay := atDay("2026-07-31 23:59")
@@ -92,6 +92,32 @@ func TestCost_RollsOverAtMidnight(t *testing.T) {
 	}
 	if len(snap.Routes) != 0 || len(snap.Upstreams) != 0 {
 		t.Errorf("跨天后明细应清空，得到 routes=%v ups=%v", snap.Routes, snap.Upstreams)
+	}
+}
+
+func TestCost_SnapshotExcludesPreviousUTCDay(t *testing.T) {
+	// GET /admin/api/probe-cost 的今日快照必须按 UTC 日切：本地日历还没跨日时，
+	// UTC 午夜之后也不能继续带着前一 UTC 日的总量。
+	loc := time.FixedZone("UTC-8", -8*3600)
+	c := NewCost()
+	var cur time.Time
+	c.now = func() time.Time { return cur }
+
+	// 本地 15:30 / UTC 23:30 —— 仍属 2026-07-31（UTC）。
+	cur = time.Date(2026, 7, 31, 15, 30, 0, 0, loc)
+	c.AddL2(10, true, 100)
+	if snap := c.Snapshot(); snap.Day != "2026-07-31" || snap.EstTokens != 100 {
+		t.Fatalf("UTC 午夜前应保留当日计数，得到 %+v", snap)
+	}
+
+	// 本地仍是 7/31 20:00，但 UTC 已是 8/01 04:00。
+	cur = time.Date(2026, 7, 31, 20, 0, 0, 0, loc)
+	snap := c.Snapshot()
+	if snap.Day != "2026-08-01" {
+		t.Errorf("Day = %q，期望 2026-08-01（UTC）", snap.Day)
+	}
+	if snap.L2Count != 0 || snap.EstTokens != 0 {
+		t.Errorf("UTC 跨日后昨日总量不得进入今日快照，得到 %+v", snap)
 	}
 }
 
