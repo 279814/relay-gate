@@ -215,6 +215,30 @@ func TestManager_KeyChangeKeepsSiblingConnectTimeoutPools(t *testing.T) {
 	}
 }
 
+// 改 *connect_sec 会换一个 connect 预算键；同身份保留兄弟不得演变成
+// 「每个历史秒数永久占一个池」。超出 maxConnectTimeoutSiblings 必须摘掉。
+func TestManager_ConnectTimeoutChurnBoundsSiblingPools(t *testing.T) {
+	manager := newTestManager(t)
+	upstream := netUpstream()
+
+	created := maxConnectTimeoutSiblings + 3
+	var newest *Transport
+	for n := 1; n <= created; n++ {
+		newest = mustTransport(t, manager, netFor(upstream, time.Duration(n)*time.Second))
+	}
+	if got := manager.PoolCount(); got > maxConnectTimeoutSiblings {
+		t.Fatalf("connect 预算历史值不得无限堆积，PoolCount=%d want ≤%d",
+			got, maxConnectTimeoutSiblings)
+	}
+	if got := manager.PoolCount(); got >= created {
+		t.Fatalf("创建了 %d 个不同 connect 预算却一个都没裁，PoolCount=%d", created, got)
+	}
+	newestTimeout := time.Duration(created) * time.Second
+	if again := mustTransport(t, manager, netFor(upstream, newestTimeout)); again != newest {
+		t.Fatal("刚建的 connect 预算不得被裁剪误伤")
+	}
+}
+
 func TestManager_DifferentUpstreamsNeverSharePool(t *testing.T) {
 	manager := newTestManager(t)
 	first := netUpstream()
