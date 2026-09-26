@@ -248,6 +248,68 @@ func TestAPI_SecurityCanary_CapsNoteInDetail(t *testing.T) {
 	}
 }
 
+// Legacy security_finding rows may still hold a raw upstream key in Detail
+// (Insert stores as-is; only ScanText redacts on write). GET list must not
+// echo that secret in JSON (§2.4).
+func TestAPI_ListSecurityFindings_RedactsLegacyDetailSecret(t *testing.T) {
+	const key = "sk-LEGACY-FINDING-DETAIL-KEY99"
+	s, _ := newTestServer(t)
+	up := &model.Upstream{
+		Name: "legacy-finding-up", BaseURL: "https://legacy-finding.example",
+		APIKey: key, Enabled: true,
+	}
+	up.Defaults()
+	if err := s.st.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	f := security.Finding{
+		ID:       "legacy-detail-secret-1",
+		AtMS:     1,
+		Severity: security.SeverityHigh,
+		Category: "xss_pattern",
+		Summary:  "legacy row",
+		Detail:   "matched body fragment token=" + key + " trailer",
+		Source:   "passive",
+	}
+	if err := s.st.InsertSecurityFinding(f); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Routes(testAdminPW)
+	rec := do(t, h, "GET", "/admin/api/security/findings", "", true)
+	if rec.Code != 200 {
+		t.Fatalf("findings status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, key) {
+		t.Fatal("findings JSON still contains fixture secret from legacy Detail")
+	}
+	var resp struct {
+		Findings []security.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse findings: %v", err)
+	}
+	if len(resp.Findings) < 1 {
+		t.Fatal("expected at least one finding")
+	}
+	found := false
+	for _, got := range resp.Findings {
+		if got.ID != f.ID {
+			continue
+		}
+		found = true
+		if strings.Contains(got.Detail, key) {
+			t.Fatal("finding Detail still contains fixture secret")
+		}
+		if !strings.Contains(got.Detail, "…") {
+			t.Fatalf("Detail missing masked secret form: %q", got.Detail)
+		}
+	}
+	if !found {
+		t.Fatal("legacy finding id missing from list response")
+	}
+}
+
 // SMTP dial/auth errors are uncontrolled I/O text. The admin test endpoint
 // must not echo them — writeErr's default maps unknowns to "internal error".
 func TestAPI_SMTPTestDoesNotEchoRawSendError(t *testing.T) {

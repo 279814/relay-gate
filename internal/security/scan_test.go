@@ -213,6 +213,32 @@ func TestCenterRingBound(t *testing.T) {
 	}
 }
 
+// RedactFindingForRead is the API read-path backstop for legacy plaintext
+// Detail (§2.4); it must not leave the raw key in any free-text field.
+func TestRedactFindingForRead_MasksDetailAndSummary(t *testing.T) {
+	const key = "sk-READ-PATH-FINDING-KEY99"
+	f := Finding{
+		Summary:          "saw " + key,
+		Detail:           "body has " + key + " here",
+		IncompleteReason: "reason " + key,
+		ReqID:            "req-" + key,
+		Upstream:         "up-" + key,
+	}
+	got := RedactFindingForRead(f, []string{key})
+	for _, field := range []string{got.Summary, got.Detail, got.IncompleteReason, got.ReqID, got.Upstream} {
+		if strings.Contains(field, key) {
+			t.Fatalf("field still contains raw secret: %q", field)
+		}
+		if !strings.Contains(field, "…") {
+			t.Fatalf("field missing masked form: %q", field)
+		}
+	}
+	// Original must be unchanged (read path must not mutate the store copy).
+	if !strings.Contains(f.Detail, key) {
+		t.Fatal("RedactFindingForRead mutated caller's Detail")
+	}
+}
+
 // Short needles (< MinRedactableKeyLen, including "") must not be used as
 // ReplaceAll targets — they would corrupt URLs like ?key=1.
 func TestRedactSecrets_SkipsShortSecretNeedles(t *testing.T) {
