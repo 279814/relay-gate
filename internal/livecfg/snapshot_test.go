@@ -44,6 +44,41 @@ func TestBuildPublishedConfig_EndpointManualHeadersNotSharedWithBundle(t *testin
 	}
 }
 
+// HeaderTemplate.Values 是 []string：只拷外层 HeaderTemplate 仍与 bundle 共享
+// Values backing。发布后改 bundle 侧 Values 不得污染 probe 快照。
+func TestBuildPublishedConfig_HeaderTemplateValuesNotSharedWithBundle(t *testing.T) {
+	headers := []model.HeaderTemplate{{Name: "X-Test", Values: []string{"before"}}}
+	ep := &model.UpstreamEndpoint{
+		ID: 1, UpstreamID: 1, Kind: model.EndpointMessages,
+		AuthProfile: model.EndpointAuthProfile{
+			Mode: model.AuthModeBearer, SecretRef: "api_key", ManualHeaders: headers,
+		},
+	}
+	bundle := &store.ConfigBundle{
+		Upstreams:  []*model.Upstream{{ID: 1, Name: "s1", BaseURL: "https://s1.example.com", Enabled: true}},
+		ModelNames: []*model.ModelName{{ID: 1, Name: "m1", Protocol: model.ProtoAnthropic, Enabled: true}},
+		Routes:     []*model.Route{{ID: 1, ModelNameID: 1, UpstreamID: 1, Enabled: true}},
+		Endpoints:  []*model.UpstreamEndpoint{ep},
+		Settings:   model.DefaultSettings(),
+	}
+	pub, err := buildPublishedConfig(bundle, 1, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := pub.Probe.Endpoints[1][model.EndpointMessages]
+	if got == nil || len(got.AuthProfile.ManualHeaders) != 1 {
+		t.Fatal("probe endpoint ManualHeaders missing")
+	}
+	if got.AuthProfile.ManualHeaders[0].Values[0] != "before" {
+		t.Fatalf("want before, got %q", got.AuthProfile.ManualHeaders[0].Values[0])
+	}
+	headers[0].Values[0] = "after-bundle-mutate"
+	if got.AuthProfile.ManualHeaders[0].Values[0] != "before" {
+		t.Fatalf("probe HeaderTemplate.Values must not share backing with bundle: got %q",
+			got.AuthProfile.ManualHeaders[0].Values[0])
+	}
+}
+
 // ModelName / Route 无 slice/map 字段；Upstream.ProbeHeaders 是 map，浅拷贝会与
 // bundle 共享 backing。发布后改 bundle 侧元素不得污染 routing 快照。
 func TestBuildPublishedConfig_ProbeHeadersNotSharedWithBundle(t *testing.T) {

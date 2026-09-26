@@ -201,6 +201,18 @@ func (s *ProbeSnapshot) secretRevisionsFor(target model.SemanticTarget, identity
 	return out
 }
 
+// cloneHeaderTemplates 拷贝外层 slice，并拷贝每个元素的 Values，避免与源共享 backing。
+func cloneHeaderTemplates(in []model.HeaderTemplate) []model.HeaderTemplate {
+	out := make([]model.HeaderTemplate, len(in))
+	for i, h := range in {
+		out[i] = model.HeaderTemplate{Name: h.Name}
+		if h.Values != nil {
+			out[i].Values = append([]string(nil), h.Values...)
+		}
+	}
+	return out
+}
+
 // buildPublishedConfig 从一份 ConfigBundle 构建同代 PublishedConfig。
 func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedAt time.Time) (*PublishedConfig, error) {
 	if bundle == nil {
@@ -262,9 +274,10 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	}
 	for _, ep := range bundle.Endpoints {
 		copyEP := *ep
-		// AuthProfile.ManualHeaders 是 slice：浅拷贝会与 bundle 共享 backing。
+		// AuthProfile.ManualHeaders 是 slice；HeaderTemplate.Values 也是 slice。
+		// 只拷外层会与 bundle 共享 Values backing。
 		if ep.AuthProfile.ManualHeaders != nil {
-			copyEP.AuthProfile.ManualHeaders = append([]model.HeaderTemplate(nil), ep.AuthProfile.ManualHeaders...)
+			copyEP.AuthProfile.ManualHeaders = cloneHeaderTemplates(ep.AuthProfile.ManualHeaders)
 		}
 		if probe.Endpoints[ep.UpstreamID] == nil {
 			probe.Endpoints[ep.UpstreamID] = map[model.EndpointKind]*model.UpstreamEndpoint{}
@@ -282,7 +295,7 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	for _, version := range bundle.RecipeVersions {
 		copyVersion := *version
 		if version.Headers != nil {
-			copyVersion.Headers = append([]model.HeaderTemplate(nil), version.Headers...)
+			copyVersion.Headers = cloneHeaderTemplates(version.Headers)
 		}
 		if version.Body != nil {
 			copyVersion.Body = append([]byte(nil), version.Body...)
@@ -292,7 +305,7 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	for _, profile := range bundle.ClientProfiles {
 		copyProfile := *profile
 		if profile.SafeHeaders != nil {
-			copyProfile.SafeHeaders = append([]model.HeaderTemplate(nil), profile.SafeHeaders...)
+			copyProfile.SafeHeaders = cloneHeaderTemplates(profile.SafeHeaders)
 		}
 		if profile.BodyTemplate != nil {
 			copyProfile.BodyTemplate = append([]byte(nil), profile.BodyTemplate...)
