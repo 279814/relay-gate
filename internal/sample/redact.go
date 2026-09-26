@@ -6,7 +6,6 @@ package sample
 
 import (
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -133,37 +132,26 @@ func RedactBodyKeys(body []byte, keys []string) []byte {
 	return []byte(out)
 }
 
-// RedactText 脱敏一段文本里的 key，用于 URL 与 query string。
+// RedactText 脱敏一段文本里的 key，用于 URL、query string 与非认证头值。
 //
 // 为什么 URL 也要扫：少数中转站接受 `?key=<key>` 查询参数，由
 // FixedQueryTemplate / legacy_exact 表达（§7.1；base_url 本身不允许 query，
 // §5.1）—— 出站 URL 会被整段存进样本的 out_url。入站 query 同理
-// （客户端可能两处都带）。
-// 漏掉这两个字段，§9.4 的「真 key 全表 grep 零命中」就不成立。
+// （客户端可能两处都带）。非认证头（X-Custom / Referer 等）同理：
+// transform 或回显可能只留下编码形态。
+// 漏掉这些字段，§9.4 的「真 key 全表 grep 零命中」就不成立。
 //
-// URL 里的 key 还有一种**编码**形态：`sk-a/b+c` 在 query 里会写成
-// `sk-a%2Fb%2Bc`，直接搜原文搜不到。所以除了原文，还试一次 URL 解码后的
-// 匹配 —— 命中就把编码形态一并替换掉。
+// 与 finding Detail / RedactBodyKeys / RedactDiagnostic 共用
+// security.RedactSecrets：原文、url.QueryEscape、小写 hex 百分号编码、
+// 以及 JSON \uXXXX（hex 大小写不敏感）一并遮掉。不能只做原文
+// ReplaceAll，否则编码形态会漏进落库样本头 / out_url / in_query。
+// 短于 MinRedactableKeyLen 的 needle 由 RedactSecrets 跳过。
+// 只改落库副本；live RoundTrip 头图不经此路径。
 func RedactText(s string, keys []string) string {
 	if s == "" {
 		return s
 	}
-	for _, k := range keys {
-		if len(k) < model.MinRedactableKeyLen {
-			continue
-		}
-		masked := store.MaskKey(k)
-		s = strings.ReplaceAll(s, k, masked)
-		// 编码形态：只在与原文不同时才多做一次替换
-		if enc := url.QueryEscape(k); enc != k {
-			s = strings.ReplaceAll(s, enc, masked)
-		}
-		// 少数实现用 PathEscape（不把空格编成 +），也一并覆盖
-		if enc := url.PathEscape(k); enc != k {
-			s = strings.ReplaceAll(s, enc, masked)
-		}
-	}
-	return s
+	return security.RedactSecrets(s, keys)
 }
 
 // urlCarryingResponseHeaders 是响应里可能携带完整 URL 的头。
