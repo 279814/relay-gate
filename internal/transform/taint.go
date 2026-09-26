@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 // secretPlaceholderRE matches declarative {{SECRET:name}} tokens only.
@@ -43,13 +45,18 @@ func (t *TaintBag) Secrets() []string {
 	return out
 }
 
+// Redact removes rendered secret plaintext from diagnostics.
+//
+// Needles shorter than model.MinRedactableKeyLen (including empty) are skipped:
+// using "api", "key", or "" as a ReplaceAll target would corrupt URLs and
+// error text. sample.RedactText / security.RedactSecrets share this floor.
 func (t *TaintBag) Redact(s string) string {
 	if t == nil || s == "" {
 		return s
 	}
 	out := s
 	for _, p := range t.plains {
-		if len(p) == 0 {
+		if len(p) < model.MinRedactableKeyLen {
 			continue
 		}
 		out = strings.ReplaceAll(out, string(p), "[REDACTED]")
