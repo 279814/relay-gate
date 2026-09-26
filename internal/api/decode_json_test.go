@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -9,8 +10,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/store"
 )
+
+// recordingCancelAdmin tracks CancelCalibration so decode failures can assert
+// the store/admin write path was never entered.
+type recordingCancelAdmin struct {
+	*probe.Service
+	cancelCalls int
+	lastRev     int64
+}
+
+func (a *recordingCancelAdmin) CancelCalibration(ctx context.Context, runID string, expectedRevision int64) error {
+	a.cancelCalls++
+	a.lastRev = expectedRevision
+	return a.Service.CancelCalibration(ctx, runID, expectedRevision)
+}
 
 // 管理端 body 只允许一个 JSON 值。Decoder.Decode 会读完第一个对象就停，
 // 若不拒绝尾随值，第一个对象会被写入 store——这是配置注入面。
@@ -115,5 +131,23 @@ func TestDecodeJSON_ErrorOmitsBodySecret(t *testing.T) {
 	}
 	if strings.Contains(logBuf.String(), fixtureSecret) {
 		t.Fatalf("log leaked fixture secret")
+	}
+}
+
+// cancelCalibration must not call CancelCalibration with a zero ExpectedRevision
+// when the body fails to decode (previously ignored decode errors).
+func TestCancelCalibration_InvalidBodyDoesNotCancel(t *testing.T) {
+	s, _ := newTestServer(t)
+	recAdmin := &recordingCancelAdmin{Service: probe.NewService(s.st, nil, nil, nil, nil, nil)}
+	h := s.WithProbeAdmin(recAdmin).Routes(testAdminPW)
+
+	rec := do(t, h, http.MethodPost, "/admin/api/calibrations/run-1/cancel",
+		`{"expected_revision":1}{"extra":true}`, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d: %s, want 400", rec.Code, rec.Body.String())
+	}
+	if recAdmin.cancelCalls != 0 {
+		t.Fatalf("CancelCalibration called %d times (rev=%d), want 0 on decode failure",
+			recAdmin.cancelCalls, recAdmin.lastRev)
 	}
 }
