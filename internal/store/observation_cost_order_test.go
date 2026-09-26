@@ -43,6 +43,9 @@ func TestCommitProbeObservation_CostWriteErrorKeepsObservation(t *testing.T) {
 	if !result.ExecutionStored || result.Reachability != model.ApplyCurrent {
 		t.Fatalf("result=%+v", result)
 	}
+	if result.CostCharged {
+		t.Fatal("CostCharged must be false when probe_cost_* insert fails")
+	}
 	if result.CommittedReachability == nil || result.CommittedReachability.LastObservationOrder != 1 {
 		t.Fatalf("reachability must persist: %+v", result.CommittedReachability)
 	}
@@ -93,6 +96,9 @@ func TestCommitProbeObservation_RecordsCostAfterObservationCommit(t *testing.T) 
 	if !result.ExecutionStored || result.Reachability != model.ApplyCurrent {
 		t.Fatalf("result=%+v", result)
 	}
+	if !result.CostCharged {
+		t.Fatal("CostCharged must be true after successful probe_cost_* commit")
+	}
 
 	var costEvents int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM probe_cost_event WHERE event_id=?`, "execution:"+execution.ID).Scan(&costEvents); err != nil {
@@ -137,6 +143,9 @@ func TestCommitProbeObservation_ConfigStaleSkipsCost(t *testing.T) {
 	}
 	if result.Reachability != model.ApplyConfigStale {
 		t.Fatalf("disposition=%s want config_stale", result.Reachability)
+	}
+	if result.CostCharged {
+		t.Fatal("CostCharged must be false when cost insert is skipped")
 	}
 
 	var costEvents, costDaily int

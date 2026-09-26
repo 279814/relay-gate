@@ -473,6 +473,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 	gateGen := s.gate.EnsureGeneration(up.ID)
 	var out Outcome
 	var reachable bool
+	var costCharged bool
 	if s.executor != nil {
 		// Probe 快照不可用时不发送（§4.9）。
 		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
@@ -483,6 +484,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		}
 		res := s.execL1(ctx, up, settings)
 		out = res.Outcome
+		costCharged = res.Apply.CostCharged
 		if out.Verdict == health.VerdictIgnore || res.Decision.ErrorClass == model.ErrorIgnored {
 			return
 		}
@@ -508,7 +510,9 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		reachable = out.Verdict == health.VerdictOK
 	}
 
-	s.countL1(up.ID, reachable)
+	if costCharged {
+		s.countL1(up.ID, reachable)
+	}
 	recovered := s.gate.Report(up.ID, gateGen, reachable, out.Err)
 
 	if !reachable {
@@ -601,6 +605,7 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 		return
 	}
 	var out Outcome
+	var costCharged bool
 	if s.executor != nil {
 		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
 			if _, err := src.ProbeSnapshot(); errors.Is(err, livecfg.ErrProbeSnapshotUnavailable) {
@@ -608,7 +613,9 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 				return
 			}
 		}
-		out = s.execL2(ctx, up, mn, rt, settings).Outcome
+		res := s.execL2(ctx, up, mn, rt, settings)
+		out = res.Outcome
+		costCharged = res.Apply.CostCharged
 	} else {
 		tr, err := s.tr.TransportFor(up, outbound.L2Budget(settings))
 		if err != nil {
@@ -620,7 +627,9 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	if out.Verdict == health.VerdictIgnore {
 		return
 	}
-	s.countL2(rt.ID, mn, out)
+	if costCharged {
+		s.countL2(rt.ID, mn, out)
+	}
 
 	changed := s.track.Report(health.Report{
 		RouteID: rt.ID, Generation: generation,
@@ -848,6 +857,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	// 绑定世代：手动探活过程中若 Route 被 Forget，迟到结论不得污染同 id 新行。
 	generation := ensureRouteGeneration(s.track, rt.ID)
 
+	var costCharged bool
 	if s.executor != nil {
 		kind, ok := mn.Protocol.Endpoint()
 		if !ok {
@@ -869,6 +879,7 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 			return l1, Outcome{Verdict: health.VerdictIgnore}, nil
 		}
 		l2 = res.Outcome
+		costCharged = res.Apply.CostCharged
 	} else {
 		l2Transport, terr := s.tr.TransportFor(up, outbound.L2Budget(settings))
 		if terr != nil {
@@ -877,7 +888,9 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 		l2 = s.prober(l2Transport).L2(ctx, up, mn, rt, settings)
 	}
 	if l2.Verdict != health.VerdictIgnore {
-		s.countL2(rt.ID, mn, l2)
+		if costCharged {
+			s.countL2(rt.ID, mn, l2)
+		}
 		// HalfOpen stays false: ProbeNow does not Claim L2 / hold RecoveryGate
 		// (§9.1). An unarmed manual 2xx must not revive StateDead.
 		s.track.Report(health.Report{
@@ -890,6 +903,9 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 }
 
 // countL1 / countL2 记一次探活开销（§5.2d）。
+//
+// 调用方必须在 CostCharged（probe_cost_* 已成功落库）之后才调用，否则
+// GET /admin/api/probe-cost 的内存快照会高于当日 probe_cost_daily。
 //
 // cost 为 nil 时静默跳过：记账是观测，绝不该让探活因为它而失败。
 func (s *Scheduler) countL1(upstreamID int64, ok bool) {
