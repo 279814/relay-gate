@@ -120,11 +120,11 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	start := time.Now()
 	resp, err := p.Transport.RoundTrip(prepared.request)
 	if err != nil {
-		if out, ok := ctxOutcome(ctx, err); ok {
+		// 不包装 RoundTrip 原文（含 ctx 到期分支）：*url.Error 含完整请求 URL（可带 query Secret），
+		// 会经 Scheduler「上游 L1 失败」日志与 route_health.last_error 外泄。
+		if out, ok := ctxOutcome(ctx, proxy.ErrConnect); ok {
 			return out
 		}
-		// 不包装 RoundTrip 原文：*url.Error 含完整请求 URL（可带 query Secret），
-		// 会经 Scheduler「上游 L1 失败」日志与 route_health.last_error 外泄。
 		return Outcome{Verdict: health.VerdictUnavailable, Err: proxy.ErrConnect}
 	}
 	defer resp.Body.Close()
@@ -205,7 +205,8 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 	if err != nil {
 		headerTimer.Stop()
 		headerCancel()
-		if out, ok := ctxOutcome(ctx, err); ok {
+		// 同 L1：ctx 到期分支也不带 RoundTrip 原文。
+		if out, ok := ctxOutcome(ctx, proxy.ErrConnect); ok {
 			return out
 		}
 		// headerCtx 到期但外层 ctx 还没到 —— 是首 Token 超时，算上游的账。
