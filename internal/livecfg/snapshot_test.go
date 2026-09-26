@@ -3,9 +3,45 @@ package livecfg
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/store"
 )
+
+// ModelName / Route 无 slice/map 字段；Upstream.ProbeHeaders 是 map，浅拷贝会与
+// bundle 共享 backing。发布后改 bundle 侧元素不得污染 routing 快照。
+func TestBuildPublishedConfig_ProbeHeadersNotSharedWithBundle(t *testing.T) {
+	headers := map[string]string{"user-agent": "before"}
+	up := &model.Upstream{
+		ID: 1, Name: "s1", BaseURL: "https://s1.example.com",
+		Enabled: true, ProbeHeaders: headers,
+	}
+	mn := &model.ModelName{ID: 1, Name: "m1", Protocol: model.ProtoAnthropic, Enabled: true}
+	rt := &model.Route{ID: 1, ModelNameID: 1, UpstreamID: 1, Enabled: true}
+	bundle := &store.ConfigBundle{
+		Upstreams:  []*model.Upstream{up},
+		ModelNames: []*model.ModelName{mn},
+		Routes:     []*model.Route{rt},
+		Settings:   model.DefaultSettings(),
+	}
+	pub, err := buildPublishedConfig(bundle, 1, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed := pub.Routing.Upstreams[1]
+	if routed == nil || routed.ProbeHeaders == nil {
+		t.Fatal("routing upstream ProbeHeaders missing")
+	}
+	if routed.ProbeHeaders["user-agent"] != "before" {
+		t.Fatalf("want before, got %q", routed.ProbeHeaders["user-agent"])
+	}
+	headers["user-agent"] = "after-bundle-mutate"
+	if routed.ProbeHeaders["user-agent"] != "before" {
+		t.Fatalf("routing ProbeHeaders must not share map with bundle: got %q",
+			routed.ProbeHeaders["user-agent"])
+	}
+}
 
 func TestProbeSnapshot_NoSecretPlaintextAndExpectations(t *testing.T) {
 	st := testStore(t)
