@@ -10,6 +10,7 @@ import (
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
+	"github.com/279814/relay-gate/internal/store"
 )
 
 // WithCredentials wires credential + keyring services for the admin credentials page.
@@ -256,12 +257,23 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			s.writeErr(w, err)
 			return
 		}
-		// §12.7 step 7: re-encrypt direct secrets under pending master in one TX
-		// before MarkDBCommitted. Failure here aborts prepared (DB unchanged).
+		// §12.7 step 7: re-encrypt direct secrets + persisted Relay Key under
+		// pending before MarkDBCommitted / ActivatePending. Failure on SQLite
+		// rewrap aborts prepared (DB unchanged). Relay reseal after SQLite
+		// commit keeps pending for recovery (same class as MarkDBCommitted fail).
 		if err := s.st.RewrapDirectSecrets(body.NewMaster); err != nil {
 			_ = s.keyring.AbortPrepared(rid)
 			s.writeErr(w, err)
 			return
+		}
+		if s.creds != nil {
+			if err := s.creds.ResealActiveRelayUnder(func(plain string) (string, error) {
+				return store.SealEnvelopeUnder(body.NewMaster, plain)
+			}); err != nil {
+				exitMaint = false
+				s.writeErr(w, err)
+				return
+			}
 		}
 		if err := s.keyring.MarkDBCommitted(rid); err != nil {
 			// DB already under new master — keep pending + maintenance for recovery.
@@ -282,11 +294,6 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		if s.creds != nil {
-			if err := s.creds.ResealActiveRelayEnvelope(); err != nil {
-				exitMaint = false
-				s.writeErr(w, err)
-				return
-			}
 			s.creds.ClearMasterReveal()
 		}
 		if err := s.keyring.MarkCleaned(rid); err != nil {
@@ -312,6 +319,14 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
+	if s.creds != nil {
+		if err := s.creds.ResealActiveRelayUnder(func(plain string) (string, error) {
+			return store.SealEnvelopeUnder(body.NewMaster, plain)
+		}); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+	}
 	if err := s.keyring.MarkDBCommitted(rid); err != nil {
 		s.writeErr(w, err)
 		return
@@ -326,10 +341,6 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if s.creds != nil {
-		if err := s.creds.ResealActiveRelayEnvelope(); err != nil {
-			s.writeErr(w, err)
-			return
-		}
 		s.creds.ClearMasterReveal()
 	}
 	if err := s.keyring.MarkCleaned(rid); err != nil {

@@ -275,16 +275,21 @@ func (s *Service) RevealActiveRelayKey() (string, error) {
 	return plain, nil
 }
 
-// ResealActiveRelayEnvelope re-encrypts the in-memory Relay Key under the
-// current EnvelopeCipher active master (§12.7 after ActivateMaster). When
-// dataDir is set, also rewrites the on-disk relay_key envelope so restart
-// under only the new master still loads. No-op when no envelope is wired or
-// no sealed copy exists.
-func (s *Service) ResealActiveRelayEnvelope() error {
+// ResealActiveRelayUnder decrypts the active Relay Key with the live
+// EnvelopeCipher and reseals it via sealUnder (typically store.SealEnvelopeUnder
+// with the pending master). Call during prepared, before MarkDBCommitted /
+// ActivatePending (§12.7 step 7), so a crash that leaves only the new active
+// key still opens bootstrap-credentials.json. When dataDir is set, rewrites
+// the on-disk relay_key envelope. No-op when no envelope is wired or no sealed
+// copy exists. Does not log key material.
+func (s *Service) ResealActiveRelayUnder(sealUnder func(plain string) (string, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.envelope == nil || s.relayActiveEnc == "" {
 		return nil
+	}
+	if sealUnder == nil {
+		return errors.New("Relay Key 重封需要 sealUnder")
 	}
 	plain, err := s.envelope.DecryptEnvelope(s.relayActiveEnc)
 	if err != nil {
@@ -293,7 +298,7 @@ func (s *Service) ResealActiveRelayEnvelope() error {
 	if digestRelayKey(plain) != s.relayActive {
 		return errors.New("Relay Key 密文与摘要不一致")
 	}
-	enc, err := s.envelope.EncryptEnvelope(plain)
+	enc, err := sealUnder(plain)
 	if err != nil {
 		return fmt.Errorf("加密 Relay Key: %w", err)
 	}
@@ -303,7 +308,7 @@ func (s *Service) ResealActiveRelayEnvelope() error {
 		}
 	}
 	s.relayActiveEnc = enc
-	s.noteLocked("relay_reseal", "envelope rewrapped under new master")
+	s.noteLocked("relay_reseal", "envelope rewrapped under pending master")
 	return nil
 }
 

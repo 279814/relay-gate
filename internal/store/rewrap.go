@@ -348,6 +348,14 @@ func encryptUnder(passphrase, plain string) (string, error) {
 	return encryptWith(aead, plain)
 }
 
+// SealEnvelopeUnder builds a v1 envelope under passphrase without switching
+// the live Cipher. Used during Master Key rotation (§12.7 step 7) so the
+// persisted Relay Key can be resealed under pending before ActivatePending
+// drops the old active key.
+func SealEnvelopeUnder(passphrase, plain string) (string, error) {
+	return encryptEnvelopeUnder(passphrase, plain)
+}
+
 func encryptEnvelopeUnder(passphrase, plain string) (string, error) {
 	aead, root, err := deriveMaster(passphrase)
 	if err != nil {
