@@ -612,6 +612,51 @@ func TestSetSamplePinned(t *testing.T) {
 	}
 }
 
+// §5.4：最多置顶 50 个 Group；第 51 个被拒绝，已置顶的不受影响且仍可取消。
+func TestSetSamplePinned_RejectsBeyondCap(t *testing.T) {
+	st := testStore(t)
+	base := time.Now().UnixMilli()
+	ids := make([]int64, 0, MaxPinnedSampleGroups+1)
+	for i := 0; i <= MaxPinnedSampleGroups; i++ {
+		s := mkSample(base + int64(i))
+		if err := st.InsertSample(s); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, s.ID)
+	}
+
+	for _, id := range ids[:MaxPinnedSampleGroups] {
+		if err := st.SetSamplePinned(id, true); err != nil {
+			t.Fatalf("前 %d 个置顶应成功：%v", MaxPinnedSampleGroups, err)
+		}
+	}
+	extra := ids[MaxPinnedSampleGroups]
+	if err := st.SetSamplePinned(extra, true); !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("第 %d 个置顶应被拒绝（ErrValidation），得到 %v", MaxPinnedSampleGroups+1, err)
+	}
+	if got, _ := st.GetSample(extra); got.Pinned {
+		t.Fatal("被拒绝的样本不应置顶")
+	}
+	if err := st.SetSamplePinned(ids[0], true); err != nil {
+		t.Fatalf("已置顶样本重复置顶应成功：%v", err)
+	}
+	for _, id := range ids[:MaxPinnedSampleGroups] {
+		if got, _ := st.GetSample(id); !got.Pinned {
+			t.Fatalf("已置顶样本 %d 不应被取消", id)
+		}
+	}
+
+	if err := st.SetSamplePinned(ids[0], false); err != nil {
+		t.Fatalf("达到上限时取消置顶应允许：%v", err)
+	}
+	if got, _ := st.GetSample(ids[0]); got.Pinned {
+		t.Fatal("应取消置顶")
+	}
+	if err := st.SetSamplePinned(extra, true); err != nil {
+		t.Fatalf("腾出名额后置顶应成功：%v", err)
+	}
+}
+
 // UI 的「一键清空」（§3.6.3d）。
 func TestClearSamples(t *testing.T) {
 	st := testStore(t)

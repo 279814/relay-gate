@@ -409,13 +409,43 @@ func (s *Store) GetSample(id int64) (*model.Sample, error) {
 	return smp, err
 }
 
+// MaxPinnedSampleGroups 是 §5.4 默认保留策略中的「最多置顶 50 个 Group」。
+const MaxPinnedSampleGroups = 50
+
 // SetSamplePinned 置顶/取消置顶。置顶的样本不参与滚动清理。
+//
+// §5.4：已置顶达到 MaxPinnedSampleGroups 时拒绝新的置顶；已置顶的行重复置顶
+// 和取消置顶始终允许。计数与更新在同一条 UPDATE 里完成，并发置顶不会越过上限。
 func (s *Store) SetSamplePinned(id int64, pinned bool) error {
-	res, err := s.db.Exec(`UPDATE sample SET pinned = ? WHERE id = ?`, pinned, id)
+	if !pinned {
+		res, err := s.db.Exec(`UPDATE sample SET pinned = 0 WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		return checkAffected(res)
+	}
+	res, err := s.db.Exec(`UPDATE sample SET pinned = 1 WHERE id = ? AND (
+		pinned = 1 OR (SELECT COUNT(*) FROM sample WHERE pinned = 1) < ?)`,
+		id, MaxPinnedSampleGroups)
 	if err != nil {
 		return err
 	}
-	return checkAffected(res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	var exists int
+	if err := s.db.QueryRow(`SELECT 1 FROM sample WHERE id = ?`, id).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return fmt.Errorf("%w: 最多置顶 %d 个样本组，请先取消置顶其他样本",
+		model.ErrValidation, MaxPinnedSampleGroups)
 }
 
 // PruneSamples 按条数、天数与磁盘配额清理，各维度独立取先到者（§5.4）。
