@@ -7,14 +7,7 @@ import (
 )
 
 func TestConfinedSpillPath_RejectsEscapeAllowsNormal(t *testing.T) {
-	root := SpillDir()
-	parent := filepath.Dir(root)
-	outsideDir, err := os.MkdirTemp(parent, "relay-gate-spill-outside-*")
-	if err != nil {
-		t.Fatalf("MkdirTemp outside spill root: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(outsideDir) })
-
+	outsideDir := mkdirOutsideSpill(t)
 	outside := filepath.Join(outsideDir, "secret.txt")
 	const payload = "SECRET_OUTSIDE"
 	if err := os.WriteFile(outside, []byte(payload), 0o600); err != nil {
@@ -24,9 +17,9 @@ func TestConfinedSpillPath_RejectsEscapeAllowsNormal(t *testing.T) {
 	if _, err := ConfinedSpillPath(outside); err == nil {
 		t.Fatal("absolute path outside SpillDir must be rejected")
 	}
-	escape := filepath.Join(root, "..", filepath.Base(outsideDir), "secret.txt")
-	if _, err := ConfinedSpillPath(escape); err == nil {
-		t.Fatalf(".. escape %q must be rejected", escape)
+	dotDot := filepath.Join(SpillDir(), "..", "relay-gate-not-a-spill")
+	if _, err := ConfinedSpillPath(dotDot); err == nil {
+		t.Fatalf(".. escape %q must be rejected", dotDot)
 	}
 	got, err := os.ReadFile(outside)
 	if err != nil {
@@ -36,7 +29,21 @@ func TestConfinedSpillPath_RejectsEscapeAllowsNormal(t *testing.T) {
 		t.Fatalf("outside file must stay untouched, got %q", got)
 	}
 
-	normal, err := os.CreateTemp(root, "relay-gate-sample-*.tmp")
+	// Custom root: sibling of a TempDir child must not resolve as in-tree.
+	root := t.TempDir()
+	sibling := filepath.Join(filepath.Dir(root), "sibling-secret.txt")
+	if err := os.WriteFile(sibling, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(sibling) })
+	if _, err := ConfinedSpillPathIn(root, sibling); err == nil {
+		t.Fatal("path outside explicit spill root must be rejected")
+	}
+	if _, err := ConfinedSpillPathIn(root, filepath.Join(root, "..", filepath.Base(sibling))); err == nil {
+		t.Fatal(".. relative to explicit spill root must be rejected")
+	}
+
+	normal, err := os.CreateTemp(SpillDir(), "relay-gate-sample-*.tmp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,4 +66,24 @@ func TestConfinedSpillPath_RejectsEscapeAllowsNormal(t *testing.T) {
 	if string(body) != "ok-spill" {
 		t.Fatalf("normal spill read = %q, want ok-spill", body)
 	}
+}
+
+func mkdirOutsideSpill(t *testing.T) string {
+	t.Helper()
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base, err = os.UserHomeDir()
+		if err != nil || base == "" {
+			t.Fatalf("need a writable dir outside SpillDir: %v", err)
+		}
+	}
+	if rel, relErr := filepath.Rel(SpillDir(), base); relErr == nil && filepath.IsLocal(rel) {
+		t.Skipf("cache/home %q is under SpillDir %q; cannot build outside fixture", base, SpillDir())
+	}
+	dir, err := os.MkdirTemp(base, "relay-gate-spill-outside-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp outside spill root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }

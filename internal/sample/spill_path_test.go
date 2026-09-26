@@ -13,14 +13,7 @@ import (
 // outside the spill directory; a normal CreateTemp spill must still redact.
 func TestRedactBodyFile_RejectsPathEscape_AllowsNormalSpill(t *testing.T) {
 	const key = "sk-spill-confine-TEST-KEY-9f3a"
-	root := model.SpillDir()
-	parent := filepath.Dir(root)
-	outsideDir, err := os.MkdirTemp(parent, "relay-gate-spill-outside-*")
-	if err != nil {
-		t.Fatalf("MkdirTemp outside spill root: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(outsideDir) })
-
+	outsideDir := mkdirOutsideSpill(t)
 	outside := filepath.Join(outsideDir, "secret.txt")
 	const payload = "token=" + key + " keep-me"
 	if err := os.WriteFile(outside, []byte(payload), 0o600); err != nil {
@@ -30,9 +23,9 @@ func TestRedactBodyFile_RejectsPathEscape_AllowsNormalSpill(t *testing.T) {
 	if err := RedactBodyFile(outside, []string{key}); err == nil {
 		t.Fatal("absolute outside spill path must not open")
 	}
-	escape := filepath.Join(root, "..", filepath.Base(outsideDir), "secret.txt")
-	if err := RedactBodyFile(escape, []string{key}); err == nil {
-		t.Fatalf(".. stored path %q must not open", escape)
+	dotDot := filepath.Join(model.SpillDir(), "..", "relay-gate-not-a-spill")
+	if err := RedactBodyFile(dotDot, []string{key}); err == nil {
+		t.Fatalf(".. stored path %q must not open", dotDot)
 	}
 	got, err := os.ReadFile(outside)
 	if err != nil {
@@ -42,7 +35,7 @@ func TestRedactBodyFile_RejectsPathEscape_AllowsNormalSpill(t *testing.T) {
 		t.Fatalf("outside file must stay untouched, got %q", got)
 	}
 
-	f, err := os.CreateTemp(root, spillTempGlob)
+	f, err := os.CreateTemp(model.SpillDir(), spillTempGlob)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,4 +61,24 @@ func TestRedactBodyFile_RejectsPathEscape_AllowsNormalSpill(t *testing.T) {
 	if !strings.Contains(s, "trail") {
 		t.Fatalf("normal spill lost unrelated text: %q", s)
 	}
+}
+
+func mkdirOutsideSpill(t *testing.T) string {
+	t.Helper()
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base, err = os.UserHomeDir()
+		if err != nil || base == "" {
+			t.Fatalf("need a writable dir outside SpillDir: %v", err)
+		}
+	}
+	if rel, relErr := filepath.Rel(model.SpillDir(), base); relErr == nil && filepath.IsLocal(rel) {
+		t.Skipf("cache/home %q is under SpillDir %q; cannot build outside fixture", base, model.SpillDir())
+	}
+	dir, err := os.MkdirTemp(base, "relay-gate-spill-outside-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp outside spill root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
