@@ -119,6 +119,21 @@ type errBody struct {
 	Error string `json:"error"`
 }
 
+// conflictClientMessage 返回三类冲突 sentinel 的稳定文案。
+// 包装层可保留给日志 / errors.Is，但不得进入 409 JSON。
+func conflictClientMessage(err error) string {
+	switch {
+	case errors.Is(err, store.ErrRevisionConflict):
+		return store.ErrRevisionConflict.Error()
+	case errors.Is(err, store.ErrDependencyConflict):
+		return store.ErrDependencyConflict.Error()
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		return store.ErrIdempotencyConflict.Error()
+	default:
+		return "conflict"
+	}
+}
+
 // writeErr 把领域错误映射到 HTTP 状态码。
 // 校验类错误一律 400 并把原文回给调用方——这些错误信息是刻意写给人看的，
 // 吞掉它们会让配置出错时只剩一个无信息的 400。
@@ -137,7 +152,9 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		// 并发改同一行、还有依赖没清、或同 ID 换了内容重放。
 		// 落到 default 会回 500，把「重新读一遍再试」变成「服务器坏了」，
 		// 调用方无从判断该重试还是该改配置。
-		writeJSON(w, http.StatusConflict, errBody{err.Error()})
+		// 正文只用 sentinel 原文：errors.Is 仍认包装层，但 err.Error()
+		// 会把 fmt.Errorf("%w", …) 外层的 SQL/驱动碎片回给客户端。
+		writeJSON(w, http.StatusConflict, errBody{conflictClientMessage(err)})
 	default:
 		s.log.Error("内部错误", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody{"internal error"})

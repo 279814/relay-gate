@@ -9,8 +9,10 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -37,6 +39,35 @@ func TestWriteErrMapsConflictErrorsTo409(t *testing.T) {
 		if recorder.Body.Len() == 0 {
 			t.Errorf("%s 冲突没有回错误说明，调用方看不出该怎么办", testCase.label)
 		}
+	}
+}
+
+// TestWriteErrConflictBodyOmitsWrappedDriverText 确认包装层里的假 SQL
+// 碎片不会进 409 JSON；errors.Is 仍选 409，正文只有 sentinel。
+func TestWriteErrConflictBodyOmitsWrappedDriverText(t *testing.T) {
+	server, _ := newTestServer(t)
+	wrapped := fmt.Errorf(
+		"UPDATE upstream: UNIQUE constraint failed: upstream.name (2067): %w",
+		store.ErrRevisionConflict,
+	)
+	recorder := httptest.NewRecorder()
+	server.writeErr(recorder, wrapped)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("wrapped revision 映射为 %d, want %d", recorder.Code, http.StatusConflict)
+	}
+	body := recorder.Body.String()
+	for _, leak := range []string{
+		"UNIQUE constraint",
+		"upstream.name",
+		"2067",
+		"UPDATE upstream",
+	} {
+		if strings.Contains(body, leak) {
+			t.Errorf("409 body 泄露包装/驱动碎片 %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, `"error":"revision conflict"`) {
+		t.Errorf("409 body = %s, want sentinel \"revision conflict\"", body)
 	}
 }
 
