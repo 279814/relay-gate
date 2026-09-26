@@ -172,3 +172,133 @@ func TestCommitCalibrationSuccess_CredentialChangeRequiresRetest(t *testing.T) {
 		t.Fatalf("凭据变更后 commit error=%v, want ErrRevisionConflict", err)
 	}
 }
+
+// CommitCalibrationSuccess 也会写 auth_manual_headers_json，须拒绝纯字面凭据。
+func TestCommitCalibrationSuccess_RejectsLiteralManualHeaderAuth(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	up := mkUpstream(t, st, "cal-literal-mh")
+	mn := mkModelName(t, st, "cal-literal-mh-model", model.ProtoAnthropic)
+	rt := &model.Route{ModelNameID: mn.ID, UpstreamID: up.ID, Priority: 1, Weight: 1, Enabled: true}
+	if err := st.CreateRoute(rt); err != nil {
+		t.Fatal(err)
+	}
+	ep, err := st.Endpoint(ctx, up.ID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &model.CalibrationRun{
+		RouteID:  rt.ID,
+		Endpoint: model.EndpointMessages,
+		Candidates: []model.CalibrationCandidate{
+			{AuthMode: model.AuthModeBearer, SourceRecipe: model.RecipeIdentity{
+				Storage: model.RecipeStorageEmbedded, Origin: model.RecipeCompact,
+				TemplateID: "builtin:messages:compact:1", Revision: 1,
+			}, EstimatedInputTokens: 12},
+		},
+	}
+	if err := st.CreateCalibrationRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.StartCalibrationRun(ctx, run.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := st.GetCalibrationRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := st.PrepareCalibrationCandidate(ctx, fresh.ID, 0, fresh.Revision, PrepareCalibrationMaterial{
+		Origin: model.RecipeCompact, Method: "POST",
+		Headers:    []model.HeaderTemplate{{Name: "content-type", Values: []string{"application/json"}}},
+		Body:       []byte(`{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`),
+		BodyIsText: true, StreamExpected: true, TimeoutProfile: model.TimeoutL2Standard,
+		EstimatedInputTokens: 12, SourceTemplateID: "builtin:messages:compact:1", SourceRevision: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err = st.GetCalibrationRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := fresh.Candidates[0]
+	execID := candidate.ExecutionID
+	if err := st.MarkCalibrationSendStarted(ctx, fresh.ID, 0, execID, fresh.Revision); err != nil {
+		t.Fatal(err)
+	}
+	recipeID, err := st.MaterializedRecipeID(ctx, fresh.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe, err := st.GetRecipe(ctx, recipeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := nextTestObservationOrder(t, st)
+	execution := model.ProbeExecution{
+		ID: execID, Trigger: model.TriggerCalibration, UpstreamID: up.ID,
+		UpstreamNetworkRevision: up.NetworkRevision, UpstreamCredentialRevision: up.CredentialRevision,
+		EndpointID: ep.ID, EndpointRevision: ep.Revision, AuthProfileRevision: ep.AuthProfile.Revision,
+		RouteID: rt.ID, RouteCapabilityRevision: rt.CapabilityRevision,
+		ModelCapabilityRevision: mn.CapabilityRevision,
+		Endpoint:                model.EndpointMessages, RecipeBindingUse: model.BindingExplicitTest,
+		RecipeStorage: model.RecipeStorageDB, RecipeOrigin: model.RecipeCompact,
+		RecipeID: recipeID, RecipeVersionID: version.ID,
+		CalibrationRunID: fresh.ID, CandidateOrdinal: 0,
+		EvidenceHash: "evidence-cal-literal-mh",
+		ErrorClass:   model.ErrorNone, Capability: model.CapabilityUnknown,
+		Scope: model.ScopeRouteEndpoint, Reachable: true, Final: true, Success: true,
+		ObservationOrder: order, SentAtMS: order, DoneAtMS: order + 1,
+	}
+	if err := st.InsertProbeExecution(ctx, &execution); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err = st.GetCalibrationRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRev := ep.Revision
+	commitEP := *ep
+	commitEP.AuthProfile.ManualHeaders = []model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"sk-live-secret-value-1234"}},
+	}
+	_, err = st.CommitCalibrationSuccess(ctx, model.CalibrationCommit{
+		RunID: fresh.ID, ExpectedRunRevision: fresh.Revision, CandidateOrdinal: 0,
+		ExecutionID: execID, Endpoint: commitEP, ExpectedEndpointRevision: ep.Revision,
+		RecipeID: recipeID, ExpectedRecipeRevision: recipe.Revision, SelectedVersionID: version.ID,
+	})
+	if !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("literal manual auth error = %v, want validation", err)
+	}
+	got, err := st.GetEndpoint(ep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision != beforeRev || len(got.AuthProfile.ManualHeaders) != 0 {
+		t.Fatalf("literal must not persist: rev=%d headers=%+v", got.Revision, got.AuthProfile.ManualHeaders)
+	}
+
+	commitEP.AuthProfile.ManualHeaders = []model.HeaderTemplate{
+		{Name: "X-Custom-Auth", Values: []string{"{{UPSTREAM_API_KEY}}"}},
+	}
+	fresh, err = st.GetCalibrationRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.CommitCalibrationSuccess(ctx, model.CalibrationCommit{
+		RunID: fresh.ID, ExpectedRunRevision: fresh.Revision, CandidateOrdinal: 0,
+		ExecutionID: execID, Endpoint: commitEP, ExpectedEndpointRevision: ep.Revision,
+		RecipeID: recipeID, ExpectedRecipeRevision: recipe.Revision, SelectedVersionID: version.ID,
+	})
+	if err != nil {
+		t.Fatalf("placeholder manual auth must commit: %v", err)
+	}
+	got, err = st.GetEndpoint(ep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.AuthProfile.ManualHeaders) != 1 ||
+		got.AuthProfile.ManualHeaders[0].Values[0] != "{{UPSTREAM_API_KEY}}" {
+		t.Fatalf("placeholder not stored: %+v", got.AuthProfile.ManualHeaders)
+	}
+}
