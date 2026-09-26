@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -34,22 +35,79 @@ type Store struct {
 // 所以由迁移完成后统一设置即可。busy_timeout 同样是连接级，一并放这里。
 const connPragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 
+// InstanceLock 是 Open 持有的同一把按数据库路径的独占 OS 锁。
+// 启动时 data/secrets 的写入必须先于 Open，却要与 SQLite 受同一把锁保护：
+// 先 AcquireInstanceLock，写完 secrets 再交给 OpenLocked。
+type InstanceLock struct {
+	lock *instanceLock
+	path string
+}
+
+// AcquireInstanceLock 取得 dsn 对应数据库的实例锁；已被持有时返回 ErrInstanceLocked。
+func AcquireInstanceLock(dsn string) (*InstanceLock, error) {
+	path := dbPathOf(dsn)
+	lock, err := acquireInstanceLock(path)
+	if err != nil {
+		return nil, err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("%w: %v", ErrUnsafeLockPath, err)
+	}
+	return &InstanceLock{lock: lock, path: absolute}, nil
+}
+
+// Close 释放尚未移交给 Store 的锁；移交后为 no-op，可无条件 defer。
+func (l *InstanceLock) Close() error {
+	if l == nil || l.lock == nil {
+		return nil
+	}
+	lock := l.lock
+	l.lock = nil
+	return lock.Close()
+}
+
 // Open 打开（或创建）数据库并建表。
 func Open(dsn string, c *Cipher) (*Store, error) {
 	if c == nil {
 		return nil, ErrNoKey
 	}
-	databasePath := dbPathOf(dsn)
-	lock, err := acquireInstanceLock(databasePath)
+	lock, err := acquireInstanceLock(dbPathOf(dsn))
 	if err != nil {
 		return nil, err
 	}
-	closeLock := true
-	defer func() {
-		if closeLock {
-			_ = lock.Close()
-		}
-	}()
+	st, err := openLocked(dsn, c, lock)
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// OpenLocked 与 Open 相同，但使用调用方已持有的同路径实例锁。
+// 成功时锁归 Store 所有（随 Store.Close 释放）；失败时仍归调用方。
+func OpenLocked(dsn string, c *Cipher, held *InstanceLock) (*Store, error) {
+	if c == nil {
+		return nil, ErrNoKey
+	}
+	if held == nil || held.lock == nil {
+		return nil, fmt.Errorf("%w: 未持有实例锁", ErrUnsafeLockPath)
+	}
+	absolute, err := filepath.Abs(dbPathOf(dsn))
+	if err != nil || !sameFilesystemPath(absolute, held.path) {
+		return nil, fmt.Errorf("%w: 实例锁与数据库路径不一致", ErrUnsafeLockPath)
+	}
+	st, err := openLocked(dsn, c, held.lock)
+	if err != nil {
+		return nil, err
+	}
+	held.lock = nil
+	return st, nil
+}
+
+func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
+	databasePath := dbPathOf(dsn)
 
 	// Resume crash-interrupted restore before treating a missing/partial DB as empty.
 	if err := resumeIncompleteRestoreIfAny(context.Background(), databasePath, c); err != nil {
@@ -94,7 +152,6 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 	// 提前 chmod 会漏掉它们。
 	restrictPerms(dsn)
 
-	closeLock = false
 	return &Store{db: db, cipher: c, lock: lock}, nil
 }
 
