@@ -141,7 +141,7 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 	if text == "" {
 		return nil
 	}
-	safeDetail := clip(redactSecrets(text, keys), 512)
+	safeDetail := clip(RedactSecrets(text, keys), 512)
 	var out []Finding
 	add := func(sev Severity, cat, summary string) {
 		out = append(out, Finding{
@@ -168,7 +168,7 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 	return out
 }
 
-// redactSecrets replaces known credential values in evidence text.
+// RedactSecrets replaces known credential values in evidence text.
 // Keep behavior aligned with store.MaskKey (security cannot import store:
 // store already imports this package).
 //
@@ -183,7 +183,10 @@ func ScanText(text, sourceLabel string, keys ...string) []Finding {
 // (\u006b), uppercase (\u006B), and mixed per-unit forms are all removed.
 // Observer scans raw response bytes, so a secret may appear only as those
 // escapes inside a JSON string; the whole document is never decoded.
-func redactSecrets(s string, keys []string) string {
+//
+// Exported so diagnostic error text (sample.RedactDiagnosticText) can reuse
+// the same encoding coverage as finding Detail — do not fork a weaker path.
+func RedactSecrets(s string, keys []string) string {
 	for _, k := range keys {
 		if k == "" {
 			continue
