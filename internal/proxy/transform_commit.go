@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -447,9 +448,18 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		return werr
 	}
 
+	// passthrough is set once an event overflows under fail_open: the rest of
+	// the stream is forwarded as original bytes and never fed to the scanner.
+	passthrough := false
 	for {
 		n, err := src.Read(buf)
-		if n > 0 {
+		if n > 0 && passthrough {
+			if werr := writeEv(transform.SSEEvent{Raw: buf[:n]}); werr != nil {
+				res.Err = werr
+				res.BytesWritten = total
+				return res
+			}
+		} else if n > 0 {
 			events, ferr := scanner.Feed(buf[:n])
 			if ferr != nil {
 				res.Err = ferr
@@ -481,6 +491,15 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 				}
 				hitAll = append(hitAll, hits...)
 				if werr := writeEv(out); werr != nil {
+					res.Err = werr
+					res.BytesWritten = total
+					return res
+				}
+			}
+			var limitErr *transform.SSELimitError
+			if errors.As(ferr, &limitErr) {
+				passthrough = true
+				if werr := writeEv(transform.SSEEvent{Raw: limitErr.Pending}); werr != nil {
 					res.Err = werr
 					res.BytesWritten = total
 					return res
