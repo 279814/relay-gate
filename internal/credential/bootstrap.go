@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/279814/relay-gate/internal/keyring"
@@ -332,8 +333,12 @@ func writeJSON0600(path string, v any) error {
 		return err
 	}
 	_ = os.Chmod(path, 0o600)
-	return nil
+	// Directory fsync after rename (§12.7), same as keyring.
+	return syncDirAfterJSONRename(filepath.Dir(path))
 }
+
+// syncDirAfterJSONRename is syncDirectory; tests may replace it to observe the call.
+var syncDirAfterJSONRename = syncDirectory
 
 // writeSyncedFile writes content then fsyncs before close so rename of a
 // same-directory temp file promotes durable bytes (same pattern as keyring).
@@ -358,6 +363,20 @@ func writeSyncedFile(path string, content []byte, mode os.FileMode) error {
 	}
 	if err := os.Chmod(path, mode); err != nil {
 		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	// Directory fsync after rename (§12.7). Windows may not support it; the
+	// file Sync above still runs. Skip Sync errors only on Windows.
+	if err := directory.Sync(); err != nil && runtime.GOOS != "windows" {
 		return err
 	}
 	return nil
