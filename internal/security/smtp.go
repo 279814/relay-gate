@@ -91,31 +91,31 @@ func (m *AlertMailer) WithNowForTest(fn func() time.Time) *AlertMailer {
 	return m
 }
 
-// sanitizeAdminURL strips CR, LF, and NUL so an admin link cannot inject
+// sanitizeSMTPField strips CR, LF, and NUL so free-text values cannot inject
 // extra SMTP header lines when written into alert/digest messages.
-func sanitizeAdminURL(u string) string {
+func sanitizeSMTPField(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\r' || r == '\n' || r == 0 {
 			return -1
 		}
 		return r
-	}, u)
+	}, s)
 }
 
 // BuildAlertMessage builds a metadata-only MIME message (no response/conversation body).
 func BuildAlertMessage(from string, to []string, f Finding, adminURL string) []byte {
-	subj := fmt.Sprintf("[relay-gate] %s %s", f.Severity, f.Category)
+	subj := fmt.Sprintf("[relay-gate] %s %s", f.Severity, sanitizeSMTPField(f.Category))
 	body := strings.Builder{}
 	body.WriteString("relay-gate security alert (metadata only; no conversation body)\r\n\r\n")
 	body.WriteString(fmt.Sprintf("severity: %s\r\n", f.Severity))
-	body.WriteString(fmt.Sprintf("category: %s\r\n", f.Category))
-	body.WriteString(fmt.Sprintf("summary: %s\r\n", clip(f.Summary, 200)))
-	body.WriteString(fmt.Sprintf("upstream: %s\r\n", f.Upstream))
+	body.WriteString(fmt.Sprintf("category: %s\r\n", sanitizeSMTPField(f.Category)))
+	body.WriteString(fmt.Sprintf("summary: %s\r\n", sanitizeSMTPField(clip(f.Summary, 200))))
+	body.WriteString(fmt.Sprintf("upstream: %s\r\n", sanitizeSMTPField(f.Upstream)))
 	body.WriteString(fmt.Sprintf("route_id: %d\r\n", f.RouteID))
-	body.WriteString(fmt.Sprintf("req_id: %s\r\n", f.ReqID))
-	body.WriteString(fmt.Sprintf("source: %s\r\n", f.Source))
-	body.WriteString(fmt.Sprintf("finding_id: %s\r\n", f.ID))
-	if u := sanitizeAdminURL(adminURL); u != "" {
+	body.WriteString(fmt.Sprintf("req_id: %s\r\n", sanitizeSMTPField(f.ReqID)))
+	body.WriteString(fmt.Sprintf("source: %s\r\n", sanitizeSMTPField(f.Source)))
+	body.WriteString(fmt.Sprintf("finding_id: %s\r\n", sanitizeSMTPField(f.ID)))
+	if u := sanitizeSMTPField(adminURL); u != "" {
 		body.WriteString(fmt.Sprintf("admin: %s\r\n", u))
 	}
 	body.WriteString("\r\nThis message intentionally omits response bodies, secrets, and chat text.\r\n")
@@ -132,14 +132,14 @@ func BuildDigestMessage(from string, to []string, items []digestItem, adminURL s
 		f := it.finding
 		body.WriteString(fmt.Sprintf("--- item %d (count=%d) ---\r\n", i+1, it.count))
 		body.WriteString(fmt.Sprintf("severity: %s\r\n", f.Severity))
-		body.WriteString(fmt.Sprintf("category: %s\r\n", f.Category))
-		body.WriteString(fmt.Sprintf("summary: %s\r\n", clip(f.Summary, 200)))
-		body.WriteString(fmt.Sprintf("upstream: %s\r\n", f.Upstream))
+		body.WriteString(fmt.Sprintf("category: %s\r\n", sanitizeSMTPField(f.Category)))
+		body.WriteString(fmt.Sprintf("summary: %s\r\n", sanitizeSMTPField(clip(f.Summary, 200))))
+		body.WriteString(fmt.Sprintf("upstream: %s\r\n", sanitizeSMTPField(f.Upstream)))
 		body.WriteString(fmt.Sprintf("route_id: %d\r\n", f.RouteID))
-		body.WriteString(fmt.Sprintf("source: %s\r\n", f.Source))
+		body.WriteString(fmt.Sprintf("source: %s\r\n", sanitizeSMTPField(f.Source)))
 		body.WriteString("\r\n")
 	}
-	if u := sanitizeAdminURL(adminURL); u != "" {
+	if u := sanitizeSMTPField(adminURL); u != "" {
 		body.WriteString(fmt.Sprintf("admin: %s\r\n", u))
 	}
 	body.WriteString("\r\nThis message intentionally omits response bodies, secrets, and chat text.\r\n")
