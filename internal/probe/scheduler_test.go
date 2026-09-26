@@ -870,6 +870,72 @@ func TestScheduler_ProbeNow(t *testing.T) {
 	if len(reports) == 0 {
 		t.Error("手动探活的结果也要落到状态机，否则界面看到「测试通过」而状态没变")
 	}
+	for _, rep := range reports {
+		if rep.HalfOpen {
+			t.Fatal("未武装的手动 ProbeNow 不得把 Report.HalfOpen 置 true")
+		}
+	}
+}
+
+// §9.1：ProbeNow 不占 ClaimL2 / RecoveryGate；dead 上的 2xx 必须留在 dead。
+func TestScheduler_ProbeNowOKOnDeadStaysDead(t *testing.T) {
+	settings := fastSettings()
+	settings.FailThreshold = 1
+	settings.OKThreshold = 1
+
+	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(aliveSSE))
+	}))
+	t.Cleanup(srv.Close)
+
+	up := &model.Upstream{
+		ID: 10, Name: "up1", BaseURL: srv.URL,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+		L1Path: "/v1/models", Enabled: true,
+	}
+	rt := &model.Route{
+		ID: 100, ModelNameID: 1, UpstreamID: 10,
+		Priority: 1, Weight: 100, Enabled: true,
+	}
+	cfg := &fakeCfg{
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, []*model.Route{rt}),
+		settings: settings,
+		state:    store.StateRunning,
+	}
+	tr := health.NewTracker(cfg)
+	sched := NewScheduler(cfg, newFakeTransport(), tr, health.NewUpstreamGate(), discardLogger()).
+		WithTargets(testTargets(), nil)
+
+	if !tr.Report(health.Report{
+		RouteID: rt.ID, Verdict: health.VerdictUnavailable, Source: health.SourceL2,
+	}) {
+		t.Fatal("setup: 应进入 dead")
+	}
+	if tr.State(rt.ID) != model.StateDead {
+		t.Fatalf("setup: want dead, got %s", tr.State(rt.ID))
+	}
+
+	snap, err := cfg.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, l2, err := sched.ProbeNow(context.Background(), snap, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.Verdict != health.VerdictOK {
+		t.Fatalf("ProbeNow L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
+	}
+	if got := tr.State(rt.ID); got != model.StateDead {
+		t.Fatalf("未武装手动 ProbeNow 的 2xx 应留在 dead，得到 %s", got)
+	}
 }
 
 // 装配 Executor 后，ProbeNow 恰好一次 manual Execute。

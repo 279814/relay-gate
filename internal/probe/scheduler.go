@@ -878,11 +878,12 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	}
 	if l2.Verdict != health.VerdictIgnore {
 		s.countL2(rt.ID, mn, l2)
+		// HalfOpen stays false: ProbeNow does not Claim L2 / hold RecoveryGate
+		// (§9.1). An unarmed manual 2xx must not revive StateDead.
 		s.track.Report(health.Report{
 			RouteID: rt.ID, Generation: generation,
 			Verdict: l2.Verdict, Source: health.SourceL2,
-			HalfOpen: true, // Claimed / manual L2 may leave StateDead (§9.1)
-			Err:      l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
+			Err: l2.Err, TTFT: l2.TTFT, RetryAfter: l2.RetryAfter,
 		})
 	}
 	return l1, l2, nil
