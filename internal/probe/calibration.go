@@ -252,11 +252,18 @@ func (s *CalibrationService) Run(ctx context.Context) {
 		if err := s.stepOnce(ctx); err != nil && !errors.Is(err, errNoCalibrationWork) {
 			s.log.Warn("calibration step", "err", err)
 		}
+		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return
 		case <-s.wake:
-		case <-time.After(2 * time.Second):
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
 }
