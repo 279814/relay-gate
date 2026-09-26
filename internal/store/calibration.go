@@ -610,8 +610,16 @@ func (store *Store) AdvanceCalibrationAfterExecution(ctx context.Context, runID 
 		// 只有「全部候选都是 try_next_auth 且已穷尽」才写 Endpoint config_error。
 		// 单个 401/403 仍 unknown；429/5xx/timeout 的 stop 不升 config_error。
 		if disposition == model.CandidateTryNextAuth && !nextOrdinal.Valid {
-			if err = writeAuthExhaustedConfigErrorTx(ctx, tx, run); err != nil {
+			var notAuthRejected int
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM calibration_candidate
+				WHERE run_id=? AND (state!='finished' OR disposition!=?)`,
+				runID, model.CandidateTryNextAuth).Scan(&notAuthRejected); err != nil {
 				return nil, err
+			}
+			if notAuthRejected == 0 {
+				if err = writeAuthExhaustedConfigErrorTx(ctx, tx, run); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE calibration_run SET state=?,finished_at=?,revision=revision+1
