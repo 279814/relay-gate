@@ -652,3 +652,81 @@ func TestResponseTransform_BodyOverMaxBufferFailOpenPassthrough(t *testing.T) {
 		t.Fatal("transform must not apply when body exceeds buffer")
 	}
 }
+
+// sseOversizeUpstream sends one normal event, then an event with no blank-line
+// boundary that is several MiB long, in 32 KiB flushed chunks.
+func sseOversizeUpstream(oversize []byte) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		w.Write([]byte("event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n"))
+		fl.Flush()
+		for off := 0; off < len(oversize); off += 32 * 1024 {
+			end := off + 32*1024
+			if end > len(oversize) {
+				end = len(oversize)
+			}
+			w.Write(oversize[off:end])
+			fl.Flush()
+		}
+	}
+}
+
+func sseOversizeBody() []byte {
+	return bytes.Repeat([]byte("data: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"), (5<<20)/64)
+}
+
+// docs/01 §15: fail_open forwards the failing event as original bytes. An
+// event over MaxSSEEventBytes must reach the client unmodified, with earlier
+// events still transformed.
+func TestSSETransform_OversizeEventFailOpenForwardsOriginal(t *testing.T) {
+	oversize := sseOversizeBody()
+	hs := newHarness(t, sseOversizeUpstream(oversize))
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("sse-oversize-open")
+	rules := []transform.Rule{
+		{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "hi", To: "hello"},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	body := rec.Body.Bytes()
+	first := []byte("event: content_block_delta\ndata: {\"delta\":\"hello\"}\n\n")
+	if !bytes.HasPrefix(body, first) {
+		t.Fatalf("first event not transformed: %q", body[:min(len(body), 120)])
+	}
+	if !bytes.Equal(body[len(first):], oversize) {
+		t.Fatalf("oversize event not forwarded as original bytes: got %d want %d", len(body)-len(first), len(oversize))
+	}
+}
+
+func TestSSETransform_OversizeEventFailClosedStops(t *testing.T) {
+	oversize := sseOversizeBody()
+	hs := newHarness(t, sseOversizeUpstream(oversize))
+	reg := transform.NewRegistry(4)
+	set, _ := reg.CreateSet("sse-oversize-closed")
+	rules := []transform.Rule{
+		{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "hi", To: "hello"},
+	}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailClosed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.PublishSnapshot(set.ID, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	hs.h.WithTransforms(reg)
+
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","stream":true}`))
+	if bytes.Contains(rec.Body.Bytes(), []byte("zzzz")) {
+		t.Fatalf("fail_closed must not forward the oversize event: len=%d", rec.Body.Len())
+	}
+}
