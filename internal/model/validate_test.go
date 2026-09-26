@@ -216,7 +216,7 @@ func TestProxyURLRejectsDisallowedSchemes(t *testing.T) {
 		"", // 直连
 		"http://127.0.0.1:8888",
 		"https://proxy.example.com:443",
-		"HTTP://127.0.0.1:8888", // scheme 大小写不敏感（Parse 会规范化）
+		"HTTP://127.0.0.1:8888",           // scheme 大小写不敏感（Parse 会规范化）
 		"http://user:pass@127.0.0.1:8888", // docs/01 允许代理凭据
 	}
 	for _, proxy := range good {
