@@ -44,7 +44,7 @@ func (store *Store) InsertProbeExecution(ctx context.Context, execution *model.P
 	if err := insertProbeExecutionTx(ctx, tx, &copyValue); err != nil {
 		return err
 	}
-	if err := recordExecutionCostTx(ctx, tx, copyValue); err != nil {
+	if _, err := recordExecutionCostTx(ctx, tx, copyValue); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -110,24 +110,32 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 	}
 	// Cost is best-effort after the observation commits. A probe_cost_* write
 	// failure must not roll capability/reachability back to the pre-probe state.
-	if costErr := store.recordExecutionCostAfterCommit(ctx, execution); costErr != nil {
+	charged, costErr := store.recordExecutionCostAfterCommit(ctx, execution)
+	if costErr != nil {
 		slog.Default().Error("探活成本落库失败", "err", costErr, "execution_id", execution.ID)
+		return result, nil
 	}
+	result.CostCharged = charged
 	return result, nil
 }
 
 // recordExecutionCostAfterCommit writes probe_cost_event/daily in its own
 // transaction so observation commit success is independent of cost flush.
-func (store *Store) recordExecutionCostAfterCommit(ctx context.Context, execution model.ProbeExecution) error {
+// charged is true only when an event was inserted or confirmed idempotent.
+func (store *Store) recordExecutionCostAfterCommit(ctx context.Context, execution model.ProbeExecution) (bool, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
-	if err := recordExecutionCostTx(ctx, tx, execution); err != nil {
-		return err
+	charged, err := recordExecutionCostTx(ctx, tx, execution)
+	if err != nil {
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return charged, nil
 }
 
 func validateProbeExecutionEnvelope(execution model.ProbeExecution) error {
@@ -678,50 +686,50 @@ func insertProbeExecutionTx(ctx context.Context, tx *sql.Tx, execution *model.Pr
 	return nil
 }
 
-func recordExecutionCostTx(ctx context.Context, tx *sql.Tx, execution model.ProbeExecution) error {
+func recordExecutionCostTx(ctx context.Context, tx *sql.Tx, execution model.ProbeExecution) (bool, error) {
 	if execution.Trigger == model.TriggerRealTraffic {
-		return nil
+		return false, nil
 	}
 	evidence, err := revisioncodec.CostEvidenceFromExecution(execution)
 	if err != nil {
-		return err
+		return false, err
 	}
 	return recordProbeCostEvidenceTx(ctx, tx, "execution:"+execution.ID, evidence)
 }
 
-func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, evidence model.ProbeCostEvidenceV1) error {
+func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, evidence model.ProbeCostEvidenceV1) (bool, error) {
 	hash, err := revisioncodec.NewProbeCostEvidenceHash(evidence)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var closedThrough string
 	if err := tx.QueryRowContext(ctx, `SELECT closed_through_day_utc FROM probe_cost_retention_watermark WHERE singleton=1`).Scan(&closedThrough); err != nil {
-		return err
+		return false, err
 	}
 	if closedThrough != "" && evidence.DayUTC <= closedThrough {
-		return nil
+		return false, nil
 	}
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO probe_cost_event
 		(event_id,day_utc,event_kind,evidence_version,cost_evidence_hash) VALUES (?,?,?,1,?)`,
 		eventID, evidence.DayUTC, evidence.Kind, hash)
 	if err != nil {
-		return err
+		return false, err
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if inserted == 0 {
 		var storedDay, storedKind, storedHash string
 		var storedVersion int
 		if err := tx.QueryRowContext(ctx, `SELECT day_utc,event_kind,evidence_version,cost_evidence_hash
 			FROM probe_cost_event WHERE event_id=?`, eventID).Scan(&storedDay, &storedKind, &storedVersion, &storedHash); err != nil {
-			return err
+			return false, err
 		}
 		if storedDay != evidence.DayUTC || storedKind != string(evidence.Kind) || storedVersion != 1 || storedHash != hash {
-			return ErrIdempotencyConflict
+			return false, ErrIdempotencyConflict
 		}
-		return nil
+		return true, nil
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO probe_cost_daily
 		(day_utc,trigger,origin,endpoint,route_id,upstream_id,requests,succeeded,failed,canceled,
@@ -737,7 +745,10 @@ func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, 
 		evidence.UpstreamID, evidence.Requests, evidence.Succeeded, evidence.Failed, evidence.Canceled,
 		evidence.EstimatedInputTokens, evidence.ObservedOutputTokens, evidence.CanceledAfterSemantic,
 		evidence.PiggybackL2Saved)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func nullableString(value string) any {

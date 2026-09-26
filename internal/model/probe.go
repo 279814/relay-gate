@@ -398,6 +398,10 @@ type ProbeApplyResult struct {
 	Capability            ApplyDisposition
 	CommittedReachability *UpstreamReachability
 	CommittedCapability   *EndpointCapability
+	// CostCharged is true only after probe_cost_event/daily was written
+	// (or confirmed idempotent). Memory Cost.Add* must follow this flag so
+	// GET /admin/api/probe-cost cannot exceed today's durable rollup.
+	CostCharged bool
 }
 
 type ProbeRuntimeStats struct {

@@ -47,9 +47,10 @@ func (f fakeTransports) RoundTripper(_ outbound.NetworkConfig) (http.RoundTrippe
 
 // captureRecorder 记录最后一次 observation，可注入写库失败。
 type captureRecorder struct {
-	calls int
-	obs   *model.ProbeObservation
-	err   error
+	calls       int
+	obs         *model.ProbeObservation
+	err         error
+	costCharged bool
 }
 
 func (r *captureRecorder) Record(_ context.Context, v *model.ProbeObservation) (model.ProbeApplyResult, error) {
@@ -63,6 +64,7 @@ func (r *captureRecorder) Record(_ context.Context, v *model.ProbeObservation) (
 		ExecutionStored: true,
 		Reachability:    model.ApplyNotApplicable,
 		Capability:      model.ApplyNotApplicable,
+		CostCharged:     r.costCharged,
 	}, nil
 }
 

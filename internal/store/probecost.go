@@ -31,7 +31,7 @@ func (store *Store) RecordProbePiggybackSaving(ctx context.Context, eventID stri
 		return err
 	}
 	defer tx.Rollback()
-	if err := recordProbeCostEvidenceTx(ctx, tx, eventID, evidence); err != nil {
+	if _, err := recordProbeCostEvidenceTx(ctx, tx, eventID, evidence); err != nil {
 		return err
 	}
 	return tx.Commit()

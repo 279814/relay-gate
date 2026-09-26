@@ -974,6 +974,51 @@ func TestScheduler_ProbeNowUsesExecutor(t *testing.T) {
 	}
 }
 
+// Failed or skipped probe_cost_* must not raise GET /admin/api/probe-cost
+// (Cost.Snapshot) above probe_cost_daily: AddL2 runs only when CostCharged.
+func TestScheduler_ProbeNowSkipsMemoryCostWhenNotCharged(t *testing.T) {
+	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(aliveSSE))
+	})
+	cost := NewCost()
+	hs.sched.WithCost(cost)
+
+	recorder := &captureRecorder{} // CostCharged stays false: insert failed/skipped
+	executor := NewExecutor(testTargets(), nil, nil,
+		ManagerTransports{Manager: outbound.NewManager()},
+		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
+	hs.sched.WithExecutor(executor)
+
+	snap, _ := hs.cfg.Snapshot()
+	rt := snap.RoutesByModelName[1][0]
+	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.Verdict != health.VerdictOK {
+		t.Fatalf("probe should succeed, got %s (%v)", l2.Verdict, l2.Err)
+	}
+	if mem := cost.Snapshot(); mem.L2Count != 0 || mem.EstTokens != 0 {
+		t.Fatalf("memory snapshot must stay empty when CostCharged=false, got L2=%d tokens=%d",
+			mem.L2Count, mem.EstTokens)
+	}
+
+	recorder.costCharged = true
+	_, l2, err = hs.sched.ProbeNow(context.Background(), snap, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.Verdict != health.VerdictOK {
+		t.Fatalf("probe should succeed, got %s (%v)", l2.Verdict, l2.Err)
+	}
+	if mem := cost.Snapshot(); mem.L2Count != 1 {
+		t.Fatalf("CostCharged=true must AddL2 once, got L2Count=%d", mem.L2Count)
+	}
+}
+
 // spyTransportSource 是一个「一被调用就记账」的 TransportSource 探针。
 //
 // 它存在只为一件事：证明装配 Executor 后 Scheduler 不再经 Prober 回落取池。
