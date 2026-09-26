@@ -91,6 +91,9 @@ func TestParseRetryAfter(t *testing.T) {
 		{"非数字（HTTP 日期形式不支持，回落到默认冷却）", "Wed, 21 Oct 2026 07:28:00 GMT", 0},
 		// 上限保护：上游误填毫秒会把站冷藏几小时，而它早就恢复了
 		{"超大值被截到上限", "999999", maxRetryAfter},
+		// 乘法前先按秒数截断：否则 Duration 溢出会把荒谬大值 wrap 成负数
+		{"溢出秒数被截到上限", "999999999999", maxRetryAfter},
+		{"int64最大秒数被截到上限", "9223372036854775807", maxRetryAfter},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
