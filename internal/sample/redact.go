@@ -5,7 +5,6 @@
 package sample
 
 import (
-	"bytes"
 	"net/http"
 	"net/url"
 	"strings"
@@ -105,35 +104,33 @@ func redactValue(v string) string {
 // 少数中转站的自定义字段也会带上它。§9.4 的验收标准是
 // 「用真 key 字符串全表 grep 断言为 0 命中」—— 只清头满足不了。
 //
-// 全程在 []byte 上操作。走 string 转换的话，每次 `string(body)` 都是一次
-// 全量拷贝 —— body 上限 32MB、keys 通常 2~4 个、每条样本调三次，
-// 那是几百 MB 的无谓拷贝，而绝大多数样本里一个 key 都不含（§3.6.3a
-// 要求采集不拖慢转发，这条路径必须在「没命中」时接近零成本）。
+// 与 finding Detail / RedactDiagnostic 共用 security.RedactSecrets：原文、
+// url.QueryEscape、小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）
+// 一并遮掉。不能只做原文 ReplaceAll，否则编码形态会漏进落库样本
+// （PrepareBody → recordSample 的 in/out body）。
 //
-// keys 通常只有 2 个（relay key 与该站的上游 key），所以逐个 Replace
-// 足够快，不必上 Aho-Corasick。
+// 没命中时返回原 slice，不做拷贝：绝大多数样本不含 key（§3.6.3a
+// 要求采集不拖慢转发）。命中时才 string → RedactSecrets → []byte。
 func RedactBodyKeys(body []byte, keys []string) []byte {
-	// 先只做查找，不做替换：绝大多数样本不含 key，这一支直接原样返回，
-	// 一个字节都不拷。
-	var hit bool
+	if len(body) == 0 {
+		return body
+	}
+	var any bool
 	for _, k := range keys {
-		if len(k) >= model.MinRedactableKeyLen && bytes.Contains(body, []byte(k)) {
-			hit = true
+		if len(k) >= model.MinRedactableKeyLen {
+			any = true
 			break
 		}
 	}
-	if !hit {
+	if !any {
 		return body
 	}
-
-	out := body
-	for _, k := range keys {
-		if len(k) < model.MinRedactableKeyLen {
-			continue
-		}
-		out = bytes.ReplaceAll(out, []byte(k), []byte(store.MaskKey(k)))
+	s := string(body)
+	out := security.RedactSecrets(s, keys)
+	if out == s {
+		return body
 	}
-	return out
+	return []byte(out)
 }
 
 // RedactText 脱敏一段文本里的 key，用于 URL 与 query string。

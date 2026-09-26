@@ -183,6 +183,46 @@ func TestRedactBodyKeys_Edges(t *testing.T) {
 	}
 }
 
+// PrepareBody (recordSample stored outbound/inbound bodies) must share
+// RedactSecrets encoding coverage — raw-only ReplaceAll would leave the
+// QueryEscape form in the sample. Live RoundTrip body keeps the raw key.
+func TestPrepareBody_RedactsQueryEscapedKey_LiveUntouched(t *testing.T) {
+	const key = "sk-samp/OMIT+TEST=KEY-7e4d9a2c"
+	enc := url.QueryEscape(key)
+	if enc == key {
+		t.Fatal("test key must differ under QueryEscape")
+	}
+	// Live outbound still carries the raw key (RoundTrip is unredacted).
+	live := []byte(`{"api_key":"` + key + `"}`)
+	// Sample body may only contain the query-escaped form (e.g. echoed URL).
+	sample := []byte(`upstream echo token=` + enc + ` trail`)
+	stored, cut := PrepareBody(sample, []string{key}, 0)
+	if cut {
+		t.Fatal("unlimited must not truncate")
+	}
+	if strings.Contains(string(stored), enc) {
+		t.Fatalf("stored sample still contains query-escaped key: %q", stored)
+	}
+	if strings.Contains(string(stored), key) {
+		t.Fatalf("stored sample still contains raw key: %q", stored)
+	}
+	if !strings.Contains(string(stored), "trail") || !strings.Contains(string(stored), "upstream echo") {
+		t.Fatalf("unrelated sample text must stay: %q", stored)
+	}
+	if !strings.Contains(string(live), key) {
+		t.Fatal("live request body must still contain raw key")
+	}
+	// PrepareBody must not mutate the live slice when it is the sample source.
+	liveCopy := append([]byte(nil), live...)
+	_, _ = PrepareBody(live, []string{key}, 0)
+	if string(live) != string(liveCopy) {
+		t.Fatalf("PrepareBody mutated live body: %q → %q", liveCopy, live)
+	}
+	if !strings.Contains(string(live), key) {
+		t.Fatal("live request body must still contain raw key after PrepareBody")
+	}
+}
+
 // Location / Content-Location / Refresh / Link 可能回显带 ?key= 的出站 URL。
 // 只替凭据值，不动无关 query 与 Link 的 rel=；其它头不碰。
 func TestRedactCredentialURLHeaders(t *testing.T) {
