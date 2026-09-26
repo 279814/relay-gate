@@ -68,6 +68,62 @@ func TestConfinedSpillPath_RejectsEscapeAllowsNormal(t *testing.T) {
 	}
 }
 
+// A symlink under SpillDir that points outside must not open or remove the
+// target; a normal (non-symlink) spill file must still resolve and read.
+func TestConfinedSpillPath_RejectsSymlinkEscape_AllowsNormal(t *testing.T) {
+	outsideDir := mkdirOutsideSpill(t)
+	outside := filepath.Join(outsideDir, "secret.txt")
+	const payload = "SECRET_VIA_SYMLINK"
+	if err := os.WriteFile(outside, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(SpillDir(), "relay-gate-spill-symlink-escape.tmp")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink creation not permitted: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(link) })
+
+	if _, err := ConfinedSpillPath(link); err == nil {
+		t.Fatal("in-spill symlink to outside must be rejected before open")
+	}
+	RemoveSpillFile(link)
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != payload {
+		t.Fatalf("outside file must stay untouched after open/remove reject, got %q", got)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("symlink itself should remain (remove must not run): %v", err)
+	}
+
+	normal, err := os.CreateTemp(SpillDir(), "relay-gate-sample-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalPath := normal.Name()
+	t.Cleanup(func() { _ = os.Remove(normalPath) })
+	if _, err := normal.WriteString("ok-spill"); err != nil {
+		t.Fatal(err)
+	}
+	if err := normal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gotPath, err := ConfinedSpillPath(normalPath)
+	if err != nil {
+		t.Fatalf("normal spill under SpillDir must resolve: %v", err)
+	}
+	body, err := os.ReadFile(gotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ok-spill" {
+		t.Fatalf("normal spill read = %q, want ok-spill", body)
+	}
+}
+
 func mkdirOutsideSpill(t *testing.T) string {
 	t.Helper()
 	base, err := os.UserCacheDir()
