@@ -48,8 +48,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 压缩 body 在需要模型映射的 Route 上不发上游（§6.7），与其他不可用
+	// Route 一样落到本地粗算（§10.3）。
 	h.log.Info("count_tokens 无可用上游，本地粗算", "model", pre.inModel)
-	h.localCountTokens(w, pre.body)
+	h.localCountTokens(w, pre.decoded)
 }
 
 type countTokensPrefer int
@@ -71,6 +73,11 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		cand, err := h.selectCountTokensCandidate(pre.snapshot, pre.inModel, tried, prefer)
 		if err != nil || cand == nil {
 			return false
+		}
+		if pre.compressedNeedsMapping(cand.Route) {
+			tried[cand.Route.ID] = true
+			cand.Release()
+			continue
 		}
 		// recovering 须占 RecoveryGate（§9.1 / §9.4）；拿不到则跳过，不排队。
 		wrapped, ok := h.wrapRecoveryIfNeeded(cand)

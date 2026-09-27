@@ -334,10 +334,20 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 		exclude = map[int64]bool{}
 	}
 	ep, _ := proto.Endpoint()
+	// §6.7: a compressed body cannot take a Route that maps the model. Skip it
+	// so a later Route without mapping can still pass the original bytes; if
+	// nothing else is left, the client gets 415 instead of no-route.
+	skippedForMapping := false
 	for {
 		cand, err := router.SelectExcluding(pre.snapshot, h.health, pre.inModel, proto, exclude)
 		if err == nil {
 			if h.capabilityExcludes(cand.Route.ID, ep) {
+				exclude[cand.Route.ID] = true
+				cand.Release()
+				continue
+			}
+			if pre.compressedNeedsMapping(cand.Route) {
+				skippedForMapping = true
 				exclude[cand.Route.ID] = true
 				cand.Release()
 				continue
@@ -359,11 +369,14 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 			cand.Release()
 			continue
 		}
-		if !allowHalfOpen {
-			return nil, false, err
+		if allowHalfOpen {
+			if c := h.halfOpen(pre.snapshot, pre.inModel, proto, pre.settings, err,
+				pre.compressedNeedsMapping); c != nil {
+				return c, true, nil
+			}
 		}
-		if c := h.halfOpen(pre.snapshot, pre.inModel, proto, pre.settings, err); c != nil {
-			return c, true, nil
+		if skippedForMapping && errors.Is(err, router.ErrNoRouteAvailable) {
+			return nil, false, errCompressedNeedsMapping
 		}
 		return nil, false, err
 	}
@@ -412,6 +425,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 
 	settings := pre.settings
 
+	if pre.compressedNeedsMapping(cand.Route) {
+		writeAPIError(w, http.StatusUnsupportedMediaType, proto, "invalid_request_error",
+			msgCompressedNeedsMapping)
+		return nil, dispatchFatal
+	}
 	outBody, err := ReplaceModel(pre.body, cand.Route.UpstreamModel)
 	if err != nil {
 		h.log.Error("替换 model 失败", "err", err, "route", cand.Route.ID)
