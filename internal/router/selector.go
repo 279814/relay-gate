@@ -374,10 +374,11 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 
 // DeadRoutesFor 返回该 ModelName 下所有 dead 的 Route，按优先级升序。
 // 供半开放行用（§4.4c）：全部 dead 时选优先级最高的试探一次。
+// 429 冷却中的 dead Route 不算候选：冷却到期才重新 half-open eligible（§8.11）。
 func DeadRoutesFor(snap *Snapshot, hv HealthView, mn *model.ModelName) []*model.Route {
 	var out []*model.Route
 	for _, r := range snap.RoutesByModelName[mn.ID] {
-		if !r.Enabled {
+		if !r.Enabled || hv.CoolingDown(r.ID) {
 			continue
 		}
 		if up := snap.Upstreams[r.UpstreamID]; up == nil || !up.Enabled {
