@@ -62,3 +62,16 @@ func (s *Server) postConfirmEndpointReview(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusOK, ep)
 }
+
+// endpointBindingChanged reports whether next alters the URL binding of cur:
+// which endpoint kind it serves, where its URL comes from, and its review flag.
+// Auth profile edits are not part of the binding.
+func endpointBindingChanged(cur, next model.UpstreamEndpoint) bool {
+	return cur.Kind != next.Kind ||
+		cur.URLMode != next.URLMode ||
+		cur.LegacyFullURLID != next.LegacyFullURLID ||
+		cur.LegacyFullURLRevision != next.LegacyFullURLRevision ||
+		cur.URLOverride != next.URLOverride ||
+		cur.FixedQueryTemplate != next.FixedQueryTemplate ||
+		cur.NeedsReview != next.NeedsReview
+}
