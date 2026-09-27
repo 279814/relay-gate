@@ -38,22 +38,32 @@ func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 // order 更低也必须替换，否则新行会输给上一 incarnation 留下的更高 order。
 // 空 ObservationToken 的旁路占位不得覆盖已有非空 token；非空 token 仍可
 // 替换空占位。
-func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachability) {
+//
+// 返回 leftUnreachable：被替换的前一行在新行的 network revision 下仍是
+// effective unreachable，而新行不再是 unreachable（§8.10「Reachability 从
+// unreachable 恢复」）。前一行可能出自另一种 selector（L1 与 L2 token 不同），
+// 所以按读侧 effective 判断，而不是比 token；已失配的旧行本就是 unknown。
+func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachability) (leftUnreachable bool) {
 	if tracker == nil || row == nil || row.UpstreamID <= 0 {
-		return
+		return false
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	current := tracker.rows[row.UpstreamID]
 	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
-		return
+		return false
 	}
 	if current != nil && current.ObservationToken == row.ObservationToken &&
 		current.LastObservationOrder >= row.LastObservationOrder {
-		return
+		return false
 	}
+	leftUnreachable = current != nil && row.ObservationToken != "" &&
+		current.State == model.ReachabilityUnreachable &&
+		row.State != model.ReachabilityUnreachable &&
+		tracker.rowCurrentLocked(current, row.ObservedNetworkRevision)
 	copyValue := *row
 	tracker.rows[row.UpstreamID] = &copyValue
+	return leftUnreachable
 }
 
 // Effective 返回读侧生效状态。token/fingerprint 失配或无行 → unknown。

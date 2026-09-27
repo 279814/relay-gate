@@ -28,6 +28,15 @@ type ResultRecorder struct {
 	reducer observation.StateReducer
 	reach   *health.ReachabilityTracker
 	caps    *CapabilityRegistry
+
+	onReachabilityRecovered func(execution model.ProbeExecution)
+}
+
+// WithReachabilityRecovered 注入「已提交 Reachability 离开 unreachable」回调
+// （§8.10 即时调度）。回调在 Registry 更新后同步调用。
+func (recorder *ResultRecorder) WithReachabilityRecovered(fn func(execution model.ProbeExecution)) *ResultRecorder {
+	recorder.onReachabilityRecovered = fn
+	return recorder
 }
 
 // NewResultRecorder 装配生产 recorder。reach/caps 可为 nil（只落库不刷内存）。
@@ -54,7 +63,9 @@ func (recorder *ResultRecorder) Record(ctx context.Context,
 	}
 
 	if result.Reachability == model.ApplyCurrent && result.CommittedReachability != nil && recorder.reach != nil {
-		recorder.reach.ApplyCommitted(result.CommittedReachability)
+		if recorder.reach.ApplyCommitted(result.CommittedReachability) && recorder.onReachabilityRecovered != nil {
+			recorder.onReachabilityRecovered(value.Execution)
+		}
 	}
 	if result.Capability == model.ApplyCurrent && result.CommittedCapability != nil && recorder.caps != nil {
 		recorder.caps.ApplyCommitted(result.CommittedCapability)
