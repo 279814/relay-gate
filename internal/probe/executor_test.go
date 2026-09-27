@@ -486,3 +486,37 @@ func TestExecutor_NoPlaintextInExecution(t *testing.T) {
 	}
 	_ = time.Now
 }
+
+// 上游把 key 整段回显进 error.type/code/param 时，字符白名单挡不住（key 本身
+// 就是 [A-Za-z0-9_-]），必须在写 execution 前按已知凭据再扫一遍（§2.4、§4.6）。
+func TestExecutor_EchoedKeyInStructuredErrorFieldIsRedacted(t *testing.T) {
+	up := upstreamFor("https://example.test")
+	for _, field := range []string{"type", "code", "param"} {
+		t.Run(field, func(t *testing.T) {
+			body := `{"type":"error","error":{"type":"authentication_error","` +
+				field + `":"` + up.APIKey + `"}}`
+			rt := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+				return respFrom(401, "application/json", body), nil
+			}}
+			recorder := &captureRecorder{}
+			exec := newTestExecutorFor(up, rt, recorder, AlwaysOpenAdmission(), WallClock())
+
+			result, err := exec.Execute(context.Background(), l2RequestFor(up))
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if recorder.obs == nil {
+				t.Fatal("execution 未写入 recorder")
+			}
+			for name, detail := range map[string]string{
+				"recorded": recorder.obs.Execution.RedactedDetail,
+				"returned": result.Execution.RedactedDetail,
+				"decision": result.Decision.RedactedDetail,
+			} {
+				if strings.Contains(detail, up.APIKey) {
+					t.Errorf("%s RedactedDetail 含上游 key: %q", name, detail)
+				}
+			}
+		})
+	}
+}
