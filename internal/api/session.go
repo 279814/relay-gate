@@ -261,8 +261,14 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 
 // authenticated 判断一个请求是否已授权：会话 Cookie 或 Bearer 口令。
 func (s *Server) authenticated(r *http.Request) bool {
-	if c, err := r.Cookie(sessionCookie); err == nil && s.sessions.valid(c.Value) {
+	if s.sessionOK(r) {
 		return true
 	}
 	return s.bearerOK(r)
+}
+
+// sessionOK 只认会话 Cookie。
+func (s *Server) sessionOK(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookie)
+	return err == nil && s.sessions.valid(c.Value)
 }

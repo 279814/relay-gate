@@ -36,9 +36,10 @@ func TestRevealRelayKey_ViewAfterReauth(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := New(st, log).WithCredentials(creds, nil)
 	h := s.Routes(testAdminPW)
+	sess := loginSession(t, h)
 
-	bad := do(t, h, "POST", "/admin/api/credentials/reveal-relay",
-		`{"password":"not-the-admin"}`, true)
+	bad := doSession(t, h, "POST", "/admin/api/credentials/reveal-relay",
+		`{"password":"not-the-admin"}`, sess)
 	if bad.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong password want 401, got %d body=%s", bad.Code, bad.Body.String())
 	}
@@ -62,8 +63,8 @@ func TestRevealRelayKey_ViewAfterReauth(t *testing.T) {
 		t.Fatal("list must not expose relay_key field")
 	}
 
-	ok := do(t, h, "POST", "/admin/api/credentials/reveal-relay",
-		`{"password":"`+testAdminPW+`"}`, true)
+	ok := doSession(t, h, "POST", "/admin/api/credentials/reveal-relay",
+		`{"password":"`+testAdminPW+`"}`, sess)
 	if ok.Code != http.StatusOK {
 		t.Fatalf("reveal want 200, got %d body=%s", ok.Code, ok.Body.String())
 	}

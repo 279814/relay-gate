@@ -95,12 +95,14 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("POST /admin/api/security/smtp/test", s.postSMTPTest)
 
 	mux.HandleFunc("GET /admin/api/credentials", s.getCredentialsStatus)
-	mux.HandleFunc("POST /admin/api/credentials/reveal-master", s.postRevealMasterKey)
-	mux.HandleFunc("POST /admin/api/credentials/reveal-relay", s.postRevealRelayKey)
-	mux.HandleFunc("POST /admin/api/credentials/rotate-relay", s.postRotateRelayKey)
-	mux.HandleFunc("POST /admin/api/credentials/revoke-relay-grace", s.postRevokeRelayGrace)
-	mux.HandleFunc("POST /admin/api/credentials/reset-admin", s.postResetAdminPassword)
-	mux.HandleFunc("POST /admin/api/credentials/rotate-master", s.postBeginMasterRotation)
+	// §12.9：敏感查看和轮换只接受 Cookie 会话加当次管理员密码（body.password），
+	// 不能只凭通用 Bearer / X-Admin-Password。
+	mux.Handle("POST /admin/api/credentials/reveal-master", s.requireSession(s.postRevealMasterKey))
+	mux.Handle("POST /admin/api/credentials/reveal-relay", s.requireSession(s.postRevealRelayKey))
+	mux.Handle("POST /admin/api/credentials/rotate-relay", s.requireSession(s.postRotateRelayKey))
+	mux.Handle("POST /admin/api/credentials/revoke-relay-grace", s.requireSession(s.postRevokeRelayGrace))
+	mux.Handle("POST /admin/api/credentials/reset-admin", s.requireSession(s.postResetAdminPassword))
+	mux.Handle("POST /admin/api/credentials/rotate-master", s.requireSession(s.postBeginMasterRotation))
 
 	mux.HandleFunc("GET /admin/api/transforms", s.listTransformSets)
 	mux.HandleFunc("POST /admin/api/transforms", s.createTransformSet)
@@ -139,6 +141,19 @@ func (s *Server) Routes(adminPW string) http.Handler {
 func (s *Server) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authenticated(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="relay-gate admin"`)
+			writeJSON(w, http.StatusUnauthorized, errBody{"未授权：需要管理口令"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireSession 要求有效的会话 Cookie；Bearer / X-Admin-Password 不算。
+// 拒绝时沿用 requireAdmin 的 401。
+func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.sessionOK(r) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="relay-gate admin"`)
 			writeJSON(w, http.StatusUnauthorized, errBody{"未授权：需要管理口令"})
 			return
