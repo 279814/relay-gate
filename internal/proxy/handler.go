@@ -194,6 +194,24 @@ func (h *Handler) WithRecoveryGate(g *health.RecoveryGate) *Handler {
 	return h
 }
 
+// WithReachability 让正常选路跳过站级 effective unreachable 的 Route（§6.4）。
+// 读的是阈值归约后的已提交 Reachability，不是每次 L1 都翻转的 legacy 视图。
+func (h *Handler) WithReachability(r *health.ReachabilityTracker) *Handler {
+	if r != nil && h.health != nil {
+		h.health = reachabilityHealth{HealthView: h.health, reach: r}
+	}
+	return h
+}
+
+type reachabilityHealth struct {
+	router.HealthView
+	reach *health.ReachabilityTracker
+}
+
+func (v reachabilityHealth) UpstreamReachable(up *model.Upstream) bool {
+	return v.reach.OK(up.ID, up.NetworkRevision)
+}
+
 // WithTransports 换成与探活共享的连接池管理器。
 //
 // 必须显式共享而不是各自 new：探活与真实请求打的是同一个上游，共用连接池

@@ -83,6 +83,13 @@ type HealthView interface {
 	TryAcquire(routeID int64, limit int) (release func(), generation uint64, ok bool)
 }
 
+// ReachabilityView 是 HealthView 的可选扩展（§6.4「Upstream Reachability 不是
+// unreachable」）。HealthView 同时实现它时，正常候选跳过站级 effective
+// unreachable 的 Route，不等 RouteHealth 走到 dead。unknown 与 reachable 仍可选。
+type ReachabilityView interface {
+	UpstreamReachable(up *model.Upstream) bool
+}
+
 // Snapshot 是选路依赖的配置快照。调用方从 store 读一次，避免每请求查库。
 type Snapshot struct {
 	ModelNames []*model.ModelName
@@ -323,8 +330,9 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 		return nil, "下没有绑定任何 Route", false
 	}
 
+	reach, _ := hv.(ReachabilityView)
 	buckets := map[int][]*model.Route{}
-	var disabled, dead, cooling, tried, shortKey int
+	var disabled, dead, cooling, tried, shortKey, unreachable int
 	for _, r := range all {
 		switch {
 		case exclude[r.ID]:
@@ -352,12 +360,19 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 			shortKey++
 			continue
 		}
+		if reach != nil && !reach.UpstreamReachable(up) {
+			unreachable++
+			continue
+		}
 		buckets[r.Priority] = append(buckets[r.Priority], r)
 	}
 
 	if len(buckets) == 0 {
 		reason := fmt.Sprintf("下的 %d 个 Route 均不可用（%d 个已停用，%d 个 dead，%d 个限流冷却中",
 			len(all), disabled, dead, cooling)
+		if unreachable > 0 {
+			reason += fmt.Sprintf("，%d 个所在站不可达", unreachable)
+		}
 		if shortKey > 0 {
 			reason += fmt.Sprintf("，%d 个 api_key 短于脱敏下限", shortKey)
 		}
@@ -366,7 +381,7 @@ func viableBuckets(snap *Snapshot, hv HealthView, mn *model.ModelName,
 		}
 		// 仅短钥（无 dead/冷却/已试过）→ 阻断前缀/兜底回落。停用行不参与
 		// 匹配候选，不影响「点名命中后仅因短钥不合格」的判定。
-		shortKeyOnly := shortKey > 0 && dead == 0 && cooling == 0 && tried == 0
+		shortKeyOnly := shortKey > 0 && dead == 0 && cooling == 0 && tried == 0 && unreachable == 0
 		return nil, reason + "）", shortKeyOnly
 	}
 	return buckets, "", false
