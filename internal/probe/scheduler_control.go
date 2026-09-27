@@ -6,10 +6,12 @@ package probe
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -40,6 +42,9 @@ type schedulerP012 struct {
 	pendingL1 map[int64]bool
 	pendingL2 map[int64]bool
 	mu        sync.Mutex
+	// lastSnap 是最近一轮 tick 读到的配置快照；PrepareResume 无 I/O，只能用它
+	// 知道 Route 归属哪个站。
+	lastSnap atomic.Pointer[router.Snapshot]
 }
 
 func (s *Scheduler) ensureP012() *schedulerP012 {
@@ -111,7 +116,62 @@ func (s *Scheduler) PrepareResume() {
 	if s.ensureP012().capReg != nil {
 		s.ensureP012().capReg.DemotePositive()
 	}
+	s.staggerResume()
 	s.log.Info("PrepareResume：正结论已降为 unknown，负状态保留")
+}
+
+func (s *Scheduler) rememberSnapshot(snap *router.Snapshot) {
+	if snap != nil {
+		s.ensureP012().lastSnap.Store(snap)
+	}
+}
+
+func (s *Scheduler) unitRand() float64 {
+	p := s.ensureP012()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rng == nil {
+		return 0
+	}
+	return p.rng.Float64()
+}
+
+// staggerResume 让恢复后首轮复核按 jitter 分散（§4.4 不得瞬时齐发）。
+// 同站 Route 共用一个 L1 分量，保证一个周期内不对同一站重复 /models。
+func (s *Scheduler) staggerResume() {
+	staggerer, ok := s.track.(interface {
+		StaggerResume(routeIDs []int64, l1Frac, l2Frac func(routeID int64) float64)
+	})
+	if !ok {
+		return
+	}
+	routeUp := map[int64]int64{}
+	if snap := s.ensureP012().lastSnap.Load(); snap != nil {
+		for _, rts := range snap.RoutesByModelName {
+			for _, rt := range rts {
+				routeUp[rt.ID] = rt.UpstreamID
+			}
+		}
+	}
+	ids := make([]int64, 0, len(routeUp))
+	for id := range routeUp {
+		ids = append(ids, id)
+	}
+	l1ByUp := map[int64]float64{}
+	staggerer.StaggerResume(ids, func(routeID int64) float64 {
+		up, ok := routeUp[routeID]
+		if !ok {
+			return 0
+		}
+		f, ok := l1ByUp[up]
+		if !ok {
+			f = s.unitRand()
+			l1ByUp[up] = f
+		}
+		return f
+	}, func(int64) float64 {
+		return s.unitRand()
+	})
 }
 
 // ResumeGradually 允许后续 tick 按并发闸渐进复核。
