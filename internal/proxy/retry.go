@@ -110,7 +110,7 @@ const (
 	dispatchSent dispatchStatus = iota
 	dispatchFatal
 	dispatchRouteLocal // nothing written; try next Route without a network Attempt
-	// dispatchRouteAuthConfig is a route-local Auth Secret failure (§6.5 / §7.2):
+	// dispatchRouteAuthConfig is a route-local URL / Auth Secret failure (§6.5 / §7.2):
 	// same skip as dispatchRouteLocal, but when no Route is left the client
 	// gets the no-route error, not the transform fail_closed text.
 	dispatchRouteAuthConfig
@@ -402,7 +402,8 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 协议/全局配置），换站无意义。
 // dispatchRouteLocal：尚未写客户端、尚未发上游（§6.5 Transform fail_closed）；
 // 调用方应跳过本 Route 并选下一个，不消耗 retry_max_attempts。
-// dispatchRouteAuthConfig：同上，原因是 Auth Secret 不可用（§7.2 空凭据等），
+// dispatchRouteAuthConfig：同上，原因是本 Route 的 URL 或 Auth Secret 配置
+// 不可用（§6.5；§7.2 空凭据等），
 // 已把该 Route 当前 Endpoint 的 Capability 记为 config_error。
 // dispatchSent：已发出上游请求，la 非空。
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
@@ -429,8 +430,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	}
 	target, err := h.resolveTarget(r, cand, kind)
 	if err != nil {
-		if errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) && r.Context().Err() == nil {
-			h.log.Warn("固定 query 引用的上游 api_key 为空，跳过本 Route", "err", err,
+		if (errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) || errors.Is(err, outbound.ErrURLConfig)) &&
+			r.Context().Err() == nil {
+			h.log.Warn("出站 URL 配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			h.markRouteConfigError(cand, kind)
 			return nil, dispatchRouteAuthConfig
