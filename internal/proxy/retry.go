@@ -566,6 +566,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.TransportFor(cand.Upstream, realBudget)
 	if err != nil {
+		if errors.Is(err, outbound.ErrURLConfig) && r.Context().Err() == nil {
+			h.log.Warn("出站网络配置不可用，跳过本 Route", "err", err,
+				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
+			h.markRouteConfigError(cand, kind)
+			return nil, dispatchRouteAuthConfig
+		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal

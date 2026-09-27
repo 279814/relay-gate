@@ -740,6 +740,26 @@ func TestManager_RejectsBadProxyURL(t *testing.T) {
 	}
 }
 
+// 装池拒绝 proxy_url 是这个 Upstream 自己的网络配置错误（§6.5 route-local）：
+// 带 ErrURLConfig 供真实转发跳过本 Route，仍是 ErrValidation，且不含凭据原文。
+func TestManager_BadProxyURLIsURLConfig(t *testing.T) {
+	for _, raw := range []string{
+		"http://proxyuser:proxysecret@",
+		"http://proxyuser:proxysecret@[::1",
+		"file://proxyuser:proxysecret@localhost/etc/passwd",
+	} {
+		upstream := netUpstream()
+		upstream.ProxyURL = raw
+		_, err := newTestManager(t).Transport(netFor(upstream, time.Second))
+		if !errors.Is(err, ErrURLConfig) || !errors.Is(err, model.ErrValidation) {
+			t.Fatalf("%q: want ErrURLConfig + ErrValidation, got %v", raw, err)
+		}
+		if strings.Contains(err.Error(), "proxyuser") || strings.Contains(err.Error(), "proxysecret") {
+			t.Fatalf("%q: error leaks proxy credentials: %v", raw, err)
+		}
+	}
+}
+
 // 出站装池不得把 file:// 等装成 Proxy：保存入口挡不住的脏行也必须 fail closed。
 func TestManager_RejectsDisallowedProxyScheme(t *testing.T) {
 	upstream := netUpstream()

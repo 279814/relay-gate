@@ -60,10 +60,9 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 	recorder := NewResultRecorder(st, health.NewObservationReducer(nil), reach, NewCapabilityRegistry(capSettings{settings}))
 
 	var order int64
-	run := func(target *model.Upstream, rt http.RoundTripper) ExecutionResult {
+	runWith := func(exec *Executor, target *model.Upstream) ExecutionResult {
 		t.Helper()
 		order++
-		exec := newTestExecutorFor(target, rt, recorder, AlwaysOpenAdmission(), WallClock())
 		res, err := exec.Execute(context.Background(), ExecutionRequest{
 			ExecutionID: fmt.Sprintf("reach-%d", order), Trigger: model.TriggerScheduled,
 			Upstream: target, Endpoint: model.EndpointModels, Mode: ObserveProbe,
@@ -77,6 +76,10 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 			t.Fatalf("execution 必须落库: %+v", res.Apply)
 		}
 		return res
+	}
+	run := func(target *model.Upstream, rt http.RoundTripper) ExecutionResult {
+		t.Helper()
+		return runWith(newTestExecutorFor(target, rt, recorder, AlwaysOpenAdmission(), WallClock()), target)
 	}
 	storedRow := func() *model.UpstreamReachability {
 		t.Helper()
@@ -113,8 +116,23 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 		t.Error("config_error 不该出网")
 		return nil, errors.New("unreachable")
 	}}
-	for name, target := range map[string]*model.Upstream{"bad_base_url": &badURL, "empty_key": &emptyKey} {
-		res := run(target, neverSend)
+	// 存量脏行的 proxy_url 在装池时被拒：走真实 Manager，而不是注入的 RoundTripper。
+	badProxy := *up
+	badProxy.ProxyURL = "http://proxyuser:proxysecret@"
+	manager := outbound.NewManager()
+	t.Cleanup(manager.CloseIdleConnections)
+	badProxyExec := NewExecutor(
+		outbound.NewProvider(testEndpoints{upstream: &badProxy}, nil, outbound.NewResolver(testHasher{})),
+		nil, nil, ManagerTransports{Manager: manager}, recorder, AlwaysOpenAdmission(), WallClock(), nil)
+	for name, target := range map[string]*model.Upstream{
+		"bad_base_url": &badURL, "empty_key": &emptyKey, "bad_proxy_url": &badProxy,
+	} {
+		var res ExecutionResult
+		if target == &badProxy {
+			res = runWith(badProxyExec, target)
+		} else {
+			res = run(target, neverSend)
+		}
 		if res.Decision.ErrorClass != model.ErrorConfig || res.Sent {
 			t.Fatalf("%s: 应为未发送的 config_error，实际 class=%q sent=%v", name, res.Decision.ErrorClass, res.Sent)
 		}

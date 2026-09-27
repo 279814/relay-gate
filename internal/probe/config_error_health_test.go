@@ -111,6 +111,47 @@ func TestScheduler_L2URLConfigErrorLeavesRouteHealth(t *testing.T) {
 	}
 }
 
+// 存量 proxy_url 缺 host 时装池失败：同样是出网前的 config_error，不给 Route
+// 报失败；同站另一条连不上的 Route 仍按连接失败计入 RouteHealth。
+func TestScheduler_L2ProxyPoolConfigErrorLeavesRouteHealth(t *testing.T) {
+	hs := newSchedHarness(t, 2, aliveL2Handler)
+	recorder := &captureRecorder{}
+	manager := outbound.NewManager()
+	t.Cleanup(manager.CloseIdleConnections)
+	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+		ManagerTransports{Manager: manager},
+		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
+
+	snap, _ := hs.cfg.Snapshot()
+	mn := findModelName(snap, 1)
+
+	badProxy := snap.Upstreams[10]
+	badProxy.ProxyURL = "http://proxyuser:proxysecret@"
+	badRoute := routeOn(t, snap, badProxy.ID)
+
+	refused := httptest.NewServer(http.NotFoundHandler())
+	refusedURL := refused.URL
+	refused.Close()
+	down := snap.Upstreams[20]
+	down.BaseURL = refusedURL
+	downRoute := routeOn(t, snap, down.ID)
+
+	hs.sched.runL2(context.Background(), badProxy, mn, badRoute, fastSettings(), 1)
+	if got := reportsFor(hs.track, badRoute.ID); len(got) != 0 {
+		t.Fatalf("bad proxy_url L2 must not report RouteHealth, got %+v", got)
+	}
+	if recorder.obs == nil || recorder.obs.Execution.ErrorClass != model.ErrorConfig ||
+		recorder.obs.Execution.SentAtMS != 0 {
+		t.Fatalf("bad proxy_url must record an unsent config_error execution, got %+v", recorder.obs)
+	}
+
+	hs.sched.runL2(context.Background(), down, mn, downRoute, fastSettings(), 1)
+	got := reportsFor(hs.track, downRoute.ID)
+	if len(got) != 1 || got[0].Verdict != health.VerdictUnavailable {
+		t.Fatalf("connection refused L2 must report unavailable, got %+v", got)
+	}
+}
+
 // 缺失的 Secret、错误模板、空 key 等 prepare 阶段的失败同样不改变 RouteHealth。
 func TestProbeConfigOutcome_PreSendErrorsAreIgnored(t *testing.T) {
 	cases := map[string]error{
