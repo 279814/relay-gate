@@ -258,7 +258,13 @@ func (e *Executor) finishConfigError(ctx context.Context, req ExecutionRequest,
 		Execution: exec,
 		Sent:      false,
 	}
-	apply, recErr := e.recordExecution(ctx, req, &result.Execution)
+	// 没有出网就没有网络证据（§8.6「不改变健康」、§8.9 只认 DNS/TCP/TLS/建连失败）：
+	// 带着 Reachability 期望落库会被 reducer 当成一次连接失败累加，阈值为 1 时
+	// 一个写错的 base URL 或空 key 就把整站提交成 unreachable。
+	recordReq := req
+	recordReq.ReachabilityExpectation = nil
+	recordReq.ReachabilityPolicy = nil
+	apply, recErr := e.recordExecution(ctx, recordReq, &result.Execution)
 	if recErr != nil {
 		return result, recErr
 	}
