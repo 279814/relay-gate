@@ -252,6 +252,14 @@ func runServer() error {
 		return errors.Is(err, store.ErrNotFound)
 	})
 
+	// §5.2：重启后匹配当前 Observation Token 的 config_error 继续生效。
+	// 必须在接流量、起探活之前装回，否则首批请求会选中已知配置错误的 Route。
+	if n, err := capRegistry.RestoreConfigErrors(context.Background(), st, cfgSrc, recipes); err != nil {
+		return fmt.Errorf("恢复 config_error 能力状态: %w", err)
+	} else if n > 0 {
+		log.Info("已恢复 config_error 能力状态", "rows", n)
+	}
+
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
 	if err != nil {

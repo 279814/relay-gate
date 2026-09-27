@@ -574,6 +574,46 @@ func loadCapability(ctx context.Context, tx *sql.Tx, execution model.ProbeExecut
 	return &value, nil
 }
 
+// ListEndpointCapabilitiesByState 读出某一状态的全部 EndpointCapability 行，供启动恢复使用。
+func (store *Store) ListEndpointCapabilitiesByState(ctx context.Context, state model.CapabilityState) ([]*model.EndpointCapability, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT scope_upstream_id,scope_route_id,endpoint,endpoint_id,
+		evidence_kind,timeout_profile,state,observation_token,resolved_url_hash,upstream_network_revision,
+		upstream_credential_revision,endpoint_revision,model_capability_revision,route_capability_revision,
+		auth_profile_revision,recipe_binding_revision,probe_settings_fingerprint,probe_secret_revisions_hash,
+		request_transform_binding_revision,observed_at,expires_at,status_code,error_class,redacted_detail,
+		last_observation_order,last_real_ok_at,last_real_ok_token FROM endpoint_capability
+		WHERE state=? ORDER BY id`, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*model.EndpointCapability{}
+	for rows.Next() {
+		var value model.EndpointCapability
+		var upstreamID, routeID sql.NullInt64
+		if err := rows.Scan(&upstreamID, &routeID, &value.Endpoint, &value.EndpointID,
+			&value.PolicySelector.Kind, &value.PolicySelector.TimeoutProfile, &value.State,
+			&value.ObservationToken, &value.ResolvedURLHash, &value.UpstreamNetworkRevision,
+			&value.UpstreamCredentialRevision, &value.EndpointRevision, &value.ModelCapabilityRevision,
+			&value.RouteCapabilityRevision, &value.AuthProfileRevision, &value.RecipeBindingRevision,
+			&value.ProbeSettingsFingerprint, &value.ProbeSecretRevisionsHash,
+			&value.RequestTransformBindingRevision, &value.ObservedAt, &value.ExpiresAt, &value.StatusCode,
+			&value.ErrorClass, &value.RedactedDetail, &value.LastObservationOrder, &value.LastRealOKAt,
+			&value.LastRealOKToken); err != nil {
+			return nil, err
+		}
+		value.PolicySelector.Endpoint = value.Endpoint
+		if routeID.Valid {
+			value.ScopeType, value.ScopeID = model.RecipeScopeRoute, routeID.Int64
+		} else {
+			value.ScopeType, value.ScopeID = model.RecipeScopeUpstream, upstreamID.Int64
+		}
+		out = append(out, &value)
+	}
+	return out, rows.Err()
+}
+
 func saveCapability(ctx context.Context, tx *sql.Tx, value *model.EndpointCapability) error {
 	var upstreamID, routeID any
 	if value.ScopeType == model.RecipeScopeRoute {
