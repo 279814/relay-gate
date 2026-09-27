@@ -256,6 +256,10 @@ func (s *Store) DeleteModelName(id int64) (err error) {
 		if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, child.id); err != nil {
 			return err
 		}
+		// §9.2: route-scoped capability rows pin route_id with ON DELETE RESTRICT.
+		if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_route_id=?`, child.id); err != nil {
+			return err
+		}
 	}
 
 	// §15: child Routes CASCADE without DeleteRoute, so drop their transform

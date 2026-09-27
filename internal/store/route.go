@@ -297,6 +297,11 @@ func (s *Store) DeleteRoute(id int64) (err error) {
 		return err
 	}
 
+	// §9.2: route-scoped capability rows pin route_id with ON DELETE RESTRICT.
+	if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_route_id=?`, id); err != nil {
+		return err
+	}
+
 	// §15: transform bindings are keyed by numeric route id. Drop them in this
 	// same transaction so a later row that reuses the id cannot inherit a
 	// published transform, and a failed delete rolls the detach back.
