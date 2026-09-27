@@ -75,9 +75,9 @@ func aliveL2Interval(s model.Settings) time.Duration {
 }
 
 func deadL2Interval(rs *routeState, s model.Settings, now time.Time) time.Duration {
-	// 优先按「已死多久」分档（§8.10）；没有 lastErrAt 时退回设置值。
-	if !rs.lastErrAt.IsZero() {
-		age := now.Sub(rs.lastErrAt)
+	// 优先按「已死多久」分档（§8.10）；没有 deadSince 时退回设置值。
+	if !rs.deadSince.IsZero() {
+		age := now.Sub(rs.deadSince)
 		switch {
 		case age <= shortDeadWindow:
 			return longDeadL2Short

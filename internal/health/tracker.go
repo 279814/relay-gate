@@ -53,6 +53,10 @@ type routeState struct {
 	lastTTFT   time.Duration
 	lastReason Verdict // 最近一次失败的类别，UI 用它区分「配置错」与「站挂了」
 
+	// deadSince 是本轮进入 dead 的时刻，dead L2 分档按它算（§8.10）。
+	// 不能用 lastErrAt：dead 期间每次失败都会刷新它，档位就永远停在 30s。
+	deadSince time.Time
+
 	// cooldownUntil 是 429 冷却的截止时刻。零值表示不在冷却中。
 	cooldownUntil time.Time
 
@@ -260,6 +264,12 @@ func (t *Tracker) Report(rep Report) (changed bool) {
 		t.noteErr(rs, rep, now)
 	}
 
+	switch {
+	case rs.state != model.StateDead:
+		rs.deadSince = time.Time{}
+	case before != model.StateDead:
+		rs.deadSince = now
+	}
 	return rs.state != before
 }
 
