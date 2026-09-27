@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -13,6 +14,15 @@ import (
 func (s *Server) WithTransformRegistry(r *transform.Registry) *Server {
 	s.transforms = r
 	return s
+}
+
+// transformClientErr maps registry errors to 400 with their message, except
+// persistence failures: those carry SQLite text and go to writeErr's 500 path.
+func transformClientErr(err error) error {
+	if errors.Is(err, transform.ErrPersist) {
+		return err
+	}
+	return fmt.Errorf("%w: %s", model.ErrValidation, err.Error())
 }
 
 func (s *Server) listTransformSets(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +47,7 @@ func (s *Server) createTransformSet(w http.ResponseWriter, r *http.Request) {
 	}
 	set, err := s.transforms.CreateSet(body.Name)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	writeJSON(w, http.StatusCreated, set)
@@ -83,7 +93,7 @@ func (s *Server) putTransformDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	set, err := s.transforms.UpdateDraft(id, body.Rules, body.ReqFailPolicy, body.ResFailPolicy, body.Note)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, set)
@@ -127,7 +137,7 @@ func (s *Server) postTransformPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.transforms.Preview(id, body.Phase, reqIn, resIn)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -176,7 +186,7 @@ func (s *Server) transformBindAction(w http.ResponseWriter, r *http.Request, act
 		err = fmt.Errorf("unknown action")
 	}
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	// §9.2: publish changes the live request Transform binding; clear RouteHealth
@@ -203,7 +213,7 @@ func (s *Server) postTransformRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.transforms.Rollback(body.RouteID, body.EndpointID, body.VersionID)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	// §9.2: rollback retargets the published Transform — Forget old RouteHealth.
@@ -265,7 +275,7 @@ func (s *Server) putTransformBudgets(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.transforms.SetBudgets(body.RequestMs, body.SSEEventMs, body.ConfirmRaise)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %s", model.ErrValidation, err.Error()))
+		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
