@@ -65,6 +65,105 @@ func (failPersist) LoadTransformSnapshot() ([]transform.Set, []transform.Binding
 	return nil, nil, nil
 }
 
+type togglePersist struct{ fail bool }
+
+func (p *togglePersist) SaveTransformSnapshot([]transform.Set, []transform.Binding) error {
+	if p.fail {
+		return errors.New("persist boom")
+	}
+	return nil
+}
+func (p *togglePersist) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, error) {
+	return nil, nil, nil
+}
+
+// A failed save must leave published/shadow pointers on the previous version
+// (an error means the binding did not change); a later successful save switches.
+func TestPointerSwitchRestoredOnPersistError(t *testing.T) {
+	sink := &togglePersist{}
+	reg := transform.NewRegistry(4).WithPersist(sink)
+	set, err := reg.CreateSet("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Demo", Value: "1"}}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	const route, ep = 7, 2
+
+	// First publish/shadow fails on a fresh binding: nothing may remain.
+	sink.fail = true
+	if _, _, err := reg.PublishSnapshot(set.ID, route, ep); err == nil {
+		t.Fatal("expected publish persist error")
+	}
+	if _, _, err := reg.ShadowSnapshot(set.ID, route, ep); err == nil {
+		t.Fatal("expected shadow persist error")
+	}
+	if _, ok := reg.GetBinding(route, ep); ok {
+		t.Fatal("failed first publish/shadow must not leave a binding")
+	}
+	if got, _ := reg.GetSet(set.ID); len(got.History) != 0 {
+		t.Fatalf("failed snapshots must not stay in history: %d", len(got.History))
+	}
+
+	sink.fail = false
+	_, v1, err := reg.PublishSnapshot(set.ID, route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, s1, err := reg.ShadowSnapshot(set.ID, route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := reg.GetBinding(route, ep)
+
+	sink.fail = true
+	if _, _, err := reg.PublishSnapshot(set.ID, route, ep); err == nil {
+		t.Fatal("expected publish persist error")
+	}
+	if _, id, _ := reg.PublishedCompiled(route, ep); id != v1.ID {
+		t.Fatalf("failed publish moved published pointer: got %d want %d", id, v1.ID)
+	}
+	if _, _, err := reg.ShadowSnapshot(set.ID, route, ep); err == nil {
+		t.Fatal("expected shadow persist error")
+	}
+	if _, id, _ := reg.ShadowCompiled(route, ep); id != s1.ID {
+		t.Fatalf("failed shadow moved shadow pointer: got %d want %d", id, s1.ID)
+	}
+	if after, _ := reg.GetBinding(route, ep); *after != *before {
+		t.Fatalf("failed saves changed binding: before=%+v after=%+v", before, after)
+	}
+
+	sink.fail = false
+	_, v2, err := reg.PublishSnapshot(set.ID, route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, id, _ := reg.PublishedCompiled(route, ep); id != v2.ID {
+		t.Fatalf("successful publish must switch: got %d want %d", id, v2.ID)
+	}
+
+	sink.fail = true
+	if _, err := reg.Rollback(route, ep, v1.ID); err == nil {
+		t.Fatal("expected rollback persist error")
+	}
+	if _, id, _ := reg.PublishedCompiled(route, ep); id != v2.ID {
+		t.Fatalf("failed rollback moved published pointer: got %d want %d", id, v2.ID)
+	}
+	if _, id, _ := reg.ShadowCompiled(route, ep); id != s1.ID {
+		t.Fatalf("failed rollback touched shadow: got %d want %d", id, s1.ID)
+	}
+
+	sink.fail = false
+	if _, err := reg.Rollback(route, ep, v1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, id, _ := reg.PublishedCompiled(route, ep); id != v1.ID {
+		t.Fatalf("successful rollback must switch: got %d want %d", id, v1.ID)
+	}
+}
+
 func TestCreateSetSurfacesPersistError(t *testing.T) {
 	reg := transform.NewRegistry(4).WithPersist(failPersist{})
 	if _, err := reg.CreateSet("x"); err == nil {
