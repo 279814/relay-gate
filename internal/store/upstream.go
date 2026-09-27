@@ -263,6 +263,13 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrRevisionConflict
 	}
+	if !current.Enabled && upstream.Enabled {
+		if err = deleteConfigErrorCapabilitiesTx(ctx, tx,
+			`scope_upstream_id=? OR scope_route_id IN (SELECT id FROM route WHERE upstream_id=?)`,
+			upstream.ID, upstream.ID); err != nil {
+			return err
+		}
+	}
 	if upstream.AuthStyle != current.AuthStyle {
 		mode, headerName := legacyAuthProfile(upstream.AuthStyle)
 		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET auth_mode=?,auth_header_name=?,

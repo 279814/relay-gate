@@ -234,6 +234,11 @@ func (s *Store) UpdateRouteWithRevision(ctx context.Context, value *model.Route,
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrRevisionConflict
 	}
+	if !current.Enabled && value.Enabled {
+		if err = deleteConfigErrorCapabilitiesTx(ctx, tx, `scope_route_id=?`, value.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

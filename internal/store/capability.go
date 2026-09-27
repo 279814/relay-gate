@@ -415,6 +415,15 @@ func (store *Store) SaveConfigErrorCapability(ctx context.Context, expectation *
 	return tx.Commit()
 }
 
+// deleteConfigErrorCapabilitiesTx 在 Enabled false→true 时删掉 scope 下落库的
+// config_error（§9.2）。Enabled 不进 Observation Token：不删的话，重启时
+// RestoreConfigErrors 会装回旧结论，§8.13 的 reducer 也会让它挡住下一次自动探活。
+func deleteConfigErrorCapabilitiesTx(ctx context.Context, tx *sql.Tx, scope string, args ...any) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM endpoint_capability WHERE state=? AND (`+scope+`)`,
+		append([]any{model.CapabilityConfigError}, args...)...)
+	return err
+}
+
 // saveConfigErrorCapabilityTx 仅在 expectation 仍是当前配置时写入，返回是否写入。
 //
 // 不占用 observation order：沿用已存行的 order 与 last_real_ok_*，之后更大
