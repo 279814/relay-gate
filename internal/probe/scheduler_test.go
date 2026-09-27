@@ -1211,10 +1211,11 @@ func TestForgetRoute_ClearsL2FlagsForIDReuse(t *testing.T) {
 	if !ok {
 		t.Fatal("setup: beginL2")
 	}
-	// Simulate a blocked sibling that left pendingL2 set.
-	if _, ok := sched.beginL2(10, 101); ok {
-		t.Fatal("setup: same upstream must refuse second L2")
-	}
+	// Simulate a sibling left with an event-driven pendingL2.
+	p0 := sched.ensureP012()
+	p0.mu.Lock()
+	p0.pendingL2[101] = true
+	p0.mu.Unlock()
 
 	sched.ForgetRoute(100)
 
