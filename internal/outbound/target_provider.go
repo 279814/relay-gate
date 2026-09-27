@@ -103,7 +103,7 @@ func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedVal
 	const prefix = "SECRET:"
 	if len(name) > len(prefix) && name[:len(prefix)] == prefix {
 		if values.Secrets == nil {
-			return ResolvedValue{}, model.WrapValidation("未配置 Probe Secret 源")
+			return ResolvedValue{}, urlConfig(model.WrapValidation("未配置 Probe Secret 源"))
 		}
 		secret, err := values.Secrets.ResolveProbeSecret(ctx, name[len(prefix):])
 		if err != nil {
@@ -113,5 +113,5 @@ func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedVal
 		}
 		return ResolvedValue{Plain: secret.Plain, Revision: secret.Revision}, nil
 	}
-	return ResolvedValue{}, model.WrapValidation("URL 不支持占位符 %q", name)
+	return ResolvedValue{}, urlConfig(model.WrapValidation("URL 不支持占位符 %q", name))
 }

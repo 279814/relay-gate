@@ -53,6 +53,27 @@ func (use ResolveUse) valid() bool {
 // 是不同的动作。
 var ErrLegacyNeedsReview = errors.New("legacy full URL 待人工审核，合成探活不可用")
 
+// ErrURLConfig 标记「这个 Endpoint 自己的 URL 配置坏了」：base_url、
+// url_override、legacy full URL、固定 query 模板，以及模板里 URL 层不支持的
+// 占位符或缺失的 Secret 源。§6.5 把它列为 route-local：真实转发据此跳过本
+// Route 并记 config_error，而不是让整个请求失败。
+//
+// 只是附加的标记：错误文本与 ErrValidation 链保持原样。Resolver 未装配、
+// 读库失败这类不属于某条 Route 配置的错误**不**带它。
+var ErrURLConfig = errors.New("出站 URL 配置错误")
+
+type urlConfigError struct{ err error }
+
+func (err *urlConfigError) Error() string   { return err.err.Error() }
+func (err *urlConfigError) Unwrap() []error { return []error{err.err, ErrURLConfig} }
+
+func urlConfig(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &urlConfigError{err: err}
+}
+
 // ResolveInput 是一次解析的全部输入。
 //
 // Endpoint 已经是取好的那一条记录：Resolver 不查库、不选 Route、不挑 Recipe。
@@ -142,7 +163,7 @@ func (resolver *Resolver) Resolve(ctx context.Context, in ResolveInput) (Resolve
 
 	base, err := parseOrigin(in.Upstream.BaseURL, "base_url")
 	if err != nil {
-		return ResolvedTarget{}, err
+		return ResolvedTarget{}, urlConfig(err)
 	}
 	requestHost, err := validateHostOverride(in.Upstream.HostOverride)
 	if err != nil {
@@ -165,17 +186,17 @@ func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,
 		// 错误变成一个打错地址的请求。空白由 parseOrigin 拒掉。
 		parsed, err := parseOrigin(override, "url_override")
 		if err != nil {
-			return ResolvedTarget{}, err
+			return ResolvedTarget{}, urlConfig(err)
 		}
 		if err := requireSameOrigin(base, parsed); err != nil {
-			return ResolvedTarget{}, err
+			return ResolvedTarget{}, urlConfig(err)
 		}
 		if parsed.RawQuery != "" {
 			// 持久化只有一个固定 query 来源（§4.3）。override 里还带着 query
 			// 说明写入路径没做机械拆分，此刻拼起来就是第二个来源 —— 那正是
 			// 「query 有时丢、有时重复」这类难查问题的源头。
-			return ResolvedTarget{}, model.WrapValidation(
-				"url_override 不能带 query，固定 query 只能存在 fixed_query_template")
+			return ResolvedTarget{}, urlConfig(model.WrapValidation(
+				"url_override 不能带 query，固定 query 只能存在 fixed_query_template"))
 		}
 		target.Path = parsed.Path
 		target.RawPath = parsed.RawPath
@@ -188,8 +209,8 @@ func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,
 		parsed, err := url.Parse(joined)
 		if err != nil {
 			// 同 parseOrigin：不带 err 文本，它会附上完整 URL。
-			return ResolvedTarget{}, model.WrapValidation("拼接 %s 的 canonical path 失败",
-				in.Endpoint.Kind)
+			return ResolvedTarget{}, urlConfig(model.WrapValidation("拼接 %s 的 canonical path 失败",
+				in.Endpoint.Kind))
 		}
 		target.Path = parsed.Path
 		target.RawPath = parsed.RawPath
@@ -245,10 +266,10 @@ func (resolver *Resolver) resolveLegacy(ctx context.Context, in ResolveInput,
 	}
 	exact, err := parseOrigin(string(plain), "legacy full URL")
 	if err != nil {
-		return ResolvedTarget{}, err
+		return ResolvedTarget{}, urlConfig(err)
 	}
 	if err := requireSameOrigin(base, exact); err != nil {
-		return ResolvedTarget{}, err
+		return ResolvedTarget{}, urlConfig(err)
 	}
 
 	target := *exact
@@ -311,7 +332,7 @@ func renderFixedQuery(ctx context.Context, in ResolveInput) (string, string, err
 		RawQuery: template,
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", urlConfig(err)
 	}
 	required := compiled.RequiredSecrets()
 	if in.Values == nil {
