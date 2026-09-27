@@ -230,6 +230,20 @@ func TestProxyURLRejectsDisallowedSchemes(t *testing.T) {
 	}
 }
 
+// 没有 host 的 proxy_url 存进去之后，outbound 建池时一定失败：每个请求都会
+// 撞上「取连接池失败」。它必须在保存入口就被拒绝，与建池口径一致。
+func TestProxyURLRejectsMissingHost(t *testing.T) {
+	for _, proxy := range []string{"http://", "https://", "http:127.0.0.1:8888", "http:///path"} {
+		t.Run(proxy, func(t *testing.T) {
+			up := &Upstream{Name: "t", BaseURL: "https://a.com", APIKey: "", ProxyURL: proxy}
+			up.Defaults()
+			if err := up.Validate(); err == nil {
+				t.Fatalf("%q 没有 host，应被拒绝", proxy)
+			}
+		})
+	}
+}
+
 // 非法 proxy_url 的校验错误不得附上 net/url 原文（其中可含 user:password）。
 func TestProxyURLParseErrorOmitsPassword(t *testing.T) {
 	const pass = "secret"

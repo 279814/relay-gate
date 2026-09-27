@@ -176,6 +176,9 @@ func validateProxyURL(raw string) error {
 	if !AllowedProxyURLScheme(u.Scheme) {
 		return invalid("proxy_url 必须是 http(s):// 代理，收到 scheme %q", u.Scheme)
 	}
+	if u.Host == "" {
+		return invalid("proxy_url 必须形如 scheme://host[:port]")
+	}
 	return nil
 }
 
