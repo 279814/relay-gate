@@ -361,7 +361,7 @@ func runServer() error {
 		// 删站后没有下一次 Transport() 去换池键，必须主动丢掉该站全部池。
 		DropUpstreamTransports: transports.Invalidate,
 	}
-	calibrator.WithInvalidator(inv)
+	calibrator.WithInvalidator(inv).WithConfigPublisher(cfgSrc)
 	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv).WithManualPreparer(sched)
 	var bg sync.WaitGroup
 	bg.Add(6)
