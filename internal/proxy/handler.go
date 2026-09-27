@@ -362,6 +362,51 @@ type preambleResult struct {
 	body     []byte
 	inModel  string
 	snapshot *router.Snapshot
+	// encoding 是入站请求 body 的 Content-Encoding（gzip / br），identity 为 ""。
+	// 非空时 body 仍是原压缩字节，只能原样转发（§6.7）。
+	encoding string
+	// decoded 是 body 的只读解码副本，只用于 model 校验、选路与本地估算；
+	// identity 时与 body 相同。
+	decoded []byte
+}
+
+// compressedNeedsMapping reports a compressed body on a Route that would
+// rewrite the model (§6.3). Strict mode cannot rewrite it (§6.7 → 415).
+func (p *preambleResult) compressedNeedsMapping(rt *model.Route) bool {
+	return p.encoding != "" && rt != nil && rt.UpstreamModel != ""
+}
+
+// errCompressedNeedsMapping: every otherwise eligible Route needs a model
+// mapping, but the request body is compressed (§6.7 strict mode → 415).
+var errCompressedNeedsMapping = fmt.Errorf("%w: 压缩请求需要模型映射", router.ErrNoRouteAvailable)
+
+const (
+	msgCompressedNeedsMapping  = "压缩的请求体需要模型映射，严格模式不支持"
+	msgUnsupportedBodyEncoding = "不支持的请求体 Content-Encoding"
+)
+
+// decodeRequestBody makes the §6.7 read-only decoded copy of a gzip / br
+// request body. ok=false means the response has already been written.
+func decodeRequestBody(w http.ResponseWriter, r *http.Request, proto model.Protocol,
+	body []byte) (enc string, decoded []byte, ok bool) {
+
+	enc = normalizeContentEncoding(r.Header.Get("Content-Encoding"))
+	switch enc {
+	case "":
+		return "", body, true
+	case "gzip", "br":
+	default:
+		writeAPIError(w, http.StatusUnsupportedMediaType, proto,
+			"invalid_request_error", msgUnsupportedBodyEncoding)
+		return "", nil, false
+	}
+	decoded, err := decodeTransformBody(enc, body, MaxRequestBody)
+	if err != nil {
+		// Fixed text: the decoder error may quote body bytes.
+		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error", "请求体解压失败或超过上限")
+		return "", nil, false
+	}
+	return enc, decoded, true
 }
 
 // preamble 跑完所有端点共用的前半段：鉴权 → 总闸 → 设置 → 读 body →
@@ -429,9 +474,15 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
+	// gzip / br：只读解码副本用于 model 校验和选路（§6.7）；body 保持原字节。
+	enc, decoded, ok := decodeRequestBody(w, r, proto, body)
+	if !ok {
+		return nil, false
+	}
+
 	// 4. 取出 model 值用于选路。只读不改。
 	// 400 文案必须是固定 reason，不得附带 body 切片、model 值或 body 里出现过的 key。
-	inModel, err := ExtractModel(body)
+	inModel, err := ExtractModel(decoded)
 	if err != nil {
 		msg := "请求体 JSON 无效"
 		switch {
@@ -456,6 +507,7 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 
 	return &preambleResult{
 		settings: settings, body: body, inModel: inModel, snapshot: snap,
+		encoding: enc, decoded: decoded,
 	}, true
 }
 
@@ -557,7 +609,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 //
 // 返回 nil 表示不该半开，调用方按原错误作答。
 func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
-	proto model.Protocol, settings model.Settings, selErr error) *router.Candidate {
+	proto model.Protocol, settings model.Settings, selErr error,
+	skip func(*model.Route) bool) *router.Candidate {
 
 	if !settings.HalfOpenEnabled || !errors.Is(selErr, router.ErrNoRouteAvailable) {
 		return nil
@@ -575,6 +628,9 @@ func (h *Handler) halfOpen(snap *router.Snapshot, inModel string,
 			continue
 		}
 		if model.APIKeyTooShortForOutbound(up.APIKey) {
+			continue
+		}
+		if skip != nil && skip(rt) {
 			continue
 		}
 		relGate, ok := h.recovery.TryAcquire(rt.ID)
@@ -917,6 +973,9 @@ func (h *Handler) writeSelectError(w http.ResponseWriter, err error,
 	w.Header().Set("X-Relay-Reason", err.Error())
 
 	switch {
+	case errors.Is(err, errCompressedNeedsMapping):
+		writeAPIError(w, http.StatusUnsupportedMediaType, proto, "invalid_request_error",
+			msgCompressedNeedsMapping)
 	case errors.Is(err, router.ErrModelNotFound):
 		writeAPIError(w, http.StatusNotFound, proto, "not_found_error",
 			fmt.Sprintf("模型 %q 未配置。请在管理界面添加对应的 ModelName", inModel))
