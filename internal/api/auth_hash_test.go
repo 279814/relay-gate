@@ -125,10 +125,23 @@ func TestResetAdminPersistsHash(t *testing.T) {
 		WithAdminHash(hash, dir)
 	h := s.Routes(old)
 
+	login := httptest.NewRecorder()
+	h.ServeHTTP(login, httptest.NewRequest("POST", "/admin/api/login",
+		strings.NewReader(`{"password":"`+old+`"}`)))
+	var sess *http.Cookie
+	for _, c := range login.Result().Cookies() {
+		if c.Name == sessionCookie {
+			sess = c
+		}
+	}
+	if sess == nil {
+		t.Fatalf("login: %d %s", login.Code, login.Body.String())
+	}
+
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/admin/api/credentials/reset-admin",
 		strings.NewReader(`{"password":"`+old+`"}`))
-	req.Header.Set("Authorization", "Bearer "+old)
+	req.AddCookie(sess)
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reset: %d %s", rec.Code, rec.Body.String())

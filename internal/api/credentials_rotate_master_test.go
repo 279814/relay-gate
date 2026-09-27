@@ -71,9 +71,10 @@ func TestRotateMaster_RewrapsSecretsForRevealAndDecrypt(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := New(st, log).WithCredentials(creds, kr).WithRunState(runCtrl)
 	h := s.Routes(testAdminPW)
+	sess := loginSession(t, h)
 
 	body := `{"password":"` + testAdminPW + `","new_master":"` + newMaster + `"}`
-	rot := do(t, h, "POST", "/admin/api/credentials/rotate-master", body, true)
+	rot := doSession(t, h, "POST", "/admin/api/credentials/rotate-master", body, sess)
 	if rot.Code != http.StatusOK {
 		t.Fatalf("rotate-master want 200, got %d body=%s", rot.Code, rot.Body.String())
 	}
@@ -93,8 +94,8 @@ func TestRotateMaster_RewrapsSecretsForRevealAndDecrypt(t *testing.T) {
 		t.Fatal("rotation response must not include password")
 	}
 
-	reveal := do(t, h, "POST", "/admin/api/credentials/reveal-relay",
-		`{"password":"`+testAdminPW+`"}`, true)
+	reveal := doSession(t, h, "POST", "/admin/api/credentials/reveal-relay",
+		`{"password":"`+testAdminPW+`"}`, sess)
 	if reveal.Code != http.StatusOK {
 		t.Fatalf("reveal-relay want 200, got %d body=%s", reveal.Code, reveal.Body.String())
 	}
