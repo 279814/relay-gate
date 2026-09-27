@@ -1149,6 +1149,26 @@ func TestCountTokens_InvalidJSONIsBadRequestOnFallback(t *testing.T) {
 	}
 }
 
+// json.Unmarshal 的 SyntaxError 会引用出错的那个 body 字节，
+// 兜底 400 只能回固定文案，不得带出解码器错误或客户端原文。
+func TestCountTokens_InvalidJSONFallbackDoesNotEchoBody(t *testing.T) {
+	hs := newHarness(t, nil)
+	rec := hs.serve(hs.countTokensRequest(`{"model":"unconfigured-model","messages":[~]}`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d, want 400（原文 %q）", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, leak := range []string{"~", "invalid character"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("400 正文含 %q（原文 %q），不得回显解码器错误", leak, body)
+		}
+	}
+	if !strings.Contains(body, "请求体 JSON 无效") {
+		t.Errorf("400 正文 = %q, want 固定文案「请求体 JSON 无效」", body)
+	}
+}
+
 // 与上一条配对：转发路径**不**代替上游校验 body。
 // 上游收下并回 200，我们就原样回 200 —— 这是严格透传的直接后果。
 func TestCountTokens_ProxyPathDoesNotValidateBody(t *testing.T) {

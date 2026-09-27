@@ -276,8 +276,9 @@ const (
 func (h *Handler) localCountTokens(w http.ResponseWriter, body []byte) {
 	n, err := estimateInputTokens(body)
 	if err != nil {
+		// 固定文案，不附带解码器错误：SyntaxError 会引用出错的 body 字节。
 		writeAPIError(w, http.StatusBadRequest, model.ProtoAnthropic,
-			"invalid_request_error", fmt.Sprintf("无法解析请求: %v", err))
+			"invalid_request_error", "请求体 JSON 无效")
 		return
 	}
 
