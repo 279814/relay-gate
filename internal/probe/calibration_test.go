@@ -3,6 +3,8 @@ package probe
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/store"
@@ -896,5 +899,80 @@ func TestExecutor_ExplicitRecipeUsesAuthOverride(t *testing.T) {
 	}
 	if result.Execution.RecipeBindingUse != model.BindingExplicitTest {
 		t.Fatalf("binding use=%s", result.Execution.RecipeBindingUse)
+	}
+}
+
+// 校准成功后的下一次真实请求必须立即只发胜出的那一种认证头，
+// 不能在 livecfg TTL 内继续读校准前的 legacy 双发 profile。
+func TestCalibration_SuccessPublishesWinnerToRealTrafficSnapshot(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	src := livecfg.New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := src.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := src.Endpoint(context.Background(), up.ID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.AuthProfile.Mode != model.AuthModeLegacyAutoRealOnly {
+		t.Fatalf("前置条件：校准前应为 legacy_auto_real_only，got %s", before.AuthProfile.Mode)
+	}
+
+	var calls atomic.Int64
+	svc, _ := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) < 3 {
+			return respFrom(401, "application/json", `{"error":{"type":"authentication_error"}}`), nil
+		}
+		return respFrom(200, "text/event-stream", anthropicSemanticBody()), nil
+	})
+	svc.WithConfigPublisher(src)
+
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := svc.Start(context.Background(), run.ID, run.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		_ = svc.stepOnce(context.Background())
+		got, _ := st.GetCalibrationRun(context.Background(), started.ID)
+		if got.State != model.CalibrationRunning {
+			break
+		}
+	}
+	final, _ := st.GetCalibrationRun(context.Background(), started.ID)
+	if final.State != model.CalibrationSucceeded {
+		t.Fatalf("state=%s", final.State)
+	}
+	if final.Selected == nil {
+		t.Fatal("成功的 run 必须记录 selected candidate")
+	}
+	winner := final.Selected.AuthMode
+
+	live, err := src.Endpoint(context.Background(), up.ID, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.AuthProfile.Mode != model.AuthModeAutoCalibrated || live.AuthProfile.CalibratedMode != winner {
+		t.Fatalf("真实转发快照 profile=%+v，want auto_calibrated/%s", live.AuthProfile, winner)
+	}
+	header := http.Header{}
+	if err := outbound.ApplyAuth(context.Background(), header, outbound.AuthInput{
+		Profile: live.AuthProfile,
+		Values:  outbound.Values{UpstreamAPIKey: []byte(up.APIKey)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var sent []string
+	for _, name := range model.AuthHeaders {
+		if header.Get(name) != "" {
+			sent = append(sent, name)
+		}
+	}
+	if len(sent) != 1 {
+		t.Fatalf("真实请求应只发胜出的一种认证头 %s，实际 %v", winner, sent)
 	}
 }

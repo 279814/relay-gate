@@ -86,6 +86,9 @@ type CalibrationService struct {
 	capReg   *CapabilityRegistry
 	// invalidator clears §9.2 RouteHealth after Auth Profile / Probe Recipe publish.
 	invalidator ConfigInvalidator
+	// publisher 在 Auth Profile 固化后刷新 livecfg 快照；不刷新的话真实转发在
+	// TTL 内仍读到校准前的 profile（legacy 双发或未校准 config_error）。
+	publisher ConfigPublisher
 
 	mu      sync.Mutex
 	wake    chan struct{}
@@ -126,6 +129,33 @@ func (s *CalibrationService) WithInvalidator(inv ConfigInvalidator) *Calibration
 		s.invalidator = inv
 	}
 	return s
+}
+
+// ConfigPublisher 发布 livecfg 同代快照；livecfg.Source 实现本接口。
+type ConfigPublisher interface {
+	Invalidate()
+	Refresh() error
+}
+
+// WithConfigPublisher wires livecfg publish after a calibration commit rewrites Auth Profile.
+func (s *CalibrationService) WithConfigPublisher(p ConfigPublisher) *CalibrationService {
+	if s != nil {
+		s.publisher = p
+	}
+	return s
+}
+
+func (s *CalibrationService) publishAfterCommit(runID string) {
+	if s.publisher == nil {
+		return
+	}
+	s.publisher.Invalidate()
+	if err := s.publisher.Refresh(); err != nil {
+		// 失败时再 Invalidate：强制下一次读取重新加载，而不是沿用旧快照一个 TTL。
+		// 不记 err 文本：刷新错误可能包装出站凭据。
+		s.publisher.Invalidate()
+		s.log.Error("校准成功后刷新配置快照失败", "run", runID)
+	}
 }
 
 // WithCrashAt 仅测试：在指定点调用 crashFn（通常 panic 或 cancel）。
@@ -651,6 +681,7 @@ func (s *CalibrationService) finishFromExecution(ctx context.Context, run *model
 		if err != nil {
 			return err
 		}
+		s.publishAfterCommit(run.ID)
 		if s.capReg != nil {
 			s.capReg.InvalidateAfterCalibration(run.RouteID, route.UpstreamID, run.Endpoint)
 		}
