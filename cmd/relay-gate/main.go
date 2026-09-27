@@ -283,6 +283,7 @@ func runServer() error {
 		WithExecutor(executor).
 		WithRunState(runCtrl).
 		WithCapabilityRegistry(capRegistry)
+	resultRecorder.WithReachabilityRecovered(sched.OnReachabilityRecovered)
 	if err := coordinator.BindResumeTarget(sched); err != nil {
 		return fmt.Errorf("绑定 scheduler resume: %w", err)
 	}

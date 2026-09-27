@@ -612,6 +612,18 @@ func (s *Scheduler) triggerDeadRoutes(upstreamID int64) int {
 	return n
 }
 
+// OnReachabilityRecovered 是 ResultRecorder 的回调：非 L1 轮次的已提交观察
+// （L2、手动测试）让站离开 unreachable 时，同样即时调度 dead Route 的 L2
+// （§8.10）。定时 L1 轮次由 runL1 自己按同一条件触发，这里跳过以免重复。
+func (s *Scheduler) OnReachabilityRecovered(execution model.ProbeExecution) {
+	if execution.Trigger == model.TriggerScheduled && execution.Endpoint == model.EndpointModels {
+		return
+	}
+	n := s.triggerDeadRoutes(execution.UpstreamID)
+	s.log.Info("上游 Reachability 离开 unreachable，已触发该站 dead Route 的 L2",
+		"upstream_id", execution.UpstreamID, "trigger", execution.Trigger, "routes", n)
+}
+
 func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	mn *model.ModelName, rt *model.Route, settings model.Settings, generation uint64) {
 
