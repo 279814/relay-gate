@@ -261,9 +261,11 @@ func (r *Registry) ClearPublished(routeID, endpointID int64) (*Binding, error) {
 	if b == nil {
 		return nil, fmt.Errorf("binding not found")
 	}
+	prev := *b
 	b.PublishedID = 0
 	b.Revision++
 	if err := r.flushLocked(); err != nil {
+		*b = prev
 		return nil, err
 	}
 	return cloneBinding(b), nil
