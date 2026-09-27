@@ -123,7 +123,14 @@ func (t *Tracker) ClaimL1(routeID int64) (generation uint64, ok bool) {
 // 窗口里的 unknown Route：unknown 的 L1 间隔为 0，而 L1 成功不改变 Route 状态，
 // 若不处理，该站会在首个 L2 到来前每个 tick 重发 /models（§4.4 不得瞬时齐发）。
 // 这段等待期按 alive 周期对待，站一次 L1 即可。
+//
+// recovering 同理：它只能由合成 L2 探通进入（L2 以站 reachable 为前提），
+// L1 成功也不改变它的状态；按 §8.10 reachable 站的 /models 周期，
+// 不得每个 tick 重发（§8.9 每 Upstream 每轮最多一次）。L2 间隔不在此处理。
 func l1IntervalFor(rs *routeState, s model.Settings, now time.Time) time.Duration {
+	if rs.state == model.StateRecovering {
+		return aliveL1Interval(s)
+	}
 	l1, _ := intervalFor(rs, s, now)
 	if l1 == 0 && rs.state == model.StateUnknown && rs.nextL2At.After(now) {
 		return aliveL1Interval(s)

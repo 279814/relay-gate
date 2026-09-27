@@ -373,6 +373,47 @@ func TestClaim_DeadL1ZeroOrNegativeUsesDocFloor(t *testing.T) {
 	}
 }
 
+// recovering L1（/models）：按 §8.10 reachable 站周期，不能每个 tick 连发（§8.9）。
+// L1 成功不改变 recovering，间隔若为 0 该站会在 OKThreshold 达成前每秒一次 /models。
+func TestClaim_RecoveringL1UsesReachableInterval(t *testing.T) {
+	for _, interval := range []int{0, 90} {
+		t.Run(strconv.Itoa(interval), func(t *testing.T) {
+			tr, fs, now := newTestTracker(t)
+			fs.s.FailThreshold = 1
+			fs.s.OKThreshold = 2
+			fs.s.L1IntervalAliveSec = interval
+			want := time.Duration(interval) * time.Second
+			if interval <= 0 {
+				want = 60 * time.Second
+			}
+
+			report(tr, 1, VerdictUnavailable, SourceL2) // → dead
+			tr.Report(Report{RouteID: 1, Verdict: VerdictOK, Source: SourceL2, HalfOpen: true})
+			if tr.State(1) != model.StateRecovering {
+				t.Fatalf("前置条件：应为 recovering，得到 %s", tr.State(1))
+			}
+			tr.TriggerL1(1)
+
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatal("首次应到期")
+			}
+			tr.CompleteL1(1, *now, 0)
+			*now = now.Add(time.Second)
+			if _, ok := tr.ClaimL1(1); ok {
+				t.Fatal("recovering 的 L1 不得在下一个 tick 再次到期")
+			}
+			*now = now.Add(want - 2*time.Second)
+			if _, ok := tr.ClaimL1(1); ok {
+				t.Fatalf("未满 %v 不应再探", want)
+			}
+			*now = now.Add(2 * time.Second)
+			if _, ok := tr.ClaimL1(1); !ok {
+				t.Fatalf("超过 %v 后应到期", want)
+			}
+		})
+	}
+}
+
 // alive L2：存库间隔为 0 或负值时仍至少等 §8.10 的 600s，不能每个 tick 连发。
 func TestClaim_AliveL2ZeroOrNegativeUsesDocFloor(t *testing.T) {
 	for _, interval := range []int{0, -30} {
