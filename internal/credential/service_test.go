@@ -82,6 +82,44 @@ func TestRelayAlsoKeysSurviveRotate(t *testing.T) {
 	}
 }
 
+// A primary repeated in RELAY_KEYS must not linger on the also-list once it
+// is rotated out: revoke and grace expiry both have to reject it.
+func TestRelayRotatedPrimaryNotKeptAsAlsoKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(s *Service, advance func())
+	}{
+		{"revoke", func(s *Service, _ func()) {
+			if err := s.RevokeGrace(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"expiry", func(_ *Service, advance func()) { advance() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			s := New().WithNow(func() time.Time { return now })
+			if err := s.SetActiveRelayKeys([]string{"rk_a", "rk_b", "rk_a"}); err != nil {
+				t.Fatal(err)
+			}
+			newKey, _, err := s.RotateRelayKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !s.ValidRelayKey("rk_a") {
+				t.Fatal("rotated-out primary should work during grace")
+			}
+			tc.end(s, func() { now = now.Add(10*time.Minute + time.Second) })
+			if s.ValidRelayKey("rk_a") {
+				t.Fatal("rotated-out primary must not survive via the also-list")
+			}
+			if !s.ValidRelayKey("rk_b") || !s.ValidRelayKey(newKey) {
+				t.Fatal("also-key and new active must remain")
+			}
+		})
+	}
+}
+
 // TestRelayDigestSnapshotAuth covers §6.1 / §12.6: hot-path snapshot holds
 // irreversible digests (not raw keys); right/grace accepted; wrong/empty and
 // unconfigured snapshots rejected.

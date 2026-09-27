@@ -247,6 +247,9 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 			return "", 0, fmt.Errorf("持久化 Relay Key 轮换: %w", err)
 		}
 	}
+	// A primary repeated in RELAY_KEYS also sits in relayAlso; drop it so the
+	// rotated-out key is grace-only and dies with revoke / expiry.
+	delete(s.relayAlso, nextGrace)
 	s.relayGrace = nextGrace
 	s.graceUntil = nextUntil
 	s.relayActive = digestRelayKey(newKey)
