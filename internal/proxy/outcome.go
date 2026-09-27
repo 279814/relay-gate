@@ -72,7 +72,7 @@ type ResultView struct {
 func viewOf(res *Result, redactKeys []string, endpoint model.EndpointKind) *ResultView {
 	return &ResultView{
 		Status:       res.Status,
-		Err:          res.Err,
+		Err:          redactErr(res.Err, redactKeys),
 		ErrBody:      sample.RedactDiagnostic(res.ErrBody, redactKeys),
 		Header:       res.RespHeaders,
 		Endpoint:     endpoint,
@@ -81,3 +81,22 @@ func viewOf(res *Result, redactKeys []string, endpoint model.EndpointKind) *Resu
 		SemanticSeen: res.SemanticSeen,
 	}
 }
+
+// redactErr 让 Err 的文本与 ErrBody 走同一条脱敏：上游回显请求行时，
+// net/http 会把那一行（query 里可能有 key）拼进 res.Err，而 Tracker 把
+// Err.Error() 原样存成 route_health.last_error。Unwrap 保留原错误链，
+// IsUpstreamFault / errors.Is 分类不受影响。
+func redactErr(err error, keys []string) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{msg: sample.RedactDiagnosticText(err.Error(), keys), err: err}
+}
+
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }

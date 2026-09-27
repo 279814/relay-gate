@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -103,6 +104,47 @@ func TestTransportErr_LogRetryRedactsKeyInErr(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), secret) {
 		t.Errorf("重试日志出现了明文上游 key:\n%s", logs.String())
+	}
+}
+
+// 健康回写的 Err 会被 Tracker 原样存成 route_health.last_error（落库，
+// /admin/api/health 可见），必须与 ErrBody 一样先脱敏。
+func TestTransportErr_EchoedRequestLineRedactedInHealthReport(t *testing.T) {
+	const secret = "sk-upstream-secret-echoed-health-report"
+	hs, _ := newEchoLineHarness(t, secret)
+	spy := &capturingReporter{}
+	hs.h.WithHealthReporter(spy)
+
+	hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
+
+	got := spy.last()
+	if got == nil || got.Err == nil {
+		t.Fatalf("应上报传输层错误，got=%+v", got)
+	}
+	if !strings.Contains(got.Err.Error(), "malformed") {
+		t.Fatalf("健康 Err 应保留解析错误原因：%q", got.Err.Error())
+	}
+	if strings.Contains(got.Err.Error(), secret) {
+		t.Errorf("健康 Err 出现了明文上游 key：%q", got.Err.Error())
+	}
+	if !IsUpstreamFault(got.Err) {
+		t.Errorf("脱敏后丢了错误链，健康分类会误判：%v", got.Err)
+	}
+}
+
+func TestViewOf_RedactedErrKeepsSentinel(t *testing.T) {
+	const secret = "sk-upstream-secret-in-view-err"
+	res := &Result{Err: fmt.Errorf("%w: malformed HTTP status code %q",
+		ErrUpstreamBroke, "/v1/messages?key="+secret)}
+	v := viewOf(res, []string{secret}, model.EndpointMessages)
+	if strings.Contains(v.Err.Error(), secret) {
+		t.Errorf("view.Err 出现了明文 key：%q", v.Err.Error())
+	}
+	if !errors.Is(v.Err, ErrUpstreamBroke) {
+		t.Errorf("view.Err 丢了哨兵：%v", v.Err)
+	}
+	if viewOf(&Result{}, []string{secret}, model.EndpointMessages).Err != nil {
+		t.Error("nil Err 应保持 nil")
 	}
 }
 
