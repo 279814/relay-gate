@@ -29,6 +29,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/revisioncodec"
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // 默认解码预算：单事件 1 MiB、总量 8 MiB。探活正文都很小，这两个上限只是
@@ -666,6 +667,7 @@ func (e *Executor) finishSuccessPath(ctx context.Context, req ExecutionRequest, 
 	decision Decision, timing sendTiming, requestBytes, responseBytes, estInputTokens int64,
 	expectedCancel bool, sentAt time.Time) (ExecutionResult, error) {
 
+	decision = redactDecisionDetail(decision, req.Upstream)
 	outcome := e.decisionOutcome(req, decision)
 	outcome.Sent = true
 	outcome.Status = decision.StatusCode
@@ -732,6 +734,7 @@ func (e *Executor) buildExecution(req ExecutionRequest, recipe ResolvedRecipe, d
 	timing sendTiming, requestBytes, responseBytes, estInputTokens int64,
 	expectedCancel bool, resolvedURLHash, requestURLHash string) model.ProbeExecution {
 
+	decision = redactDecisionDetail(decision, req.Upstream)
 	var routeID int64
 	if req.Route != nil {
 		routeID = req.Route.ID
@@ -1027,6 +1030,19 @@ func retryAfterDuration(decision Decision, now time.Time) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// redactDecisionDetail 按本次上游 key 再扫一遍 RedactedDetail（§2.4、§4.6）。
+//
+// structuredIdentifier 的字符白名单只挡散文：key 本身就是 [A-Za-z0-9_.-]，
+// 上游把它整段回显进 error.type/code/param 时会原样进详情，继而进
+// probe_execution、能力/可达性行、健康视图和管理 API。
+func redactDecisionDetail(decision Decision, up *model.Upstream) Decision {
+	if up == nil || decision.RedactedDetail == "" {
+		return decision
+	}
+	decision.RedactedDetail = sample.RedactDiagnosticText(decision.RedactedDetail, []string{up.APIKey})
+	return decision
 }
 
 // detailErr 从脱敏详情造一个 error，供健康视图展示。绝不含明文。

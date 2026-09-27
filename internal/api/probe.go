@@ -7,6 +7,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
+	"github.com/279814/relay-gate/internal/sample"
 )
 
 // ManualProbeRunner 执行恰好一次 manual ProbeExecution（P0-14）。
@@ -366,7 +367,18 @@ func (s *Server) listProbeExecutions(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	keys := s.knownUpstreamRedactKeys()
+	for i := range page.Items {
+		page.Items[i] = redactExecutionDetail(page.Items[i], keys)
+	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// redactExecutionDetail 读侧兜底：写侧按本次上游 key 脱敏之前落库的行，
+// redacted_detail 可能含上游整段回显进 error.type/code/param 的 key（§2.4）。
+func redactExecutionDetail(exec model.ProbeExecution, keys []string) model.ProbeExecution {
+	exec.RedactedDetail = sample.RedactDiagnosticText(exec.RedactedDetail, keys)
+	return exec
 }
 
 func (s *Server) getProbeExecution(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +392,7 @@ func (s *Server) getProbeExecution(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, exec)
+	writeJSON(w, http.StatusOK, redactExecutionDetail(exec, s.knownUpstreamRedactKeys()))
 }
 
 func (s *Server) listCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -392,6 +404,11 @@ func (s *Server) listCapabilities(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	// 能力行的 redacted_detail 由 reducer 从 execution 原样复制，历史行同样要兜底。
+	keys := s.knownUpstreamRedactKeys()
+	for i := range page.Items {
+		page.Items[i].RedactedDetail = sample.RedactDiagnosticText(page.Items[i].RedactedDetail, keys)
 	}
 	writeJSON(w, http.StatusOK, page)
 }
@@ -405,6 +422,11 @@ func (s *Server) listReachability(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	// last_error 取自 execution.redacted_detail，历史行同样要兜底。
+	keys := s.knownUpstreamRedactKeys()
+	for i := range page.Items {
+		page.Items[i].LastError = sample.RedactDiagnosticText(page.Items[i].LastError, keys)
 	}
 	writeJSON(w, http.StatusOK, page)
 }
