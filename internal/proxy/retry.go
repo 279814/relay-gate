@@ -110,6 +110,10 @@ const (
 	dispatchSent dispatchStatus = iota
 	dispatchFatal
 	dispatchRouteLocal // nothing written; try next Route without a network Attempt
+	// dispatchRouteAuthConfig is a route-local Auth Secret failure (§6.5 / §7.2):
+	// same skip as dispatchRouteLocal, but when no Route is left the client
+	// gets the no-route error, not the transform fail_closed text.
+	dispatchRouteAuthConfig
 )
 
 // forwardWithRetry 完成选路 + 转发，失败时按 §3.5 换站重试。
@@ -202,22 +206,35 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			held = nil
 			return nil, false
 		}
-		if status == dispatchRouteLocal {
-			// §6.5 / §15.7: Transform fail_closed is route-local — no upstream
-			// send, no maxAttempts burn; skip to the next Route.
+		if status == dispatchRouteLocal || status == dispatchRouteAuthConfig {
+			// §6.5 / §15.7: Transform fail_closed and Auth Secret errors are
+			// route-local — no upstream send, no maxAttempts burn; skip to the
+			// next Route.
 			cand.Release()
 			held = nil
 			localSkips++
-			h.log.Info("route-local 请求转换失败，跳过本 Route",
+			h.log.Info("route-local 本地失败，跳过本 Route",
 				"route", cand.Route.ID, "local_skips", localSkips,
 				"max_local_skips", plan.maxLocalSkips)
-			if localSkips >= plan.maxLocalSkips {
+			exhausted := func(selErr error) {
+				if status == dispatchRouteAuthConfig {
+					// The auth error text stays in the log; the client only
+					// sees the documented no-route response.
+					if selErr == nil || !errors.Is(selErr, router.ErrNoRouteAvailable) {
+						selErr = router.ErrNoRouteAvailable
+					}
+					h.writeSelectError(w, selErr, proto, pre.inModel)
+					return
+				}
 				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")
+			}
+			if localSkips >= plan.maxLocalSkips {
+				exhausted(nil)
 				return nil, false
 			}
 			next, _, selErr := h.selectFor(pre, proto, plan.tried, false)
 			if selErr != nil || next == nil {
-				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")
+				exhausted(selErr)
 				return nil, false
 			}
 			cand = next
@@ -385,6 +402,8 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 协议/全局配置），换站无意义。
 // dispatchRouteLocal：尚未写客户端、尚未发上游（§6.5 Transform fail_closed）；
 // 调用方应跳过本 Route 并选下一个，不消耗 retry_max_attempts。
+// dispatchRouteAuthConfig：同上，原因是 Auth Secret 不可用（§7.2 空凭据等），
+// 已把该 Route 当前 Endpoint 的 Capability 记为 config_error。
 // dispatchSent：已发出上游请求，la 非空。
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
@@ -420,6 +439,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	// 配旧认证」，症状是偶发 401。
 	outHeader, err := h.outboundHeaders(r, cand, target, proto)
 	if err != nil {
+		if errors.Is(err, outbound.ErrAuthConfig) && r.Context().Err() == nil {
+			h.log.Warn("出站认证配置不可用，跳过本 Route", "err", err,
+				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
+			h.markRouteConfigError(cand, kind)
+			return nil, dispatchRouteAuthConfig
+		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
