@@ -114,6 +114,10 @@ const (
 	// same skip as dispatchRouteLocal, but when no Route is left the client
 	// gets the no-route error, not the transform fail_closed text.
 	dispatchRouteAuthConfig
+	// dispatchRouteCompressedTransform: the body is compressed and this Route's
+	// published request transform rewrites the body (§6.7). Skip like a
+	// mapping Route; when no Route is left the client gets 415.
+	dispatchRouteCompressedTransform
 )
 
 // forwardWithRetry 完成选路 + 转发，失败时按 §3.5 换站重试。
@@ -206,7 +210,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			held = nil
 			return nil, false
 		}
-		if status == dispatchRouteLocal || status == dispatchRouteAuthConfig {
+		if status == dispatchRouteLocal || status == dispatchRouteAuthConfig ||
+			status == dispatchRouteCompressedTransform {
 			// §6.5 / §15.7: Transform fail_closed and Auth Secret errors are
 			// route-local — no upstream send, no maxAttempts burn; skip to the
 			// next Route.
@@ -217,6 +222,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				"route", cand.Route.ID, "local_skips", localSkips,
 				"max_local_skips", plan.maxLocalSkips)
 			exhausted := func(selErr error) {
+				if status == dispatchRouteCompressedTransform {
+					writeAPIError(w, http.StatusUnsupportedMediaType, proto, "invalid_request_error",
+						msgCompressedNeedsTransform)
+					return
+				}
 				if status == dispatchRouteAuthConfig {
 					// The auth error text stays in the log; the client only
 					// sees the documented no-route response.
@@ -418,6 +428,7 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // dispatchRouteAuthConfig：同上，原因是本 Route 的 URL 或 Auth Secret 配置
 // 不可用（§6.5；§7.2 空凭据等），
 // 已把该 Route 当前 Endpoint 的 Capability 记为 config_error。
+// dispatchRouteCompressedTransform：同上，原因是压缩请求体遇上请求 body 转换（§6.7）。
 // dispatchSent：已发出上游请求，la 非空。
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
@@ -487,6 +498,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		if terr != nil {
 			h.log.Error("加载 transform 失败", "err", terr, "route", cand.Route.ID)
 			return nil, dispatchRouteLocal
+		}
+		if compiled != nil && pre.encoding != "" && compiled.HasRequestBodyRules() {
+			h.log.Info("压缩请求体不能走请求 body 转换，跳过本 Route",
+				"route", cand.Route.ID, "endpoint", target.EndpointID)
+			return nil, dispatchRouteCompressedTransform
 		}
 		if compiled != nil {
 			beforeBody := outBody

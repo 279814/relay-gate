@@ -61,6 +61,22 @@ func (c *Compiled) ApplyRequest(in RequestInput) RequestResult {
 	return c.ApplyRequestSecrets(in, nil)
 }
 
+// HasRequestBodyRules reports whether the request path would read or rewrite
+// the body. Header-only rule sets never touch it.
+func (c *Compiled) HasRequestBodyRules() bool {
+	if c == nil {
+		return false
+	}
+	for _, rule := range c.Version.Rules {
+		switch rule.Kind {
+		case KindReplaceBytes, KindSetJSONPointer,
+			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate:
+			return true
+		}
+	}
+	return false
+}
+
 // ApplyRequestSecrets is ApplyRequest with optional secret resolution for
 // secret_ref / {{SECRET:name}} rules. Rendered secrets are tainted.
 func (c *Compiled) ApplyRequestSecrets(in RequestInput, secrets SecretMap) RequestResult {
