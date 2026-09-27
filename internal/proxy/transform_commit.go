@@ -13,7 +13,15 @@ import (
 
 // commitLive writes the attempt to the client, optionally applying a published
 // response / SSE transform. Unbound (compiled == nil) stays pure passthrough.
+// A bound shadow version only observes a copy of what was written (§15.2).
 func (h *Handler) commitLive(w http.ResponseWriter, la *liveAttempt) *Result {
+	shadow := h.attachResponseShadow(w, la)
+	res := h.commitLiveBytes(w, la)
+	shadow.finish(res)
+	return res
+}
+
+func (h *Handler) commitLiveBytes(w http.ResponseWriter, la *liveAttempt) *Result {
 	if la.compiled == nil {
 		return la.at.Commit(w)
 	}
