@@ -115,9 +115,20 @@ func (t *Tracker) ClaimL1(routeID int64) (generation uint64, ok bool) {
 	if !rs.nextL1At.IsZero() && now.Before(rs.nextL1At) {
 		return 0, false
 	}
-	l1, _ := intervalFor(rs, s, now)
-	rs.nextL1At = now.Add(l1)
+	rs.nextL1At = now.Add(l1IntervalFor(rs, s, now))
 	return rs.generation, true
+}
+
+// l1IntervalFor 是 intervalFor 的 L1 分量，另处理恢复后首轮 L2 尚在 jitter
+// 窗口里的 unknown Route：unknown 的 L1 间隔为 0，而 L1 成功不改变 Route 状态，
+// 若不处理，该站会在首个 L2 到来前每个 tick 重发 /models（§4.4 不得瞬时齐发）。
+// 这段等待期按 alive 周期对待，站一次 L1 即可。
+func l1IntervalFor(rs *routeState, s model.Settings, now time.Time) time.Duration {
+	l1, _ := intervalFor(rs, s, now)
+	if l1 == 0 && rs.state == model.StateUnknown && rs.nextL2At.After(now) {
+		return aliveL1Interval(s)
+	}
+	return l1
 }
 
 // ClaimL2 同 ClaimL1，另外实现 piggyback（§4.6）。
@@ -283,11 +294,10 @@ func (t *Tracker) CompleteL1(routeID int64, completedAt time.Time, jitter float6
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	rs := t.get(routeID)
-	l1, _ := intervalFor(rs, s, completedAt)
 	if completedAt.IsZero() {
 		completedAt = t.now()
 	}
-	rs.nextL1At = completedAt.Add(applyJitter(l1, jitter))
+	rs.nextL1At = completedAt.Add(applyJitter(l1IntervalFor(rs, s, completedAt), jitter))
 }
 
 // CompleteL2 同 CompleteL1。
