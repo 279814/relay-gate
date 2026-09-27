@@ -164,6 +164,58 @@ func TestPointerSwitchRestoredOnPersistError(t *testing.T) {
 	}
 }
 
+// A failed ClearPublished save must leave the published pointer and revision
+// untouched (and shadow unchanged); a later successful clear sets it to 0.
+func TestClearPublishedRestoredOnPersistError(t *testing.T) {
+	sink := &togglePersist{}
+	reg := transform.NewRegistry(4).WithPersist(sink)
+	set, err := reg.CreateSet("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Demo", Value: "1"}}
+	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	const route, ep = 7, 2
+	_, v1, err := reg.PublishSnapshot(set.ID, route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, s1, err := reg.ShadowSnapshot(set.ID, route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := reg.GetBinding(route, ep)
+
+	sink.fail = true
+	if _, err := reg.ClearPublished(route, ep); err == nil {
+		t.Fatal("expected clear persist error")
+	}
+	after, _ := reg.GetBinding(route, ep)
+	if *after != *before {
+		t.Fatalf("failed clear changed binding: before=%+v after=%+v", before, after)
+	}
+	if _, id, _ := reg.PublishedCompiled(route, ep); id != v1.ID {
+		t.Fatalf("failed clear moved published pointer: got %d want %d", id, v1.ID)
+	}
+	if _, id, _ := reg.ShadowCompiled(route, ep); id != s1.ID {
+		t.Fatalf("failed clear touched shadow: got %d want %d", id, s1.ID)
+	}
+
+	sink.fail = false
+	b, err := reg.ClearPublished(route, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.PublishedID != 0 || b.Revision != before.Revision+1 || b.ShadowID != s1.ID {
+		t.Fatalf("successful clear: got %+v (before %+v)", b, before)
+	}
+	if c, id, _ := reg.PublishedCompiled(route, ep); c != nil || id != 0 {
+		t.Fatalf("successful clear must disable published: id=%d", id)
+	}
+}
+
 func TestCreateSetSurfacesPersistError(t *testing.T) {
 	reg := transform.NewRegistry(4).WithPersist(failPersist{})
 	if _, err := reg.CreateSet("x"); err == nil {
