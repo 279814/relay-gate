@@ -540,7 +540,8 @@ func TestInvalidate_RouteReEnableClearsDeadWithoutProbe(t *testing.T) {
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
 	tr := health.NewTracker(fs)
-	sem := health.NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
 		Semantic: sem,
@@ -570,6 +571,7 @@ func TestInvalidate_RouteReEnableClearsDeadWithoutProbe(t *testing.T) {
 	if _, _, ok := tr.TryAcquire(sibID, 10); !ok {
 		t.Fatal("setup: acquire sibling inFlight")
 	}
+	*caps = recordingCaps{}
 	beforeRoutes, beforeUps, _ := inner.counts()
 
 	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":false}`, true)
@@ -589,6 +591,13 @@ func TestInvalidate_RouteReEnableClearsDeadWithoutProbe(t *testing.T) {
 	if tr.InFlight(sibID) != 1 {
 		t.Fatalf("sibling inFlight=%d want 1", tr.InFlight(sibID))
 	}
+	if !caps.has(rtID) {
+		t.Fatalf("§9.2 route re-enable must clear route Capability, cleared=%v", caps.cleared)
+	}
+	if caps.has(sibID) || len(caps.upstreamCleared) != 0 {
+		t.Fatalf("route re-enable must not clear sibling/upstream Capability: routes=%v ups=%v",
+			caps.cleared, caps.upstreamCleared)
+	}
 	afterRoutes, afterUps, _ := inner.counts()
 	if afterRoutes != beforeRoutes || afterUps != beforeUps {
 		t.Fatalf("re-enable must not schedule probes: routes %d→%d ups %d→%d",
@@ -602,7 +611,8 @@ func TestInvalidate_UpstreamReEnableClearsDeadWithoutProbe(t *testing.T) {
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
 	tr := health.NewTracker(fs)
-	sem := health.NewSemanticInvalidator(tr, nil, nil, nil, nil)
+	caps := &recordingCaps{}
+	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
 		Semantic:         sem,
@@ -629,6 +639,7 @@ func TestInvalidate_UpstreamReEnableClearsDeadWithoutProbe(t *testing.T) {
 	if _, _, ok := tr.TryAcquire(sibID, 10); !ok {
 		t.Fatal("setup: acquire sibling inFlight")
 	}
+	*caps = recordingCaps{}
 	beforeRoutes, beforeUps, _ := inner.counts()
 
 	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
@@ -647,6 +658,14 @@ func TestInvalidate_UpstreamReEnableClearsDeadWithoutProbe(t *testing.T) {
 	}
 	if tr.InFlight(sibID) != 1 {
 		t.Fatalf("sibling inFlight=%d want 1", tr.InFlight(sibID))
+	}
+	if !caps.has(rtID) || !caps.hasUpstream(upID) {
+		t.Fatalf("§9.2 upstream re-enable must clear child route + upstream Capability: routes=%v ups=%v",
+			caps.cleared, caps.upstreamCleared)
+	}
+	if caps.has(sibID) || caps.hasUpstream(upSib) {
+		t.Fatalf("upstream re-enable must not clear sibling Capability: routes=%v ups=%v",
+			caps.cleared, caps.upstreamCleared)
 	}
 	afterRoutes, afterUps, _ := inner.counts()
 	if afterRoutes != beforeRoutes || afterUps != beforeUps {

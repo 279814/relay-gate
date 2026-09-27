@@ -70,11 +70,11 @@ func (s *SemanticInvalidator) InvalidateRoute(routeID int64) {
 	}
 }
 
-// ForgetRouteHealth drops RouteHealth and RecoveryGate for one Route without
-// scheduling probes or clearing Capability.
+// ForgetRouteHealth drops RouteHealth, RecoveryGate and route-scoped Capability
+// for one Route without scheduling probes.
 //
-// Used when Enabled flips false→true: a pre-disable dead/cooldown verdict must
-// not permanently block selection, but re-enable must not start L1/L2.
+// Used when Enabled flips false→true: §9.2 lists re-enable among the edits that
+// clear health and Capability, but re-enable must not start L1/L2.
 func (s *SemanticInvalidator) ForgetRouteHealth(routeID int64) {
 	if s == nil || routeID <= 0 {
 		return
@@ -86,6 +86,24 @@ func (s *SemanticInvalidator) ForgetRouteHealth(routeID int64) {
 	}
 	if s.recovery != nil {
 		s.recovery.Forget(routeID)
+	}
+	if s.caps != nil {
+		s.caps.InvalidateScope(model.RecipeScopeRoute, routeID)
+	}
+}
+
+// ForgetUpstreamHealth is the Upstream re-enable counterpart of
+// ForgetRouteHealth: it forgets every child Route and the upstream-scoped
+// Capability rows, without scheduling probes.
+func (s *SemanticInvalidator) ForgetUpstreamHealth(upstreamID int64, routeIDs []int64) {
+	if s == nil {
+		return
+	}
+	for _, id := range routeIDs {
+		s.ForgetRouteHealth(id)
+	}
+	if s.caps != nil && upstreamID > 0 {
+		s.caps.InvalidateScope(model.RecipeScopeUpstream, upstreamID)
 	}
 }
 

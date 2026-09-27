@@ -80,8 +80,8 @@ func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
 	}
 }
 
-// ForgetRouteHealth clears RouteHealth / RecoveryGate for one Route without
-// scheduling synthetic probes (Enabled false→true path).
+// ForgetRouteHealth clears RouteHealth / RecoveryGate / Capability for one
+// Route without scheduling synthetic probes (Enabled false→true path).
 func (s *SemanticConfigInvalidator) ForgetRouteHealth(routeID int64) {
 	if s == nil || s.Semantic == nil {
 		return
@@ -119,8 +119,9 @@ func (s *SemanticConfigInvalidator) ForgetUpstream(upstreamID int64, routeIDs []
 	}
 }
 
-// ForgetUpstreamHealth clears RouteHealth for every known child Route of an
-// Upstream without scheduling probes. Sibling upstreams are untouched.
+// ForgetUpstreamHealth clears RouteHealth / Capability for every known child
+// Route of an Upstream, plus its upstream-scoped Capability, without scheduling
+// probes. Sibling upstreams are untouched.
 func (s *SemanticConfigInvalidator) ForgetUpstreamHealth(upstreamID int64) {
 	if s == nil {
 		return
@@ -128,6 +129,12 @@ func (s *SemanticConfigInvalidator) ForgetUpstreamHealth(upstreamID int64) {
 	var routeIDs []int64
 	if s.RoutesOfUpstream != nil {
 		routeIDs = s.RoutesOfUpstream(upstreamID)
+	}
+	if f, ok := s.Semantic.(interface {
+		ForgetUpstreamHealth(upstreamID int64, routeIDs []int64)
+	}); ok {
+		f.ForgetUpstreamHealth(upstreamID, routeIDs)
+		return
 	}
 	for _, id := range routeIDs {
 		s.ForgetRouteHealth(id)
