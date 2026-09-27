@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -18,9 +20,17 @@ import (
 // not switch the live Cipher — caller ActivateMaster after Keyring
 // key_activated. Failed rewrap rolls back the TX so activation never leaves
 // half the samples on the old key.
-func (s *Store) RewrapDirectSecrets(newMaster string) error {
+//
+// rotationID is written in the same TX (§12.7 step 7) so startup recovery can
+// tell "prepared, DB not committed" (abort) from "prepared, DB committed"
+// (roll forward): aborting after this commit would discard the only key the
+// rows open under.
+func (s *Store) RewrapDirectSecrets(newMaster, rotationID string) error {
 	if s == nil || s.cipher == nil {
 		return ErrNoKey
+	}
+	if strings.TrimSpace(rotationID) == "" {
+		return fmt.Errorf("rewrap 需要 rotation_id")
 	}
 	if _, _, err := deriveMaster(newMaster); err != nil {
 		return err
@@ -46,7 +56,47 @@ func (s *Store) RewrapDirectSecrets(newMaster string) error {
 	if err := rewrapSampleBodies(tx, s.cipher, newMaster); err != nil {
 		return fmt.Errorf("rewrap sample: %w", err)
 	}
+	if _, err := tx.Exec(`INSERT INTO setting (key, value, updated_at) VALUES (?,?,?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		keyMasterRotation, rotationID, nowMS()); err != nil {
+		return fmt.Errorf("rewrap rotation_id: %w", err)
+	}
 	return tx.Commit()
+}
+
+const keyMasterRotation = "master_rotation_id"
+
+// CommittedMasterRotation returns the rotation_id last committed by
+// RewrapDirectSecrets in the SQLite file at dbPath, or "" when the file, the
+// setting table, or the row is absent. Startup calls it before the Store is
+// opened (the live Cipher depends on which key recovery leaves active).
+func CommittedMasterRotation(dbPath string) (string, error) {
+	path := dbPathOf(dbPath)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	db, err := sql.Open("sqlite", path+connPragmas)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='setting'`).Scan(&n); err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", nil
+	}
+	var rid string
+	err = db.QueryRow(`SELECT value FROM setting WHERE key=?`, keyMasterRotation).Scan(&rid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return rid, err
 }
 
 func rewrapUpstreamKeys(tx *sql.Tx, c *Cipher, newMaster string) error {

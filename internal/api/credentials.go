@@ -261,7 +261,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		// pending before MarkDBCommitted / ActivatePending. Failure on SQLite
 		// rewrap aborts prepared (DB unchanged). Relay reseal after SQLite
 		// commit keeps pending for recovery (same class as MarkDBCommitted fail).
-		if err := s.st.RewrapDirectSecrets(body.NewMaster); err != nil {
+		if err := s.st.RewrapDirectSecrets(body.NewMaster, rid); err != nil {
 			_ = s.keyring.AbortPrepared(rid)
 			s.writeErr(w, err)
 			return
@@ -314,7 +314,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.RewrapDirectSecrets(body.NewMaster); err != nil {
+	if err := s.st.RewrapDirectSecrets(body.NewMaster, rid); err != nil {
 		_ = s.keyring.AbortPrepared(rid)
 		s.writeErr(w, err)
 		return
