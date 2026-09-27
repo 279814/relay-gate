@@ -121,6 +121,10 @@ func (s *Server) createUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
+	if in.NeedsReview || in.URLMode == model.EndpointURLLegacyExact {
+		s.writeErr(w, model.WrapValidation("不能新增待审核 Endpoint：未审核状态禁止新增 URL 绑定（§19.2）"))
+		return
+	}
 	ep, err := s.probeAdmin.CreateEndpoint(r.Context(), in)
 	if err != nil {
 		s.writeErr(w, err)
@@ -166,6 +170,12 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	// 或把 Invalidate 打到错误 Upstream（store UPDATE 本身不写 upstream_id 列）。
 	body.ID = id
 	body.UpstreamID = cur.UpstreamID
+	// §19.2 第 4 条：未审核 Endpoint 的 URL 绑定只能经 confirm-review 改写，
+	// 否则通用 PUT 可以绕过「每个 Endpoint 须用户确认」。
+	if cur.NeedsReview && endpointBindingChanged(cur, body.UpstreamEndpoint) {
+		s.writeErr(w, model.WrapValidation("Endpoint 待审核：URL 绑定须经 confirm-review 确认后才能修改"))
+		return
+	}
 	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, body.UpstreamEndpoint)
 	if err != nil {
 		s.writeErr(w, err)
