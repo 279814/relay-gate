@@ -25,7 +25,7 @@ const (
 )
 
 var defaultCapabilityReductionPolicy = model.CapabilityReductionPolicy{
-	SupportedTTL:   10 * time.Minute,
+	SupportedTTL:   7 * 24 * time.Hour,
 	UnsupportedTTL: 24 * time.Hour,
 	TransientTTL:   time.Minute,
 }
