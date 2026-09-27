@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -316,6 +319,72 @@ func TestShadowBinding_SSESideCopyPerEvent(t *testing.T) {
 	}
 	if strings.Contains(sr.DiffSummary, "hello") || strings.Contains(sr.DiffSummary, "shadowed") {
 		t.Fatalf("shadow diff must not carry raw events: %s", sr.DiffSummary)
+	}
+}
+
+type flushTrackingWriter struct {
+	*httptest.ResponseRecorder
+	written, flushed int
+}
+
+func (w *flushTrackingWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	w.written += n
+	return n, err
+}
+
+func (w *flushTrackingWriter) Flush() {
+	w.flushed = w.written
+	w.ResponseRecorder.Flush()
+}
+
+type flushOrderTee struct {
+	w         *flushTrackingWriter
+	calls     int
+	unflushed int
+}
+
+func (p *flushOrderTee) Write(b []byte) (int, error) {
+	p.calls++
+	if p.w.flushed != p.w.written {
+		p.unflushed++
+	}
+	return len(b), nil
+}
+
+// Published SSE: the response tee (where the shadow side copy runs
+// ApplySSEEvent) must only see an event after its live flush, so shadow work
+// never delays client-visible flush timing.
+func TestCommitSSE_RespTeeRunsAfterLiveFlush(t *testing.T) {
+	c, err := transform.Compile(transform.Version{Rules: []transform.Rule{
+		{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "hi", To: "hello"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: content_block_delta\ndata: {\"delta\":\"hi\"}\n\n"
+	w := &flushTrackingWriter{ResponseRecorder: httptest.NewRecorder()}
+	probe := &flushOrderTee{w: w}
+	at := &Attempt{
+		f: &Forwarder{RespTee: probe},
+		resp: &http.Response{StatusCode: 200,
+			Header: http.Header{"Content-Type": {"text/event-stream"}},
+			Body:   io.NopCloser(strings.NewReader(stream))},
+		res:       &Result{},
+		cancel:    func() {},
+		ctx:       context.Background(),
+		clientCtx: context.Background(),
+	}
+	res := at.CommitTransformed(w, c, nil)
+	if res.Err != nil || !res.HeadersSent {
+		t.Fatalf("commit: %+v", res)
+	}
+	if probe.calls != 2 {
+		t.Fatalf("tee should see each event once, got %d", probe.calls)
+	}
+	if probe.unflushed != 0 {
+		t.Fatalf("tee saw %d event(s) before their live flush", probe.unflushed)
 	}
 }
 
