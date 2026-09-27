@@ -218,6 +218,67 @@ func TestReduceCapability_ScopeIsolationAndTTL(t *testing.T) {
 	}
 }
 
+func TestReduceCapability_ConfigErrorClearsOnlyByManualOrConfigChange(t *testing.T) {
+	reducer := NewObservationReducer(fixedNow)
+	policy := model.CapabilityReductionPolicy{
+		SupportedTTL:   7 * 24 * time.Hour,
+		UnsupportedTTL: 24 * time.Hour,
+		TransientTTL:   time.Minute,
+	}
+	configError := &model.EndpointCapability{
+		State: model.CapabilityConfigError, Endpoint: model.EndpointMessages,
+		ErrorClass: model.ErrorModelNotFound, StatusCode: 404, ObservationToken: "tok-a",
+	}
+	success := func(trigger model.ProbeTrigger, token string) model.ProbeExecution {
+		return model.ProbeExecution{
+			Trigger: trigger, Endpoint: model.EndpointMessages, Success: true,
+			Capability: model.CapabilitySupported, ErrorClass: model.ErrorNone, StatusCode: 200,
+			CapabilityToken: token,
+		}
+	}
+
+	for _, trigger := range []model.ProbeTrigger{
+		model.TriggerScheduled, model.TriggerRecovery, model.TriggerCalibration, model.TriggerRealTraffic,
+	} {
+		kept, err := reducer.ReduceCapability(configError, success(trigger, "tok-a"), policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kept.State != model.CapabilityConfigError || kept.ExpiresAt != 0 ||
+			kept.ErrorClass != model.ErrorModelNotFound || kept.StatusCode != 404 {
+			t.Fatalf("%s success must not clear config_error: %+v", trigger, kept)
+		}
+	}
+
+	transient, err := reducer.ReduceCapability(configError, model.ProbeExecution{
+		Trigger: model.TriggerScheduled, Endpoint: model.EndpointMessages,
+		Capability: model.CapabilityTransientError, ErrorClass: model.ErrorTransient, StatusCode: 503,
+		CapabilityToken: "tok-a",
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transient.State != model.CapabilityConfigError {
+		t.Fatalf("scheduled transient_error must not replace config_error: %+v", transient)
+	}
+
+	manual, err := reducer.ReduceCapability(configError, success(model.TriggerManual, "tok-a"), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manual.State != model.CapabilitySupported {
+		t.Fatalf("manual retest success must clear config_error, got %s", manual.State)
+	}
+
+	changed, err := reducer.ReduceCapability(configError, success(model.TriggerScheduled, "tok-b"), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.State != model.CapabilitySupported {
+		t.Fatalf("scheduled success under a new config token must replace config_error, got %s", changed.State)
+	}
+}
+
 func fixedNow() time.Time {
 	return time.UnixMilli(1_700_000_000_000)
 }
