@@ -277,34 +277,36 @@ func TestResolve_QueryFidelity(t *testing.T) {
 	}
 }
 
-// 固定 query 已写入上游 key 时，入站同名参数必须丢掉：保留网关值、不并列
-// 客户端的 key，同时放行 beta 等普通参数。固定 query 无凭据占位符时，
-// 入站 key= 仍原样追加（不是按名字 denylist）。
-func TestResolve_DropsIncomingCredentialQueryParam(t *testing.T) {
+// §7.1 第 4 条与同名规则：入站 RawQuery 不解析、不去重，与固定 query 同名时
+// 两者均保留。凭据参数名也不例外 —— 入站 key= 是客户端自己的选择，网关不替它剥掉；
+// base_url 的公共路径前缀与规范路径同时保留。
+func TestResolve_KeepsIncomingCredentialQueryParam(t *testing.T) {
 	const gatewayKey = "sk-gateway-fixed-key"
 	values := staticValues{"UPSTREAM_API_KEY": {Plain: []byte(gatewayKey), Revision: 3}}
+	upstream := testUpstream()
+	upstream.BaseURL = "https://a.example/api"
 
-	t.Run("网关 key 保留且丢弃入站同名", func(t *testing.T) {
-		endpoint := canonicalEndpoint(model.EndpointMessages)
-		endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
-		got := resolve(t, ResolveInput{
-			Upstream: testUpstream(), Endpoint: endpoint,
-			IncomingRawQuery: "key=other&beta=true&key=second",
-			Values:           values,
+	for _, kind := range []model.EndpointKind{
+		model.EndpointMessages, model.EndpointResponses,
+		model.EndpointChatCompletions, model.EndpointCountTokens,
+	} {
+		t.Run("canonical/"+string(kind), func(t *testing.T) {
+			endpoint := canonicalEndpoint(kind)
+			endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
+			got := resolve(t, ResolveInput{
+				Upstream: upstream, Endpoint: endpoint,
+				IncomingRawQuery: "key=client&beta=true&ke%79=second",
+				Values:           values,
+			})
+			want := "https://a.example/api" + kind.CanonicalPath() +
+				"?key=" + gatewayKey + "&key=client&beta=true&ke%79=second"
+			if got.RawURL != want {
+				t.Fatalf("RawURL\nwant %q\ngot  %q", want, got.RawURL)
+			}
 		})
-		want := "key=" + gatewayKey + "&beta=true"
-		if got.URL.RawQuery != want {
-			t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
-		}
-		if strings.Contains(got.URL.RawQuery, "key=other") || strings.Contains(got.URL.RawQuery, "key=second") {
-			t.Fatalf("入站 key 不得出现在出站 query：%q", got.URL.RawQuery)
-		}
-		if !strings.Contains(got.URL.RawQuery, "beta=true") {
-			t.Fatalf("beta=true 必须保留：%q", got.URL.RawQuery)
-		}
-	})
+	}
 
-	t.Run("SECRET 占位符同名也丢弃", func(t *testing.T) {
+	t.Run("SECRET 占位符同名", func(t *testing.T) {
 		endpoint := canonicalEndpoint(model.EndpointMessages)
 		endpoint.FixedQueryTemplate = "token={{SECRET:site-token}}&beta=true"
 		got := resolve(t, ResolveInput{
@@ -312,61 +314,25 @@ func TestResolve_DropsIncomingCredentialQueryParam(t *testing.T) {
 			IncomingRawQuery: "token=client-token&flag=1",
 			Values:           staticValues{"SECRET:site-token": {Plain: []byte("site-secret"), Revision: 1}},
 		})
-		want := "token=site-secret&beta=true&flag=1"
+		want := "token=site-secret&beta=true&token=client-token&flag=1"
 		if got.URL.RawQuery != want {
 			t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
 		}
 	})
 
-	t.Run("固定 query 无凭据时入站 key 原样追加", func(t *testing.T) {
-		endpoint := canonicalEndpoint(model.EndpointMessages)
-		endpoint.FixedQueryTemplate = "beta=true"
+	t.Run("legacy_exact 捕获 query 同名", func(t *testing.T) {
+		legacy := &fakeLegacy{id: 55, revision: 2, plain: "https://a.example/v1/messages?key=captured"}
+		endpoint := legacyEndpoint(model.EndpointMessages, false)
+		endpoint.AuthProfile.QueryName = "key"
 		got := resolve(t, ResolveInput{
 			Upstream: testUpstream(), Endpoint: endpoint,
-			IncomingRawQuery: "key=client-key&x=1",
+			LegacyURLs: legacy, IncomingRawQuery: "key=client&beta=true",
 		})
-		want := "beta=true&key=client-key&x=1"
-		if got.URL.RawQuery != want {
-			t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
+		const want = "https://a.example/v1/messages?key=captured&key=client&beta=true"
+		if got.RawURL != want {
+			t.Fatalf("RawURL\nwant %q\ngot  %q", want, got.RawURL)
 		}
 	})
-
-	t.Run("百分号编码同名也丢弃大小写不同保留", func(t *testing.T) {
-		endpoint := canonicalEndpoint(model.EndpointMessages)
-		endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
-		got := resolve(t, ResolveInput{
-			Upstream: testUpstream(), Endpoint: endpoint,
-			// ke%79 经 QueryUnescape 即 key；Key 大小写不同，按 ParseQuery 不是同名。
-			IncomingRawQuery: "ke%79=evil&beta=true&Key=keep&other=" + gatewayKey,
-			Values:           values,
-		})
-		want := "key=" + gatewayKey + "&beta=true&Key=keep&other=" + gatewayKey
-		if got.URL.RawQuery != want {
-			t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
-		}
-		if strings.Contains(got.URL.RawQuery, "ke%79=") || strings.Contains(got.URL.RawQuery, "evil") {
-			t.Fatalf("编码后的同名 key 不得出现在出站 query：%q", got.URL.RawQuery)
-		}
-	})
-
-	for _, kind := range []model.EndpointKind{
-		model.EndpointMessages, model.EndpointResponses,
-		model.EndpointChatCompletions, model.EndpointCountTokens,
-	} {
-		t.Run("各端点/"+string(kind), func(t *testing.T) {
-			endpoint := canonicalEndpoint(kind)
-			endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
-			got := resolve(t, ResolveInput{
-				Upstream: testUpstream(), Endpoint: endpoint,
-				IncomingRawQuery: "key=spoof&beta=true",
-				Values:           values,
-			})
-			want := "key=" + gatewayKey + "&beta=true"
-			if got.URL.RawQuery != want {
-				t.Fatalf("RawQuery want %q got %q", want, got.URL.RawQuery)
-			}
-		})
-	}
 }
 
 // url_override 带 query 时必须失败：parseOrigin 与 base_url 同口径拒绝 query。
