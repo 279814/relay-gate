@@ -2,8 +2,10 @@ package probe
 
 import (
 	"context"
+	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -34,6 +37,111 @@ func TestP012_LazyZeroSyntheticAcrossTicks(t *testing.T) {
 	hs.sched.wg.Wait()
 	if hits.Load() != 0 {
 		t.Fatalf("Lazy 不得有合成 RoundTrip，实际 %d", hits.Load())
+	}
+}
+
+// §4.4：恢复后按全局限流和抖动逐步复核，不得瞬时齐发。恢复后的第一个 tick
+// 不得把所有站的 L1/L2 同时发出；同站 Route 的首轮 L1 到期一致，以便收敛。
+// 恢复窗口内再次暂停，探活必须仍停。
+func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
+	var hits atomic.Int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(200)
+			return
+		}
+		drainBody(r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "event: message_start\ndata: {}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"4\"}}\n\n")
+		_, _ = io.WriteString(w, "event: message_stop\ndata: {}\n\n")
+	}
+
+	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+	var ups []*model.Upstream
+	for i := 1; i <= 3; i++ {
+		srv := httptest.NewServer(http.HandlerFunc(handler))
+		t.Cleanup(srv.Close)
+		ups = append(ups, &model.Upstream{
+			ID: int64(i * 10), Name: "up" + string(rune('0'+i)), BaseURL: srv.URL,
+			APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+			L1Path: "/v1/models", Enabled: true,
+		})
+	}
+	routes := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
+		{ID: 101, ModelNameID: 1, UpstreamID: 10, Priority: 2, Weight: 100, Enabled: true},
+		{ID: 200, ModelNameID: 1, UpstreamID: 20, Priority: 1, Weight: 100, Enabled: true},
+		{ID: 300, ModelNameID: 1, UpstreamID: 30, Priority: 1, Weight: 100, Enabled: true},
+	}
+	cfg := &fakeCfg{
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
+		settings: fastSettings(),
+		state:    store.StateRunning,
+	}
+	track := health.NewTracker(cfg)
+	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
+		WithTargets(testTargets(), nil).
+		WithRNG(rand.New(rand.NewSource(7)))
+
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if hits.Load() == 0 {
+		t.Fatal("暖机 tick 应发出探活")
+	}
+
+	cfg.setState(store.StatePaused)
+	sched.tick(context.Background())
+	sched.wg.Wait()
+
+	sched.PrepareResume()
+	before := time.Now()
+	cfg.setState(store.StateRunning)
+	sched.ResumeGradually()
+	base := hits.Load()
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if got := hits.Load() - base; got != 0 {
+		t.Fatalf("恢复后第一个 tick 不得瞬时齐发，实际发出 %d 个探活", got)
+	}
+
+	settings := fastSettings()
+	l1Window := time.Duration(settings.L1IntervalAliveSec) * time.Second / 10
+	l2Window := time.Duration(settings.L2IntervalAliveSec) * time.Second / 10
+	limitL1 := before.Add(l1Window + time.Second).UnixMilli()
+	limitL2 := before.Add(l2Window + time.Second).UnixMilli()
+	l2At := map[int64]bool{}
+	for _, rt := range routes {
+		st := track.Status(rt.ID)
+		if st.NextL1At == 0 || st.NextL1At > limitL1 {
+			t.Fatalf("route %d NextL1At=%d 应落在 L1 周期 10%% 窗口内", rt.ID, st.NextL1At)
+		}
+		if st.NextL2At == 0 || st.NextL2At > limitL2 {
+			t.Fatalf("route %d NextL2At=%d 应落在 L2 周期 10%% 窗口内", rt.ID, st.NextL2At)
+		}
+		l2At[st.NextL2At] = true
+	}
+	if track.Status(100).NextL1At != track.Status(101).NextL1At {
+		t.Fatal("同站 Route 的首轮 L1 到期必须一致，才能收敛成一次 /models")
+	}
+	if len(l2At) < 2 {
+		t.Fatal("各 Route 的首轮 L2 应带 jitter 分散")
+	}
+
+	cfg.setState(store.StatePaused)
+	for _, rt := range routes {
+		track.TriggerL1(rt.ID)
+		track.TriggerL2(rt.ID)
+	}
+	base = hits.Load()
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if got := hits.Load() - base; got != 0 {
+		t.Fatalf("恢复窗口内再次暂停必须停探活，实际发出 %d 个", got)
 	}
 }
 

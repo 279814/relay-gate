@@ -385,6 +385,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 
+	s.rememberSnapshot(snap)
 	s.gcRemoved(snap)
 
 	// 每轮 tick 重新开始，站级 L1 收敛只对本轮生效。

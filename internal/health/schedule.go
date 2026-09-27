@@ -214,6 +214,46 @@ func (t *Tracker) DemotePositiveConclusions() {
 	}
 }
 
+// resumeJitterWindow 是恢复后首轮复核的分散窗口占周期的比例（§8.10 周期 jitter 10%）。
+const resumeJitterWindow = 0.1
+
+// StaggerResume 把恢复后首轮 L1/L2 的到期时刻分散到各自周期的 10% 窗口内
+// （§4.4：按全局限流和抖动逐步复核，不得瞬时齐发）。
+//
+// l1Frac / l2Frac 返回 [0,1)。L1 窗口对所有 Route 取同一周期：同站 Route
+// 拿到相同 l1Frac 时到期时刻一致，beginL1 才能把它们收敛成一次 /models。
+// routeIDs 是当前配置里的 Route：尚无状态行的也要建行，否则它们首个 tick 即到期。
+// 回调在持锁期间调用，不得回调 Tracker。
+func (t *Tracker) StaggerResume(routeIDs []int64, l1Frac, l2Frac func(routeID int64) float64) {
+	s := t.currentSettings()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, id := range routeIDs {
+		t.get(id)
+	}
+	now := t.now()
+	l1Window := time.Duration(float64(aliveL1Interval(s)) * resumeJitterWindow)
+	for id, rs := range t.state {
+		l2 := aliveL2Interval(s)
+		if rs.state == model.StateDead {
+			l2 = deadL2Interval(rs, s, now)
+		}
+		l2Window := time.Duration(float64(l2) * resumeJitterWindow)
+		rs.nextL1At = now.Add(time.Duration(clampFrac(l1Frac(id)) * float64(l1Window)))
+		rs.nextL2At = now.Add(time.Duration(clampFrac(l2Frac(id)) * float64(l2Window)))
+	}
+}
+
+func clampFrac(f float64) float64 {
+	if f < 0 {
+		return 0
+	}
+	if f >= 1 {
+		return 0.999
+	}
+	return f
+}
+
 // RouteHealthCounts 按状态汇总已知 Route（§13.5 暖机进度）。
 //
 // unknown 计为 pending；alive 单独；其余（dead/recovering 等）归 negative。
