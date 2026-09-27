@@ -306,6 +306,31 @@ func TestPrepareOutboundHeaders_StripsAdminPassword(t *testing.T) {
 	}
 }
 
+// 边缘内部元数据（客户端 IP、原始协议）绝不能出站（docs/01 §6.1、§12.2）。
+func TestPrepareOutboundHeaders_StripsEdgeMetadata(t *testing.T) {
+	in := claudeCodeHeaders()
+	in.Set("X-Forwarded-For", "203.0.113.7")
+	in.Set("x-real-ip", "203.0.113.7")
+	in.Set("X-Forwarded-Proto", "https")
+
+	out := PrepareOutboundHeaders(in, model.ProtoAnthropic)
+	for _, k := range []string{"X-Forwarded-For", "X-Real-IP", "X-Forwarded-Proto"} {
+		if vs := out.Values(k); len(vs) != 0 {
+			t.Errorf("%s 不得转发给上游，得到 %q", k, vs)
+		}
+	}
+	for k, vs := range out {
+		for _, v := range vs {
+			if strings.Contains(v, "203.0.113.7") {
+				t.Errorf("客户端 IP 泄漏到出站头 %s: %q", k, v)
+			}
+		}
+	}
+	if out.Get("User-Agent") != in.Get("User-Agent") {
+		t.Errorf("User-Agent 应原样转发，得到 %q", out.Get("User-Agent"))
+	}
+}
+
 func TestPrepareOutboundHeaders_StripsGatewaySessionCookie(t *testing.T) {
 	const sessionTok = "admin-session-token-must-not-leak"
 	in := claudeCodeHeaders()
