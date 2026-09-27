@@ -3,9 +3,12 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -440,6 +443,50 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 	c, _, err = reg.PublishedCompiled(routeID, reused.ID)
 	if err != nil || c == nil {
 		t.Fatalf("bindings attached after delete commits must remain: c=%v err=%v", c != nil, err)
+	}
+}
+
+type failingTransformSink struct{ err error }
+
+func (f failingTransformSink) SaveTransformSnapshot([]transform.Set, []transform.Binding) error {
+	return f.err
+}
+
+func (f failingTransformSink) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, error) {
+	return nil, nil, nil
+}
+
+// Snapshot persistence failures carry SQLite text (table names, constraint
+// wording); they must take writeErr's 500 path, not be echoed as a 400.
+func TestTransformAPI_PersistFailureDoesNotLeakSQL(t *testing.T) {
+	driverErr := errors.New("constraint failed: FOREIGN KEY constraint failed: transform_binding.set_id (787)")
+	reg := transform.NewRegistry(20).WithPersist(failingTransformSink{err: driverErr})
+	var logBuf bytes.Buffer
+	h := New(nil, slog.New(slog.NewTextHandler(&logBuf, nil))).WithTransformRegistry(reg).Routes(testAdminPW)
+
+	rec := do(t, h, "POST", "/admin/api/transforms", `{"name":"t1"}`, true)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("persist failure status %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, leak := range []string{"FOREIGN KEY", "CHECK constraint", "constraint failed", "transform_binding", "persist transform snapshot"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("client body leaks %q: %s", leak, body)
+		}
+	}
+	if got := decodeBody[errBody](t, rec).Error; got != "internal error" {
+		t.Fatalf("client error %q, want %q", got, "internal error")
+	}
+	if !strings.Contains(logBuf.String(), "transform_binding.set_id") {
+		t.Fatalf("server log should keep the underlying error: %s", logBuf.String())
+	}
+
+	rec = do(t, h, "POST", "/admin/api/transforms", `{"name":"  "}`, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("registry validation status %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeBody[errBody](t, rec).Error; got != "name required" {
+		t.Fatalf("registry validation message %q, want %q", got, "name required")
 	}
 }
 
