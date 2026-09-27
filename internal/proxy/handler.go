@@ -381,8 +381,9 @@ func (p *preambleResult) compressedNeedsMapping(rt *model.Route) bool {
 var errCompressedNeedsMapping = fmt.Errorf("%w: 压缩请求需要模型映射", router.ErrNoRouteAvailable)
 
 const (
-	msgCompressedNeedsMapping  = "压缩的请求体需要模型映射，严格模式不支持"
-	msgUnsupportedBodyEncoding = "不支持的请求体 Content-Encoding"
+	msgCompressedNeedsMapping   = "压缩的请求体需要模型映射，严格模式不支持"
+	msgCompressedNeedsTransform = "压缩的请求体需要请求 body 转换，严格模式不支持"
+	msgUnsupportedBodyEncoding  = "不支持的请求体 Content-Encoding"
 )
 
 // decodeRequestBody makes the §6.7 read-only decoded copy of a gzip / br
