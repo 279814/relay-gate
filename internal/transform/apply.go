@@ -477,6 +477,20 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		}
 		return fmt.Sprintf("response changed=%v hits=%v status %d→%d in=%s out=%s err=%v",
 			r.Changed, r.HitRules, res.Status, r.Status, HashBytes(res.Body), HashBytes(r.Body), errMsg)
+	case "sse":
+		s := c.NewSSEShadow()
+		scanner := &SSEScanner{}
+		events, err := scanner.Feed(res.Body)
+		for _, ev := range events {
+			s.Event(ev)
+		}
+		s.Fail(err)
+		if err == nil {
+			if ev, ok := scanner.Flush(); ok {
+				s.Event(ev)
+			}
+		}
+		return s.Summary()
 	default:
 		return "unknown phase"
 	}
