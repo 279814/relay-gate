@@ -35,10 +35,8 @@ func canonicalEndpointBundle(upstream *model.Upstream) []*model.UpstreamEndpoint
 			UpstreamID: upstream.ID,
 			Kind:       kind,
 			URLMode:    model.EndpointURLCanonical,
-			// full_url_mode 与自定义 l1_path 必须在创建时就落到 url_override 上。
-			// 只在 UpdateUpstream 里翻译的话，一个**新建**的 full_url_mode 站
-			// 会被 Resolver 拼成 base+/v1/messages —— 而这个开关的全部用途
-			// 恰恰是「不要拼路径」。
+			// 自定义 l1_path 必须在创建时就落到 models 的 url_override 上；
+			// full_url_mode 不推断协议端点（§19.2），新站没有 Route 可依据。
 			URLOverride:          upstream.EndpointURLOverride(kind),
 			LegacyCompatRealOnly: realOnly,
 			AuthProfile: model.EndpointAuthProfile{

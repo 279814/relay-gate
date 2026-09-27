@@ -231,9 +231,8 @@ type ProbeUpstreamConfig struct {
 // 某个 Endpoint 的 url_override。返回空表示该 Endpoint 用 canonical path。
 //
 // 为什么必须有这个翻译：EndpointResolver 是唯一拼 URL 的地方，而它只认
-// Endpoint 上的 url_override。两个旧开关若不落到 Endpoint 上，就会静默失效 ——
-// full_url_mode 的站会被拼成 base+/v1/messages（旧行为是 base 本身），
-// 自定义 l1_path 的站会被探成 /v1/models。两者都表现为「配置还在、行为变了」。
+// Endpoint 上的 url_override。自定义 l1_path 若不落到 models Endpoint 上，
+// 站会被探成 /v1/models，表现为「配置还在、行为变了」。
 //
 // full_url_mode 下 base_url 已是完整端点（可带路径）。L1 必须接到同一
 // origin，不能把 l1_path 再叠到那条路径后面，也不能回落 canonical 让
@@ -261,10 +260,9 @@ func (u *Upstream) EndpointURLOverride(kind EndpointKind) string {
 			return root + u.L1Path
 		}
 	}
-	if u.FullURLMode {
-		// full_url_mode 的语义就是「base_url 即完整端点，不再拼路径」。
-		return base
-	}
+	// 协议端点不从 full_url_mode 推断：一个旧完整 URL 无法无歧义映射到
+	// messages / responses / chat_completions / count_tokens（§19.2）。
+	// 只有迁移在 Route 协议唯一时才复制 URL；其余由用户逐个 Endpoint 确认。
 	return ""
 }
 

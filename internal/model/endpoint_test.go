@@ -94,9 +94,6 @@ func TestEndpointURLOverride_FullURLModeDoesNotDoubleAppendL1Path(t *testing.T) 
 		FullURLMode: true,
 		L1Path:      "/status",
 	}
-	if got, want := up.EndpointURLOverride(EndpointMessages), "https://a.com/custom/entry"; got != want {
-		t.Errorf("messages override = %q, want %q", got, want)
-	}
 	if got, want := up.EndpointURLOverride(EndpointModels), "https://a.com/status"; got != want {
 		t.Errorf("custom l1_path override = %q, want %q（不得变成 /custom/entry/status）", got, want)
 	}
@@ -114,6 +111,18 @@ func TestEndpointURLOverride_FullURLModeDoesNotDoubleAppendL1Path(t *testing.T) 
 	plain.L1Path = "/v1/models"
 	if got := plain.EndpointURLOverride(EndpointModels); got != "" {
 		t.Errorf("canonical models 应返回空 override，得到 %q", got)
+	}
+}
+
+// 一个旧完整 URL 不得被静默当成所有协议端点的 URL（docs/01 §19.2）。
+func TestEndpointURLOverride_FullURLModeDoesNotGuessProtocolEndpoints(t *testing.T) {
+	up := &Upstream{BaseURL: "https://a.com/custom/entry", FullURLMode: true, L1Path: "/v1/models"}
+	for _, kind := range []EndpointKind{
+		EndpointMessages, EndpointResponses, EndpointChatCompletions, EndpointCountTokens,
+	} {
+		if got := up.EndpointURLOverride(kind); got != "" {
+			t.Errorf("%s override = %q, want empty", kind, got)
+		}
 	}
 }
 
