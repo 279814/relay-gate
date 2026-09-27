@@ -360,7 +360,7 @@ func runServer() error {
 		DropUpstreamTransports: transports.Invalidate,
 	}
 	calibrator.WithInvalidator(inv)
-	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv)
+	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv).WithManualPreparer(sched)
 	var bg sync.WaitGroup
 	bg.Add(6)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()

@@ -988,6 +988,20 @@ func (s *Scheduler) ProbeNow(ctx context.Context, snap *router.Snapshot,
 	return l1, l2, nil
 }
 
+// PrepareManual 为管理面的一次 manual Execute 分配 observation order 并附上
+// 与 ProbeNow 同一路径的双期望。缺了期望，结论只落 execution 行、不推进
+// Capability，人工重测便无法按 §8.13 解除 config_error。拿不到号返回错误，
+// 调用方据此不发。
+func (s *Scheduler) PrepareManual(ctx context.Context, req *ExecutionRequest) error {
+	order, err := s.nextOrder(ctx, model.TriggerManual)
+	if err != nil {
+		return err
+	}
+	req.ObservationOrder = order
+	s.attachExpectations(ctx, req, req.Upstream, req.ModelName, req.Route, req.Endpoint)
+	return nil
+}
+
 // countL1 / countL2 记一次探活开销（§5.2d）。
 //
 // 调用方必须在 CostCharged（probe_cost_* 已成功落库）之后才调用，否则

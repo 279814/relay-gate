@@ -66,6 +66,21 @@ type Service struct {
 	snapshots   SnapshotSource
 	runtime     RuntimeStatsSource
 	invalidator ConfigInvalidator
+	manual      ManualPreparer
+}
+
+// ManualPreparer 为 manual Execute 分配 observation order 并附上 Capability
+// 期望。由 Scheduler 实现。
+type ManualPreparer interface {
+	PrepareManual(ctx context.Context, req *ExecutionRequest) error
+}
+
+// WithManualPreparer 让 RunManual 的结论能推进 Capability（§8.13 人工重测）。
+func (s *Service) WithManualPreparer(preparer ManualPreparer) *Service {
+	if s != nil {
+		s.manual = preparer
+	}
+	return s
 }
 
 // ConfigInvalidator 配置变更后触发调度。
@@ -119,8 +134,13 @@ func (s *Service) RunManual(ctx context.Context, routeID int64) (model.ProbeExec
 	}
 	if src, ok := s.snapshots.(ProbeSnapshotSource); ok {
 		if snap, err := src.ProbeSnapshot(); err == nil && snap != nil {
-			_ = snap // expectation 装配仍由 Executor attach 路径处理；无则走 not_applicable
+			_ = snap // expectation 由 ManualPreparer 附上；未装配时走 not_applicable
 		} else if err == livecfg.ErrProbeSnapshotUnavailable {
+			return model.ProbeExecution{}, err
+		}
+	}
+	if s.manual != nil {
+		if err := s.manual.PrepareManual(ctx, &req); err != nil {
 			return model.ProbeExecution{}, err
 		}
 	}
