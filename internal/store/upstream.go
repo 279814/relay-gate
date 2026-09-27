@@ -285,22 +285,30 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	if upstream.L1Path != current.L1Path || upstream.BaseURL != current.BaseURL ||
 		upstream.FullURLMode != current.FullURLMode {
 
-		for _, kind := range []model.EndpointKind{
-			model.EndpointModels, model.EndpointMessages, model.EndpointResponses,
-			model.EndpointChatCompletions, model.EndpointCountTokens,
-		} {
-			// 只改 canonical Endpoint：legacy_exact 的 URL 存在加密记录里，
-			// 它的行为必须逐字节保持不变（§19.2），碰它就是改动线上语义。
-			//
-			// `url_override<>?` 是必须的：Endpoint revision 会失效对应的
-			// Capability（§4.2），无条件 bump 等于把「改了 base_url」变成
-			// 「五个端点全部重新探活」，而其中四个的 override 通常都是空、
-			// 压根没变。规范也明确要求仅时间戳不构成一次写入。
-			if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,
-				revision=revision+1,updated_at=? WHERE upstream_id=? AND endpoint=? AND url_mode=?
-				AND url_override<>?`,
-				upstream.EndpointURLOverride(kind), upstream.UpdatedAt, upstream.ID, kind,
-				model.EndpointURLCanonical, upstream.EndpointURLOverride(kind)); err != nil {
+		// 只改 canonical Endpoint：legacy_exact 的 URL 存在加密记录里，
+		// 它的行为必须逐字节保持不变（§19.2），碰它就是改动线上语义。
+		//
+		// `url_override<>?` 是必须的：Endpoint revision 会失效对应的
+		// Capability（§4.2），无条件 bump 等于把「改了 base_url」变成
+		// 「五个端点全部重新探活」，而其中四个的 override 通常都是空、
+		// 压根没变。规范也明确要求仅时间戳不构成一次写入。
+		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,
+			revision=revision+1,updated_at=? WHERE upstream_id=? AND endpoint=? AND url_mode=?
+			AND url_override<>?`,
+			upstream.EndpointURLOverride(model.EndpointModels), upstream.UpdatedAt, upstream.ID,
+			model.EndpointModels, model.EndpointURLCanonical,
+			upstream.EndpointURLOverride(model.EndpointModels)); err != nil {
+			return err
+		}
+		// 协议端点的 override 不由站级字段决定：用户逐个设置的值必须保留。
+		// 只清掉旧创建路径按 full_url_mode 写下的猜测值（base_url 本身）。
+		if legacyStamp := strings.TrimRight(current.BaseURL, "/"); current.FullURLMode && legacyStamp != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override='',
+				revision=revision+1,updated_at=? WHERE upstream_id=? AND url_mode=? AND url_override=?
+				AND endpoint IN (?,?,?,?)`,
+				upstream.UpdatedAt, upstream.ID, model.EndpointURLCanonical, legacyStamp,
+				model.EndpointMessages, model.EndpointResponses,
+				model.EndpointChatCompletions, model.EndpointCountTokens); err != nil {
 				return err
 			}
 		}
