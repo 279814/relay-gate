@@ -18,6 +18,13 @@ import (
 // 后者要累计健康失败，前者不该影响上游健康。
 var ErrAuthConfig = errors.New("认证配置不可用")
 
+// ErrUpstreamAPIKeyEmpty 表示 URL 模板引用了 {{UPSTREAM_API_KEY}} 而上游 key 为空。
+//
+// 它是 ErrAuthConfig（§7.2 空凭据即 config_error），但单独可辨：真实转发据此
+// 只把「空 key」这一种 URL 解析失败当成 route-local（§6.5），其余解析失败
+// （模板、base_url、Secret 源）保持原来的 ErrValidation 口径不变。
+var ErrUpstreamAPIKeyEmpty = fmt.Errorf("%w: 上游 api_key 为空", ErrAuthConfig)
+
 // AuthInput 是一次认证改写的输入。
 type AuthInput struct {
 	Profile model.EndpointAuthProfile
