@@ -211,7 +211,8 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		if r.Context().Err() != nil {
 			return ""
 		}
-		return fmt.Sprintf("转发失败: %v", err)
+		return fmt.Sprintf("转发失败: %s",
+			sample.RedactDiagnosticText(err.Error(), h.credentialsOf(r, cand)))
 	}
 	defer resp.Body.Close()
 

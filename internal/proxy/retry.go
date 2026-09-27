@@ -878,7 +878,7 @@ func (h *Handler) logRetry(la *liveAttempt, inModel string, attempt, maxAttempts
 		"status", res.Status,
 	}
 	if res.Err != nil {
-		attrs = append(attrs, "err", res.Err)
+		attrs = append(attrs, "err", sample.RedactDiagnosticText(res.Err.Error(), la.keys))
 	}
 	h.log.Warn("这次尝试失败，换站重试", attrs...)
 }
