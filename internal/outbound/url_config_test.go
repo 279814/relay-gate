@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -73,5 +74,41 @@ func TestResolve_NonURLConfigErrorsAreNotMarked(t *testing.T) {
 	err = resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint, Values: Values{}})
 	if !errors.Is(err, ErrUpstreamAPIKeyEmpty) || errors.Is(err, ErrURLConfig) {
 		t.Errorf("empty key keeps its own sentinel, got %v", err)
+	}
+}
+
+type absentSecrets struct{}
+
+func (absentSecrets) ResolveProbeSecret(context.Context, string) (probetemplate.ResolvedSecret, error) {
+	return probetemplate.ResolvedSecret{}, ErrSecretNotFound
+}
+
+// §6.5: a named Secret that does not exist is this Route's URL / Auth
+// configuration error; a store read failure is neither URL nor Auth config.
+func TestSecretNotFound_IsRouteConfigButReadFailureIsNot(t *testing.T) {
+	endpoint := canonicalEndpoint(model.EndpointMessages)
+	endpoint.FixedQueryTemplate = "key={{SECRET:site-token}}"
+	err := resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint,
+		Values: Values{Secrets: absentSecrets{}}})
+	if !errors.Is(err, ErrURLConfig) {
+		t.Errorf("missing Secret in URL must be ErrURLConfig, got %v", err)
+	}
+
+	profile := model.EndpointAuthProfile{Mode: model.AuthModeManualHeaders,
+		ManualHeaders: []model.HeaderTemplate{{Name: "X-Site-Token", Values: []string{"{{SECRET:site-token}}"}}}}
+	apply := func(secrets SecretSource) error {
+		return ApplyAuth(context.Background(), make(http.Header), AuthInput{
+			Profile: profile, Values: Values{UpstreamAPIKey: []byte("sk-up-test-key"), Secrets: secrets},
+			Use: ResolveRealForward})
+	}
+	if err := apply(absentSecrets{}); !errors.Is(err, ErrAuthConfig) {
+		t.Errorf("missing Secret in auth header must be ErrAuthConfig, got %v", err)
+	}
+	err = apply(failingSecrets{})
+	if err == nil || errors.Is(err, ErrAuthConfig) || errors.Is(err, ErrURLConfig) {
+		t.Errorf("Secret store read error in auth header must not be route config, got %v", err)
+	}
+	if !errors.Is(err, ErrSecretSourceRead) {
+		t.Errorf("read failure must stay identifiable, got %v", err)
 	}
 }

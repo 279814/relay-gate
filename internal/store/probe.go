@@ -12,8 +12,13 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probetemplate"
 )
+
+// errProbeSecretNotFound 只在名字不存在时返回：既是 ErrNotFound（API 层回 404），
+// 也满足 outbound.SecretSource 的不存在约定。读库/解密失败原样返回，不带它。
+var errProbeSecretNotFound = fmt.Errorf("%w: %w", ErrNotFound, outbound.ErrSecretNotFound)
 
 func (store *Store) CreateProbeSecret(name string, plain []byte) (*model.ProbeSecret, error) {
 	if !validProbeSecretName(name) || len(plain) == 0 {
@@ -104,7 +109,7 @@ func (store *Store) ResolveProbeSecret(ctx context.Context, name string) (probet
 	var encrypted string
 	if err := store.db.QueryRowContext(ctx, `SELECT id,value_enc,revision FROM probe_secret WHERE name=?`, name).
 		Scan(&result.ID, &encrypted, &result.Revision); errors.Is(err, sql.ErrNoRows) {
-		return result, ErrNotFound
+		return result, errProbeSecretNotFound
 	} else if err != nil {
 		return result, err
 	}
