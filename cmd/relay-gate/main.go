@@ -254,6 +254,8 @@ func runServer() error {
 
 	// §5.2：重启后匹配当前 Observation Token 的 config_error 继续生效。
 	// 必须在接流量、起探活之前装回，否则首批请求会选中已知配置错误的 Route。
+	// 真实流量 / 校准的 config_error 也以同一 token 落库，下次启动才能装回。
+	capRegistry.WithConfigErrorPersistence(st, cfgSrc, recipes)
 	if n, err := capRegistry.RestoreConfigErrors(context.Background(), st, cfgSrc, recipes); err != nil {
 		return fmt.Errorf("恢复 config_error 能力状态: %w", err)
 	} else if n > 0 {

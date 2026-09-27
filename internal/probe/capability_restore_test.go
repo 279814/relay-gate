@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -137,5 +139,72 @@ func TestRestoreConfigErrors_MatchingTokenSurvivesRestart(t *testing.T) {
 	}
 	if got := staleCaps.Effective(model.RecipeScopeRoute, rt.ID, endpoint, ""); got != model.CapabilityUnknown {
 		t.Fatalf("stale token state=%s, want unknown", got)
+	}
+}
+
+// restartedRegistry 按 main 的启动顺序新建 Registry 并 RestoreConfigErrors。
+func restartedRegistry(t *testing.T, st *store.Store) *CapabilityRegistry {
+	t.Helper()
+	cfg, recipes := restoreTestDeps(st)
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithConfigErrorPersistence(st, cfg, recipes)
+	if _, err := caps.RestoreConfigErrors(context.Background(), st, cfg, recipes); err != nil {
+		t.Fatal(err)
+	}
+	return caps
+}
+
+func persistingRegistry(st *store.Store) *CapabilityRegistry {
+	cfg, recipes := restoreTestDeps(st)
+	return NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithConfigErrorPersistence(st, cfg, recipes)
+}
+
+// §5.2 / §8.12：真实流量 model_not_found 的 config_error 必须跨重启；落库不
+// 占用 observation order，之后的探活提交仍可覆盖（§8.13 人工重测）。
+func TestRestoreConfigErrors_LiveModelNotFoundSurvivesRestart(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	rep := NewReporter(health.NewTracker(nil)).WithCapabilityRegistry(persistingRegistry(st))
+	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
+	rep.ReportResult(rt.ID, 0, &proxy.ResultView{
+		Status: 404, ErrBody: body, Endpoint: model.EndpointMessages, BytesWritten: int64(len(body)),
+	})
+
+	caps := restartedRegistry(t, st)
+	if got := caps.Effective(model.RecipeScopeRoute, rt.ID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("after restart messages=%s, want config_error", got)
+	}
+	commitRouteConfigError(t, st, up, rt, model.EndpointMessages)
+}
+
+// §5.2 / §8.7：校准鉴权穷尽写的 config_error 必须用 RestoreConfigErrors 能
+// 现算出的 token，不能是永远匹配不上的占位串。
+func TestRestoreConfigErrors_CalibrationAuthExhaustedSurvivesRestart(t *testing.T) {
+	st := calibrationTestStore(t)
+	up, _, rt := seedCalibrationRoute(t, st)
+	svc, _ := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
+		return respFrom(401, "application/json", `{"error":{"type":"authentication_error"}}`), nil
+	})
+	svc.capReg = persistingRegistry(st)
+	run, err := svc.Plan(context.Background(), rt.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := svc.Start(context.Background(), run.ID, run.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		_ = svc.stepOnce(context.Background())
+		if got, _ := st.GetCalibrationRun(context.Background(), started.ID); got.State == model.CalibrationFailed {
+			break
+		}
+	}
+	if final, _ := st.GetCalibrationRun(context.Background(), started.ID); final.State != model.CalibrationFailed {
+		t.Fatalf("state=%s", final.State)
+	}
+
+	caps := restartedRegistry(t, st)
+	if got := caps.Effective(model.RecipeScopeRoute, rt.ID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("after restart messages=%s, want config_error", got)
 	}
 }

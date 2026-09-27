@@ -514,8 +514,10 @@ func (store *Store) InterruptCalibrationCandidate(ctx context.Context, runID str
 	return tx.Commit()
 }
 
+// authExhausted 是该 Route 端点当前的 SemanticExpectation；鉴权穷尽写
+// config_error 时用它的 token，重启后 RestoreConfigErrors 才能装回（§5.2）。
 func (store *Store) AdvanceCalibrationAfterExecution(ctx context.Context, runID string, ordinal int,
-	executionID string, expectedRunRevision int64) (*model.CalibrationRun, error) {
+	executionID string, expectedRunRevision int64, authExhausted *model.SemanticExpectation) (*model.CalibrationRun, error) {
 
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -617,7 +619,7 @@ func (store *Store) AdvanceCalibrationAfterExecution(ctx context.Context, runID 
 				return nil, err
 			}
 			if notAuthRejected == 0 {
-				if err = writeAuthExhaustedConfigErrorTx(ctx, tx, run); err != nil {
+				if err = writeAuthExhaustedConfigErrorTx(ctx, tx, run, authExhausted); err != nil {
 					return nil, err
 				}
 			}
@@ -865,7 +867,17 @@ func plannedExecutionID(candidate model.CalibrationCandidate) (string, error) {
 	return "", model.WrapValidation("candidate 没有预分配 execution id")
 }
 
-func writeAuthExhaustedConfigErrorTx(ctx context.Context, tx *sql.Tx, run *model.CalibrationRun) error {
+func writeAuthExhaustedConfigErrorTx(ctx context.Context, tx *sql.Tx, run *model.CalibrationRun,
+	expectation *model.SemanticExpectation) error {
+
+	if expectation != nil && expectation.Target.RouteID == run.RouteID && expectation.Target.Endpoint == run.Endpoint {
+		written, err := saveConfigErrorCapabilityTx(ctx, tx, expectation, 0, model.ErrorAuthRejected,
+			"auth_calibration_exhausted", nowMS())
+		if err != nil || written {
+			return err
+		}
+	}
+	// 没有当前 expectation 时仍留行供管理界面显示；空 token 表示不跨重启。
 	var upstreamID int64
 	if err := tx.QueryRowContext(ctx, `SELECT upstream_id FROM route WHERE id=?`, run.RouteID).Scan(&upstreamID); err != nil {
 		return err
@@ -894,7 +906,7 @@ func writeAuthExhaustedConfigErrorTx(ctx context.Context, tx *sql.Tx, run *model
 		EndpointID:                 endpoint.ID,
 		State:                      model.CapabilityConfigError,
 		PolicySelector:             selector,
-		ObservationToken:           "calibration-auth-exhausted",
+		ObservationToken:           "",
 		UpstreamNetworkRevision:    networkRev,
 		UpstreamCredentialRevision: credentialRev,
 		EndpointRevision:           endpoint.Revision,

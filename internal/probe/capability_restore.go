@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"time"
 
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
@@ -62,22 +63,32 @@ func (registry *CapabilityRegistry) RestoreConfigErrors(ctx context.Context, row
 func currentCapabilityToken(ctx context.Context, snap *livecfg.ProbeSnapshot, recipes *RecipeResolver,
 	row *model.EndpointCapability) (string, bool) {
 
+	expectation := currentCapabilityExpectation(ctx, snap, recipes, row)
+	if expectation == nil {
+		return "", false
+	}
+	return expectation.ObservationToken, true
+}
+
+func currentCapabilityExpectation(ctx context.Context, snap *livecfg.ProbeSnapshot, recipes *RecipeResolver,
+	row *model.EndpointCapability) *model.SemanticExpectation {
+
 	var upstreamID int64
 	var route *model.Route
 	switch row.ScopeType {
 	case model.RecipeScopeUpstream:
 		if row.Endpoint != model.EndpointModels {
-			return "", false
+			return nil
 		}
 		upstreamID = row.ScopeID
 	case model.RecipeScopeRoute:
 		route = snap.Routes[row.ScopeID]
 		if route == nil || row.Endpoint == model.EndpointModels {
-			return "", false
+			return nil
 		}
 		upstreamID = route.UpstreamID
 	default:
-		return "", false
+		return nil
 	}
 	var routeID int64
 	if route != nil {
@@ -85,7 +96,7 @@ func currentCapabilityToken(ctx context.Context, snap *livecfg.ProbeSnapshot, re
 	}
 	recipe, err := recipes.Resolve(ctx, RecipeQuery{UpstreamID: upstreamID, RouteID: routeID, Endpoint: row.Endpoint})
 	if err != nil {
-		return "", false
+		return nil
 	}
 	var expectation *model.SemanticExpectation
 	if route == nil {
@@ -93,8 +104,64 @@ func currentCapabilityToken(ctx context.Context, snap *livecfg.ProbeSnapshot, re
 	} else {
 		_, _, expectation, _, err = buildL2Expectations(snap, &model.Upstream{ID: upstreamID}, route, row.Endpoint, recipe)
 	}
-	if err != nil || expectation == nil {
-		return "", false
+	if err != nil {
+		return nil
 	}
-	return expectation.ObservationToken, true
+	return expectation
+}
+
+// ConfigErrorStore 落库真实流量得到的 Route config_error。由 store.Store 实现。
+type ConfigErrorStore interface {
+	SaveConfigErrorCapability(ctx context.Context, expectation *model.SemanticExpectation,
+		statusCode int, errorClass model.ErrorClass, detail string, observedAt int64) error
+}
+
+// WithConfigErrorPersistence 让真实流量与校准的 config_error 以当前
+// Observation Token 落库，重启后由 RestoreConfigErrors 装回（§5.2）。
+// 必须在接流量前调用。
+func (registry *CapabilityRegistry) WithConfigErrorPersistence(st ConfigErrorStore,
+	configs PublishedConfigSource, recipes *RecipeResolver) *CapabilityRegistry {
+
+	if registry != nil {
+		registry.configErrors = st
+		registry.configs = configs
+		registry.recipes = recipes
+	}
+	return registry
+}
+
+// currentRouteExpectation 按 RestoreConfigErrors 同一路径现算 Route 端点的
+// SemanticExpectation；未装配或算不出时返回 nil。
+func (registry *CapabilityRegistry) currentRouteExpectation(ctx context.Context, routeID int64,
+	endpoint model.EndpointKind) *model.SemanticExpectation {
+
+	if registry == nil || registry.configs == nil || registry.recipes == nil || routeID <= 0 {
+		return nil
+	}
+	pub, err := registry.configs.Bundle()
+	if err != nil || pub == nil || pub.Probe == nil {
+		return nil
+	}
+	return currentCapabilityExpectation(ctx, pub.Probe, registry.recipes, &model.EndpointCapability{
+		ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: endpoint,
+	})
+}
+
+const configErrorPersistTimeout = 5 * time.Second
+
+// persistRouteConfigError 尽力落库；失败时内存标记照常生效，只是不跨重启。
+func (registry *CapabilityRegistry) persistRouteConfigError(routeID int64, endpoint model.EndpointKind,
+	statusCode int, errorClass model.ErrorClass, observedAt int64) {
+
+	if registry == nil || registry.configErrors == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), configErrorPersistTimeout)
+	defer cancel()
+	expectation := registry.currentRouteExpectation(ctx, routeID, endpoint)
+	if expectation == nil {
+		return
+	}
+	_ = registry.configErrors.SaveConfigErrorCapability(ctx, expectation, statusCode, errorClass,
+		string(errorClass), observedAt)
 }
