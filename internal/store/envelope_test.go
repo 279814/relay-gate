@@ -76,7 +76,7 @@ func TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rawOld []byte
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, old.ID).Scan(&rawOld); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, old.ID).Scan(&rawOld); err != nil {
 		t.Fatal(err)
 	}
 	if !IsSampleEnvelope(rawOld) || !strings.Contains(string(rawOld), "v1:"+oldID+":") {
@@ -101,7 +101,7 @@ func TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rawNew []byte
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, neu.ID).Scan(&rawNew); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, neu.ID).Scan(&rawNew); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(rawNew), "v1:"+newID+":") {

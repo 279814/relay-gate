@@ -579,6 +579,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 
 	if oc.respTee != nil {
 		h.recordSample(r, proto, oc, recvAt, pre.inModel, pre.body, pre.settings)
+	} else {
+		closeSampleTrail(oc.trail)
 	}
 	if h.security != nil && oc.secTee != nil {
 		upName := ""
@@ -727,7 +729,7 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 		fmt.Sprintf("%s（%s）：%s", msg, cand.Upstream.Name, safeErr))
 }
 
-// recordSample 组装并投递一条样本（§3.6）。
+// recordSample 组装并投递一个 Sample Group（§3.6 / §5.4）。
 //
 // 全程只读转发路径产生的数据，绝不回写；投递是非阻塞的，
 // 队列满就丢。任何在这里发生的问题都不该影响已经完成的转发。
@@ -741,84 +743,49 @@ func (h *Handler) writeForwardError(w http.ResponseWriter, err error,
 // 重读一次既多一次 livecfg 加锁，又可能拿到与转发时不同的值 ——
 // 样本描述的是**这次**转发，用的必须是它当时那份配置。
 //
-// keys 走 oc.keys（它只有两处来源：入站 relay key 与出站上游 key）。
-// 与健康回写、出站错误响应共用同一份，避免各算一遍时漏掉某个凭据位置。
+// keys 走 oc.keys 与各被丢弃尝试的 la.keys（来源只有入站 relay key、
+// 出站上游 key 与 transform taint）。与健康回写、出站错误响应共用同一份，
+// 避免各算一遍时漏掉某个凭据位置。
 func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	oc *forwardOutcome, recvAt time.Time, inModel string, inBody []byte,
 	settings model.Settings) {
 
-	cand, keys, res := oc.cand, oc.keys, oc.res
+	// 同组各尝试的凭据合在一起扫：上游回显的可能是另一站的 key，
+	// 入站原文也按全组凭据脱敏。
+	keys := append([]string(nil), oc.keys...)
+	for _, la := range oc.trail {
+		keys = append(keys, la.keys...)
+	}
 
 	// 先截断再脱敏（PrepareBody 内部保证顺序安全）：body 上限 32MB，
 	// 而留档上限可配（默认不限），先扫全量等于为了丢掉的部分白扫一遍。
 	inTrunc, inCut := sample.PrepareBody(inBody, keys, settings.SampleMaxBodyBytes)
-	outTrunc, outCut := sample.PrepareBody(oc.outBody, keys, settings.SampleMaxBodyBytes)
-	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
-	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
-	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
-	// 完整模式大包：DetachBody 保留 spill，不把全文拼进 []byte。
-	// 有界头尾 / 短响应：仍走 Bytes()（含省略标记与尾缓冲拼装）。
-	var respSafe []byte
-	var respSpill string
-	if oc.respTee.SpillBytes() > 0 {
-		_, respSpill = oc.respTee.DetachBody()
-		if err := sample.RedactBodyFile(respSpill, keys); err != nil {
-			h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
-				"err", err, "route", cand.Route.ID)
-			model.RemoveSpillFile(respSpill)
-			respSpill = ""
-		}
-	} else {
-		respSafe = sample.RedactBodyKeys(oc.respTee.Bytes(), keys)
+
+	// §5.4：入站请求只存一次；每次实际发给上游的请求与上游响应各成一条尝试，
+	// 按发送顺序排列，最终尝试在最后。route-local 跳过从未出网，不在其中。
+	attempts := make([]*model.SampleAttempt, 0, len(oc.trail)+1)
+	for _, la := range oc.trail {
+		attempts = append(attempts, h.sampleAttempt(la.cand, la.body, la.header, la.url,
+			la.tee, la.at.Result(), keys, inModel, recvAt, settings))
+		la.tee = nil
 	}
+	final := h.sampleAttempt(oc.cand, oc.outBody, oc.outHeader, oc.outURL,
+		oc.respTee, oc.res, keys, inModel, recvAt, settings)
+	attempts = append(attempts, final)
 
 	var flags model.TruncFlags
 	if inCut {
 		flags |= model.TruncInBody
 	}
-	if outCut {
-		flags |= model.TruncOutBody
-	}
-	if oc.respTee.Truncated() {
-		flags |= model.TruncRespBody
-	}
-	if oc.respTee.QuotaOverflow() {
-		// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。
-		// 采集是旁路，只记日志，绝不回写或中断已完成的转发。
-		kept := len(respSafe)
-		if respSpill != "" {
-			if p, err := model.ConfinedSpillPath(respSpill); err == nil {
-				if fi, err := os.Stat(p); err == nil {
-					kept = int(fi.Size())
-				}
-			}
-		}
-		h.log.Warn("样本响应超过剩余磁盘配额，已改留头尾",
-			"route", cand.Route.ID,
-			"resp_total", oc.respTee.Total(),
-			"resp_kept", kept)
-	}
-
-	modelOut := inModel
-	if cand.Route.UpstreamModel != "" {
-		modelOut = cand.Route.UpstreamModel
-	}
 
 	smp := &model.Sample{
 		// 与这次请求的多行日志同组（M6），便于在「发了哪些字节」与
 		// 「试过哪几个站」之间互跳。
-		ReqID:       oc.reqID,
-		TSRecv:      recvAt.UnixMilli(),
-		TSSent:      msOrZero(res.SentAt),
-		TSFirstByte: msOrZero(res.FirstByteAt),
-		TSDone:      msOrZero(res.DoneAt),
+		ReqID:  oc.reqID,
+		TSRecv: recvAt.UnixMilli(),
 
-		Endpoint:    proto.Path(),
-		ModelIn:     inModel,
-		ModelOut:    modelOut,
-		ModelNameID: cand.ModelName.ID,
-		RouteID:     cand.Route.ID,
-		UpstreamID:  cand.Upstream.ID,
+		Endpoint: proto.Path(),
+		ModelIn:  inModel,
 
 		InMethod: r.Method,
 		InPath:   r.URL.Path,
@@ -829,8 +796,99 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		InHeaders: sample.RedactHeaders(r.Header, keys),
 		InBody:    inTrunc,
 
-		OutURL:     sample.RedactText(oc.outURL, keys),
-		OutHeaders: sample.RedactHeaders(oc.outHeader, keys),
+		// 平铺字段是最终尝试的视图；spill 文件只挂在 Attempts 上。
+		TSSent:      final.TSSent,
+		TSFirstByte: final.TSFirstByte,
+		TSDone:      final.TSDone,
+		ModelOut:    final.ModelOut,
+		ModelNameID: final.ModelNameID,
+		RouteID:     final.RouteID,
+		UpstreamID:  final.UpstreamID,
+		OutURL:      final.OutURL,
+		OutHeaders:  final.OutHeaders,
+		OutBody:     final.OutBody,
+		RespStatus:  final.RespStatus,
+		RespHeaders: final.RespHeaders,
+		RespBody:    final.RespBody,
+		Outcome:     final.Outcome,
+		Error:       final.Error,
+		Truncated:   flags | final.Truncated,
+
+		AttemptCount: len(attempts),
+		Attempts:     attempts,
+	}
+	h.samples.Record(smp)
+}
+
+// sampleAttempt 把一次已发出的尝试整理成样本尝试（已脱敏）。
+// tee 的所有权转给返回值：spill 文件挂在 RespBodyFile 上，由样本落库或丢弃时释放。
+func (h *Handler) sampleAttempt(cand *router.Candidate, outBody []byte, outHeader http.Header,
+	outURL string, tee *sample.HeadTail, res *Result, keys []string, inModel string,
+	recvAt time.Time, settings model.Settings) *model.SampleAttempt {
+
+	outTrunc, outCut := sample.PrepareBody(outBody, keys, settings.SampleMaxBodyBytes)
+	// 响应体同样要扫。上游的鉴权错误经常把 key 回显在消息里
+	// （`{"error":"Invalid API key: sk-xxx"}` 是常见格式），
+	// 漏掉这一处，样本库里就会躺着明文 key —— §3.6.3b 的要求是无条件的。
+	// 完整模式大包：DetachBody 保留 spill，不把全文拼进 []byte。
+	// 有界头尾 / 短响应：仍走 Bytes()（含省略标记与尾缓冲拼装）。
+	var respSafe []byte
+	var respSpill string
+	var flags model.TruncFlags
+	if outCut {
+		flags |= model.TruncOutBody
+	}
+	if tee != nil {
+		if tee.SpillBytes() > 0 {
+			_, respSpill = tee.DetachBody()
+			if err := sample.RedactBodyFile(respSpill, keys); err != nil {
+				h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
+					"err", err, "route", cand.Route.ID)
+				model.RemoveSpillFile(respSpill)
+				respSpill = ""
+			}
+		} else {
+			respSafe = sample.RedactBodyKeys(tee.Bytes(), keys)
+		}
+		if tee.Truncated() {
+			flags |= model.TruncRespBody
+		}
+		if tee.QuotaOverflow() {
+			// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。
+			// 采集是旁路，只记日志，绝不回写或中断已完成的转发。
+			kept := len(respSafe)
+			if respSpill != "" {
+				if p, err := model.ConfinedSpillPath(respSpill); err == nil {
+					if fi, err := os.Stat(p); err == nil {
+						kept = int(fi.Size())
+					}
+				}
+			}
+			h.log.Warn("样本响应超过剩余磁盘配额，已改留头尾",
+				"route", cand.Route.ID,
+				"resp_total", tee.Total(),
+				"resp_kept", kept)
+		}
+	}
+
+	modelOut := inModel
+	if cand.Route.UpstreamModel != "" {
+		modelOut = cand.Route.UpstreamModel
+	}
+
+	a := &model.SampleAttempt{
+		TSRecv:      recvAt.UnixMilli(),
+		TSSent:      msOrZero(res.SentAt),
+		TSFirstByte: msOrZero(res.FirstByteAt),
+		TSDone:      msOrZero(res.DoneAt),
+
+		ModelOut:    modelOut,
+		ModelNameID: cand.ModelName.ID,
+		RouteID:     cand.Route.ID,
+		UpstreamID:  cand.Upstream.ID,
+
+		OutURL:     sample.RedactText(outURL, keys),
+		OutHeaders: sample.RedactHeaders(outHeader, keys),
 		OutBody:    outTrunc,
 
 		RespStatus: res.Status,
@@ -844,9 +902,9 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		Truncated: flags,
 	}
 	if res.Err != nil {
-		smp.Error = sample.RedactDiagnosticText(res.Err.Error(), keys)
+		a.Error = sample.RedactDiagnosticText(res.Err.Error(), keys)
 	}
-	h.samples.Record(smp)
+	return a
 }
 
 func msOrZero(t time.Time) int64 {

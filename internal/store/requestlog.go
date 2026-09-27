@@ -144,7 +144,7 @@ func (s *Store) ListRequestLogs(f RequestLogFilter) ([]*model.RequestLog, error)
 // 没什么意义，要留证据就置顶样本。
 func (s *Store) PruneRequestLogs(keepCount, keepDays int) (int64, error) {
 	var total int64
-	const orphanOnly = `NOT EXISTS (SELECT 1 FROM sample WHERE sample.req_id = request_log.req_id)`
+	const orphanOnly = `NOT EXISTS (SELECT 1 FROM sample_request WHERE sample_request.req_id = request_log.req_id)`
 
 	if keepDays > 0 {
 		cutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()

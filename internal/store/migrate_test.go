@@ -41,31 +41,33 @@ func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 	}
 	defer st2.Close()
 
-	// 3. 列加上了
-	has, err := hasColumn(st2.db, "sample", "req_id")
+	// 3. 老 sample 已迁成 Sample Group（schema 7），req_id 列在 sample_request 上
+	has, err := hasColumn(st2.db, "sample_request", "req_id")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !has {
-		t.Error("迁移应给已存在的 sample 表加上 req_id —— " +
-			"没加的话新功能静默不工作，且不报错")
+		t.Error("迁移后的 sample_request 应带 req_id —— " +
+			"没有的话新功能静默不工作，且不报错")
 	}
 
-	// 4. 索引也要补上，否则按 req_id 查样本会全表扫
+	// 4. 索引也要有，否则按 req_id 查样本会全表扫
 	var idx int
 	if err := st2.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'index' AND name = 'idx_sample_req'`).Scan(&idx); err != nil {
+		WHERE type = 'index' AND name = 'idx_sample_request_req'`).Scan(&idx); err != nil {
 		t.Fatal(err)
 	}
 	if idx != 1 {
-		t.Error("迁移应补上 idx_sample_req")
+		t.Error("迁移应建 idx_sample_request_req")
 	}
 
-	// 5. 旧数据还在，且新列取到默认值（空串）而不是 NULL
-	var n int
+	// 5. 旧数据还在（一条 request + 一条代表旧最终尝试的 attempt），
+	//    且 req_id 取到默认值（空串）而不是 NULL
+	var n, attempts int
 	var reqID string
 	if err := st2.db.QueryRow(
-		`SELECT COUNT(*), COALESCE(MAX(req_id), 'NULL!') FROM sample`).Scan(&n, &reqID); err != nil {
+		`SELECT COUNT(*), COALESCE(MAX(req_id), 'NULL!') FROM sample_request
+		WHERE legacy_sample_id = id`).Scan(&n, &reqID); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
@@ -73,6 +75,12 @@ func TestMigrate_AddsReqIDToExistingSampleTable(t *testing.T) {
 	}
 	if reqID != "" {
 		t.Errorf("老行的 req_id 应是空串（DEFAULT ''），得到 %q", reqID)
+	}
+	if err := st2.db.QueryRow(`SELECT COUNT(*) FROM sample_attempt`).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Errorf("旧样本应只迁成 1 条尝试，得到 %d", attempts)
 	}
 
 	// 6. 迁移后的库要能正常读写 —— 加列之后 scanSample 的列顺序必须仍然对得上
@@ -109,18 +117,15 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 }
 
-// 新库走 0001_legacy.sql 就该带 req_id，不依赖迁移补。
-//
-// 两条路径都要通：只靠迁移的话，建表脚本与实际结构会越差越远，
-// 而建表脚本是唯一能一眼看全表结构的地方。
+// 新库建好的 sample_request 就该带 req_id，不依赖迁移补。
 func TestMigrate_FreshDBHasReqIDFromSchema(t *testing.T) {
 	st := testStore(t)
-	has, err := hasColumn(st.db, "sample", "req_id")
+	has, err := hasColumn(st.db, "sample_request", "req_id")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !has {
-		t.Error("新库的 0001_legacy.sql 里就该有 req_id")
+		t.Error("新库的 sample_request 就该有 req_id")
 	}
 }
 

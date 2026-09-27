@@ -44,13 +44,21 @@ const (
 
 func (f TruncFlags) Has(x TruncFlags) bool { return f&x != 0 }
 
-// Sample 是一次转发的完整留档（§3.6）。
+// Sample 是一个 Sample Group 的留档（§5.4）：一个客户端请求 = 一条
+// sample_request + 每次实际发给上游的 sample_attempt。
 //
 // 三份内容：入站原始请求、实际发往公益站的请求、公益站的返回。
 // body 一律是**原始字节**，不是重新序列化的 JSON —— 整个功能的意义就在于
 // 「发出去的到底是哪些字节」，转一道就失去了价值。
+//
+// 平铺的 Out*/Resp*/Route 等尝试字段是**最终**那次尝试（客户端拿到的响应）
+// 的视图；Attempts 按发送顺序列出全部尝试（含最终那次）。写入时 Attempts
+// 为空则把平铺字段当作唯一一次尝试。
 type Sample struct {
 	ID int64 `json:"id"`
+	// LegacySampleID 非零表示本组由 schema 7 之前的 sample 行迁移而来（§5.7）：
+	// 只有旧的最终尝试，历史上未保存的重试不存在。
+	LegacySampleID int64 `json:"legacy_sample_id,omitempty"`
 
 	// ReqID 与 RequestLog 同组，便于从样本跳到「这次请求试过哪几个站」
 	// （反向亦然）。空串表示这条样本早于 M6，或请求日志被关掉了。
@@ -98,14 +106,57 @@ type Sample struct {
 	Truncated TruncFlags `json:"truncated"`
 	// Pinned 的样本不参与滚动清理（§3.6.3c）。
 	Pinned bool `json:"pinned"`
+
+	// AttemptCount 是本组实际发给上游的尝试数。
+	AttemptCount int `json:"attempt_count"`
+	// Attempts 只在详情里返回；列表不含。
+	Attempts []*SampleAttempt `json:"attempts,omitempty"`
+}
+
+// SampleAttempt 是一次实际发给上游的尝试（§5.4 sample_attempt）。
+// 本地跳过（没有联系上游）的 Route 不产生尝试。
+type SampleAttempt struct {
+	ID        int64 `json:"id"`
+	RequestID int64 `json:"request_id"`
+
+	TSRecv      int64 `json:"ts_recv"`
+	TSSent      int64 `json:"ts_sent"`
+	TSFirstByte int64 `json:"ts_first_byte"`
+	TSDone      int64 `json:"ts_done"`
+
+	ModelOut    string `json:"model_out"`
+	ModelNameID int64  `json:"model_name_id"`
+	RouteID     int64  `json:"route_id"`
+	UpstreamID  int64  `json:"upstream_id"`
+
+	OutURL     string      `json:"out_url"`
+	OutHeaders http.Header `json:"out_headers"`
+	OutBody    []byte      `json:"out_body,omitempty"`
+
+	RespStatus   int         `json:"resp_status"`
+	RespHeaders  http.Header `json:"resp_headers"`
+	RespBody     []byte      `json:"resp_body,omitempty"`
+	RespBodyFile string      `json:"-"`
+
+	Outcome   Outcome    `json:"outcome"`
+	Error     string     `json:"error"`
+	Truncated TruncFlags `json:"truncated"`
 }
 
 // ReleaseTempFiles 删除样本持有的 spill 临时文件。可重复调用。
 // 越出 SpillDir 的路径拒删，避免毒化的 RespBodyFile 删到 spill 树外。
 func (s *Sample) ReleaseTempFiles() {
-	if s == nil || s.RespBodyFile == "" {
+	if s == nil {
 		return
 	}
-	RemoveSpillFile(s.RespBodyFile)
-	s.RespBodyFile = ""
+	if s.RespBodyFile != "" {
+		RemoveSpillFile(s.RespBodyFile)
+		s.RespBodyFile = ""
+	}
+	for _, a := range s.Attempts {
+		if a != nil && a.RespBodyFile != "" {
+			RemoveSpillFile(a.RespBodyFile)
+			a.RespBodyFile = ""
+		}
+	}
 }

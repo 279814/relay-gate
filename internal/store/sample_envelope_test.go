@@ -13,22 +13,7 @@ func TestSampleEnvelope_RoundTripAndLegacyMigration(t *testing.T) {
 
 	// Legacy plaintext row (simulates pre-envelope history).
 	plain := []byte(`{"model":"legacy-keep-me","secret":"do-not-drop"}`)
-	res, err := st.db.Exec(`INSERT INTO sample (
-		req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
-		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
-		in_method, in_path, in_query, in_headers, in_body,
-		out_url, out_headers, out_body,
-		resp_status, resp_headers, resp_body,
-		outcome, error, truncated, pinned
-	) VALUES ('legacy-1', ?,0,0,0, '/v1/messages','m','m',1,1,1,
-		'POST','/v1/messages','','{}',?,
-		'https://ex','{}',?,
-		200,'{}',?,
-		'ok','',0,0)`, time.Now().UnixMilli(), plain, plain, plain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyID, _ := res.LastInsertId()
+	legacyID := insertRawSampleGroup(t, st, "legacy-1", time.Now().UnixMilli(), plain, plain, plain)
 
 	// Readable before migration (dual-read plaintext).
 	got, err := st.GetSample(legacyID)
@@ -49,7 +34,7 @@ func TestSampleEnvelope_RoundTripAndLegacyMigration(t *testing.T) {
 
 	// Raw storage must be enveloped; plaintext must not remain.
 	var rawIn []byte
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, legacyID).Scan(&rawIn); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, legacyID).Scan(&rawIn); err != nil {
 		t.Fatal(err)
 	}
 	if !IsSampleEnvelope(rawIn) {
@@ -57,6 +42,13 @@ func TestSampleEnvelope_RoundTripAndLegacyMigration(t *testing.T) {
 	}
 	if bytes.Contains(rawIn, []byte("do-not-drop")) {
 		t.Fatal("plaintext secret still visible in stored BLOB")
+	}
+	var rawOut, rawResp []byte
+	if err := st.db.QueryRow(`SELECT out_body, resp_body FROM sample_attempt WHERE request_id=?`, legacyID).Scan(&rawOut, &rawResp); err != nil {
+		t.Fatal(err)
+	}
+	if !IsSampleEnvelope(rawOut) || !IsSampleEnvelope(rawResp) {
+		t.Fatal("attempt bodies must be enveloped by migration")
 	}
 
 	got2, err := st.GetSample(legacyID)
@@ -87,7 +79,7 @@ func TestSampleEnvelope_RoundTripAndLegacyMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rawFresh []byte
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, fresh.ID).Scan(&rawFresh); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, fresh.ID).Scan(&rawFresh); err != nil {
 		t.Fatal(err)
 	}
 	if !IsSampleEnvelope(rawFresh) {

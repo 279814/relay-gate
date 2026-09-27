@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // RewrapDirectSecrets re-encrypts Master-Key–sealed direct secrets under
@@ -205,19 +206,32 @@ func rewrapLegacyURLs(tx *sql.Tx, c *Cipher, newMaster string) error {
 // rewrapSampleBodies reseals v1 sample body envelopes under newMaster.
 // Plaintext rows stay as-is so dual-read history is not corrupted.
 func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
-	rows, err := tx.Query(`SELECT id, in_body, out_body, resp_body FROM sample`)
+	if err := rewrapSampleTable(tx, c, newMaster, "sample_request", "in_body"); err != nil {
+		return err
+	}
+	return rewrapSampleTable(tx, c, newMaster, "sample_attempt", "out_body", "resp_body")
+}
+
+// rewrapSampleTable reseals the named body columns of one sample table.
+// table/cols are code literals, never user input.
+func rewrapSampleTable(tx *sql.Tx, c *Cipher, newMaster, table string, cols ...string) error {
+	rows, err := tx.Query(`SELECT id, ` + strings.Join(cols, ", ") + ` FROM ` + table)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	type row struct {
-		id            int64
-		in, out, resp []byte
+		id     int64
+		fields [][]byte
 	}
 	var batch []row
 	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.in, &r.out, &r.resp); err != nil {
+		r := row{fields: make([][]byte, len(cols))}
+		dest := []any{&r.id}
+		for i := range r.fields {
+			dest = append(dest, &r.fields[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return err
 		}
 		batch = append(batch, r)
@@ -225,24 +239,29 @@ func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	_ = rows.Close()
+	sets := make([]string, len(cols))
+	for i, col := range cols {
+		sets[i] = col + "=?"
+	}
+	update := `UPDATE ` + table + ` SET ` + strings.Join(sets, ", ") + ` WHERE id=?`
 	for _, r := range batch {
-		in, err := rewrapSampleField(c, newMaster, r.in)
-		if err != nil {
-			return fmt.Errorf("id=%d in_body: %w", r.id, err)
+		changed := false
+		args := make([]any, 0, len(cols)+1)
+		for i, raw := range r.fields {
+			neu, err := rewrapSampleField(c, newMaster, raw)
+			if err != nil {
+				return fmt.Errorf("%s id=%d %s: %w", table, r.id, cols[i], err)
+			}
+			if !bytes.Equal(neu, raw) {
+				changed = true
+			}
+			args = append(args, neu)
 		}
-		out, err := rewrapSampleField(c, newMaster, r.out)
-		if err != nil {
-			return fmt.Errorf("id=%d out_body: %w", r.id, err)
-		}
-		resp, err := rewrapSampleField(c, newMaster, r.resp)
-		if err != nil {
-			return fmt.Errorf("id=%d resp_body: %w", r.id, err)
-		}
-		if bytes.Equal(in, r.in) && bytes.Equal(out, r.out) && bytes.Equal(resp, r.resp) {
+		if !changed {
 			continue
 		}
-		if _, err := tx.Exec(`UPDATE sample SET in_body=?, out_body=?, resp_body=? WHERE id=?`,
-			in, out, resp, r.id); err != nil {
+		if _, err := tx.Exec(update, append(args, r.id)...); err != nil {
 			return err
 		}
 	}

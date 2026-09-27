@@ -32,6 +32,26 @@ func mkSample(recvMS int64) *model.Sample {
 	}
 }
 
+// insertRawSampleGroup 直接写一组 sample_request + 单条 sample_attempt，
+// 正文按原样落盘（不加密）——等同于 schema 7 从旧明文 sample 行迁来的形态。
+func insertRawSampleGroup(t *testing.T, st *Store, reqID string, tsRecv int64, in, out, resp []byte) int64 {
+	t.Helper()
+	res, err := st.db.Exec(`INSERT INTO sample_request (
+		req_id, ts_recv, endpoint, model_in, in_method, in_path, in_query, in_headers, in_body, truncated, pinned
+	) VALUES (?, ?, '/v1/messages', 'm', 'POST', '/v1/messages', '', '{}', ?, 0, 0)`, reqID, tsRecv, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := st.db.Exec(`INSERT INTO sample_attempt (
+		request_id, ts_recv, model_out, model_name_id, route_id, upstream_id,
+		out_url, out_headers, out_body, resp_status, resp_headers, resp_body, outcome
+	) VALUES (?, ?, 'm', 1, 1, 1, 'https://ex', '{}', ?, 200, '{}', ?, 'ok')`, id, tsRecv, out, resp); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func TestInsertAndGetSample(t *testing.T) {
 	st := testStore(t)
 	in := mkSample(time.Now().UnixMilli())
@@ -539,22 +559,7 @@ func TestPruneSamples_ByDiskQuota(t *testing.T) {
 func TestPruneSamples_DiskQuotaDeletesPlaintextAndEnvelope(t *testing.T) {
 	st := testStore(t)
 	plain := bytes.Repeat([]byte("plain-legacy-body"), 128)
-	res, err := st.db.Exec(`INSERT INTO sample (
-		req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
-		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
-		in_method, in_path, in_query, in_headers, in_body,
-		out_url, out_headers, out_body,
-		resp_status, resp_headers, resp_body,
-		outcome, error, truncated, pinned
-	) VALUES ('plain-1', ?,0,0,0, '/v1/messages','m','m',1,1,1,
-		'POST','/v1/messages','','{}',?,
-		'https://ex','{}',?,
-		200,'{}',?,
-		'ok','',0,0)`, time.Now().UnixMilli()-1000, plain, plain, plain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plainID, _ := res.LastInsertId()
+	plainID := insertRawSampleGroup(t, st, "plain-1", time.Now().UnixMilli()-1000, plain, plain, plain)
 
 	env := mkSample(time.Now().UnixMilli())
 	env.InBody = bytes.Repeat([]byte("envelope-body"), 128)
@@ -838,7 +843,7 @@ func TestInsertSampleWithinQuota_SpillFileChunkedNoAssemble(t *testing.T) {
 	}
 
 	var raw []byte
-	if err := st.db.QueryRow(`SELECT resp_body FROM sample WHERE id=?`, s.ID).Scan(&raw); err != nil {
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, s.ID).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if !isSampleMultipart(raw) {
