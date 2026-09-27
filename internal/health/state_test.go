@@ -548,6 +548,42 @@ func TestDeadModelIntervals(t *testing.T) {
 	}
 }
 
+// §8.10 按「已死多久」分档：dead 期间每轮 L2 仍失败，也不得把档位重置回 30s。
+func TestDeadModelIntervals_KeepWideningWhileProbesKeepFailing(t *testing.T) {
+	tr, fs, now := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	fs.s.L2IntervalDeadSec = 30
+
+	report(tr, 1, VerdictUnavailable, SourceL2) // → dead
+	start := *now
+	failEvery := func(until time.Duration, step time.Duration) {
+		for now.Sub(start) < until {
+			*now = now.Add(step)
+			report(tr, 1, VerdictUnavailable, SourceL2)
+		}
+	}
+
+	failEvery(11*time.Minute, 30*time.Second) // 已死约 11 分钟，期间持续失败
+	tr.TriggerL2(1)
+	_, _ = tr.ClaimL2(1)
+	*now = now.Add(31 * time.Second)
+	if _, ok := tr.ClaimL2(1); ok {
+		t.Fatal("已死 10–60 分钟的 Route L2 应为 120s，持续失败不应重置回 30s")
+	}
+
+	failEvery(61*time.Minute, 120*time.Second) // 已死超过 60 分钟，期间持续失败
+	tr.TriggerL2(1)
+	_, _ = tr.ClaimL2(1)
+	*now = now.Add(121 * time.Second)
+	if _, ok := tr.ClaimL2(1); ok {
+		t.Fatal("已死超过 60 分钟的 Route L2 应为 300s")
+	}
+	*now = now.Add(180 * time.Second)
+	if _, ok := tr.ClaimL2(1); !ok {
+		t.Fatal("超过 300 秒后应到期")
+	}
+}
+
 // piggyback：真实请求成功等价于一次 L2 探活，省下探活 token。
 func TestClaim_PiggybackSkipsL2AfterRealSuccess(t *testing.T) {
 	tr, fs, now := newTestTracker(t)
