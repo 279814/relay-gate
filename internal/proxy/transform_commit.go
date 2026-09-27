@@ -437,11 +437,12 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		}
 		wn, werr := w.Write(ev.Raw)
 		total += int64(wn)
-		if f.RespTee != nil && wn > 0 {
-			_, _ = f.RespTee.Write(ev.Raw[:wn])
-		}
 		if canFlush {
 			flusher.Flush()
+		}
+		// After the flush: the shadow side copy applies rules inside the tee.
+		if f.RespTee != nil && wn > 0 {
+			_, _ = f.RespTee.Write(ev.Raw[:wn])
 		}
 		if semSniffer != nil && !semSniffer.Seen() && wn > 0 {
 			semSniffer.Feed(ev.Raw[:wn], ct)
