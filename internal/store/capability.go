@@ -365,32 +365,110 @@ func (store *Store) reduceCapabilityTx(ctx context.Context, tx *sql.Tx, executio
 	if reduced == nil {
 		return "", nil, errors.New("capability reducer 返回 nil")
 	}
-	reduced.ScopeType = expectation.Target.Scope
-	if reduced.ScopeType == model.RecipeScopeRoute {
-		reduced.ScopeID = expectation.Target.RouteID
-	} else {
-		reduced.ScopeID = expectation.Target.UpstreamID
-	}
+	stampCapabilityExpectation(reduced, expectation)
 	reduced.Endpoint = execution.Endpoint
-	reduced.EndpointID = expectation.Revision.EndpointID
-	reduced.PolicySelector = expectation.PolicySelector
-	reduced.ObservationToken = expectation.ObservationToken
-	reduced.UpstreamNetworkRevision = expectation.Revision.UpstreamNetwork
-	reduced.UpstreamCredentialRevision = expectation.Revision.UpstreamCredential
-	reduced.EndpointRevision = expectation.Revision.EndpointRevision
-	reduced.ModelCapabilityRevision = expectation.Revision.ModelCapability
-	reduced.RouteCapabilityRevision = expectation.Revision.RouteCapability
-	reduced.AuthProfileRevision = expectation.Revision.AuthProfile
-	reduced.RecipeBindingRevision = expectation.Revision.RecipeBindingRevision
-	reduced.ProbeSettingsFingerprint = expectation.Revision.ProbeSettingsFingerprint
-	reduced.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(expectation.Revision.ProbeSecrets)
-	reduced.RequestTransformBindingRevision = expectation.Revision.RequestTransform
 	reduced.LastObservationOrder = execution.ObservationOrder
 	if err := saveCapability(ctx, tx, reduced); err != nil {
 		return "", nil, err
 	}
 	copyValue := *reduced
 	return model.ApplyCurrent, &copyValue, nil
+}
+
+// stampCapabilityExpectation 把 expectation 的 scope、token 与语义版本写进行。
+func stampCapabilityExpectation(row *model.EndpointCapability, expectation *model.SemanticExpectation) {
+	row.ScopeType = expectation.Target.Scope
+	if row.ScopeType == model.RecipeScopeRoute {
+		row.ScopeID = expectation.Target.RouteID
+	} else {
+		row.ScopeID = expectation.Target.UpstreamID
+	}
+	row.Endpoint = expectation.Target.Endpoint
+	row.EndpointID = expectation.Revision.EndpointID
+	row.PolicySelector = expectation.PolicySelector
+	row.ObservationToken = expectation.ObservationToken
+	row.UpstreamNetworkRevision = expectation.Revision.UpstreamNetwork
+	row.UpstreamCredentialRevision = expectation.Revision.UpstreamCredential
+	row.EndpointRevision = expectation.Revision.EndpointRevision
+	row.ModelCapabilityRevision = expectation.Revision.ModelCapability
+	row.RouteCapabilityRevision = expectation.Revision.RouteCapability
+	row.AuthProfileRevision = expectation.Revision.AuthProfile
+	row.RecipeBindingRevision = expectation.Revision.RecipeBindingRevision
+	row.ProbeSettingsFingerprint = expectation.Revision.ProbeSettingsFingerprint
+	row.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(expectation.Revision.ProbeSecrets)
+	row.RequestTransformBindingRevision = expectation.Revision.RequestTransform
+}
+
+// SaveConfigErrorCapability 把真实流量观察到的 Route config_error 按
+// expectation 落库（docs/01 §5.2），token 与 RestoreConfigErrors 现算的一致。
+func (store *Store) SaveConfigErrorCapability(ctx context.Context, expectation *model.SemanticExpectation,
+	statusCode int, errorClass model.ErrorClass, detail string, observedAt int64) error {
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := saveConfigErrorCapabilityTx(ctx, tx, expectation, statusCode, errorClass, detail, observedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// saveConfigErrorCapabilityTx 仅在 expectation 仍是当前配置时写入，返回是否写入。
+//
+// 不占用 observation order：沿用已存行的 order 与 last_real_ok_*，之后更大
+// order 的探活或人工重测仍可覆盖（§8.13）。
+func saveConfigErrorCapabilityTx(ctx context.Context, tx *sql.Tx, expectation *model.SemanticExpectation,
+	statusCode int, errorClass model.ErrorClass, detail string, observedAt int64) (bool, error) {
+
+	if expectation == nil || expectation.Target.Scope != model.RecipeScopeRoute || expectation.Target.RouteID < 1 ||
+		expectation.Target.UpstreamID < 1 || !expectation.Target.Endpoint.Valid() ||
+		expectation.ObservationToken == "" ||
+		revisioncodec.NewObservationToken(expectation.Revision) != expectation.ObservationToken {
+		return false, nil
+	}
+	bindingCurrent, err := recipeBindingFactsCurrent(ctx, tx, expectation)
+	if err != nil {
+		return false, err
+	}
+	if !bindingCurrent {
+		return false, nil
+	}
+	current, err := currentSemanticRevision(ctx, tx, expectation)
+	if errors.Is(err, ErrNotFound) || errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !reflect.DeepEqual(current, expectation.Revision) {
+		return false, nil
+	}
+	row := &model.EndpointCapability{
+		State:          model.CapabilityConfigError,
+		StatusCode:     statusCode,
+		ErrorClass:     errorClass,
+		RedactedDetail: detail,
+		ObservedAt:     observedAt,
+	}
+	stampCapabilityExpectation(row, expectation)
+	existing, err := loadCapability(ctx, tx, model.ProbeExecution{
+		UpstreamID: expectation.Target.UpstreamID, RouteID: expectation.Target.RouteID,
+		Endpoint: expectation.Target.Endpoint,
+	})
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+	if existing != nil {
+		row.LastObservationOrder = existing.LastObservationOrder
+		row.LastRealOKAt = existing.LastRealOKAt
+		row.LastRealOKToken = existing.LastRealOKToken
+	}
+	if err := saveCapability(ctx, tx, row); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type publishedBindingRow struct {

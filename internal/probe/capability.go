@@ -33,6 +33,11 @@ type CapabilityRegistry struct {
 	routeGen interface {
 		GenerationOf(routeID int64) uint64
 	}
+	// configErrors / configs / recipes persist live config_error marks under
+	// the token RestoreConfigErrors recomputes; see WithConfigErrorPersistence.
+	configErrors ConfigErrorStore
+	configs      PublishedConfigSource
+	recipes      *RecipeResolver
 }
 
 // SettingsSource 提供读侧失效所需的当前 Settings。

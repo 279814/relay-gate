@@ -99,6 +99,7 @@ func (r *Reporter) applyRouteModelNotFound(routeID int64, endpoint model.Endpoin
 		ExpiresAt:                0, // §8.13: config_error 不自动过期
 		RedactedDetail:           string(model.ErrorModelNotFound),
 	})
+	r.caps.persistRouteConfigError(routeID, endpoint, status, model.ErrorModelNotFound, nowMS)
 }
 
 // structuredRemoteErrorFromBody builds a ProtocolEvent from a real-traffic

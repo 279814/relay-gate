@@ -34,7 +34,7 @@ type CalibrationStore interface {
 	InterruptCalibrationCandidate(ctx context.Context, runID string, ordinal int,
 		expectedRunRevision int64) error
 	AdvanceCalibrationAfterExecution(ctx context.Context, runID string, ordinal int,
-		executionID string, expectedRunRevision int64) (*model.CalibrationRun, error)
+		executionID string, expectedRunRevision int64, authExhausted *model.SemanticExpectation) (*model.CalibrationRun, error)
 	CommitCalibrationSuccess(ctx context.Context, commit model.CalibrationCommit) (*model.ProbeRecipeVersion, error)
 	FinishCalibrationRun(ctx context.Context, id string, state model.CalibrationState, expectedRevision int64) error
 	MaterializedRecipeID(ctx context.Context, runID string, ordinal int) (int64, error)
@@ -662,7 +662,8 @@ func (s *CalibrationService) finishFromExecution(ctx context.Context, run *model
 		return nil
 	}
 
-	_, err = s.store.AdvanceCalibrationAfterExecution(ctx, run.ID, candidate.Ordinal, execution.ID, run.Revision)
+	authExhausted := s.capReg.currentRouteExpectation(ctx, run.RouteID, run.Endpoint)
+	_, err = s.store.AdvanceCalibrationAfterExecution(ctx, run.ID, candidate.Ordinal, execution.ID, run.Revision, authExhausted)
 	if err != nil {
 		return err
 	}
