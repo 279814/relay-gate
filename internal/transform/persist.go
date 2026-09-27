@@ -1,6 +1,13 @@
 package transform
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrPersist marks a PersistSink failure. The wrapped text is raw driver
+// output (table names, SQLite messages) and must not reach an API client.
+var ErrPersist = errors.New("persist transform snapshot")
 
 // PersistSink stores the full transform snapshot (SQLite).
 type PersistSink interface {
@@ -72,7 +79,7 @@ func (r *Registry) flushLocked() error {
 		bindings = append(bindings, *cloneBinding(b))
 	}
 	if err := r.persist.SaveTransformSnapshot(sets, bindings); err != nil {
-		return fmt.Errorf("persist transform snapshot: %w", err)
+		return fmt.Errorf("%w: %w", ErrPersist, err)
 	}
 	return nil
 }
