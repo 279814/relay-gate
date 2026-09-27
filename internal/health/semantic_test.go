@@ -59,7 +59,8 @@ func TestSemanticInvalidatorClearsTrackerGateCapsSchedule(t *testing.T) {
 	}
 }
 
-// ForgetRouteHealth clears dead/cooldown without scheduling or clearing Capability.
+// ForgetRouteHealth (re-enable, §9.2) clears dead/cooldown and Capability
+// without scheduling.
 func TestSemanticInvalidatorForgetRouteHealthNoSchedule(t *testing.T) {
 	tr, fs, _ := newTestTracker(t)
 	fs.s.FailThreshold = 1
@@ -85,8 +86,39 @@ func TestSemanticInvalidatorForgetRouteHealthNoSchedule(t *testing.T) {
 	if tr.State(8) != model.StateDead {
 		t.Fatalf("sibling state=%s want dead", tr.State(8))
 	}
-	if len(caps.cleared) != 0 {
-		t.Fatalf("must not clear Capability: %v", caps.cleared)
+	if len(caps.cleared) != 1 || caps.cleared[0] != 7 {
+		t.Fatalf("route Capability scopes=%v want [7]", caps.cleared)
+	}
+	if len(caps.upstreamCleared) != 0 {
+		t.Fatalf("route re-enable must not clear upstream Capability: %v", caps.upstreamCleared)
+	}
+	if len(sched.routes) != 0 {
+		t.Fatalf("must not schedule: %v", sched.routes)
+	}
+}
+
+// Upstream re-enable (§9.2) clears child RouteHealth, child route Capability
+// and upstream-scoped Capability, without scheduling.
+func TestSemanticInvalidatorForgetUpstreamHealthClearsCapabilityNoSchedule(t *testing.T) {
+	tr, fs, _ := newTestTracker(t)
+	fs.s.FailThreshold = 1
+	tr.Report(Report{RouteID: 31, Verdict: VerdictUnavailable, Source: SourceL2})
+	tr.Report(Report{RouteID: 99, Verdict: VerdictUnavailable, Source: SourceL2})
+	caps := &memCaps{}
+	sched := &memSched{}
+	inv := NewSemanticInvalidator(tr, nil, caps, sched, nil)
+	inv.ForgetUpstreamHealth(5, []int64{31})
+	if tr.State(31) != model.StateUnknown {
+		t.Fatalf("child state=%s want unknown", tr.State(31))
+	}
+	if tr.State(99) != model.StateDead {
+		t.Fatalf("unrelated state=%s want dead", tr.State(99))
+	}
+	if len(caps.cleared) != 1 || caps.cleared[0] != 31 {
+		t.Fatalf("route Capability scopes=%v want [31]", caps.cleared)
+	}
+	if len(caps.upstreamCleared) != 1 || caps.upstreamCleared[0] != 5 {
+		t.Fatalf("upstream Capability scopes=%v want [5]", caps.upstreamCleared)
 	}
 	if len(sched.routes) != 0 {
 		t.Fatalf("must not schedule: %v", sched.routes)
