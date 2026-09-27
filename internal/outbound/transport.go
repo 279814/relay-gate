@@ -524,19 +524,21 @@ func newTransport(network NetworkConfig) (*Transport, error) {
 		ForceAttemptHTTP2: true,
 	}
 
+	// proxy_url 是这个 Upstream 自己的网络配置：拒绝时带 ErrURLConfig，
+	// 真实转发据此跳过本 Route（§6.5），而不是让整个请求失败。
 	if network.ProxyURL != "" {
 		parsed, err := url.Parse(network.ProxyURL)
 		if err != nil {
 			// 不带 err 文本：net/url 的错误会附上完整 URL，而 proxy_url
 			// 可以带 user:password。这条错误会落进 last_error 并显示在 UI 上。
-			return nil, model.WrapValidation("proxy_url 不是合法 URL")
+			return nil, urlConfig(model.WrapValidation("proxy_url 不是合法 URL"))
 		}
 		if parsed.Scheme == "" || parsed.Host == "" {
-			return nil, model.WrapValidation("proxy_url 必须形如 scheme://host[:port]")
+			return nil, urlConfig(model.WrapValidation("proxy_url 必须形如 scheme://host[:port]"))
 		}
 		// 与 Upstream.Validate 同口径：只装 http(s) 代理，拒绝 file/ftp/…。
 		if !model.AllowedProxyURLScheme(parsed.Scheme) {
-			return nil, model.WrapValidation("proxy_url 必须是 http(s):// 代理")
+			return nil, urlConfig(model.WrapValidation("proxy_url 必须是 http(s):// 代理"))
 		}
 		base.Proxy = http.ProxyURL(parsed)
 	}
