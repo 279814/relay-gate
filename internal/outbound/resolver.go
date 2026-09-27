@@ -54,7 +54,7 @@ func (use ResolveUse) valid() bool {
 var ErrLegacyNeedsReview = errors.New("legacy full URL 待人工审核，合成探活不可用")
 
 // ErrURLConfig 标记「这个 Endpoint 自己的 URL 配置坏了」：base_url、
-// url_override、legacy full URL、固定 query 模板，以及模板里 URL 层不支持的
+// host_override、url_override、legacy full URL、固定 query 模板，以及模板里 URL 层不支持的
 // 占位符或缺失的 Secret 源。§6.5 把它列为 route-local：真实转发据此跳过本
 // Route 并记 config_error，而不是让整个请求失败。
 //
@@ -167,7 +167,7 @@ func (resolver *Resolver) Resolve(ctx context.Context, in ResolveInput) (Resolve
 	}
 	requestHost, err := validateHostOverride(in.Upstream.HostOverride)
 	if err != nil {
-		return ResolvedTarget{}, err
+		return ResolvedTarget{}, urlConfig(err)
 	}
 
 	if in.Endpoint.URLMode == model.EndpointURLLegacyExact {

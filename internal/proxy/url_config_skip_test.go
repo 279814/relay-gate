@@ -39,9 +39,10 @@ const (
 // urlConfigCase is one §6.5 "this Route's URL / Auth Secret configuration
 // error" on Upstream 10. None of them may reach the wire.
 type urlConfigCase struct {
-	name    string
-	baseURL string // empty = the harness upstream
-	query   string
+	name         string
+	baseURL      string // empty = the harness upstream
+	query        string
+	hostOverride string
 }
 
 func urlConfigCases() []urlConfigCase {
@@ -51,6 +52,8 @@ func urlConfigCases() []urlConfigCase {
 		{name: "bad base URL", baseURL: "not-a-url"},
 		{name: "missing Secret source", query: "key={{SECRET:site-token}}"},
 		{name: "unsupported placeholder", query: "model={{UPSTREAM_MODEL}}"},
+		{name: "host override with path", hostOverride: "hostov-leak.example/admin"},
+		{name: "host override bad port", hostOverride: "hostov-leak.example:https"},
 	}
 }
 
@@ -63,7 +66,7 @@ func (tc urlConfigCase) setup(t *testing.T, hs *harness, twoRoutes bool) *routeC
 	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
 		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
 	bad := &model.Upstream{ID: 10, Name: "broken-url", BaseURL: baseURL,
-		APIKey: badURLKey, AuthStyle: model.AuthBearer, Enabled: true}
+		APIKey: badURLKey, AuthStyle: model.AuthBearer, Enabled: true, HostOverride: tc.hostOverride}
 	ups := []*model.Upstream{bad}
 	routes := []*model.Route{
 		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
@@ -151,7 +154,7 @@ func TestURLConfigError_OnlyRouteReturnsNoRoute(t *testing.T) {
 			body := rec.Body.String()
 			reason := rec.Header().Get("X-Relay-Reason")
 			for _, leak := range []string{"{{", "}}", "SECRET", "site-token", "UPSTREAM", "key=",
-				"not-a-url", "base_url", "占位符", "模板", "配置错误", badURLKey} {
+				"not-a-url", "base_url", "hostov-leak", "host_override", "占位符", "模板", "配置错误", badURLKey} {
 				if strings.Contains(body, leak) || strings.Contains(reason, leak) {
 					t.Fatalf("response leaks config text %q: header=%q body=%s", leak, reason, body)
 				}
@@ -160,6 +163,34 @@ func TestURLConfigError_OnlyRouteReturnsNoRoute(t *testing.T) {
 				t.Fatalf("capability = %s, want config_error", got)
 			}
 		})
+	}
+}
+
+// A valid host:port override is still sent as the outbound Host, and the
+// URL authority stays the configured base_url.
+func TestURLConfigError_ValidHostOverrideSetsOutboundHost(t *testing.T) {
+	var gotHost atomic.Value
+	var hits atomic.Int32
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		gotHost.Store(r.Host)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+	caps := urlConfigCase{name: "valid host override", hostOverride: "real.example:8443"}.setup(t, hs, false)
+
+	rec := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("upstream hits = %d, want 1", n)
+	}
+	if got, _ := gotHost.Load().(string); got != "real.example:8443" {
+		t.Fatalf("outbound Host = %q, want real.example:8443", got)
+	}
+	if caps.marks != 0 {
+		t.Fatalf("config_error marks = %d, want 0 for a valid host override", caps.marks)
 	}
 }
 

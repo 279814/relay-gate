@@ -484,7 +484,13 @@ func TestResolve_RejectsBadHostOverride(t *testing.T) {
 		t.Run(override, func(t *testing.T) {
 			up := testUpstream()
 			up.HostOverride = override
-			resolveErr(t, ResolveInput{Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages)})
+			err := resolveErr(t, ResolveInput{Upstream: up, Endpoint: canonicalEndpoint(model.EndpointMessages)})
+			if !errors.Is(err, ErrURLConfig) {
+				t.Fatalf("坏 host_override 必须带 ErrURLConfig（§6.5 route-local），得到 %v", err)
+			}
+			if !errors.Is(err, model.ErrValidation) {
+				t.Fatalf("坏 host_override 仍须是 ErrValidation，得到 %v", err)
+			}
 		})
 	}
 }
