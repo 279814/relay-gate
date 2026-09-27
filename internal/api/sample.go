@@ -98,6 +98,7 @@ func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	s.auditSample("sample_view", fmt.Sprintf("id=%d", id))
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, smp)
 }
@@ -125,6 +126,7 @@ func (s *Server) pinSample(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	s.auditSample("sample_pin", fmt.Sprintf("id=%d pinned=%t", id, body.Pinned))
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "pinned": body.Pinned})
 }
 
@@ -154,7 +156,15 @@ func (s *Server) clearSamples(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("清空样本", "deleted", n, "keep_pinned", keepPinned)
+	s.auditSample("sample_bulk_delete", fmt.Sprintf("deleted=%d keep_pinned=%t", n, keepPinned))
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
+// auditSample 写 §5.4 未脱敏样本操作的审计记录，只在成功路径调用。
+func (s *Server) auditSample(action, detail string) {
+	if s.creds != nil {
+		s.creds.Note(action, detail)
+	}
 }
 
 // queryInt64 解析查询参数。空串是「没传」，返回 0 且不算错。

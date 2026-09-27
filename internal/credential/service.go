@@ -409,6 +409,15 @@ func (s *Service) expireGraceLocked() {
 	}
 }
 
+// Note appends an admin audit row for sensitive actions outside this package
+// (§5.4 unredacted sample view / pin / bulk delete). detail must hold only
+// ids and flags, never sample bodies or secrets.
+func (s *Service) Note(action, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noteLocked(action, detail)
+}
+
 func (s *Service) noteLocked(action, detail string) {
 	ev := AuditEvent{
 		At: s.now().UTC().Format(time.RFC3339Nano), Action: action, Detail: detail,
