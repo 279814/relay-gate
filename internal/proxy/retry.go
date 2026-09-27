@@ -429,6 +429,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	var compiled *transform.Compiled
 	var verID int64
 	redactKeys := h.credentialsOf(r, cand)
+	shadowHeader, shadowBody := outHeader, outBody
 	if h.transforms != nil && target.EndpointID != 0 {
 		var terr error
 		compiled, verID, terr = h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
@@ -477,6 +478,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			}
 		}
 	}
+	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.TransportFor(cand.Upstream, realBudget)
