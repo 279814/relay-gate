@@ -88,8 +88,10 @@ func (r *Registry) sseBudget() time.Duration {
 // ErrBudgetExceeded is returned when apply exceeds the configured wall-clock budget.
 var ErrBudgetExceeded = fmt.Errorf("transform execution budget exceeded")
 
+var budgetNow = time.Now
+
 func checkBudget(deadline time.Time) error {
-	if time.Now().After(deadline) {
+	if budgetNow().After(deadline) {
 		return ErrBudgetExceeded
 	}
 	return nil

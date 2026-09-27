@@ -80,33 +80,34 @@ func (c *Compiled) ApplyRequestSecrets(in RequestInput, secrets SecretMap) Reque
 	if budget == 0 {
 		budget = time.Duration(DefaultRequestBudgetMs) * time.Millisecond
 	}
-	deadline := time.Now().Add(budget)
+	deadline := budgetNow().Add(budget)
+	restoreOriginal := func(err error) RequestResult {
+		out.Err = err
+		out.Header = cloneHeader(in.Header)
+		out.Body = append([]byte(nil), in.Body...)
+		out.Changed = false
+		out.HitRules = nil
+		restoreProtected(out.Header, savedAuth)
+		return out
+	}
 
 	for i, rule := range c.Version.Rules {
 		if err := checkBudget(deadline); err != nil {
-			out.Err = err
-			out.Header = cloneHeader(in.Header)
-			out.Body = append([]byte(nil), in.Body...)
-			out.Changed = false
-			out.HitRules = nil
-			restoreProtected(out.Header, savedAuth)
-			return out
+			return restoreOriginal(err)
 		}
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate:
 			if err := c.applyOneRequest(i, rule, &out, sec); err != nil {
-				out.Err = sec.taint.RedactErr(err)
-				out.Header = cloneHeader(in.Header)
-				out.Body = append([]byte(nil), in.Body...)
-				out.Changed = false
-				out.HitRules = nil
-				restoreProtected(out.Header, savedAuth)
-				return out
+				return restoreOriginal(sec.taint.RedactErr(err))
 			}
 		default:
 			// response / SSE rules skipped on request path
 		}
+	}
+	// The budget covers the whole apply, including the last rule that ran.
+	if err := checkBudget(deadline); err != nil {
+		return restoreOriginal(err)
 	}
 	restoreProtected(out.Header, savedAuth)
 	out.Changed = HeaderFingerprint(out.Header) != HeaderFingerprint(in.Header) ||
@@ -241,28 +242,29 @@ func (c *Compiled) ApplyResponseSecrets(in ResponseInput, secrets SecretMap) Res
 	if budget == 0 {
 		budget = time.Duration(DefaultRequestBudgetMs) * time.Millisecond
 	}
-	deadline := time.Now().Add(budget)
+	deadline := budgetNow().Add(budget)
+	restoreOriginal := func(err error) ResponseResult {
+		out.Err = err
+		out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
+		out.Changed = false
+		out.HitRules = nil
+		restoreProtected(out.Header, saved)
+		return out
+	}
 	for i, rule := range c.Version.Rules {
 		if err := checkBudget(deadline); err != nil {
-			out.Err = err
-			out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
-			out.Changed = false
-			out.HitRules = nil
-			restoreProtected(out.Header, saved)
-			return out
+			return restoreOriginal(err)
 		}
 		switch rule.Kind {
 		case KindSetHeader, KindDeleteHeader, KindRenameHeader, KindReplaceBytes, KindSetJSONPointer,
 			KindJSONPatchAdd, KindJSONPatchRemove, KindJSONPatchCopy, KindBodyTemplate, KindSetStatus:
 			if err := c.applyOneResponse(i, rule, &out, sec); err != nil {
-				out.Err = sec.taint.RedactErr(err)
-				out.Status, out.Header, out.Body = in.Status, cloneHeader(in.Header), append([]byte(nil), in.Body...)
-				out.Changed = false
-				out.HitRules = nil
-				restoreProtected(out.Header, saved)
-				return out
+				return restoreOriginal(sec.taint.RedactErr(err))
 			}
 		}
+	}
+	if err := checkBudget(deadline); err != nil {
+		return restoreOriginal(err)
 	}
 	restoreProtected(out.Header, saved)
 	out.Changed = out.Status != in.Status ||
@@ -387,7 +389,7 @@ func (c *Compiled) ApplySSEEvent(ev SSEEvent) (SSEEvent, []string, bool, error) 
 	if budget == 0 {
 		budget = time.Duration(DefaultSSEBudgetMs) * time.Millisecond
 	}
-	deadline := time.Now().Add(budget)
+	deadline := budgetNow().Add(budget)
 	for i, rule := range c.Version.Rules {
 		if err := checkBudget(deadline); err != nil {
 			return ev, hits, false, err
@@ -413,6 +415,9 @@ func (c *Compiled) ApplySSEEvent(ev SSEEvent) (SSEEvent, []string, bool, error) 
 		case KindSSEAppendEnd:
 			// handled by AppendSyntheticEnd, not per-event
 		}
+	}
+	if err := checkBudget(deadline); err != nil {
+		return ev, hits, false, err
 	}
 	if len(out.Data) > MaxSSEEventBytes {
 		return ev, hits, false, fmt.Errorf("sse event exceeds %d bytes", MaxSSEEventBytes)
