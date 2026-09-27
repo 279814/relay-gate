@@ -44,5 +44,7 @@ func wrapConstraint(err error, table string) error {
 	case strings.Contains(msg, "FOREIGN KEY"):
 		return fmt.Errorf("%w: 引用的 ModelName 或 Upstream 不存在", model.ErrValidation)
 	}
-	return fmt.Errorf("%w: %s 约束冲突: %v", model.ErrValidation, table, err)
+	// 未识别的约束不包 ErrValidation：驱动原文含表名 / SQLite 文案，
+	// 走 writeErr 的 400 分支会原样回给客户端；落到 500 分支只回 "internal error"，原文经脱敏进日志。
+	return fmt.Errorf("%s: %w", table, err)
 }
