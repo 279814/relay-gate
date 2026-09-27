@@ -40,6 +40,13 @@ type schedulerP012 struct {
 	pendingL1 map[int64]bool
 	pendingL2 map[int64]bool
 	mu        sync.Mutex
+
+	// 恢复复核波（§4.4「按全局限流和抖动逐步复核，不得瞬时齐发」）：
+	// resumeDone 记本轮恢复已发出复核 L1 的站，resumeInflight 记其中仍在途的
+	// hold；在途数受全局并发上限约束，全部站复核发出后 resumeRamp 结束。
+	resumeRamp     bool
+	resumeDone     map[int64]bool
+	resumeInflight map[int64]uint64
 }
 
 func (s *Scheduler) ensureP012() *schedulerP012 {
@@ -115,11 +122,71 @@ func (s *Scheduler) PrepareResume() {
 }
 
 // ResumeGradually 允许后续 tick 按并发闸渐进复核。
+//
+// L2 本来就受全局并发闸约束；L1 平时不设全局上限，但 PrepareResume 清空了
+// 全部到期时间，不加约束的话下一个 tick 会对所有站同时发 /models。
+// 因此开启一轮恢复复核波，让每站的首个复核 L1 也受同一个全局上限。
 func (s *Scheduler) ResumeGradually() {
 	s.mu.Lock()
 	s.lastRunning = store.StateRunning
 	s.mu.Unlock()
+	p := s.ensureP012()
+	p.mu.Lock()
+	p.resumeRamp = true
+	p.resumeDone = map[int64]bool{}
+	p.resumeInflight = map[int64]uint64{}
+	p.mu.Unlock()
 	s.log.Info("ResumeGradually：已允许调度按并发闸渐进复核")
+}
+
+// admitResumeL1 判断该站的 L1 能否在恢复复核波中发出。
+// ramp 为 true 表示这次 L1 属于复核波，发出后须 noteResumeL1Started。
+func (s *Scheduler) admitResumeL1(upstreamID int64) (ramp, ok bool) {
+	limit := s.l2Limit()
+	p := s.ensureP012()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.resumeRamp || p.resumeDone[upstreamID] {
+		return false, true
+	}
+	return true, len(p.resumeInflight) < limit
+}
+
+func (s *Scheduler) noteResumeL1Started(upstreamID int64, hold uint64) {
+	p := s.ensureP012()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.resumeRamp {
+		return
+	}
+	p.resumeDone[upstreamID] = true
+	p.resumeInflight[upstreamID] = hold
+}
+
+func (s *Scheduler) noteResumeL1Ended(upstreamID int64, hold uint64) {
+	p := s.ensureP012()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.resumeInflight[upstreamID] == hold {
+		delete(p.resumeInflight, upstreamID)
+	}
+}
+
+// finishResumeRamp 在本轮参与调度的站都已发出复核 L1 后结束复核波。
+func (s *Scheduler) finishResumeRamp(eligible map[int64]bool) {
+	p := s.ensureP012()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.resumeRamp {
+		return
+	}
+	for id := range eligible {
+		if !p.resumeDone[id] {
+			return
+		}
+	}
+	p.resumeRamp = false
+	p.resumeDone = nil
 }
 
 // Trigger 事件驱动调度；在途时只置 pending。
