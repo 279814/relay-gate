@@ -429,6 +429,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	}
 	target, err := h.resolveTarget(r, cand, kind)
 	if err != nil {
+		if errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) && r.Context().Err() == nil {
+			h.log.Warn("固定 query 引用的上游 api_key 为空，跳过本 Route", "err", err,
+				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
+			h.markRouteConfigError(cand, kind)
+			return nil, dispatchRouteAuthConfig
+		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal

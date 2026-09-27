@@ -90,7 +90,7 @@ type Values struct {
 func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedValue, error) {
 	if name == "UPSTREAM_API_KEY" {
 		if len(values.UpstreamAPIKey) == 0 {
-			return ResolvedValue{}, model.WrapValidation("upstream api_key 未配置")
+			return ResolvedValue{}, ErrUpstreamAPIKeyEmpty
 		}
 		// 脏行/历史短钥：不得进 FixedQuery / URL 模板。写入路径已拒短钥；
 		// 这里是选路漏网与探活共用的最后一道门（与 ApplyAuth 同源）。

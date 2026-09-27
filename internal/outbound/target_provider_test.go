@@ -183,11 +183,53 @@ func TestValues_RejectsNonURLPlaceholders(t *testing.T) {
 }
 
 func TestValues_FailsWhenKeyOrSourceMissing(t *testing.T) {
-	if _, err := (Values{}).ResolveValue(context.Background(), "UPSTREAM_API_KEY"); err == nil {
+	_, err := (Values{}).ResolveValue(context.Background(), "UPSTREAM_API_KEY")
+	if err == nil {
 		t.Error("未配置 api_key 时不能渲染出空值")
 	}
-	if _, err := (Values{}).ResolveValue(context.Background(), "SECRET:x"); err == nil {
+	// §7.2：空凭据是 config_error，且单独可辨，真实转发据此只跳过这一种。
+	if !errors.Is(err, ErrUpstreamAPIKeyEmpty) || !errors.Is(err, ErrAuthConfig) {
+		t.Errorf("空 api_key 应是 ErrUpstreamAPIKeyEmpty / ErrAuthConfig，得到 %v", err)
+	}
+	_, err = (Values{}).ResolveValue(context.Background(), "SECRET:x")
+	if err == nil {
 		t.Error("没有 Secret 源时应报错")
+	}
+	if errors.Is(err, ErrAuthConfig) || !errors.Is(err, model.ErrValidation) {
+		t.Errorf("缺 Secret 源不属于空 api_key，应保持 ErrValidation，得到 %v", err)
+	}
+}
+
+// 空 key 经 Resolver 渲染固定 query 时，错误链仍可辨认为 ErrUpstreamAPIKeyEmpty；
+// 其他解析失败（非法模板）不得被带成空 key。
+func TestProvider_EmptyKeyInFixedQueryIsDistinct(t *testing.T) {
+	endpoint := canonicalEndpoint(model.EndpointMessages)
+	endpoint.FixedQueryTemplate = "key={{UPSTREAM_API_KEY}}"
+	provider := newTestProvider(&fakeEndpoints{byKind: map[model.EndpointKind]*model.UpstreamEndpoint{
+		model.EndpointMessages: endpoint,
+	}}, nil)
+	_, err := provider.ResolveTarget(context.Background(), TargetInput{
+		Upstream: testUpstream(), Endpoint: model.EndpointMessages,
+		Values: Values{}, Use: ResolveRealForward,
+	})
+	if !errors.Is(err, ErrUpstreamAPIKeyEmpty) {
+		t.Fatalf("空 key 应可辨认为 ErrUpstreamAPIKeyEmpty，得到 %v", err)
+	}
+
+	bad := canonicalEndpoint(model.EndpointMessages)
+	bad.FixedQueryTemplate = "key={{UPSTREAM_API_KEY"
+	provider = newTestProvider(&fakeEndpoints{byKind: map[model.EndpointKind]*model.UpstreamEndpoint{
+		model.EndpointMessages: bad,
+	}}, nil)
+	_, err = provider.ResolveTarget(context.Background(), TargetInput{
+		Upstream: testUpstream(), Endpoint: model.EndpointMessages,
+		Values: Values{}, Use: ResolveRealForward,
+	})
+	if err == nil {
+		t.Fatal("非法模板应解析失败")
+	}
+	if errors.Is(err, ErrUpstreamAPIKeyEmpty) || errors.Is(err, ErrAuthConfig) {
+		t.Fatalf("非法模板不是空 key，不得归入 ErrAuthConfig，得到 %v", err)
 	}
 }
 
