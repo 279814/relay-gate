@@ -39,7 +39,7 @@ type releaseReloader struct{}
 
 func (releaseReloader) Reload() error { return nil }
 
-func TestEmptyDBOpensAsSchema6(t *testing.T) {
+func TestEmptyDBOpensAsSchema7(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "relay.db")
 	cipher, err := store.NewCipher("test-passphrase-at-least-16-chars")
@@ -55,8 +55,8 @@ func TestEmptyDBOpensAsSchema6(t *testing.T) {
 	if err := st.DB().QueryRow(`SELECT version FROM schema_version WHERE singleton = 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 6 {
-		t.Fatalf("schema_version=%d want 6", version)
+	if version != 7 {
+		t.Fatalf("schema_version=%d want 7", version)
 	}
 	var n int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='security_finding'`).Scan(&n); err != nil || n != 1 {
@@ -64,6 +64,14 @@ func TestEmptyDBOpensAsSchema6(t *testing.T) {
 	}
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transform_set'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("transform_set missing: n=%d err=%v", n, err)
+	}
+	for _, table := range []string{"sample_request", "sample_attempt"} {
+		if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?`, table).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("%s missing: n=%d err=%v", table, n, err)
+		}
+	}
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='sample'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("legacy sample table must be gone: n=%d err=%v", n, err)
 	}
 }
 

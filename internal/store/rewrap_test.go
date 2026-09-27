@@ -165,31 +165,16 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 
 	plainBody := []byte(`{"model":"legacy-plaintext","keep":"me"}`)
 	empty := []byte{}
-	res, err := st.db.Exec(`INSERT INTO sample (
-		req_id, ts_recv, ts_sent, ts_first_byte, ts_done,
-		endpoint, model_in, model_out, model_name_id, route_id, upstream_id,
-		in_method, in_path, in_query, in_headers, in_body,
-		out_url, out_headers, out_body,
-		resp_status, resp_headers, resp_body,
-		outcome, error, truncated, pinned
-	) VALUES ('legacy-plain', ?,0,0,0, '/v1/messages','m','m',1,1,1,
-		'POST','/v1/messages','','{}',?,
-		'https://ex','{}',?,
-		200,'{}',?,
-		'ok','',0,0)`, time.Now().UnixMilli(), plainBody, empty, empty)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plainID, _ := res.LastInsertId()
+	plainID := insertRawSampleGroup(t, st, "legacy-plain", time.Now().UnixMilli(), plainBody, empty, empty)
 
 	var rawEnvBefore, rawPlainBefore []byte
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, env.ID).Scan(&rawEnvBefore); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, env.ID).Scan(&rawEnvBefore); err != nil {
 		t.Fatal(err)
 	}
 	if !IsSampleEnvelope(rawEnvBefore) || !strings.Contains(string(rawEnvBefore), "v1:"+oldID+":") {
 		t.Fatalf("pre-rewrap envelope want key-id %s, got %q", oldID, rawEnvBefore)
 	}
-	if err := st.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, plainID).Scan(&rawPlainBefore); err != nil {
+	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, plainID).Scan(&rawPlainBefore); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,7 +198,7 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	t.Cleanup(func() { st2.Close() })
 
 	var rawEnvAfter, rawPlainAfter []byte
-	if err := st2.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, env.ID).Scan(&rawEnvAfter); err != nil {
+	if err := st2.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, env.ID).Scan(&rawEnvAfter); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(rawEnvAfter), "v1:"+newID+":") {
@@ -222,7 +207,7 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	if strings.Contains(string(rawEnvAfter), "v1:"+oldID+":") {
 		t.Fatal("sample envelope still sealed under old master after rewrap")
 	}
-	if err := st2.db.QueryRow(`SELECT in_body FROM sample WHERE id=?`, plainID).Scan(&rawPlainAfter); err != nil {
+	if err := st2.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, plainID).Scan(&rawPlainAfter); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(rawPlainAfter, rawPlainBefore) {
@@ -282,7 +267,7 @@ func TestRewrapSampleField_MultipartPerFrameNoAssemble(t *testing.T) {
 	}
 
 	var raw []byte
-	if err := st.db.QueryRow(`SELECT resp_body FROM sample WHERE id=?`, s.ID).Scan(&raw); err != nil {
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, s.ID).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if !isSampleMultipart(raw) {

@@ -520,6 +520,12 @@ func (at *Attempt) Discard() {
 	//
 	// 这里**不会多读一个字节**：为了让连接还回池子，这段排水本来就要做。
 	// 只是把目的地从 io.Discard 换成一个缓冲区，所以阻塞行为与之前完全一致。
+	//
+	// 读到的字节（预读前缀 + 排水）同样交给 RespTee：§16.3 要求样本保留
+	// 每次上游响应，被丢弃的尝试也不例外。
+	if tee := at.respTee(); tee != nil && len(at.peeked) > 0 {
+		_, _ = tee.Write(at.peeked)
+	}
 	at.captureDrain()
 	at.resp.Body.Close()
 	if at.res.DoneAt.IsZero() {
@@ -536,8 +542,12 @@ const discardDrainLimit = 4 << 10
 // 在「有没有走重试」两条路径上会给出不同长度的 last_error，
 // 而那正是 UI 上用来比对的字段。
 func (at *Attempt) captureDrain() {
+	var body io.Reader = at.resp.Body
+	if tee := at.respTee(); tee != nil {
+		body = io.TeeReader(body, lenientWriter{tee})
+	}
 	if len(at.res.ErrBody) > 0 {
-		io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
+		io.CopyN(io.Discard, body, discardDrainLimit)
 		return
 	}
 
@@ -549,7 +559,7 @@ func (at *Attempt) captureDrain() {
 	// 普通 2xx 成功响应不攒副本。
 	keep := at.res.Status >= 400 || IsStructuredErrorPayload(at.peeked, ct)
 	if !keep {
-		io.CopyN(io.Discard, at.resp.Body, discardDrainLimit)
+		io.CopyN(io.Discard, body, discardDrainLimit)
 		return
 	}
 
@@ -558,7 +568,7 @@ func (at *Attempt) captureDrain() {
 	at.res.ErrBody = at.peeked
 
 	var buf bytes.Buffer
-	io.CopyN(&buf, at.resp.Body, discardDrainLimit)
+	io.CopyN(&buf, body, discardDrainLimit)
 	room := maxErrBodyCapture - len(at.res.ErrBody)
 	if b := buf.Bytes(); room > 0 && len(b) > 0 {
 		if len(b) > room {
@@ -566,6 +576,21 @@ func (at *Attempt) captureDrain() {
 		}
 		at.res.ErrBody = append(at.res.ErrBody, b...)
 	}
+}
+
+func (at *Attempt) respTee() io.Writer {
+	if at.f == nil {
+		return nil
+	}
+	return at.f.RespTee
+}
+
+// lenientWriter 吞掉旁路副本的写入错误：采集失败不得截断排水。
+type lenientWriter struct{ w io.Writer }
+
+func (l lenientWriter) Write(p []byte) (int, error) {
+	_, _ = l.w.Write(p)
+	return len(p), nil
 }
 
 // streamBody 逐块拷贝响应体，并在首字节前后应用不同的超时。

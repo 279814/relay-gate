@@ -45,11 +45,10 @@ type LogSink interface {
 
 // forwardOutcome 是转发（含重试）结束后，收尾阶段需要的全部信息。
 //
-// 它描述的是**最终那次**尝试 —— 也就是客户端实际拿到的那个响应。
-// 被丢弃的尝试在循环里就已经回写过健康状态并记过日志，不留在这里：
-// 样本表的一行代表「客户端的一次请求」，把 N 次尝试记成 N 行会让
-// 样本浏览器显示成 N 个客户端请求，那比不记更误导。
-// 逐次尝试的完整留档归 request_log。
+// 平铺字段描述的是**最终那次**尝试 —— 也就是客户端实际拿到的那个响应。
+// 被丢弃的尝试在循环里就已经回写过健康状态并记过日志；它们的出站产物
+// 与响应副本留在 trail 里，供样本把整个 Sample Group 落下来（§5.4：
+// 一个客户端请求 = 一条 sample_request + 每次实际发送的 sample_attempt）。
 type forwardOutcome struct {
 	cand      *router.Candidate
 	outBody   []byte
@@ -69,6 +68,20 @@ type forwardOutcome struct {
 	// logs 是**全部**尝试的日志（含被丢弃的），等 attempts 定下来之后
 	// 才由调用方统一投递 —— 见 forwardWithRetry 里的说明。
 	logs []*model.RequestLog
+	// trail 是最终尝试之前、实际发给上游又被丢弃的尝试，按发送顺序。
+	// route-local 跳过从未出网，不在这里。持有各自的响应 tee，
+	// 由 recordSample 接手，或经 closeSampleTrail 释放。
+	trail []*liveAttempt
+}
+
+// closeSampleTrail 释放被丢弃尝试的样本 tee（完整模式可能已 spill 到临时文件）。
+func closeSampleTrail(trail []*liveAttempt) {
+	for _, la := range trail {
+		if la != nil && la.tee != nil {
+			la.tee.Close()
+			la.tee = nil
+		}
+	}
 }
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
@@ -198,6 +211,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
 	reqID := sample.NewReqID()
 	var logs []*model.RequestLog
+	// trail 在交给 forwardOutcome 之前归本函数所有；任何提前返回都要释放。
+	var trail []*liveAttempt
+	defer func() { closeSampleTrail(trail) }()
 	localSkips := 0
 	attempt := 0
 
@@ -261,7 +277,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				res: la.at.Result(), attempts: attempt,
 				halfOpen: armedHalfOpen(la.cand.Route.ID, attempt),
 				reqID:    reqID,
+				trail:    trail,
 			}
+			trail = nil
 			if la.at.CanCommit() {
 				oc.res = h.commitLive(w, la)
 				// fail_closed response transform before any client byte.
@@ -271,6 +289,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 					finishObserver(la, health.AttemptFinish{})
 					la.cand.Release()
 					held = nil
+					closeSampleTrail(oc.trail)
 					return nil, false
 				}
 			} else {
@@ -308,12 +327,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		// 「500 + body 里写着 rate limit」会被判成故障而累计判死，
 		// 本该只是冷却 60 秒。
 		la.at.Discard()
-		// 完整模式可能已 spill 到临时文件；丢弃的尝试不会走 recordSample/Bytes，
-		// 必须在这里 Close，否则临时文件泄漏。
-		if la.tee != nil {
-			la.tee.Close()
-			la.tee = nil
-		}
+		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
+		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
+		trail = append(trail, la)
 		finishObserver(la, health.AttemptFinish{})
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
