@@ -101,6 +101,13 @@ func (reducer *ObservationReducer) ReduceCapability(current *model.EndpointCapab
 		copyValue := *current
 		return &copyValue, nil
 	}
+	if current != nil && current.State == model.CapabilityConfigError &&
+		current.ObservationToken == execution.CapabilityToken &&
+		execution.Trigger != model.TriggerManual && execution.Capability != model.CapabilityConfigError {
+		// §8.13：同一配置下 config_error 只由人工重测解除；配置变更换 token 后才放行。
+		copyValue := *current
+		return &copyValue, nil
+	}
 
 	state := execution.Capability
 	if state == "" {
