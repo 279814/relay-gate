@@ -52,24 +52,18 @@ func (p *Prober) values(up *model.Upstream) outbound.Values {
 
 // probeConfigOutcome 把「还没发出去就失败了」翻译成 Outcome。
 //
-// legacy 待审核与普通配置错误分开：前者是「这个站的 URL 或认证还没人审核过」，
-// 动作是提示用户去审核；后者是配置写错了。混成一类会让用户对着一个
-// 「配置错误」找不到该改什么。
+// Err 原样保留：legacy 待审核（去审核）与普通配置错误（去改配置）的动作不同，
+// 界面要靠它区分。
 //
-// 三类都不发网络请求（§8.6 末段的 route-local 失败），所以都不该被计成
-// 「上游拒了我们」—— 那会让一个配置问题累计成上游判死。
+// 这里的每个错误都发生在发送之前（prepare 或取连接池），没有网络证据，
+// 所以不该被计成「上游拒了我们」—— 那会让一个配置问题累计成 Route 判死。
 //
-// 模板/Secret 失败（ErrTemplateValue、ErrNoRecipe）走同一条：它们同样是
-// 「没发出去」，而 Unavailable 会累计健康失败。这在 P0 是刻意的粗粒度 ——
-// 精确的 config_error 状态要等 P0-08 的 ResponseClassifier 与 P0-09 的
-// ProbeExecution 落库，那时才有地方记「这次失败的类别」。
+// 模板、URL（含 base_url 错误与缺失的 Secret）、认证、Secret 读库失败一律
+// Ignore：§8.6 表格「模板、URL、Secret、受保护头错误 | config_error |
+// 不改变 RouteHealth」。config_error 本身由 Executor.finishConfigError 记进
+// Capability，不靠这里的 Verdict。
 func probeConfigOutcome(err error) Outcome {
-	if errors.Is(err, outbound.ErrLegacyNeedsReview) || errors.Is(err, outbound.ErrAuthConfig) ||
-		errors.Is(err, outbound.ErrSecretSourceRead) {
-		// 本地配置问题（含脏行短 api_key）或 Secret 读库失败：不发请求，也不把站判死。
-		return Outcome{Verdict: health.VerdictIgnore, Err: err}
-	}
-	return Outcome{Verdict: health.VerdictUnavailable, Err: err}
+	return Outcome{Verdict: health.VerdictIgnore, Err: err}
 }
 
 // redactOutcome 脱敏一个 Outcome 里可能含上游原文的错误。
