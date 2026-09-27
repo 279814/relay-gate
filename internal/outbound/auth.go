@@ -297,6 +297,11 @@ func renderAuthValue(ctx context.Context, values ValueResolver, name, raw string
 	tracker := &identityTracker{inner: values}
 	request, err := compiled.Render(ctx, tracker)
 	if err != nil {
+		// Secret 源读失败不是本 Route 的认证配置错误：不带 ErrAuthConfig，
+		// 否则真实转发会把一次读库故障当 route-local 跳过。
+		if errors.Is(err, ErrSecretSourceRead) {
+			return "", &authSecretReadError{header: name, cause: err}
+		}
 		// 同 renderFixedQuery：只报占位符名，不复述下层文本
 		// （probetemplate.Render 用 %w 包装 ValueResolver 的错误，
 		// 而那条错误会落进 last_error 并显示在 UI 上）。
@@ -309,3 +314,16 @@ func renderAuthValue(ctx context.Context, values ValueResolver, name, raw string
 	}
 	return request.Header.Get(name), nil
 }
+
+// authSecretReadError 报告认证头引用的 Secret 读取失败，只给头名，不复述
+// 下层文本；Unwrap 保留错误链供 errors.Is 判 ctx 取消之类。
+type authSecretReadError struct {
+	header string
+	cause  error
+}
+
+func (err *authSecretReadError) Error() string {
+	return fmt.Sprintf("manual auth header %q 引用的 Probe Secret 读取失败", err.header)
+}
+
+func (err *authSecretReadError) Unwrap() error { return err.cause }

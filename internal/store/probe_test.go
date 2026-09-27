@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
 func TestProbeSecretCRUDNeverListsCiphertextAndUsesRevisionCAS(t *testing.T) {
@@ -50,6 +51,22 @@ func TestProbeSecretCRUDNeverListsCiphertextAndUsesRevisionCAS(t *testing.T) {
 	resolvedEmpty, err := store.ResolveProbeSecret(context.Background(), "tenant_token")
 	if err != nil || !bytes.Equal(resolvedEmpty.Plain, []byte("rotated-secret-value")) {
 		t.Fatalf("empty value must keep plaintext: %+v err=%v", resolvedEmpty, err)
+	}
+}
+
+// 不存在与读失败必须可分：前者是本 Route 的 config_error，后者是整次请求失败。
+func TestResolveProbeSecretSeparatesNotFoundFromReadFailure(t *testing.T) {
+	store := testStore(t)
+	_, err := store.ResolveProbeSecret(context.Background(), "never_stored")
+	if !errors.Is(err, ErrNotFound) || !errors.Is(err, outbound.ErrSecretNotFound) {
+		t.Fatalf("missing name = %v, want ErrNotFound + outbound.ErrSecretNotFound", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = store.ResolveProbeSecret(ctx, "never_stored")
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, outbound.ErrSecretNotFound) {
+		t.Fatalf("cancelled read = %v, must not look like a missing Secret", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -71,10 +72,23 @@ func (provider *Provider) ResolveTarget(ctx context.Context, in TargetInput) (Re
 	})
 }
 
+// ErrSecretNotFound 是 SecretSource 在「这个名字不存在」时必须带上的哨兵。
+//
+// 只给不存在用：§6.5 把本 Route 引用的 Secret 缺失算作 route-local 的
+// config_error，而读库失败（锁、I/O、ctx 取消、解密失败）不属于任何一条
+// Route 的配置，带上它就会把一次读库故障变成静默换站。
+var ErrSecretNotFound = errors.New("Probe Secret 不存在")
+
 // SecretSource 按名字解析一个 Probe Secret。由 store.Store 实现。
+// 名字不存在时返回的错误须满足 errors.Is(err, ErrSecretNotFound)。
 type SecretSource interface {
 	ResolveProbeSecret(ctx context.Context, name string) (probetemplate.ResolvedSecret, error)
 }
+
+// ErrSecretSourceRead 标记 Secret 源读失败（不是「不存在」）。它既不是
+// ErrURLConfig 也不是 ErrAuthConfig：读库故障不属于某条 Route 的配置，
+// 真实转发不得据此换站；也不是上游的问题，探活不得据此判它不可用。
+var ErrSecretSourceRead = errors.New("Probe Secret 读取失败")
 
 // Values 把「这次出站可用的值」组装成 ValueResolver。
 //
@@ -109,7 +123,11 @@ func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedVal
 		if err != nil {
 			// 错误里只带占位符名，不带值：这条错误会流进 last_error 并显示在
 			// 管理界面上（§4.3 的 config_error 路径）。
-			return ResolvedValue{}, fmt.Errorf("Probe Secret %q 不可用: %w", name[len(prefix):], err)
+			if errors.Is(err, ErrSecretNotFound) {
+				return ResolvedValue{}, urlConfig(model.WrapValidation("Probe Secret %q 不存在", name[len(prefix):]))
+			}
+			return ResolvedValue{}, fmt.Errorf("%w: Probe Secret %q 不可用: %w",
+				ErrSecretSourceRead, name[len(prefix):], err)
 		}
 		return ResolvedValue{Plain: secret.Plain, Revision: secret.Revision}, nil
 	}
