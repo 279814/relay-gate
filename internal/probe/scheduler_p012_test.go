@@ -145,6 +145,63 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 	}
 }
 
+// §4.4：恢复后首轮 L2 被 jitter 推后时，Route 仍是 unknown（L1 间隔为 0），
+// 而 L1 成功不改变 Route 状态。等待首个 L2 期间，同一站只能复核一次 /models，
+// 不得每个 tick 重发，也不得因同站另一条 Route 再发一次。
+func TestP012_ResumeDoesNotRepeatL1BeforeFirstL2(t *testing.T) {
+	var models atomic.Int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			models.Add(1)
+		}
+		drainBody(r)
+		w.WriteHeader(200)
+	}
+	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srv.Close)
+	ups := []*model.Upstream{{ID: 10, Name: "up1", BaseURL: srv.URL,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+		L1Path: "/v1/models", Enabled: true}}
+	routes := []*model.Route{
+		{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true},
+		{ID: 101, ModelNameID: 1, UpstreamID: 10, Priority: 2, Weight: 100, Enabled: true},
+	}
+	settings := fastSettings()
+	settings.L1IntervalAliveSec = 5
+	settings.L2IntervalAliveSec = 6000
+	cfg := &fakeCfg{
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
+		settings: settings,
+		state:    store.StateRunning,
+	}
+	track := health.NewTracker(cfg)
+	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
+		WithTargets(testTargets(), nil).
+		WithRNG(rand.New(rand.NewSource(7)))
+
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	cfg.setState(store.StatePaused)
+	sched.tick(context.Background())
+
+	sched.PrepareResume()
+	cfg.setState(store.StateRunning)
+	sched.ResumeGradually()
+	base := models.Load()
+	deadline := time.Now().Add(time.Duration(settings.L1IntervalAliveSec)*time.Second/10 + 2*time.Second)
+	for time.Now().Before(deadline) {
+		sched.tick(context.Background())
+		sched.wg.Wait()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := models.Load() - base; got != 1 {
+		t.Fatalf("首个 L2 到来前该站只应复核一次 /models，实际 %d 次", got)
+	}
+}
+
 // §4.4：恢复后按全局限流逐步复核，不得瞬时齐发。PrepareResume 清空了全部
 // L1 到期时间；恢复后的首个 tick 只能对全局上限个数的站发 /models，
 // 其余站在后续 tick 里依次补上。
