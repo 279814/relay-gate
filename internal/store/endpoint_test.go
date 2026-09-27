@@ -100,11 +100,9 @@ func TestEndpointUpdateUsesRevisionCAS(t *testing.T) {
 	}
 }
 
-// 站级的 full_url_mode 与自定义 l1_path 必须在**创建**时就落成 url_override。
-//
-// 只在 UpdateUpstream 里翻译是不够的：EndpointResolver 只认 Endpoint 上的
-// url_override，所以一个新建的 full_url_mode 站会被拼成 base+/v1/messages ——
-// 而这个开关的全部用途正是「不要拼路径」。
+// 自定义 l1_path 必须在**创建**时就落成 models 的 url_override；
+// full_url_mode 的单 URL 不得被复制到任何协议端点（docs/01 §19.2）——
+// 新站没有 Route，是「零个协议」的情形，只能由用户逐个 Endpoint 确认。
 func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 	store := testStore(t)
 	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry",
@@ -115,11 +113,10 @@ func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 	}
 
 	cases := map[model.EndpointKind]string{
-		// full_url_mode：base_url 即完整端点
-		model.EndpointMessages:        "https://a.com/custom/entry",
-		model.EndpointCountTokens:     "https://a.com/custom/entry",
-		model.EndpointResponses:       "https://a.com/custom/entry",
-		model.EndpointChatCompletions: "https://a.com/custom/entry",
+		model.EndpointMessages:        "",
+		model.EndpointCountTokens:     "",
+		model.EndpointResponses:       "",
+		model.EndpointChatCompletions: "",
 		// 自定义 l1_path 接到 origin，不叠到完整端点路径后面
 		model.EndpointModels: "https://a.com/status",
 	}
@@ -131,6 +128,42 @@ func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 		if endpoint.URLOverride != want {
 			t.Errorf("%s 的 url_override want %q got %q", kind, want, endpoint.URLOverride)
 		}
+	}
+}
+
+// 保持 full_url_mode 改 base_url 时，也不得把新 URL 盖到四个协议端点上（§19.2）。
+func TestUpdateUpstreamFullURLModeDoesNotStampProtocolEndpoints(t *testing.T) {
+	store := testStore(t)
+	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry",
+		APIKey: "sk-fullurl-upd1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
+		L1Path: "/status", Enabled: false}
+	if err := store.CreateUpstream(upstream); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.BaseURL = "https://b.com/other/entry"
+	if err := store.UpdateUpstream(upstream); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, kind := range []model.EndpointKind{
+		model.EndpointMessages, model.EndpointResponses,
+		model.EndpointChatCompletions, model.EndpointCountTokens,
+	} {
+		endpoint, err := store.Endpoint(context.Background(), upstream.ID, kind)
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		if endpoint.URLOverride != "" {
+			t.Errorf("%s 的 url_override want empty got %q", kind, endpoint.URLOverride)
+		}
+	}
+	models, err := store.Endpoint(context.Background(), upstream.ID, model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := models.URLOverride, "https://b.com/status"; got != want {
+		t.Errorf("models 的 url_override want %q got %q", want, got)
 	}
 }
 

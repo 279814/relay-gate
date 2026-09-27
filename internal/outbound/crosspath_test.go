@@ -153,15 +153,16 @@ func crossPathCases() []crossPathCase {
 			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
-			// full_url_mode：messages 用 base 本身；L1 接到 origin，
+			// full_url_mode 不推断协议端点（§19.2）：无 override 时是
+			// base 路径 + canonical 路径。L1 接到 origin，
 			// 不得变成 /custom/entry/v1/models 或 /custom/entry/status。
 			name:             "full_url_mode 不叠 L1 路径",
 			basePath:         "/custom/entry",
 			fullURLMode:      true,
 			l1Path:           "/v1/models",
 			incomingQuery:    "beta=true",
-			wantPath:         "/custom/entry",
-			wantCountPath:    "/custom/entry",
+			wantPath:         "/custom/entry/v1/messages",
+			wantCountPath:    "/custom/entry/v1/messages/count_tokens",
 			wantModelsPath:   "/v1/models",
 			wantRealQuery:    "beta=true",
 			wantProbeL2Query: probeRecipeQuery,
