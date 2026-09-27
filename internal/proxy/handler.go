@@ -138,6 +138,23 @@ func (h *Handler) capabilityExcludes(routeID int64, endpoint model.EndpointKind)
 	return state == model.CapabilityUnsupported || state == model.CapabilityConfigError
 }
 
+// RouteConfigErrorMarker is the optional Capability write for a route-local
+// Auth Secret failure on real traffic (§6.5 / §7.2). Checked by type assertion
+// on the injected CountTokensCapability so existing implementations keep
+// compiling; without it the Route is still skipped for this request.
+type RouteConfigErrorMarker interface {
+	MarkRouteConfigError(routeID int64, generation uint64, endpoint model.EndpointKind)
+}
+
+func (h *Handler) markRouteConfigError(cand *router.Candidate, endpoint model.EndpointKind) {
+	if cand == nil || cand.Route == nil || !endpoint.Valid() {
+		return
+	}
+	if marker, ok := h.countCaps.(RouteConfigErrorMarker); ok {
+		marker.MarkRouteConfigError(cand.Route.ID, cand.HealthGeneration, endpoint)
+	}
+}
+
 // WithRelayKeyValidator wires live relay-key auth (rotate / grace / revoke).
 // When set, authOK consults the validator and ignores the static relayKeys map.
 func (h *Handler) WithRelayKeyValidator(v RelayKeyValidator) *Handler {

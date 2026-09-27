@@ -228,6 +228,51 @@ func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, ge
 	})
 }
 
+// MarkRouteConfigError records §6.5 / §7.2 on real traffic: the Route's Auth
+// Secret is unusable (e.g. empty upstream api_key), so that Route's endpoint
+// Capability is config_error and nothing was sent. Same shape as the real-traffic
+// model_not_found mark: empty token in memory, persisted under the current
+// Observation Token when persistence is wired. Does not touch RouteHealth.
+func (registry *CapabilityRegistry) MarkRouteConfigError(routeID int64, generation uint64, endpoint model.EndpointKind) {
+	if registry == nil || routeID <= 0 || !endpoint.Valid() {
+		return
+	}
+	if !registry.routeGenerationCurrent(routeID, generation) {
+		return
+	}
+	selector := model.EvidencePolicySelector{
+		Kind:     model.EvidenceRealTraffic,
+		Endpoint: endpoint,
+	}
+	settings := model.DefaultSettings()
+	if registry.settings != nil {
+		if s, err := registry.settings.Settings(); err == nil {
+			settings = s
+		}
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		return
+	}
+	fp := revisioncodec.ProbeSettingsFingerprint(policy)
+	nowMS := registry.now().UnixMilli()
+	registry.ApplyCommitted(&model.EndpointCapability{
+		ScopeType:                model.RecipeScopeRoute,
+		ScopeID:                  routeID,
+		Endpoint:                 endpoint,
+		PolicySelector:           selector,
+		State:                    model.CapabilityConfigError,
+		ErrorClass:               model.ErrorConfig,
+		ObservationToken:         "",
+		ProbeSettingsFingerprint: fp,
+		LastObservationOrder:     nowMS,
+		ObservedAt:               nowMS,
+		ExpiresAt:                0, // §8.13: config_error 不自动过期
+		RedactedDetail:           string(model.ErrorConfig),
+	})
+	registry.persistRouteConfigError(routeID, endpoint, 0, model.ErrorConfig, nowMS)
+}
+
 // routeGenerationCurrent mirrors Reporter.routeGenerationCurrent for count_tokens
 // marks. generation == 0 is unbound (tests / first mark before TryAcquire): apply
 // only when the live RouteHealth generation is also 0. A zero argument against a
