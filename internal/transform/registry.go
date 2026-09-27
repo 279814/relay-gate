@@ -144,21 +144,25 @@ func (r *Registry) PublishSnapshot(setID, routeID, endpointID int64) (*Binding, 
 	snap.ID = r.nextVer.Add(1) - 1
 	snap.CreatedAt = time.Now().UTC()
 	snap.Rules = append([]Rule(nil), s.Draft.Rules...)
+	prevHistory := len(s.History)
 	s.History = append(s.History, snap)
 
 	key := bindKey(routeID, endpointID)
 	b := r.bindings[key]
-	if b == nil {
+	created := b == nil
+	if created {
 		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
 		r.bindings[key] = b
 	}
 	if b.SetID != 0 && b.SetID != setID {
 		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
 	}
+	prev := *b
 	b.SetID = setID
 	b.PublishedID = snap.ID
 	b.Revision++
 	if err := r.flushLocked(); err != nil {
+		r.undoSnapshotLocked(s, prevHistory, key, b, prev, created)
 		return nil, nil, err
 	}
 	return cloneBinding(b), &snap, nil
@@ -179,24 +183,40 @@ func (r *Registry) ShadowSnapshot(setID, routeID, endpointID int64) (*Binding, *
 	snap.ID = r.nextVer.Add(1) - 1
 	snap.CreatedAt = time.Now().UTC()
 	snap.Rules = append([]Rule(nil), s.Draft.Rules...)
+	prevHistory := len(s.History)
 	s.History = append(s.History, snap)
 
 	key := bindKey(routeID, endpointID)
 	b := r.bindings[key]
-	if b == nil {
+	created := b == nil
+	if created {
 		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
 		r.bindings[key] = b
 	}
 	if b.SetID != 0 && b.SetID != setID {
 		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
 	}
+	prev := *b
 	b.SetID = setID
 	b.ShadowID = snap.ID
 	b.Revision++
 	if err := r.flushLocked(); err != nil {
+		r.undoSnapshotLocked(s, prevHistory, key, b, prev, created)
 		return nil, nil, err
 	}
 	return cloneBinding(b), &snap, nil
+}
+
+// undoSnapshotLocked reverts a Publish/Shadow snapshot whose flush failed so
+// memory matches the durable snapshot: a returned error means the binding
+// did not change.
+func (r *Registry) undoSnapshotLocked(s *Set, prevHistory int, key string, b *Binding, prev Binding, created bool) {
+	s.History = s.History[:prevHistory]
+	if created {
+		delete(r.bindings, key)
+		return
+	}
+	*b = prev
 }
 
 // Rollback sets published pointer to a prior history version id.
@@ -222,9 +242,11 @@ func (r *Registry) Rollback(routeID, endpointID, versionID int64) (*Binding, err
 	if !found {
 		return nil, fmt.Errorf("version %d not in history", versionID)
 	}
+	prev := *b
 	b.PublishedID = versionID
 	b.Revision++
 	if err := r.flushLocked(); err != nil {
+		*b = prev
 		return nil, err
 	}
 	return cloneBinding(b), nil
