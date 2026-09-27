@@ -145,6 +145,62 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 	}
 }
 
+// §4.4：恢复后按全局限流逐步复核，不得瞬时齐发。PrepareResume 清空了全部
+// L1 到期时间；恢复后的首个 tick 只能对全局上限个数的站发 /models，
+// 其余站在后续 tick 里依次补上。
+func TestP012_ResumeL1WaveHonorsGlobalLimit(t *testing.T) {
+	const stations, limit = 8, 2
+	var mu sync.Mutex
+	var concurrent, peak int
+	hit := map[string]bool{}
+	hs := newSchedHarness(t, stations, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(200)
+			return
+		}
+		mu.Lock()
+		concurrent++
+		if concurrent > peak {
+			peak = concurrent
+		}
+		hit[r.Host] = true
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		mu.Lock()
+		concurrent--
+		mu.Unlock()
+		w.WriteHeader(200)
+	})
+	hs.cfg.settings.GlobalL2Concurrency = limit
+	hs.track.l2Allowed = map[int64]bool{}
+
+	hs.cfg.setState(store.StatePaused)
+	hs.sched.tick(context.Background())
+	hs.cfg.setState(store.StateRunning)
+	hs.sched.tick(context.Background())
+	hs.sched.wg.Wait()
+
+	mu.Lock()
+	firstPeak, firstHits := peak, len(hit)
+	mu.Unlock()
+	if firstPeak > limit || firstHits > limit {
+		t.Fatalf("恢复首个 tick 不得瞬时齐发：峰值 %d、触达 %d 站，上限 %d", firstPeak, firstHits, limit)
+	}
+	if firstHits == 0 {
+		t.Fatal("恢复首个 tick 应至少复核一个站")
+	}
+
+	for i := 0; i < stations; i++ {
+		hs.sched.tick(context.Background())
+		hs.sched.wg.Wait()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hit) != stations {
+		t.Fatalf("复核波应最终覆盖全部 %d 站，实际 %d", stations, len(hit))
+	}
+}
+
 func TestP012_ScheduleKeyPendingCoalesces(t *testing.T) {
 	sched, track, _ := invHarness()
 	sched.mu.Lock()

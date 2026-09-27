@@ -399,6 +399,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 	s.l1Scheduled = map[int64]bool{}
 	s.mu.Unlock()
 
+	eligible := map[int64]bool{}
 	for _, mn := range snap.ModelNames {
 		if !mn.Enabled {
 			continue
@@ -414,9 +415,11 @@ func (s *Scheduler) tick(ctx context.Context) {
 			if up.ProbeMode == model.ProbeModeLazy {
 				continue
 			}
+			eligible[up.ID] = true
 			s.maybeProbe(ctx, up, mn, rt, settings)
 		}
 	}
+	s.finishResumeRamp(eligible)
 }
 
 // maybeProbe 判断并发起一个 Route 的 L1/L2。
@@ -430,10 +433,20 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	// beginL1 有两道闸（见其注释）：l1Scheduled 收本轮 tick 内同时到期的
 	// 多条 Route，inflightL1 收跨 tick 仍在跑的 L1。
 	if _, ok := s.track.ClaimL1(rt.ID); ok {
-		if hold, ok := s.beginL1(up.ID); ok {
+		ramp, admitted := s.admitResumeL1(up.ID)
+		if !admitted {
+			// 恢复复核波已满：撤回预占，下个 tick 再排队。
+			s.track.TriggerL1(rt.ID)
+		} else if hold, ok := s.beginL1(up.ID); ok {
+			if ramp {
+				s.noteResumeL1Started(up.ID, hold)
+			}
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
+				if ramp {
+					defer s.noteResumeL1Ended(up.ID, hold)
+				}
 				defer s.endL1(up.ID, hold)
 				defer s.completeL1(rt.ID)
 				s.runL1(ctx, up, settings)
