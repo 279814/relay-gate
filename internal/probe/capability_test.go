@@ -129,6 +129,45 @@ func TestCapabilityRegistry_CountTokensUnsupportedLasts24Hours(t *testing.T) {
 	}
 }
 
+// §8.13: supported goes stale only after 7 days without a new observation.
+func TestCapabilityRegistry_SupportedLasts7Days(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	start := time.UnixMilli(1_700_000_000_000)
+	now := start
+	reg.now = func() time.Time { return now }
+
+	selector := model.EvidencePolicySelector{
+		Kind: model.EvidenceL2, Endpoint: model.EndpointMessages, TimeoutProfile: model.TimeoutL2Standard,
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reducer := health.NewObservationReducer(func() time.Time { return start })
+	row, err := reducer.ReduceCapability(nil, model.ProbeExecution{
+		Capability: model.CapabilitySupported, Success: true, CapabilityToken: "tok",
+	}, policy.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.ScopeType, row.ScopeID, row.Endpoint = model.RecipeScopeRoute, 5, model.EndpointMessages
+	row.PolicySelector = selector
+	row.ObservationToken = "tok"
+	row.ProbeSettingsFingerprint = revisioncodec.ProbeSettingsFingerprint(policy)
+	row.LastObservationOrder = 1
+	reg.ApplyCommitted(row)
+
+	now = start.Add(7*24*time.Hour - time.Millisecond)
+	if got := reg.Effective(model.RecipeScopeRoute, 5, model.EndpointMessages, "tok"); got != model.CapabilitySupported {
+		t.Fatalf("just before 7d effective=%s, want supported", got)
+	}
+	now = start.Add(7 * 24 * time.Hour)
+	if got := reg.Effective(model.RecipeScopeRoute, 5, model.EndpointMessages, "tok"); got != model.CapabilityUnknown {
+		t.Fatalf("at 7d effective=%s, want unknown", got)
+	}
+}
+
 func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
