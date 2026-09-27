@@ -167,6 +167,88 @@ func TestUpdateUpstreamFullURLModeDoesNotStampProtocolEndpoints(t *testing.T) {
 	}
 }
 
+// 用户在单个协议 Endpoint 上显式设置的 override 不属于站级翻译，
+// 改 base_url / l1_path / full_url_mode 都不得把它清掉。
+func TestUpdateUpstreamKeepsExplicitProtocolEndpointOverride(t *testing.T) {
+	bases := map[bool][2]string{
+		false: {"https://a.com", "https://a.com:443"},
+		true:  {"https://a.com/entry", "https://a.com/other"},
+	}
+	for _, fullURL := range []bool{false, true} {
+		st := testStore(t)
+		upstream := &model.Upstream{Name: "s", BaseURL: bases[fullURL][0],
+			APIKey: "sk-explicit-keep1", AuthStyle: model.AuthXAPIKey, FullURLMode: fullURL,
+			L1Path: "/v1/models", Enabled: false}
+		if err := st.CreateUpstream(upstream); err != nil {
+			t.Fatal(err)
+		}
+		endpoint, err := st.Endpoint(context.Background(), upstream.ID, model.EndpointResponses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const explicit = "https://a.com/gw/openai/responses"
+		endpoint.URLOverride = explicit
+		if err := st.UpdateEndpoint(endpoint, endpoint.Revision); err != nil {
+			t.Fatal(err)
+		}
+
+		upstream.BaseURL = bases[fullURL][1]
+		if err := st.UpdateUpstream(upstream); err != nil {
+			t.Fatal(err)
+		}
+		upstream.L1Path = "/status"
+		if err := st.UpdateUpstream(upstream); err != nil {
+			t.Fatal(err)
+		}
+		upstream.BaseURL = "https://a.com"
+		upstream.FullURLMode = !fullURL
+		if err := st.UpdateUpstream(upstream); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := st.Endpoint(context.Background(), upstream.ID, model.EndpointResponses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.URLOverride != explicit {
+			t.Errorf("full_url_mode=%v: 显式 override 被改成 %q", fullURL, got.URLOverride)
+		}
+	}
+}
+
+// 旧创建路径写下的 full_url_mode 猜测值（base_url 本身）在站级 URL 改变时清空。
+func TestUpdateUpstreamClearsLegacyFullURLStamp(t *testing.T) {
+	st := testStore(t)
+	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry/",
+		APIKey: "sk-legacy-stamp1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
+		L1Path: "/v1/models", Enabled: false}
+	if err := st.CreateUpstream(upstream); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE upstream_endpoint SET url_override=? WHERE upstream_id=? AND endpoint IN (?,?,?,?)`,
+		"https://a.com/custom/entry", upstream.ID, model.EndpointMessages, model.EndpointResponses,
+		model.EndpointChatCompletions, model.EndpointCountTokens); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.BaseURL = "https://a.com/next/entry"
+	if err := st.UpdateUpstream(upstream); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []model.EndpointKind{
+		model.EndpointMessages, model.EndpointResponses,
+		model.EndpointChatCompletions, model.EndpointCountTokens,
+	} {
+		got, err := st.Endpoint(context.Background(), upstream.ID, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.URLOverride != "" {
+			t.Errorf("%s 的旧猜测值应清空，得到 %q", kind, got.URLOverride)
+		}
+	}
+}
+
 // 改 base_url 时，override 值实际未变的 Endpoint 不得 bump revision。
 //
 // Endpoint revision 会失效对应的 Capability（§4.2）。无条件 bump 等于把
