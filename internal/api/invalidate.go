@@ -206,8 +206,8 @@ func (s *Server) WithConfigPublisher(p ConfigPublisher) *Server {
 
 // publishAfterSuccessfulWrite forces the next select/preamble (and Probe)
 // snapshot to reflect rows just written to SQL. Only call after
-// Create*/Update*/Delete* of Upstream / ModelName / Route / Endpoint, or
-// SaveSettings, succeeded.
+// Create*/Update*/Delete* of Upstream / ModelName / Route / Endpoint /
+// Probe Secret, or SaveSettings, succeeded.
 //
 // On Refresh failure the HTTP write must not return success: a failed
 // Refresh stamps lastAttempt while leaving the pre-write routing pointer,

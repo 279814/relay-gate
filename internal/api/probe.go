@@ -267,6 +267,12 @@ func (s *Server) createProbeSecret(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	// Probe 快照的 SecretRevisions 进 Observation Token；不刷新的话下一次
+	// 探活按旧 revision 构造 expectation，Capability 结果只能 config_stale。
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, maskSecret(sec))
 }
 
@@ -293,6 +299,10 @@ func (s *Server) updateProbeSecret(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, maskSecret(sec))
 }
 
@@ -308,6 +318,10 @@ func (s *Server) deleteProbeSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	expected, _ := strconv.ParseInt(r.URL.Query().Get("expected_revision"), 10, 64)
 	if err := s.probeAdmin.DeleteSecret(r.Context(), id, expected); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
 		s.writeErr(w, err)
 		return
 	}

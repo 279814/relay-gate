@@ -599,6 +599,12 @@ func currentSemanticRevision(ctx context.Context, tx *sql.Tx, expectation *model
 		return model.SemanticRevision{}, err
 	}
 	current.ProbeSettingsFingerprint = revisioncodec.ProbeSettingsFingerprint(policy)
+	// 不能原地改：current 与 expectation.Revision 共享 backing，改了之后
+	// DeepEqual 永远相等，Secret 在途变更就不会是 config_stale。
+	if expectation.Revision.ProbeSecrets != nil {
+		current.ProbeSecrets = make([]model.SecretRevision, len(expectation.Revision.ProbeSecrets))
+		copy(current.ProbeSecrets, expectation.Revision.ProbeSecrets)
+	}
 	for index, secret := range current.ProbeSecrets {
 		var id, revision int64
 		err := tx.QueryRowContext(ctx, `SELECT id,revision FROM probe_secret WHERE name=?`, secret.Name).Scan(&id, &revision)
