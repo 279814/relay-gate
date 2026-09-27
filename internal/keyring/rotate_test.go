@@ -102,6 +102,43 @@ func TestRecoverUnfinished_PreparedAbortsWithoutMaintenance(t *testing.T) {
 	}
 }
 
+// §12.7：prepared 但 SQLite 已以同一 rotation_id 提交重封，须前滚而非删除
+// pending；rotation_id 不匹配（旧轮换残留）仍按未提交回滚。
+func TestRecoverUnfinishedAgainst_PreparedCommittedRollsForward(t *testing.T) {
+	const oldMaster = "aaaaaaaaaaaaaaaa"
+	const newMaster = "bbbbbbbbbbbbbbbb"
+
+	stale := Open(t.TempDir())
+	if err := stale.EnsureInitialized("mk_a", oldMaster); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.BeginRotation(newMaster); err != nil {
+		t.Fatal(err)
+	}
+	if _, st, err := stale.RecoverUnfinishedAgainst("some-older-rotation"); err != nil || st.HasPending || st.Phase != PhaseIdle {
+		t.Fatalf("mismatched rotation_id must abort: %+v err=%v", st, err)
+	}
+
+	f := Open(t.TempDir())
+	if err := f.EnsureInitialized("mk_a", oldMaster); err != nil {
+		t.Fatal(err)
+	}
+	rid, err := f.BeginRotation(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold, st, err := f.RecoverUnfinishedAgainst(rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hold || st.HasPending || st.Phase != PhaseKeyActivated {
+		t.Fatalf("committed prepared must activate forward: hold=%v %+v", hold, st)
+	}
+	if _, active, err := f.LoadActive(); err != nil || active != newMaster {
+		t.Fatalf("active must be new master: err=%v", err)
+	}
+}
+
 // §12.7：db_committed 必须前滚 ActivatePending；新 Key 成为 active，不得把
 // pending 留成唯一未用密钥，也不得声称已提交数据库可回滚。
 func TestRecoverUnfinished_DBCommittedActivatesForward(t *testing.T) {

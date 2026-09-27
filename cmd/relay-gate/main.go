@@ -106,8 +106,7 @@ func runServer() error {
 	// §12.7：进程重启发现未完成阶段时先执行恢复。db_committed 必须在
 	// LoadActive / NewCipher / Open Store 之前 ActivatePending，否则旧 active
 	// 无法解密已在新 Key 下重封的库密文。恢复完成前保持 maintenance。
-	kr := keyring.Open(dataDir)
-	holdMaint, krStatus, err := kr.RecoverUnfinished()
+	holdMaint, krStatus, err := recoverMasterRotation(dataDir, dbPath)
 	if err != nil {
 		if !errors.Is(err, keyring.ErrNotInitialized) {
 			return fmt.Errorf("恢复未完成 Master Key 轮换: %w", err)
@@ -126,7 +125,7 @@ func runServer() error {
 		return err
 	}
 	dataDir = cfg.DataDir()
-	kr = keyring.Open(dataDir)
+	kr := keyring.Open(dataDir)
 	if err := kr.EnsureInitialized(cipher.KeyID(), cfg.EncKey); err != nil {
 		return fmt.Errorf("初始化 keyring: %w", err)
 	}

@@ -131,7 +131,8 @@ func (f *File) AbortPrepared(rotationID string) error {
 
 // RecoverUnfinished applies §12.7 startup recovery before admitting traffic.
 //
-// prepared (DB not committed): AbortPrepared — pending deleted, old active kept;
+// prepared (DB not committed per RecoverUnfinishedAgainst): AbortPrepared —
+// pending deleted, old active kept;
 // HoldMaintenance is false so the gateway may leave maintenance.
 // db_committed: must roll forward via ActivatePending (DB already under new key);
 // HoldMaintenance is false once activation finishes. Never claims rollback.
@@ -141,9 +142,23 @@ func (f *File) AbortPrepared(rotationID string) error {
 // Idle/cleaned keyrings return HoldMaintenance false with no mutation.
 // Does not log or return key material.
 func (f *File) RecoverUnfinished() (holdMaintenance bool, st Status, err error) {
+	return f.RecoverUnfinishedAgainst("")
+}
+
+// RecoverUnfinishedAgainst is RecoverUnfinished with the rotation_id SQLite
+// committed alongside the rewrap (§12.7 step 7). prepared whose rotation_id
+// matches dbRotationID means the DB is already under pending, so it rolls
+// forward like db_committed instead of discarding pending.
+func (f *File) RecoverUnfinishedAgainst(dbRotationID string) (holdMaintenance bool, st Status, err error) {
 	st, err = f.Status()
 	if err != nil {
 		return false, Status{}, err
+	}
+	if st.Phase == PhasePrepared && st.RotationID != "" && st.RotationID == dbRotationID {
+		if err := f.MarkDBCommitted(st.RotationID); err != nil {
+			return true, st, err
+		}
+		st.Phase = PhaseDBCommitted
 	}
 	switch st.Phase {
 	case PhasePrepared:

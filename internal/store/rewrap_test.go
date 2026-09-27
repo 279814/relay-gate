@@ -63,7 +63,7 @@ func TestRewrapDirectSecrets_NewMasterAloneDecrypts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.RewrapDirectSecrets(newMaster); err != nil {
+	if err := st.RewrapDirectSecrets(newMaster, "rid-test"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.ActivateMaster(newMaster); err != nil {
@@ -178,7 +178,7 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.RewrapDirectSecrets(newMaster); err != nil {
+	if err := st.RewrapDirectSecrets(newMaster, "rid-test"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
