@@ -110,6 +110,25 @@ func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
 	}
 }
 
+// §8.13: unsupported returns to unknown after 24 hours, not sooner.
+func TestCapabilityRegistry_CountTokensUnsupportedLasts24Hours(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	start := time.UnixMilli(1_700_000_000_000)
+	now := start
+	reg.now = func() time.Time { return now }
+
+	reg.MarkCountTokensUnsupported(7, 0, 405)
+	now = start.Add(24*time.Hour - time.Millisecond)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("just before 24h effective=%s, want unsupported", got)
+	}
+	now = start.Add(24 * time.Hour)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("at 24h effective=%s, want unknown", got)
+	}
+}
+
 func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
