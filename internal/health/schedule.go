@@ -138,6 +138,12 @@ func (t *Tracker) ClaimL2(routeID int64) (generation uint64, ok bool) {
 	if !rs.nextL2At.IsZero() && now.Before(rs.nextL2At) {
 		return 0, false
 	}
+	// 429 冷却期内不发合成 L2（§8.12 遵循 Retry-After）：dead 的恢复 L2
+	// 只隔 30 秒，远短于上游可能给的 Retry-After。不推进 nextL2At，
+	// 冷却一过下个 tick 即可探。
+	if !rs.cooldownUntil.IsZero() && now.Before(rs.cooldownUntil) {
+		return 0, false
+	}
 	_, l2 := intervalFor(rs, s, now)
 
 	// Tracker 侧 piggyback 仅按时间窗粗判；P0-12 Scheduler 以

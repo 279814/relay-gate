@@ -423,6 +423,35 @@ func TestClaim_DeadUsesShortFixedIntervals(t *testing.T) {
 	}
 }
 
+// dead Route 在 429 冷却期内不得领到恢复 L2（§8.12 遵循 Retry-After）。
+// 否则半开吃了 Retry-After: 1200 之后，30 秒一轮的 dead L2 照样去打上游。
+func TestClaimL2_SkipsWhileCoolingDown(t *testing.T) {
+	tr, fs, now := newTestTracker(t)
+	fs.s.FailThreshold = 1
+
+	report(tr, 1, VerdictUnavailable, SourceL2)
+	_, _ = tr.ClaimL2(1)
+	tr.Report(Report{RouteID: 1, Verdict: VerdictRateLimited, Source: SourceReal,
+		RetryAfter: 20 * time.Minute})
+	if tr.State(1) != model.StateDead || !tr.CoolingDown(1) {
+		t.Fatalf("前置条件：应为 dead 且冷却中，得到 %s cooling=%v", tr.State(1), tr.CoolingDown(1))
+	}
+
+	*now = now.Add(31 * time.Second)
+	if _, ok := tr.ClaimL2(1); ok {
+		t.Error("dead L2 周期到了但仍在 Retry-After 内，不该领到 L2")
+	}
+	tr.TriggerL2(1)
+	if _, ok := tr.ClaimL2(1); ok {
+		t.Error("TriggerL2 也不得绕过冷却")
+	}
+
+	*now = now.Add(20 * time.Minute)
+	if _, ok := tr.ClaimL2(1); !ok {
+		t.Error("冷却结束后应能领到 L2")
+	}
+}
+
 // dead 超过 60 分钟后 L2 放宽到 300s；L1 仍保持短周期（§8.10）。
 func TestClaim_LongDeadWidensL2ButNotL1(t *testing.T) {
 	tr, fs, now := newTestTracker(t)
