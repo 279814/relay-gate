@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -119,6 +120,11 @@ type Scheduler struct {
 	// 只在 tick() 的单线程遍历里读写，不需要额外锁。
 	l1Scheduled map[int64]bool
 
+	// l1Followers 按 L1 hold 记录被 beginL1 收敛进这次站级 /models 的同站
+	// Route。它们只在 Claim 时预占过，完成时须与发起者一起从完成时刻重算
+	// （§8.10），否则下一次 /models 会按开始时刻提前到期。
+	l1Followers map[uint64][]int64
+
 	// wg 等所有在途探活收尾，让 Close 有确定的语义。
 	wg sync.WaitGroup
 
@@ -151,6 +157,7 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 		inflightL1:  map[int64]uint64{},
 		inflightL2:  map[int64]uint64{},
 		l1Scheduled: map[int64]bool{},
+		l1Followers: map[uint64][]int64{},
 		lastRunning: store.StateRunning,
 	}
 }
@@ -448,9 +455,11 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 					defer s.noteResumeL1Ended(up.ID, hold)
 				}
 				defer s.endL1(up.ID, hold)
-				defer s.completeL1(rt.ID)
+				defer s.completeL1(rt.ID, hold)
 				s.runL1(ctx, up, settings)
 			}()
+		} else {
+			s.followL1(up.ID, rt.ID)
 		}
 	}
 
@@ -693,15 +702,36 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 		"verdict", out.Verdict.String(), "ttft_ms", out.TTFT.Milliseconds())
 }
 
-// completeL1 从完成时刻重算下次 L1（含 jitter）。
-func (s *Scheduler) completeL1(routeID int64) {
+// completeL1 从完成时刻重算发起者及其同站跟随者的下次 L1（共用一个 jitter，
+// 同站到期保持一致才能继续收敛成一次 /models）。
+func (s *Scheduler) completeL1(routeID int64, hold uint64) {
+	s.mu.Lock()
+	followers := s.l1Followers[hold]
+	delete(s.l1Followers, hold)
+	s.mu.Unlock()
 	completer, ok := s.track.(interface {
 		CompleteL1(routeID int64, completedAt time.Time, jitter float64)
 	})
 	if !ok {
 		return
 	}
-	completer.CompleteL1(routeID, time.Now(), s.jitterFactor())
+	now, jitter := time.Now(), s.jitterFactor()
+	completer.CompleteL1(routeID, now, jitter)
+	for _, id := range followers {
+		completer.CompleteL1(id, now, jitter)
+	}
+}
+
+// followL1 把被在途站级 L1 收敛掉的 Route 挂到该次 L1 上。
+func (s *Scheduler) followL1(upstreamID, routeID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hold := s.inflightL1[upstreamID]
+	routes, open := s.l1Followers[hold]
+	if hold == 0 || !open || slices.Contains(routes, routeID) {
+		return
+	}
+	s.l1Followers[hold] = append(routes, routeID)
 }
 
 func (s *Scheduler) completeL2(routeID int64) {
@@ -741,6 +771,7 @@ func (s *Scheduler) beginL1(upstreamID int64) (hold uint64, ok bool) {
 	hold = s.holdSeq
 	s.l1Scheduled[upstreamID] = true
 	s.inflightL1[upstreamID] = hold
+	s.l1Followers[hold] = nil
 	return hold, true
 }
 
@@ -758,14 +789,14 @@ func (s *Scheduler) endL1(upstreamID int64, hold uint64) {
 }
 
 // beginL2 同时满足三个约束：全局并发上限、同 Upstream 串行、同 Route 不重入。
+//
+// 拒绝时不置 pendingL2：周期到期被拒由调用方撤预占、下个 tick 重试；
+// 置了 pending 会在该 Route 下一次完成后立刻再补一发，绕过从完成时刻
+// 计算的间隔（§8.10）。pending 只留给在途期间的事件触发。
 func (s *Scheduler) beginL2(upstreamID, routeID int64) (hold uint64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.busyUp[upstreamID] != 0 || s.inflightL2[routeID] != 0 || s.l2Inflight >= s.l2Limit() {
-		p := s.ensureP012()
-		p.mu.Lock()
-		p.pendingL2[routeID] = true
-		p.mu.Unlock()
 		return 0, false
 	}
 	s.holdSeq++
