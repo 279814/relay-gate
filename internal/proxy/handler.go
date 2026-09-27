@@ -442,7 +442,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	}
 	res, keys := oc.res, oc.keys
 
-	h.logResult(oc.cand, pre.inModel, oc.outURL, res, oc.attempts)
+	h.logResult(oc.cand, pre.inModel, oc.outURL, res, oc.attempts, keys)
 
 	// 请求日志（M6）：**每次尝试一行**，含被丢弃的那些。
 	//
@@ -752,7 +752,7 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 		Truncated: flags,
 	}
 	if res.Err != nil {
-		smp.Error = res.Err.Error()
+		smp.Error = sample.RedactDiagnosticText(res.Err.Error(), keys)
 	}
 	h.samples.Record(smp)
 }
@@ -897,7 +897,7 @@ func (h *Handler) writeSelectError(w http.ResponseWriter, err error,
 }
 
 func (h *Handler) logResult(cand *router.Candidate, inModel, outURL string,
-	res *Result, attempts int) {
+	res *Result, attempts int, keys []string) {
 
 	attrs := []any{
 		"model", inModel,
@@ -918,7 +918,9 @@ func (h *Handler) logResult(cand *router.Candidate, inModel, outURL string,
 		attrs = append(attrs, "mapped_to", cand.Route.UpstreamModel)
 	}
 	if res.Err != nil {
-		attrs = append(attrs, "err", res.Err)
+		// net/http 的解析错误会原样引用上游回的状态行（可能是回显的请求行，
+		// 含 FixedQueryTemplate 里的 key），与请求日志 Error 列同一条脱敏规则。
+		attrs = append(attrs, "err", sample.RedactDiagnosticText(res.Err.Error(), keys))
 		if IsUpstreamFault(res.Err) {
 			h.log.Warn("转发失败", attrs...)
 		} else {
