@@ -224,7 +224,13 @@ func (store *Store) reduceReachabilityTx(ctx context.Context, tx *sql.Tx, execut
 	if current != nil && current.LastObservationOrder >= execution.ObservationOrder {
 		return model.ApplySuperseded, nil, nil
 	}
-	reduced, err := callReachabilityReducer(reducer, current, execution, *value.ReachabilityPolicy)
+	// 旧 network_revision 下的行只保留供诊断，不作为归约起点：否则旧的
+	// 连续失败或 reachable 状态会被新网络来源的第一次观察直接继承。
+	prior := current
+	if prior != nil && prior.ObservedNetworkRevision != expectation.Revision.NetworkRevision {
+		prior = nil
+	}
+	reduced, err := callReachabilityReducer(reducer, prior, execution, *value.ReachabilityPolicy)
 	if err != nil {
 		return "", nil, err
 	}
