@@ -475,9 +475,13 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		return
 	}
 	gateGen := s.gate.EnsureGeneration(up.ID)
+	reachTracker := s.gate.Tracker()
+	wasUnreachable := reachTracker != nil &&
+		reachTracker.Effective(up.ID, up.NetworkRevision) == model.ReachabilityUnreachable
 	var out Outcome
 	var reachable bool
 	var costCharged bool
+	var committed *model.UpstreamReachability
 	if s.executor != nil {
 		// Probe 快照不可用时不发送（§4.9）。
 		if src, ok := s.cfg.(ProbeSnapshotSource); ok {
@@ -489,6 +493,9 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		res := s.execL1(ctx, up, settings)
 		out = res.Outcome
 		costCharged = res.Apply.CostCharged
+		if res.Apply.Reachability == model.ApplyCurrent {
+			committed = res.Apply.CommittedReachability
+		}
 		if out.Verdict == health.VerdictIgnore || res.Decision.ErrorClass == model.ErrorIgnored {
 			return
 		}
@@ -518,6 +525,12 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		s.countL1(up.ID, reachable)
 	}
 	recovered := s.gate.Report(up.ID, gateGen, reachable, out.Err)
+	if reachTracker != nil && s.executor != nil {
+		// 「从 unreachable 恢复」必须以阈值归约后的已提交 Reachability 为准
+		// （§8.10）；legacy 视图每次失败都翻转，且看不到其他观察提交的 unreachable。
+		recovered = reachable && wasUnreachable && committed != nil &&
+			committed.State != model.ReachabilityUnreachable
+	}
 
 	if !reachable {
 		// 只有真正拿不到响应头才连坐 RouteHealth（§8.9）。
