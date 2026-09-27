@@ -831,6 +831,32 @@ func TestDeadRoutesFor(t *testing.T) {
 	}
 }
 
+// §8.11 / §9.4：dead Route 的半开试探吃到 429 后按 Retry-After 冷却，
+// 冷却到期前不得再被半开选中；到期后恢复为半开候选。
+func TestDeadRoutesFor_SkipsCoolingDown(t *testing.T) {
+	snap := basicSnapshot()
+	hv := newFakeHealth()
+	hv.states[100] = model.StateDead
+	hv.states[200] = model.StateDead
+	hv.states[300] = model.StateDead
+	hv.cooling[100] = true
+
+	mn := snap.ModelNames[0]
+	dead := DeadRoutesFor(snap, hv, mn)
+	if len(dead) != 2 || dead[0].ID != 200 {
+		ids := make([]int64, 0, len(dead))
+		for _, r := range dead {
+			ids = append(ids, r.ID)
+		}
+		t.Fatalf("冷却中的 dead Route 不应作为半开候选，得到 %v", ids)
+	}
+
+	hv.cooling[100] = false
+	if dead = DeadRoutesFor(snap, hv, mn); len(dead) != 3 || dead[0].ID != 100 {
+		t.Errorf("冷却结束后应恢复为半开候选，得到 %d 个", len(dead))
+	}
+}
+
 func TestSelect_ReturnsFullCandidate(t *testing.T) {
 	snap := basicSnapshot()
 	c, err := Select(snap, newFakeHealth(), "claude-opus-5", model.ProtoAnthropic)
