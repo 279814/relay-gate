@@ -229,6 +229,7 @@ func runServer() error {
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
+		WithReachability(reachTracker).
 		WithSecurityObserver(secObs).
 		WithTransforms(xform).
 		WithSampleDiskStat(st)

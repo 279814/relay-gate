@@ -1120,3 +1120,36 @@ func TestSelect_ShortKeyMatchDoesNotFallToPrefixOrFallback(t *testing.T) {
 	}
 	c.Release()
 }
+
+type reachHealth struct {
+	*fakeHealth
+	unreachable map[int64]bool
+}
+
+func (r reachHealth) UpstreamReachable(up *model.Upstream) bool { return !r.unreachable[up.ID] }
+
+// §6.4：站级 unreachable 时，该站 Route 不作为正常候选，即便 RouteHealth 还不是 dead。
+func TestSelect_SkipsUnreachableUpstreamBeforeRouteDead(t *testing.T) {
+	snap := basicSnapshot()
+	hv := reachHealth{fakeHealth: newFakeHealth(), unreachable: map[int64]bool{10: true}}
+
+	for i := 0; i < 20; i++ {
+		c, err := Select(snap, hv, "claude-opus-5", model.ProtoAnthropic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Route.ID != 200 {
+			t.Fatalf("unreachable 站的 Route 100 不得被选中，得到 %d", c.Route.ID)
+		}
+		c.Release()
+	}
+
+	hv.unreachable = map[int64]bool{10: true, 20: true, 30: true}
+	_, err := Select(snap, hv, "claude-opus-5", model.ProtoAnthropic)
+	if !errors.Is(err, ErrNoRouteAvailable) || !strings.Contains(err.Error(), "不可达") {
+		t.Fatalf("全部站 unreachable 应 ErrNoRouteAvailable 且说明不可达，得到 %v", err)
+	}
+	if got := DeadRoutesFor(snap, hv, snap.ModelNames[0]); len(got) != 0 {
+		t.Fatalf("未 dead 的 Route 不进半开候选，得到 %d 条", len(got))
+	}
+}
