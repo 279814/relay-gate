@@ -254,6 +254,10 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 成功。原样回传上游响应体。
+	if h.countCaps != nil && cand.Route != nil && resp.StatusCode == http.StatusOK &&
+		hasPositiveInputTokens(respBody) {
+		h.countCaps.MarkCountTokensSupported(cand.Route.ID, cand.HealthGeneration)
+	}
 	FinalizeClientResponseHeaders(resp.Header, h.credentialsOf(r, cand))
 	dst := w.Header()
 	for k, vs := range resp.Header {
@@ -267,6 +271,15 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 	return ""
+}
+
+// hasPositiveInputTokens 与 probe 的 count_tokens 判据同口径（§8.8）：
+// 只有正整数 input_tokens 才算 supported 的证据。
+func hasPositiveInputTokens(body []byte) bool {
+	var resp struct {
+		InputTokens int64 `json:"input_tokens"`
+	}
+	return json.Unmarshal(body, &resp) == nil && resp.InputTokens > 0
 }
 
 const (
