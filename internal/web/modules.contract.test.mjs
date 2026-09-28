@@ -17,6 +17,7 @@ const jsDir = path.join(staticDir, 'js');
 const { createApiClient, parseProbeHeadersJSON, field } = await import(pathToFileURL(path.join(jsDir, 'api.mjs')).href);
 const { createProbeFeature, mergeProbeTabs, probeTabIds } = await import(pathToFileURL(path.join(jsDir, 'probes.mjs')).href);
 const modal = await import(pathToFileURL(path.join(jsDir, 'modal.mjs')).href);
+const { createCountTokensFeature, summarizeCountTokens, countTokensClass } = await import(pathToFileURL(path.join(jsDir, 'count_tokens.mjs')).href);
 
 let failed = 0;
 async function check(name, fn) {
@@ -39,7 +40,7 @@ await check('script order in index.html', () => {
 });
 
 await check('no x-html / innerHTML / storage in business modules', () => {
-  for (const name of ['api.mjs', 'probes.mjs', 'modal.mjs', 'boot.mjs', 'errors.mjs', 'migration.mjs', 'credentials.mjs', 'security.mjs', 'transforms.mjs', 'runtime.mjs']) {
+  for (const name of ['api.mjs', 'probes.mjs', 'modal.mjs', 'boot.mjs', 'errors.mjs', 'migration.mjs', 'credentials.mjs', 'security.mjs', 'transforms.mjs', 'runtime.mjs', 'count_tokens.mjs']) {
     const src = fs.readFileSync(path.join(jsDir, name), 'utf8');
     assert.ok(!/x-html/.test(src), name + ' x-html');
     assert.ok(!/\binnerHTML\b/.test(src), name + ' innerHTML');
@@ -198,6 +199,13 @@ await check('boot wraps window.app without requiring committed app.js edits', ()
   assert.equal(typeof sandbox.window.app, 'function');
 });
 
+await check('boot wrappers call originals with the reactive this, not bind(shell)', () => {
+  const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
+  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp', 'saveUp']) {
+    assert.ok(!new RegExp(`shell\\.${name}\\.bind\\(shell\\)`).test(boot), name + ' bound to raw shell');
+  }
+});
+
 await check('Secret clear sends empty value', async () => {
   let putBody;
   const originalFetch = globalThis.fetch;
@@ -219,6 +227,42 @@ await check('Secret clear sends empty value', async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+await check('count_tokens station posture: uniform, mixed, not wired', () => {
+  const routes = [
+    { route_id: 1, upstream_id: 10, model_name: 'a', count_tokens: 'supported' },
+    { route_id: 2, upstream_id: 10, model_name: 'b', count_tokens: 'supported' },
+    { route_id: 3, upstream_id: 20, model_name: 'a', count_tokens: 'unsupported' },
+    { route_id: 4, upstream_id: 30, model_name: 'a', count_tokens: 'unknown' },
+    { route_id: 5, upstream_id: 40, model_name: 'a', count_tokens: 'config_error' },
+    { route_id: 6, upstream_id: 50, model_name: 'a', count_tokens: 'unknown' },
+    { route_id: 7, upstream_id: 50, model_name: 'b', count_tokens: 'supported' },
+    { route_id: 8, upstream_id: 50, model_name: 'c', count_tokens: 'unsupported' },
+    { route_id: 9, upstream_id: 60, model_name: 'a' },
+  ];
+  assert.equal(summarizeCountTokens(routes, 10).state, 'supported');
+  assert.equal(summarizeCountTokens(routes, 20).state, 'unsupported');
+  assert.equal(summarizeCountTokens(routes, 30).state, 'unknown');
+  assert.equal(summarizeCountTokens(routes, 40).state, 'config_error');
+  const mixed = summarizeCountTokens(routes, 50);
+  assert.equal(mixed.state, 'mixed');
+  assert.equal(mixed.text, 'mixed: 1 supported / 1 unsupported / 1 unknown');
+  assert.equal(mixed.routes.length, 3);
+  assert.equal(summarizeCountTokens(routes, 60).state, 'na');
+  assert.equal(summarizeCountTokens(routes, 99).state, 'none');
+  assert.equal(countTokensClass('supported'), 'ok');
+  assert.equal(countTokensClass('unsupported'), 'err');
+  assert.equal(countTokensClass('config_error'), 'err');
+  assert.equal(countTokensClass('mixed'), 'warn');
+  assert.equal(countTokensClass('unknown'), 'unknown');
+
+  const shell = { health: { routes: [] }, routes: [{ id: 3, upstream_id: 20 }] };
+  createCountTokensFeature(shell);
+  assert.equal(shell.countTokensPosture(20).state, 'na', 'configured routes but no /health rows');
+  assert.equal(shell.countTokensPosture(99).state, 'none');
+  shell.health.routes = routes;
+  assert.equal(shell.countTokensPosture(50).state, 'mixed');
 });
 
 if (failed) {

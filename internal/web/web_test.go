@@ -37,6 +37,7 @@ func TestHandler_ServesStaticAssets(t *testing.T) {
 		{"/admin/js/probes.mjs", "javascript", "createProbeFeature"},
 		{"/admin/js/modal.mjs", "javascript", "openModalLock"},
 		{"/admin/js/boot.mjs", "javascript", "createProbeFeature"},
+		{"/admin/js/count_tokens.mjs", "javascript", "createCountTokensFeature"},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
@@ -102,20 +103,21 @@ func TestHandler_DoesNotRequireAuth(t *testing.T) {
 // TestEmbed_OnlyShipsWhatTheBrowserNeeds 守住内嵌资源的边界（递归精确白名单）。
 func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 	want := map[string]bool{
-		"static/index.html":         true,
-		"static/app.js":             true,
-		"static/app.css":            true,
-		"static/alpine.min.js":      true,
-		"static/js/api.mjs":         true,
-		"static/js/probes.mjs":      true,
-		"static/js/modal.mjs":       true,
-		"static/js/boot.mjs":        true,
-		"static/js/errors.mjs":      true,
-		"static/js/migration.mjs":   true,
-		"static/js/credentials.mjs": true,
-		"static/js/security.mjs":    true,
-		"static/js/transforms.mjs":  true,
-		"static/js/runtime.mjs":     true,
+		"static/index.html":          true,
+		"static/app.js":              true,
+		"static/app.css":             true,
+		"static/alpine.min.js":       true,
+		"static/js/api.mjs":          true,
+		"static/js/probes.mjs":       true,
+		"static/js/modal.mjs":        true,
+		"static/js/boot.mjs":         true,
+		"static/js/errors.mjs":       true,
+		"static/js/migration.mjs":    true,
+		"static/js/credentials.mjs":  true,
+		"static/js/security.mjs":     true,
+		"static/js/transforms.mjs":   true,
+		"static/js/runtime.mjs":      true,
+		"static/js/count_tokens.mjs": true,
 	}
 	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

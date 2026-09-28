@@ -132,7 +132,7 @@
               <thead>
                 <tr>
                   <th>模型</th><th>上游</th><th>优先级</th>
-                  <th>Reachability</th><th>Capability</th><th>RouteHealth</th>
+                  <th>Reachability</th><th>Capability</th><th>count_tokens</th><th>RouteHealth</th>
                   <th>可选路</th><th>TTFT</th><th>连续</th><th>最近错误</th><th></th>
                 </tr>
               </thead>
@@ -151,6 +151,10 @@
                     </td>
                     <td>
                       <span class="tag" x-text="capStateFor(r.route_id, 'messages')"></span>
+                    </td>
+                    <td>
+                      <span class="tag" :class="countTokensClass(r.count_tokens)"
+                            x-text="r.count_tokens || '—'"></span>
                     </td>
                     <td>
                       <span class="tag dot" :class="stateClass(r.state)" x-text="r.state"></span>
@@ -177,12 +181,12 @@
                   </tr>
                 </template>
                 <tr x-show="!(health.routes || []).length">
-                  <td colspan="11" class="empty">还没有 Route。先在「上游」与「模型」页建好，再到「路由」页绑定。</td>
+                  <td colspan="12" class="empty">还没有 Route。先在「上游」与「模型」页建好，再到「路由」页绑定。</td>
                 </tr>
               </tbody>
             </table>
             <p class="dim" x-show="probeResult?.execution_id"
-               x-text="'本次手动探活 execution_id=' + probeResult.execution_id"></p>
+               x-text="'本次手动探活 execution_id=' + (probeResult?.execution_id || '')"></p>
 
             <!-- 手动探活结果。同步返回，点了就该看到答案 -->
             <template x-if="probeResult">
@@ -238,6 +242,7 @@
             <table>
               <thead>
                 <tr><th>名称</th><th>地址</th><th>鉴权</th><th>Key</th><th>L1 路径</th>
+                    <th title="各 Route 的 count_tokens Capability；Route 之间不一致时显示 mixed">count_tokens</th>
                     <th>状态</th><th></th></tr>
               </thead>
               <tbody>
@@ -248,6 +253,19 @@
                     <td class="nowrap" x-text="u.auth_style"></td>
                     <td class="mono dim" x-text="u.api_key_is_set ? u.api_key : '未设置'"></td>
                     <td class="mono dim" x-text="u.l1_path || '（仅握手）'"></td>
+                    <td class="count-tokens-cell" :data-upstream-id="u.id">
+                      <span class="tag" :class="countTokensClass(countTokensPosture(u.id).state)"
+                            :data-ct-state="countTokensPosture(u.id).state"
+                            :title="countTokensPosture(u.id).detail"
+                            x-text="countTokensPosture(u.id).text"></span>
+                      <template x-if="countTokensPosture(u.id).state === 'mixed'">
+                        <div class="dim">
+                          <template x-for="rc in countTokensPosture(u.id).routes" :key="rc.route_id">
+                            <div x-text="`${rc.model}: ${rc.state}`"></div>
+                          </template>
+                        </div>
+                      </template>
+                    </td>
                     <td>
                       <span class="tag" :class="u.enabled ? 'ok' : 'unknown'"
                             x-text="u.enabled ? '启用' : '停用'"></span>
@@ -259,7 +277,7 @@
                   </tr>
                 </template>
                 <tr x-show="!upstreams.length">
-                  <td colspan="7" class="empty">还没有上游站点。</td>
+                  <td colspan="8" class="empty">还没有上游站点。</td>
                 </tr>
               </tbody>
             </table>

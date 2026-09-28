@@ -13,6 +13,7 @@ import { createCredentialsFeature, mergeCredentialsTab } from './credentials.mjs
 import { createSecurityFeature, mergeSecurityTab } from './security.mjs';
 import { createTransformsFeature, mergeTransformsTab } from './transforms.mjs';
 import { createRuntimeStateFeature } from './runtime.mjs';
+import { createCountTokensFeature } from './count_tokens.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -46,6 +47,7 @@ if (typeof base !== 'function') {
       mergeSecurityTab(shell);
       createTransformsFeature(shell, api);
       mergeTransformsTab(shell);
+      createCountTokensFeature(shell);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -53,12 +55,14 @@ if (typeof base !== 'function') {
       console.error(shell.probeModuleError, e);
     }
 
-    const origBoot = shell.boot && shell.boot.bind(shell);
+    // Alpine 把 shell 包成响应式代理后才调用这些方法：原方法必须以调用方的
+    // this（代理）执行。bind(shell) 会写到原始对象上，tab / health 等改动不触发渲染。
+    const origBoot = shell.boot;
     shell.boot = async function boot() {
       if (!this.probeModuleReady && this.probeModuleError) {
         this.err = this.probeModuleError;
       }
-      if (origBoot) await origBoot();
+      if (origBoot) await origBoot.call(this);
       if (this.authed && this.probeModuleReady) {
         try {
           const st = await api.get('/state');
@@ -69,10 +73,10 @@ if (typeof base !== 'function') {
       }
     };
 
-    const origLoadAll = shell.loadAll && shell.loadAll.bind(shell);
+    const origLoadAll = shell.loadAll;
     if (origLoadAll) {
       shell.loadAll = async function loadAll() {
-        await origLoadAll();
+        await origLoadAll.call(this);
         try {
           const st = await api.get('/state');
           this.applyStatePayload(st);
@@ -82,18 +86,18 @@ if (typeof base !== 'function') {
       };
     }
 
-    const origLoadHealth = shell.loadHealth && shell.loadHealth.bind(shell);
+    const origLoadHealth = shell.loadHealth;
     if (origLoadHealth) {
       shell.loadHealth = async function loadHealth() {
-        await origLoadHealth();
+        await origLoadHealth.call(this);
         if (this.probeModuleReady) await this.refreshHealthSide();
         if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };
     }
 
-    const origGo = shell.go && shell.go.bind(shell);
+    const origGo = shell.go;
     shell.go = function go(tab) {
-      if (origGo) origGo(tab);
+      if (origGo) origGo.call(this, tab);
       if (!this.probeModuleReady) return;
       if (tab === 'capabilities') {
         this.loadCapabilities(true);
@@ -118,6 +122,8 @@ if (typeof base !== 'function') {
         this.loadTransforms();
       } else if (tab === 'health') {
         this.refreshHealthSide();
+      } else if (tab === 'upstreams') {
+        this.loadHealth();
       }
     };
 
@@ -161,10 +167,10 @@ if (typeof base !== 'function') {
     };
 
     // Upstream 编辑：补 Active/Lazy、Host Override、TLS Server Name；探活头走 position 提示。
-    const origEditUp = shell.editUp && shell.editUp.bind(shell);
+    const origEditUp = shell.editUp;
     if (origEditUp) {
       shell.editUp = function editUp(u) {
-        origEditUp(u);
+        origEditUp.call(this, u);
         if (!this.upForm) return;
         if (!u) {
           this.upForm.probe_mode = 'active';
@@ -178,7 +184,7 @@ if (typeof base !== 'function') {
       };
     }
 
-    const origSaveUp = shell.saveUp && shell.saveUp.bind(shell);
+    const origSaveUp = shell.saveUp;
     if (origSaveUp) {
       shell.saveUp = async function saveUp() {
         const f = this.upForm;
@@ -203,7 +209,7 @@ if (typeof base !== 'function') {
             return innerApi(method, path, body);
           };
           try {
-            return await origSaveUp();
+            return await origSaveUp.call(this);
           } finally {
             this.api = innerApi;
             f.probe_headers_raw = prev;
