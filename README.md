@@ -94,6 +94,23 @@ export ANTHROPIC_AUTH_TOKEN=<RELAY_KEYS 打印出的值>
 
 网关三个位置都认凭据（`x-api-key` / `Authorization: Bearer` / `Api-Key`）。
 
+### 单独测一个中转站（probe-matrix）
+
+不启动网关，直接对 sub2api / New API / One API 等中转站测 `/v1/models`、`/v1/messages`、
+`/v1/messages/count_tokens`、`/v1/responses`（及 chat），逐端点打印 `PASS` / `FAIL`。
+会产生真实费用（每端点 1 次最小请求），所以必须显式加 `--online --accept-probe-cost`。
+key 只从环境变量或被 gitignore 的 TSV 读，不走命令行参数：
+
+```powershell
+$env:RELAY_KEY = '<该站 key>'
+go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
+  --base-url https://relay.example.com --key-env RELAY_KEY `
+  --claude-model claude-opus-5 --gpt-model gpt-5.6-sol
+```
+
+多站批量：按 `scripts/upstreams.example.tsv` 填 `scripts/upstreams.tsv`（已 gitignore），
+再 `bash scripts/probe-all.sh scripts/upstreams.tsv`；可选 `--output x.json --report x.md` 落盘。
+
 ## 为什么不是「重试就行了」
 
 被动 failover（请求失败再换下一个）在长思考场景下代价很高：一次首 Token 超时可能是

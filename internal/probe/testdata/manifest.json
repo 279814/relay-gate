@@ -151,6 +151,45 @@
       "expected_decision": {"success": false, "capability": "transient_error", "error_class": "transient_error"}
     },
     {
+      "id": "responses_200_failed_rate_limit",
+      "protocol": "openai-responses",
+      "endpoint": "responses",
+      "wire_format": "sse",
+      "status": 200,
+      "headers": {"content-type": ["text/event-stream"]},
+      "request_file": "requests/openai_responses.json",
+      "response_file": "responses/responses_200_failed_rate_limit.bin",
+      "chunk_plan": {"name": "single_byte"},
+      "expected_events": [{"type": "response.created"}, {"type": "response.failed", "error": true}],
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "rate_limited"}
+    },
+    {
+      "id": "responses_200_error_event_rate_limit",
+      "protocol": "openai-responses",
+      "endpoint": "responses",
+      "wire_format": "sse",
+      "status": 200,
+      "headers": {"content-type": ["text/event-stream"]},
+      "request_file": "requests/openai_responses.json",
+      "response_file": "responses/responses_200_error_event_rate_limit.bin",
+      "chunk_plan": {"name": "whole"},
+      "expected_events": [{"type": "error", "error": true}],
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "rate_limited"}
+    },
+    {
+      "id": "chat_200_bare_data_error",
+      "protocol": "openai-chat",
+      "endpoint": "chat_completions",
+      "wire_format": "sse",
+      "status": 200,
+      "headers": {"content-type": ["text/event-stream"]},
+      "request_file": "requests/openai_chat.json",
+      "response_file": "responses/chat_200_bare_data_error.bin",
+      "chunk_plan": {"name": "single_byte"},
+      "expected_events": [{"type": "error", "error": true}, {"type": "done"}],
+      "expected_decision": {"success": false, "capability": "transient_error", "error_class": "transient_error"}
+    },
+    {
       "id": "chat_chunk_delta",
       "protocol": "openai-chat",
       "endpoint": "chat_completions",
