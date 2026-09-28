@@ -455,7 +455,7 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 					defer s.noteResumeL1Ended(up.ID, hold)
 				}
 				defer s.endL1(up.ID, hold)
-				defer s.completeL1(rt.ID, hold)
+				defer s.completeL1(up, rt.ID, hold)
 				s.runL1(ctx, up, settings)
 			}()
 		} else {
@@ -704,7 +704,10 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 
 // completeL1 从完成时刻重算发起者及其同站跟随者的下次 L1（共用一个 jitter，
 // 同站到期保持一致才能继续收敛成一次 /models）。
-func (s *Scheduler) completeL1(routeID int64, hold uint64) {
+//
+// 站已提交 unreachable 时走 CompleteL1Unreachable：unknown Route 不得因间隔为 0
+// 在该站的 20 秒连接恢复周期内反复触发 /models（§8.9 / §8.10）。
+func (s *Scheduler) completeL1(up *model.Upstream, routeID int64, hold uint64) {
 	s.mu.Lock()
 	followers := s.l1Followers[hold]
 	delete(s.l1Followers, hold)
@@ -715,10 +718,18 @@ func (s *Scheduler) completeL1(routeID int64, hold uint64) {
 	if !ok {
 		return
 	}
+	complete := completer.CompleteL1
+	if !s.gate.OKAt(up.ID, up.NetworkRevision) {
+		if u, ok := s.track.(interface {
+			CompleteL1Unreachable(routeID int64, completedAt time.Time, jitter float64)
+		}); ok {
+			complete = u.CompleteL1Unreachable
+		}
+	}
 	now, jitter := time.Now(), s.jitterFactor()
-	completer.CompleteL1(routeID, now, jitter)
+	complete(routeID, now, jitter)
 	for _, id := range followers {
-		completer.CompleteL1(id, now, jitter)
+		complete(id, now, jitter)
 	}
 }
 
