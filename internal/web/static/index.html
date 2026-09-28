@@ -186,7 +186,7 @@
               </tbody>
             </table>
             <p class="dim" x-show="probeResult?.execution_id"
-               x-text="'本次手动探活 execution_id=' + probeResult.execution_id"></p>
+               x-text="'本次手动探活 execution_id=' + (probeResult?.execution_id || '')"></p>
 
             <!-- 手动探活结果。同步返回，点了就该看到答案 -->
             <template x-if="probeResult">

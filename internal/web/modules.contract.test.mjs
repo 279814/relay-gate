@@ -199,6 +199,13 @@ await check('boot wraps window.app without requiring committed app.js edits', ()
   assert.equal(typeof sandbox.window.app, 'function');
 });
 
+await check('boot wrappers call originals with the reactive this, not bind(shell)', () => {
+  const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
+  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp', 'saveUp']) {
+    assert.ok(!new RegExp(`shell\\.${name}\\.bind\\(shell\\)`).test(boot), name + ' bound to raw shell');
+  }
+});
+
 await check('Secret clear sends empty value', async () => {
   let putBody;
   const originalFetch = globalThis.fetch;
