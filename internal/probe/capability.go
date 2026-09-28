@@ -181,6 +181,52 @@ func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, ge
 	})
 }
 
+// MarkCountTokensSupported records §10.3 / §8.13: a real count_tokens 200 with
+// positive input_tokens → that Route's count_tokens Capability is supported.
+// TTL is the existing SupportedTTL; generation mirrors MarkCountTokensUnsupported.
+func (registry *CapabilityRegistry) MarkCountTokensSupported(routeID int64, generation uint64) {
+	if registry == nil || routeID <= 0 {
+		return
+	}
+	if !registry.routeGenerationCurrent(routeID, generation) {
+		return
+	}
+	selector := model.EvidencePolicySelector{
+		Kind:     model.EvidenceCountTokens,
+		Endpoint: model.EndpointCountTokens,
+	}
+	settings := model.DefaultSettings()
+	if registry.settings != nil {
+		if s, err := registry.settings.Settings(); err == nil {
+			settings = s
+		}
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
+	if err != nil {
+		return
+	}
+	fp := revisioncodec.ProbeSettingsFingerprint(policy)
+	nowMS := registry.now().UnixMilli()
+	expiresAt := int64(0)
+	if policy.State.SupportedTTL > 0 {
+		expiresAt = nowMS + policy.State.SupportedTTL.Milliseconds()
+	}
+	registry.ApplyCommitted(&model.EndpointCapability{
+		ScopeType:                model.RecipeScopeRoute,
+		ScopeID:                  routeID,
+		Endpoint:                 model.EndpointCountTokens,
+		PolicySelector:           selector,
+		State:                    model.CapabilitySupported,
+		ErrorClass:               model.ErrorNone,
+		StatusCode:               http.StatusOK,
+		ObservationToken:         "",
+		ProbeSettingsFingerprint: fp,
+		LastObservationOrder:     nowMS,
+		ObservedAt:               nowMS,
+		ExpiresAt:                expiresAt,
+	})
+}
+
 // MarkCountTokensConfigError records §10.3: upstream 401/403 on count_tokens
 // → that Route's count_tokens Capability is config_error (端点配置错误).
 // Does not touch RouteHealth or other endpoints; ExpiresAt stays 0 (§8.13).

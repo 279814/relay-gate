@@ -168,6 +168,41 @@ func TestCapabilityRegistry_SupportedLasts7Days(t *testing.T) {
 	}
 }
 
+// §8.13 / §10.3: a successful real count_tokens observation is supported,
+// expires on the existing SupportedTTL, and stays count_tokens-only.
+func TestCapabilityRegistry_MarkCountTokensSupported(t *testing.T) {
+	settings := model.DefaultSettings()
+	reg := NewCapabilityRegistry(capSettings{settings})
+	start := time.UnixMilli(1_700_000_000_000)
+	now := start
+	reg.now = func() time.Time { return now }
+
+	reg.MarkCountTokensSupported(7, 0)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilitySupported {
+		t.Fatalf("effective=%s, want supported", got)
+	}
+	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
+	if row == nil || row.StatusCode != 200 || row.ErrorClass != model.ErrorNone {
+		t.Fatalf("snapshot=%+v", row)
+	}
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, model.EvidencePolicySelector{
+		Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := start.UnixMilli() + policy.State.SupportedTTL.Milliseconds(); row.ExpiresAt != want {
+		t.Fatalf("ExpiresAt=%d want=%d (existing SupportedTTL)", row.ExpiresAt, want)
+	}
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages capability leaked: %s", got)
+	}
+	now = start.Add(policy.State.SupportedTTL)
+	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("after SupportedTTL effective=%s, want unknown", got)
+	}
+}
+
 func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})

@@ -30,6 +30,7 @@ func (c *routeConfigCaps) Effective(_ model.RecipeScope, scopeID int64,
 
 func (c *routeConfigCaps) MarkCountTokensUnsupported(int64, uint64, int) {}
 func (c *routeConfigCaps) MarkCountTokensConfigError(int64, uint64, int) {}
+func (c *routeConfigCaps) MarkCountTokensSupported(int64, uint64)        {}
 
 func (c *routeConfigCaps) MarkRouteConfigError(routeID int64, _ uint64, endpoint model.EndpointKind) {
 	c.mu.Lock()

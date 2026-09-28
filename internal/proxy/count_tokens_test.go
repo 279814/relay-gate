@@ -176,8 +176,9 @@ func TestCountTokens_403MarksConfigError(t *testing.T) {
 	}
 }
 
-// 200 成功不得写 unsupported。
-func TestCountTokens_200DoesNotMarkUnsupported(t *testing.T) {
+// §10.3 / §8.13：对 unknown Route 的真实 count_tokens 观察到 200 + 正整数
+// input_tokens（与 probe 判据同口径）→ supported；不写 unsupported/config_error。
+func TestCountTokens_200MarksSupported(t *testing.T) {
 	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"input_tokens":9}`))
 	})
@@ -185,12 +186,28 @@ func TestCountTokens_200DoesNotMarkUnsupported(t *testing.T) {
 	hs.h.WithCountTokensCapability(caps)
 
 	hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("after 200 capability = %s, want unknown", got)
+	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilitySupported {
+		t.Fatalf("after 200 capability = %s, want supported", got)
 	}
 	if caps.markedUnsupported != 0 || caps.markedConfigError != 0 {
 		t.Fatalf("Mark* called unsupported=%d config_error=%d, want 0",
 			caps.markedUnsupported, caps.markedConfigError)
+	}
+}
+
+// 200 但没有正整数 input_tokens 不是 count_tokens 的回复，不得写 supported。
+func TestCountTokens_200WithoutInputTokensStaysUnknown(t *testing.T) {
+	for _, body := range []string{`{}`, `{"input_tokens":0}`, `not json`} {
+		hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		})
+		caps := &memoryCountCaps{}
+		hs.h.WithCountTokensCapability(caps)
+
+		hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
+		if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+			t.Fatalf("body %q: capability = %s, want unknown", body, got)
+		}
 	}
 }
 
@@ -239,6 +256,10 @@ func (m *memoryCountCaps) MarkCountTokensConfigError(routeID int64, _ uint64, st
 	}
 	m.states[routeID] = model.CapabilityConfigError
 	m.markedConfigError++
+}
+
+func (m *memoryCountCaps) MarkCountTokensSupported(routeID int64, _ uint64) {
+	m.set(routeID, model.CapabilitySupported)
 }
 
 func (m *memoryCountCaps) set(routeID int64, state model.CapabilityState) {
