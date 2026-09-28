@@ -454,6 +454,16 @@ func (classifier *ResponseClassifier) applyRemoteError(decision *Decision) {
 		return
 	}
 
+	// OpenAI 形态的限流只在 code 上：Responses 的 `event: error` 把 type 写成
+	// "error"，response.failed 的 error 干脆没有 type，中转站透传时 type 还可能是
+	// invalid_request_error / server_error。先于 type 判：否则一个只是在限流的站
+	// 会被判成 config_error（只能人工解除）或按 transient 一路判死。
+	if _, found := rateLimitCodes[event.ErrorCode]; found {
+		decision.Capability = model.CapabilityTransientError
+		decision.ErrorClass = model.ErrorRateLimited
+		return
+	}
+
 	switch event.RedactedType {
 	case "rate_limit_error", "overloaded_error":
 		// overloaded 归限流而不是服务故障：Anthropic 的 529 overloaded_error
@@ -472,14 +482,6 @@ func (classifier *ResponseClassifier) applyRemoteError(decision *Decision) {
 		decision.Capability = model.CapabilityTransientError
 		decision.ErrorClass = model.ErrorTransient
 	default:
-		// OpenAI 形态的限流只在 code 上：Responses 的 `event: error` 把 type 写成
-		// "error"，response.failed 的 error 干脆没有 type。按 transient 累计的话，
-		// 一个只是在限流的站会被一路判死。
-		if _, found := rateLimitCodes[event.ErrorCode]; found {
-			decision.Capability = model.CapabilityTransientError
-			decision.ErrorClass = model.ErrorRateLimited
-			return
-		}
 		// 未知的结构化 type：当作瞬时故障并停止换候选。
 		// 猜成配置错误会让一个临时故障永久排除该端点（config_error 只能人工
 		// 解除），猜成可换候选会白烧钱 —— 两个方向都比「等下次再探」更糟。
