@@ -1,0 +1,3 @@
+event: error
+data: {"type":"error","code":"rate_limit_exceeded","message":"fixture rate limit","param":null}
+

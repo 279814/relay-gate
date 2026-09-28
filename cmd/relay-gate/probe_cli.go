@@ -70,6 +70,12 @@ type probeFlags struct {
 	report              string
 	controlManifest     string
 	unknownAuth         []string
+	// 单站 flag 模式：不写 TSV 也能探。key 只从 --key-env 指名的环境变量读，
+	// 不接受 key 本身作为 argv。
+	baseURL     string
+	keyEnv      string
+	claudeModel string
+	gptModel    string
 }
 
 type tsvRow struct {
@@ -124,11 +130,15 @@ type probeCLIDeps struct {
 	transport http.RoundTripper
 	now       func() time.Time
 	repoRoot  string
+	getenv    func(string) string
 }
 
 func runProbeCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, deps probeCLIDeps) int {
 	if deps.now == nil {
 		deps.now = time.Now
+	}
+	if deps.getenv == nil {
+		deps.getenv = os.Getenv
 	}
 	if deps.repoRoot == "" {
 		if root, err := findRepoRoot(); err == nil {
@@ -177,12 +187,17 @@ func runProbeCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		return exitFail
 	}
 
-	rows, err := loadTSV(flags.input, stdin)
+	var rows []tsvRow
+	if flags.baseURL != "" {
+		rows, err = rowFromFlags(flags, deps.getenv)
+	} else {
+		rows, err = loadTSV(flags.input, stdin)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return exitFail
 	}
-	if flags.cmd == "probe-one" {
+	if flags.cmd == "probe-one" && flags.baseURL == "" {
 		filtered := rows[:0]
 		for _, r := range rows {
 			if r.Alias == flags.name {
@@ -227,14 +242,17 @@ func runProbeCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 			if !res.CompatOK {
 				compatFail = true
 			}
+			printProbeLine(stdout, res)
 		}
 	}
 
-	if err := writeJSONFile(flags.output, results); err != nil {
-		fmt.Fprintln(stderr, err.Error())
-		return exitFail
+	if flags.output != "" {
+		if err := writeJSONFile(flags.output, results); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return exitFail
+		}
 	}
-	if flags.cmd == "probe-matrix" && flags.report != "" {
+	if flags.report != "" {
 		if err := writeReport(flags.report, results); err != nil {
 			fmt.Fprintln(stderr, err.Error())
 			return exitFail
@@ -251,6 +269,41 @@ func runProbeCLI(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		return exitFail
 	}
 	return exitOK
+}
+
+// printProbeLine 给人看的逐端点结论。只打印 alias，不打印 base URL 或 key。
+func printProbeLine(w io.Writer, r probeResultRow) {
+	verdict := "FAIL"
+	if r.DecisionSuccess {
+		verdict = "PASS"
+	}
+	class := r.ErrorClass
+	if class == "" {
+		class = "-"
+	}
+	fmt.Fprintf(w, "%s\t%s\t%s\thttp=%d\tclass=%s\tmodel=%s\n",
+		verdict, r.Alias, r.Endpoint, r.HTTPStatus, class, r.ModelAlias)
+}
+
+func rowFromFlags(flags probeFlags, getenv func(string) string) ([]tsvRow, error) {
+	claude := splitModels(flags.claudeModel)
+	gpt := splitModels(flags.gptModel)
+	if len(claude) == 0 && len(gpt) == 0 {
+		return nil, errors.New("--base-url 需要至少一个 --claude-model 或 --gpt-model")
+	}
+	key := ""
+	if flags.keyEnv != "" {
+		key = getenv(flags.keyEnv)
+		if key == "" {
+			return nil, fmt.Errorf("环境变量 %s 为空", flags.keyEnv)
+		}
+	}
+	alias := flags.name
+	if alias == "" {
+		alias = "cli"
+	}
+	return []tsvRow{{Alias: alias, BaseURL: flags.baseURL, APIKey: key,
+		ClaudeModels: claude, GPTModels: gpt}}, nil
 }
 
 func assertNoIO(flags probeFlags) {
@@ -290,6 +343,18 @@ func parseProbeFlags(args []string) (probeFlags, error) {
 		case a == "--control-manifest" && i+1 < len(args):
 			i++
 			f.controlManifest = args[i]
+		case a == "--base-url" && i+1 < len(args):
+			i++
+			f.baseURL = args[i]
+		case a == "--key-env" && i+1 < len(args):
+			i++
+			f.keyEnv = args[i]
+		case a == "--claude-model" && i+1 < len(args):
+			i++
+			f.claudeModel = args[i]
+		case a == "--gpt-model" && i+1 < len(args):
+			i++
+			f.gptModel = args[i]
 		case strings.HasPrefix(a, "--accept-"):
 			f.unknownAuth = append(f.unknownAuth, a)
 		case strings.HasPrefix(a, "--"):
@@ -298,17 +363,14 @@ func parseProbeFlags(args []string) (probeFlags, error) {
 			return f, fmt.Errorf("意外参数 %s", a)
 		}
 	}
-	if f.cmd == "probe-one" && f.name == "" {
+	if f.input != "" && f.baseURL != "" {
+		return f, errors.New("--input 与 --base-url 只能二选一")
+	}
+	if f.input == "" && f.baseURL == "" {
+		return f, errors.New("需要 --input <tsv> 或 --base-url <url>")
+	}
+	if f.cmd == "probe-one" && f.baseURL == "" && f.name == "" {
 		return f, errors.New("probe-one 需要 --name")
-	}
-	if f.input == "" {
-		return f, errors.New("需要 --input <tsv>")
-	}
-	if f.output == "" {
-		return f, errors.New("需要 --output <json>")
-	}
-	if f.cmd == "probe-matrix" && f.report == "" {
-		return f, errors.New("probe-matrix 需要 --report <md>")
 	}
 	return f, nil
 }
@@ -519,13 +581,12 @@ func runOneProbe(client *http.Client, row tsvRow, endpoint model.EndpointKind,
 		return res
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	res.HTTPStatus = resp.StatusCode
 	res.TTFTMS = deps.now().Sub(start).Milliseconds()
-	respHash := sha256.Sum256(body)
-	res.ResponseHash = hex.EncodeToString(respHash[:8])
-
-	decision := classifyProbeResponse(endpoint, row, resp.StatusCode, resp.Header, body)
+	respHasher := sha256.New()
+	decision := classifyProbeResponse(endpoint, resp.StatusCode, resp.Header,
+		io.TeeReader(io.LimitReader(resp.Body, 1<<20), respHasher))
+	res.ResponseHash = hex.EncodeToString(respHasher.Sum(nil)[:8])
 	res.DecisionSuccess = decision.Success
 	res.DecisionReachable = decision.Reachable
 	res.Capability = string(decision.Capability)
@@ -554,7 +615,9 @@ func runOneProbe(client *http.Client, row tsvRow, endpoint model.EndpointKind,
 func buildProbeRequest(ctx context.Context, row tsvRow, endpoint model.EndpointKind,
 	entry *controlEntry) (*http.Request, string, error) {
 
-	base := strings.TrimRight(row.BaseURL, "/")
+	// 常见误填：base 带了 /v1。CanonicalPath 自带 /v1，不剥会拼出 /v1/v1/...，
+	// 结果是一整排 404 被误读成「站不支持」。
+	base := strings.TrimSuffix(strings.TrimRight(row.BaseURL, "/"), "/v1")
 	path := endpoint.CanonicalPath()
 	if path == "" {
 		return nil, "", fmt.Errorf("未知 endpoint %s", endpoint)
@@ -579,9 +642,10 @@ func buildProbeRequest(ctx context.Context, row tsvRow, endpoint model.EndpointK
 		if entry != nil && entry.Nonce != "" {
 			prompt = "1+1=? control:" + entry.Nonce
 		}
+		// 输出上限与内置模板一致（anthropic/chat 为 1，responses 为 16）。
 		payload := map[string]any{
 			"model":      modelName,
-			"max_tokens": 16,
+			"max_tokens": 1,
 			"messages":   []map[string]string{{"role": "user", "content": prompt}},
 			"stream":     true,
 		}
@@ -601,13 +665,14 @@ func buildProbeRequest(ctx context.Context, row tsvRow, endpoint model.EndpointK
 		}
 		if endpoint == model.EndpointChatCompletions {
 			body, _ = json.Marshal(map[string]any{
-				"model": modelName, "stream": true, "max_tokens": 16,
+				"model": modelName, "stream": true, "max_tokens": 1,
 				"messages": []map[string]string{{"role": "user", "content": prompt}},
 			})
 		} else {
 			body, _ = json.Marshal(map[string]any{
-				"model": modelName, "stream": true,
-				"input": prompt,
+				"model": modelName, "stream": true, "max_output_tokens": 16,
+				"input": []map[string]any{{"role": "user", "content": []map[string]string{
+					{"type": "input_text", "text": prompt}}}},
 			})
 		}
 	}
@@ -623,12 +688,18 @@ func buildProbeRequest(ctx context.Context, row tsvRow, endpoint model.EndpointK
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// 原生 Anthropic 与透传它的 sub2api 类网关缺这个头直接 400。
+	if endpoint == model.EndpointMessages || endpoint == model.EndpointCountTokens {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 	req.Header.Set("User-Agent", "relay-gate-probe-cli/1.0")
 	return req, modelName, nil
 }
 
-func classifyProbeResponse(endpoint model.EndpointKind, row tsvRow,
-	status int, header http.Header, body []byte) probe.Decision {
+// classifyProbeResponse 边读边判，首个语义证据出现即停止读取（与周期探活一致，
+// 不把 max_tokens 之外的剩余正文也读完）。
+func classifyProbeResponse(endpoint model.EndpointKind,
+	status int, header http.Header, body io.Reader) probe.Decision {
 
 	protocol := model.Protocol("")
 	switch endpoint {
@@ -641,7 +712,6 @@ func classifyProbeResponse(endpoint model.EndpointKind, row tsvRow,
 	case model.EndpointResponses:
 		protocol = model.ProtoOpenAIResponses
 	}
-	_ = row
 
 	clf := probe.NewResponseClassifier(probe.ObserveProbe, endpoint, status, header, time.Now())
 	if status == 0 {
@@ -652,25 +722,34 @@ func classifyProbeResponse(endpoint model.EndpointKind, row tsvRow,
 	if err != nil {
 		return clf.Finish(err, nil)
 	}
-	events, feedErr := dec.Feed(body)
-	for _, ev := range events {
-		if _, done := clf.Observe(ev); done {
-			return clf.Finish(feedErr, nil)
+	buf := make([]byte, 4<<10)
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			events, feedErr := dec.Feed(buf[:n])
+			for _, ev := range events {
+				if _, done := clf.Observe(ev); done {
+					return clf.Finish(nil, nil)
+				}
+			}
+			if feedErr != nil {
+				return clf.Finish(feedErr, nil)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return clf.Finish(readErr, nil)
 		}
 	}
 	more, finErr := dec.Finish()
 	for _, ev := range more {
 		if _, done := clf.Observe(ev); done {
-			if finErr != nil {
-				return clf.Finish(finErr, nil)
-			}
-			return clf.Finish(feedErr, nil)
+			return clf.Finish(finErr, nil)
 		}
 	}
-	if finErr != nil {
-		return clf.Finish(finErr, nil)
-	}
-	return clf.Finish(feedErr, nil)
+	return clf.Finish(finErr, nil)
 }
 
 func writeJSONFile(path string, v any) error {

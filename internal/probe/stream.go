@@ -759,6 +759,12 @@ func (d *incrementalDecoder) eventFromObject(eventName string, object map[string
 	if name == "error" {
 		return []ProtocolEvent{remoteErrorEvent(name, payload)}, nil
 	}
+	// Responses 流以 response.failed 收尾时，错误嵌在 response.error 里，顶层没有
+	// error 字段。New API / One API / sub2api 都原样透传这个事件。不认它的话，
+	// 一次 rate_limit_exceeded 会读到 EOF 后被判成 fake_alive —— 结论与原因都错。
+	if name == "response.failed" && d.spec.Protocol == model.ProtoOpenAIResponses {
+		return []ProtocolEvent{responsesFailedEvent(name, object)}, nil
+	}
 	if name == "ping" {
 		return []ProtocolEvent{{Kind: EventKeepalive, EventName: name}}, nil
 	}
@@ -992,6 +998,18 @@ func nonEmptyCallArguments(raw json.RawMessage) bool {
 		return false
 	}
 	return nonEmptyString(call["arguments"])
+}
+
+// responsesFailedEvent 把 response.failed 转成远端错误。response.error 缺失或为空
+// 时仍是错误（status=failed 本身就是结论），只是没有结构化字段可带。
+func responsesFailedEvent(eventName string, object map[string]json.RawMessage) ProtocolEvent {
+	var response map[string]json.RawMessage
+	if json.Unmarshal(object["response"], &response) == nil {
+		if raw, ok := response["error"]; ok && carriesError(raw) {
+			return remoteErrorEvent(eventName, raw)
+		}
+	}
+	return ProtocolEvent{Kind: EventRemoteError, EventName: eventName}
 }
 
 func remoteErrorEvent(eventName string, raw json.RawMessage) ProtocolEvent {
