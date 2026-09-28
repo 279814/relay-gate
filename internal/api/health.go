@@ -29,10 +29,27 @@ type Prober interface {
 		rt *model.Route) (l1, l2 probe.Outcome, err error)
 }
 
+// CountTokensView 暴露 Route 级 count_tokens 的 effective Capability。
+// 由 probe.CapabilityRegistry 实现；与 proxy 选 count_tokens Route 时读的是同一个值
+// （过期、配置 revision 不匹配都回落 unknown），界面不另行推断。
+type CountTokensView interface {
+	Effective(scope model.RecipeScope, scopeID int64,
+		endpoint model.EndpointKind, expectedToken string) model.CapabilityState
+}
+
+var _ CountTokensView = (*probe.CapabilityRegistry)(nil)
+
 // WithHealth 接上健康看板与手动探活。分成单独的 setter，理由同 WithRuntime：
 // 这些属于探活链路，而 api.Server 的主职责是配置 CRUD。
 func (s *Server) WithHealth(hv HealthView, gate GateView, prober Prober) *Server {
 	s.healthView, s.gate, s.prober = hv, gate, prober
+	return s
+}
+
+// WithCountTokensView 让健康看板每行带上该 Route 的 count_tokens Capability。
+// 未接入时字段省略，界面显示「—」而不是伪装成 unknown。
+func (s *Server) WithCountTokensView(v CountTokensView) *Server {
+	s.countTokensView = v
 	return s
 }
 
@@ -59,6 +76,8 @@ type healthRow struct {
 	// 而选不上。只看 state 的界面会让人以为「unknown 就是有问题」。
 	Selectable bool   `json:"selectable"`
 	Reason     string `json:"reason,omitempty"`
+
+	CountTokens model.CapabilityState `json:"count_tokens,omitempty"`
 
 	Health health.Status         `json:"health"`
 	L1     health.UpstreamStatus `json:"l1"`
@@ -120,6 +139,10 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		row.Selectable, row.Reason = selectability(rt, up, st)
+		if s.countTokensView != nil {
+			row.CountTokens = s.countTokensView.Effective(model.RecipeScopeRoute, rt.ID,
+				model.EndpointCountTokens, "")
+		}
 		rows = append(rows, row)
 	}
 

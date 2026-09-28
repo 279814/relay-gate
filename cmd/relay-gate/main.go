@@ -387,6 +387,7 @@ func runServer() error {
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
 		WithHealth(tracker, gate, sched).
+		WithCountTokensView(capRegistry).
 		WithCost(cost).
 		WithInvalidator(inv).
 		WithConfigPublisher(cfgSrc).

@@ -13,6 +13,7 @@ import { createCredentialsFeature, mergeCredentialsTab } from './credentials.mjs
 import { createSecurityFeature, mergeSecurityTab } from './security.mjs';
 import { createTransformsFeature, mergeTransformsTab } from './transforms.mjs';
 import { createRuntimeStateFeature } from './runtime.mjs';
+import { createCountTokensFeature } from './count_tokens.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -46,6 +47,7 @@ if (typeof base !== 'function') {
       mergeSecurityTab(shell);
       createTransformsFeature(shell, api);
       mergeTransformsTab(shell);
+      createCountTokensFeature(shell);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -118,6 +120,8 @@ if (typeof base !== 'function') {
         this.loadTransforms();
       } else if (tab === 'health') {
         this.refreshHealthSide();
+      } else if (tab === 'upstreams') {
+        this.loadHealth();
       }
     };
 

@@ -23,6 +23,7 @@ async function main() {
   const { createSecurityFeature, mergeSecurityTab } = await import(pathToFileURL(path.join(dir, 'js', 'security.mjs')).href);
   const { createTransformsFeature, mergeTransformsTab } = await import(pathToFileURL(path.join(dir, 'js', 'transforms.mjs')).href);
   const { createRuntimeStateFeature } = await import(pathToFileURL(path.join(dir, 'js', 'runtime.mjs')).href);
+  const { createCountTokensFeature } = await import(pathToFileURL(path.join(dir, 'js', 'count_tokens.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
@@ -37,6 +38,7 @@ async function main() {
   mergeSecurityTab(inst);
   createTransformsFeature(inst, api);
   mergeTransformsTab(inst);
+  createCountTokensFeature(inst);
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([
