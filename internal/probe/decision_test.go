@@ -522,6 +522,12 @@ func TestInStreamErrorsAreClassifiedByStructuredCode(t *testing.T) {
 		{"model not found", ProtocolEvent{Kind: EventRemoteError,
 			RedactedType: "invalid_request_error", ErrorCode: "model_not_found"},
 			model.CapabilityConfigError, model.ErrorModelNotFound},
+		{"rate_limit_exceeded code beats invalid_request type", ProtocolEvent{Kind: EventRemoteError,
+			RedactedType: "invalid_request_error", ErrorCode: "rate_limit_exceeded"},
+			model.CapabilityTransientError, model.ErrorRateLimited},
+		{"rate_limit_exceeded code beats server_error type", ProtocolEvent{Kind: EventRemoteError,
+			RedactedType: "server_error", ErrorCode: "rate_limit_exceeded"},
+			model.CapabilityTransientError, model.ErrorRateLimited},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
