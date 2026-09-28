@@ -297,6 +297,18 @@ func (t *Tracker) RouteHealthCounts() (unknown, alive, negative, total int) {
 
 // CompleteL1 在探活完成后从完成时刻计算下次到期（§8.10）。
 func (t *Tracker) CompleteL1(routeID int64, completedAt time.Time, jitter float64) {
+	t.completeL1(routeID, completedAt, jitter, false)
+}
+
+// CompleteL1Unreachable 同 CompleteL1，供站已提交 unreachable 时调用（§8.9 / §8.10）。
+// unknown Route 的 L1 间隔为 0，而站不可达时 L2 被跳过，它要攒够失败阈值才转 dead；
+// 按 0 重算会让它每个 tick 对同一个不可达的站重发 /models。站的连接恢复检查
+// 按 unreachable 周期走，一个周期内不重复。
+func (t *Tracker) CompleteL1Unreachable(routeID int64, completedAt time.Time, jitter float64) {
+	t.completeL1(routeID, completedAt, jitter, true)
+}
+
+func (t *Tracker) completeL1(routeID int64, completedAt time.Time, jitter float64, unreachable bool) {
 	s := t.currentSettings()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -304,7 +316,11 @@ func (t *Tracker) CompleteL1(routeID int64, completedAt time.Time, jitter float6
 	if completedAt.IsZero() {
 		completedAt = t.now()
 	}
-	rs.nextL1At = completedAt.Add(applyJitter(l1IntervalFor(rs, s, completedAt), jitter))
+	l1 := l1IntervalFor(rs, s, completedAt)
+	if unreachable && l1 == 0 && rs.state == model.StateUnknown {
+		l1 = deadL1Interval(s)
+	}
+	rs.nextL1At = completedAt.Add(applyJitter(l1, jitter))
 }
 
 // CompleteL2 同 CompleteL1。

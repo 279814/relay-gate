@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -66,6 +67,61 @@ func TestScheduler_L1CompletionRearmsFoldedSiblings(t *testing.T) {
 	earliest := start.Add(l1Latency + l1*9/10).UnixMilli()
 	if follower < earliest {
 		t.Fatalf("跟随者 NextL1At=%d 早于完成时刻 + 周期下限 %d", follower, earliest)
+	}
+}
+
+// §8.9 / §8.10：站已 unreachable 时，未达失败阈值、仍为 unknown 的 Route 不得
+// 按 0 间隔在每个 tick 对该站重发 /models；下一次按站的连接恢复周期到期。
+func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := srv.URL
+	srv.Close()
+
+	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
+		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+	ups := []*model.Upstream{{ID: 10, Name: "down", BaseURL: baseURL,
+		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
+		L1Path: "/v1/models", Enabled: true}}
+	routes := []*model.Route{{ID: 100, ModelNameID: 1, UpstreamID: 10, Priority: 1, Weight: 100, Enabled: true}}
+	cfg := &fakeCfg{
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
+		settings: fastSettings(),
+		state:    store.StateRunning,
+	}
+	if cfg.settings.FailThreshold < 2 {
+		t.Fatalf("setup: FailThreshold=%d, need >=2 so one L1 failure leaves the Route unknown", cfg.settings.FailThreshold)
+	}
+	track := health.NewTracker(cfg)
+	gate := health.NewUpstreamGate()
+	gate.Report(10, gate.EnsureGeneration(10), false, errors.New("connection refused"))
+	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).
+		WithTargets(testTargets(), nil).
+		WithRNG(rand.New(rand.NewSource(7)))
+
+	start := time.Now()
+	sched.tick(context.Background())
+	sched.wg.Wait()
+
+	if gate.OKAt(10, ups[0].NetworkRevision) {
+		t.Fatal("setup: connection refused must leave the station unreachable")
+	}
+	st := track.Status(100)
+	if st.State != model.StateUnknown || st.ConsecutiveFail != 1 {
+		t.Fatalf("setup: want unknown with 1 failure, got %s fail=%d", st.State, st.ConsecutiveFail)
+	}
+	l1 := time.Duration(cfg.settings.L1IntervalDeadSec) * time.Second
+	if l1 <= 0 {
+		l1 = 20 * time.Second
+	}
+	if earliest := start.Add(l1 * 9 / 10).UnixMilli(); st.NextL1At < earliest {
+		t.Fatalf("unknown Route on unreachable station re-armed L1 at %d, before station cycle %d", st.NextL1At, earliest)
+	}
+
+	sched.tick(context.Background())
+	sched.wg.Wait()
+	if got := track.Status(100).ConsecutiveFail; got != 1 {
+		t.Fatalf("next tick sent another /models to the unreachable station: fail=%d", got)
 	}
 }
 
