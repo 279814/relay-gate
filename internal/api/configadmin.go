@@ -25,6 +25,8 @@ type ConfigAdmin interface {
 	DeleteModelName(context.Context, int64, int64) error
 	ListRoutes(context.Context, model.RouteFilter) (model.Page[model.Route], error)
 	ListRouteMetadata(context.Context, model.RouteFilter) (model.Page[model.RouteMetadata], error)
+	RouteIDsOfUpstream(context.Context, int64) ([]int64, error)
+	RouteIDsOfModelName(context.Context, int64) ([]int64, error)
 	GetRoute(context.Context, int64) (model.Route, error)
 	CreateRoute(context.Context, model.Route) (model.Route, error)
 	UpdateRoute(context.Context, int64, int64, model.Route) (model.Route, error)
