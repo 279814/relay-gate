@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -210,9 +211,38 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		req.Host = target.RequestHost
 	}
 	req.ContentLength = int64(len(outBody))
+	instr := health.NoopInstrumentation()
+	if h.observers != nil {
+		instr = h.observers.PrepareAttempt(ctx, health.AttemptTarget{
+			Protocol: model.ProtoAnthropic, Endpoint: model.EndpointCountTokens,
+			UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID,
+			Config: health.AttemptConfigFacts{
+				EndpointID: target.EndpointID, EndpointRevision: target.EndpointRevision,
+				AuthProfileRevision:        target.AuthProfile.Revision,
+				UpstreamNetworkRevision:    cand.Upstream.NetworkRevision,
+				UpstreamCredentialRevision: cand.Upstream.CredentialRevision,
+				UpstreamCreatedAt:          cand.Upstream.CreatedAt,
+				RouteCreatedAt:             cand.Route.CreatedAt,
+				RouteCapabilityRevision:    cand.Route.CapabilityRevision,
+				ModelCapabilityRevision:    cand.ModelName.CapabilityRevision,
+				ResolvedURLHash:            target.ResolvedURLHash,
+			},
+		}, health.AttemptRequestView{})
+	}
+	var readErr error
+	defer func() {
+		if instr.Observer != nil {
+			instr.Observer.Finish(health.AttemptFinish{ReadErr: readErr, ClientCanceled: r.Context().Err() != nil})
+		}
+	}()
+	if instr.Trace != nil {
+		instr.Trace.MarkSent(time.Now())
+		req = req.WithContext(outbound.WithAttemptTrace(req.Context(), instr.Trace))
+	}
 
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
+		readErr = err
 		// 客户端自己走了就不该再兜底：连接已经没了，本地算完也写不出去，
 		// 而且会白占一次 CPU。
 		if r.Context().Err() != nil {
@@ -222,12 +252,19 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 			sample.RedactDiagnosticText(err.Error(), h.credentialsOf(r, cand)))
 	}
 	defer resp.Body.Close()
+	if instr.Observer != nil {
+		instr.Observer.TryHeaders(resp.StatusCode, resp.Header, time.Now())
+	}
 
 	// 响应很小（Anthropic 的格式就是 {"input_tokens":N}），限长只为防异常站
 	// 回一个巨大的错误页。
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCountTokensResp))
 	if err != nil {
+		readErr = err
 		return fmt.Sprintf("读响应失败: %v", err)
+	}
+	if instr.Observer != nil {
+		instr.Observer.TryChunk(sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand)), time.Now())
 	}
 
 	// 4xx/5xx 对客户端一律降级到本地估算（拿不到准确值）。Capability 写回
@@ -240,7 +277,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
-		if h.countCaps != nil && cand.Route != nil {
+		if h.observers == nil && h.countCaps != nil && cand.Route != nil {
 			switch resp.StatusCode {
 			case http.StatusNotFound, http.StatusMethodNotAllowed:
 				h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, cand.HealthGeneration, resp.StatusCode)
@@ -254,7 +291,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 成功。原样回传上游响应体。
-	if h.countCaps != nil && cand.Route != nil && resp.StatusCode == http.StatusOK &&
+	if h.observers == nil && h.countCaps != nil && cand.Route != nil && resp.StatusCode == http.StatusOK &&
 		hasPositiveInputTokens(respBody) {
 		h.countCaps.MarkCountTokensSupported(cand.Route.ID, cand.HealthGeneration)
 	}

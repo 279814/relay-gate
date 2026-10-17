@@ -559,6 +559,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	if h.reporter != nil {
 		ep, _ := proto.Endpoint()
 		view := viewOf(res, keys, ep)
+		view.CapabilityObserved = h.observers != nil
 		view.HalfOpen = oc.halfOpen
 		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, view)
 	}

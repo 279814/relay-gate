@@ -54,6 +54,9 @@ type ResultView struct {
 	// HalfOpen marks a §4.4c armed half-open Attempt. Tracker only lets
 	// VerdictOK leave StateDead when this is set.
 	HalfOpen bool
+	// CapabilityObserved means the configured observer owns Capability writes;
+	// Reporter still classifies RouteHealth but must not persist a second mark.
+	CapabilityObserved bool
 }
 
 // viewOf 从完整结果里摘出健康判定需要的部分。

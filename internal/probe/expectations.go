@@ -60,6 +60,9 @@ func buildL2Expectations(snap *livecfg.ProbeSnapshot, up *model.Upstream, rt *mo
 	selector := model.EvidencePolicySelector{
 		Kind: model.EvidenceL2, Endpoint: endpoint, TimeoutProfile: timeout,
 	}
+	if endpoint == model.EndpointCountTokens {
+		selector = model.EvidencePolicySelector{Kind: model.EvidenceCountTokens, Endpoint: endpoint}
+	}
 	reachExp, err := snap.ReachabilityExpectation(up.ID, selector)
 	if err != nil {
 		return nil, nil, nil, nil, err
