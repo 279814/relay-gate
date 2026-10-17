@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import vm from 'node:vm';
 import { test } from 'node:test';
+import { createApiClient } from './static/js/api.mjs';
+import { createSettingsFeature } from './static/js/settings.mjs';
+import { createRuntimeStateFeature } from './static/js/runtime.mjs';
 
 const moduleFile = new URL('./static/js/settings.mjs', import.meta.url);
 const snapshot = revision => ({ settings: { real_connect_sec: 30, real_response_header_sec: 1200, real_first_byte_sec: 1200, real_first_semantic_sec: 1200, real_idle_sec: 600, real_total_sec: 1800, count_tokens_connect_sec: 30, count_tokens_total_sec: 180 }, revision, limits: { min_real_first_semantic_sec: 300 } });
@@ -130,4 +134,84 @@ test('late Settings write errors do not mark the new login conflicted or unlock 
   assert.equal(shell.err, 'new login message');
   finishNewSave({settings: {...snapshot(8).settings, count_tokens_total_sec:210}, revision:9});
   await saving;
+});
+
+// Exercise the actual boot -> shared client -> feature boundary. The proxy
+// records reactive writes, rather than substituting an API that skips 401 hooks.
+async function bootClientFixture(t, fetchResponse) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchResponse;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let resets = 0;
+  const base = { authed:true, settings:null, err:'', msg:'', tabs:[],
+    async boot() {}, reset() { resets++; this.authed = false; } };
+  const source = fs.readFileSync(new URL('./static/js/boot.mjs', import.meta.url), 'utf8');
+  const imports = [...source.matchAll(/^import \{ ([^}]+) \} from .+;$/gm)].flatMap(match => match[1].split(',').map(name => name.trim()));
+  const context = { window:{app:()=>base}, console, createApiClient, createSettingsFeature, createRuntimeStateFeature };
+  for (const name of imports) if (!(name in context)) context[name] = () => {};
+  vm.runInNewContext(source.replace(/^import .+;$/gm, ''), context);
+  const raw = context.window.app();
+  const writes = [];
+  const shell = new Proxy(raw, {set(target,key,value) { writes.push([key,value]); return Reflect.set(target,key,value); }});
+  await shell.boot();
+  return {shell,writes,resets:()=>resets};
+}
+
+const httpJSON = (status, data) => ({status,ok:status>=200&&status<300,text:async()=>JSON.stringify(data)});
+
+test('real client old 401 preserves the new login draft and its pending save', async t => {
+  let finishOld, finishSave;
+  let reads = 0;
+  const oldResponse = new Promise(resolve => {finishOld=resolve;});
+  const saveResponse = new Promise(resolve => {finishSave=resolve;});
+  const {shell} = await bootClientFixture(t, (url,opt) => {
+    if (opt.method==='PUT') return saveResponse;
+    return ++reads===1 ? oldResponse : Promise.resolve(httpJSON(200,snapshot(8)));
+  });
+  const oldLoad=shell.loadSettings();
+  shell.reset();shell.authed=true;
+  await shell.loadSettings();
+  shell.settings.count_tokens_total_sec=210;
+  const saving=shell.saveSettings();
+  finishOld(httpJSON(401,{error:'old login expired'}));await oldLoad;
+  assert.equal(shell.authed,true);
+  assert.equal(shell.settings.count_tokens_total_sec,210);
+  assert.equal(shell.settingsState.revision,8);
+  assert.equal(shell.settingsState.busy,true);
+  finishSave(httpJSON(200,{settings:{...snapshot(8).settings,count_tokens_total_sec:210},revision:9}));
+  await saving;
+  assert.equal(shell.settingsState.revision,9);
+});
+
+test('real client current 401 clears state through the reactive receiver', async t => {
+  const {shell,writes,resets} = await bootClientFixture(t,async()=>httpJSON(401,{error:'expired'}));
+  shell.applyStatePayload({state:'running',revision:4});
+  writes.length=0;
+  await shell.loadSettings();
+  assert.equal(shell.authed,false);
+  assert.equal(shell.settings,null);
+  assert.equal(shell.stateRevision,0);
+  assert.equal(resets(),1);
+  assert.ok(writes.some(([key,value])=>key==='authed'&&value===false),'reset must write through the Alpine receiver');
+});
+
+test('concurrent old 401s cannot clear a relogin and current 401 still resets it', async t => {
+  const responses=[];
+  const {shell,resets} = await bootClientFixture(t,()=>new Promise(resolve=>responses.push(resolve)));
+  const first=shell.loadSettings();
+  const second=shell.refreshState();
+  responses[0](httpJSON(401,{}));await first;
+  assert.equal(resets(),1);
+  shell.authed=true;
+  const current=shell.loadSettings();
+  responses[2](httpJSON(200,snapshot(8)));await current;
+  shell.settings.count_tokens_total_sec=220;
+  responses[1](httpJSON(401,{}));await second;
+  assert.equal(resets(),1);
+  assert.equal(shell.authed,true);
+  assert.equal(shell.settings.count_tokens_total_sec,220);
+  const current401=shell.refreshState();
+  responses[3](httpJSON(401,{}));await current401;
+  assert.equal(resets(),2);
+  assert.equal(shell.authed,false);
 });

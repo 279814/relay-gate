@@ -9,8 +9,12 @@
  */
 export function createApiClient(hooks = {}) {
   const onUnauthorized = hooks.onUnauthorized || (() => {});
+  let owner = {};
+
+  function invalidatePendingRequests() { owner = {}; }
 
   async function request(method, path, body) {
+    const requestOwner = owner;
     const opt = { method, headers: {}, credentials: 'same-origin' };
     if (body !== undefined) {
       opt.headers['Content-Type'] = 'application/json';
@@ -18,7 +22,13 @@ export function createApiClient(hooks = {}) {
     }
     const r = await fetch('/admin/api' + path, opt);
     if (r.status === 401) {
-      onUnauthorized();
+      // A response authenticated before logout must not clear a newer login.
+      // Invalidate the cohort before invoking the hook, so concurrent 401s
+      // cannot repeatedly reset the current component.
+      if (requestOwner === owner) {
+        invalidatePendingRequests();
+        onUnauthorized();
+      }
       const e = new Error('会话已过期，请重新登录');
       e.status = 401;
       throw e;
@@ -43,6 +53,7 @@ export function createApiClient(hooks = {}) {
   }
 
   return {
+    invalidatePendingRequests,
     request,
     get: (path) => request('GET', path),
     post: (path, body) => request('POST', path, body),

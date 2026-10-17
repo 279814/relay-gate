@@ -23,13 +23,14 @@ if (typeof base !== 'function') {
 } else if (!base.__relayProbeBooted) {
   window.app = function app() {
     const shell = base();
+    let receiver = shell;
     shell.probeModuleReady = false;
     shell.probeModuleError = '';
     createRuntimeStateFeature(shell);
 
     const api = createApiClient({
       onUnauthorized: () => {
-        if (typeof shell.reset === 'function') shell.reset();
+        if (typeof receiver.reset === 'function') receiver.reset();
       },
     });
 
@@ -59,10 +60,19 @@ if (typeof base !== 'function') {
       console.error(shell.probeModuleError, e);
     }
 
+    const originalReset = shell.reset;
+    shell.reset = function resetPendingRequests() {
+      api.invalidatePendingRequests();
+      return originalReset?.call(this);
+    };
+
     // Alpine 把 shell 包成响应式代理后才调用这些方法：原方法必须以调用方的
     // this（代理）执行。bind(shell) 会写到原始对象上，tab / health 等改动不触发渲染。
     const origBoot = shell.boot;
     shell.boot = async function boot() {
+      // Alpine supplies the reactive receiver only after app() returns. Hooks
+      // must use it too; writes to the raw shell would leave private DOM visible.
+      receiver = this;
       if (!this.probeModuleReady && this.probeModuleError) {
         this.err = this.probeModuleError;
       }
