@@ -37,7 +37,6 @@ func fastSettings() model.Settings {
 	s.L2TotalSec = 2
 	s.L2ConnectSec = 1
 	s.L2IdleSec = 1
-	s.L2FirstSemanticSec = 1
 	s.L2ResponseHeaderSec = 1
 	s.L2FirstByteSec = 1
 	s.L2FirstEventSec = 1

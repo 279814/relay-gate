@@ -142,7 +142,7 @@ func TestSettingsRejectNonPositive(t *testing.T) {
 		{"fail_threshold", func(s *Settings) { s.FailThreshold = 0 }},
 		{"global_l2_concurrency", func(s *Settings) { s.GlobalL2Concurrency = 0 }},
 		{"sample_queue_size", func(s *Settings) { s.SampleQueueSize = 0 }},
-		{"l2_first_token_sec 负数", func(s *Settings) { s.L2FirstSemanticSec = -5 }},
+		{"l2_first_semantic_sec 负数", func(s *Settings) { s.L2FirstSemanticSec = -5 }},
 		// 0 不是「关闭重试」而是「一次都不发」。关闭重试是 1。
 		{"retry_max_attempts", func(s *Settings) { s.RetryMaxAttempts = 0 }},
 	} {

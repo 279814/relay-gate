@@ -80,6 +80,9 @@ jobs:
       - name: 前端模块契约测试
         run: node --test internal/web/modules.contract.test.mjs
 
+      - name: Settings and service-state revision contracts
+        run: node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs
+
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 

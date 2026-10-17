@@ -284,7 +284,7 @@ func TestSource_InvalidSettingsFallsBackToDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.RealFirstSemanticSec < model.MinRealFirstSemanticSec {
-		t.Errorf("不合法的 settings 应降级为默认值，得到 real_first_token_sec=%d",
+		t.Errorf("不合法的 settings 应降级为默认值，得到 real_first_semantic_sec=%d",
 			got.RealFirstSemanticSec)
 	}
 }

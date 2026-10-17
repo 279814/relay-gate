@@ -206,7 +206,8 @@ def verify(binary):
             assert PRIVATE not in repr(profiles) and profiles[0][-1] == 1, "private content or telemetry changed profile identity"
             eventually(lambda: runtime.sql("SELECT COUNT(*) FROM sample_request") == [(3,)])
             before_samples = 3
-            runtime.api("PUT", "/settings", {"sample_enabled": False})
+            settings = runtime.api("GET", "/settings")
+            runtime.api("PUT", "/settings", {"sample_enabled": False, "expected_revision": settings["revision"]})
             MockUpstream.mode = "complete"
             assert runtime.request("POST", "/v1/messages", body, proxy=True)[0] == 200
             eventually(lambda: runtime.sql("SELECT seen_count FROM client_probe_profile") == [(3,)])
