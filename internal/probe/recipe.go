@@ -298,12 +298,22 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 	// relay_session，或把客户端 messages/system/tools/认证值写进 BodyTemplate；
 	// 认证必须走 Endpoint auth profile（§7.2），探活 body 物化为紧凑模板，
 	// 不能从学来的原文回放。
-	safe := sanitizeLearnedShape(query.Endpoint, model.ClientRequestShape{
+	// Profiles have no Secret binding snapshot; reject declarations even when
+	// an unsupported header would otherwise be discarded by the sanitizer.
+	if required, _ := probetemplate.ScanRequiredSecrets(query.Endpoint, probetemplate.TemplateContent{
+		Method: query.Endpoint.Method(), Headers: profile.SafeHeaders, RawQuery: profile.FixedRawQuery,
+	}); len(required) > 0 {
+		return ResolvedRecipe{}, model.WrapValidation("profile %d 不能声明 Probe Secret", profile.ID)
+	}
+	safe, err := sanitizeLearnedShape(query.Endpoint, model.ClientRequestShape{
 		SafeHeaders:   profile.SafeHeaders,
 		FixedRawQuery: profile.FixedRawQuery,
 		BodyTemplate:  profile.BodyTemplate,
 		BodyShapeJSON: profile.BodyShapeJSON,
 	})
+	if err != nil {
+		return ResolvedRecipe{}, fmt.Errorf("校验 profile %d 的 shape: %w", profile.ID, err)
+	}
 	compiled, err := probetemplate.CompileContent(query.Endpoint, probetemplate.TemplateContent{
 		Method:   query.Endpoint.Method(),
 		RawQuery: safe.FixedRawQuery,
