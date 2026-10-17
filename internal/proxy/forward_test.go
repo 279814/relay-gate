@@ -31,7 +31,7 @@ func testForwarder(t *testing.T, to Timeouts) *Forwarder {
 
 func fastTimeouts() Timeouts {
 	// 测试用的短超时。生产值有 300s 硬下限，测试里不受此限（那是配置层的约束）
-	return Timeouts{Connect: 2 * time.Second, FirstToken: 600 * time.Millisecond,
+	return Timeouts{Connect: 2 * time.Second, ResponseHead: 600 * time.Millisecond, FirstByte: 600 * time.Millisecond, FirstSemantic: 600 * time.Millisecond,
 		Idle: 400 * time.Millisecond, Total: 5 * time.Second}
 }
 
@@ -147,7 +147,7 @@ func TestForward_StreamsIncrementally(t *testing.T) {
 
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
 	f := testForwarder(t, Timeouts{Connect: 2 * time.Second,
-		FirstToken: 2 * time.Second, Idle: 2 * time.Second, Total: 5 * time.Second})
+		FirstSemantic: 2 * time.Second, Idle: 2 * time.Second, Total: 5 * time.Second})
 	res := f.Forward(context.Background(), rec, "POST", up.URL, http.Header{}, []byte("{}"))
 
 	if res.Err != nil {
@@ -257,7 +257,7 @@ func TestForward_FirstTokenTimeout(t *testing.T) {
 	if !errors.Is(res.Err, ErrFirstTokenTimeout) {
 		t.Fatalf("应返回 ErrFirstTokenTimeout，得到 %v", res.Err)
 	}
-	// 必须真的在 FirstToken 时限内中断，而不是等到 Total
+	// 必须真的在 FirstSemantic 时限内中断，而不是等到 Total
 	if elapsed > 2*time.Second {
 		t.Errorf("应在首 Token 超时（600ms）后立即中断，实际耗时 %v —— "+
 			"超时未生效会让死站一直占住请求", elapsed)
@@ -273,7 +273,7 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	release := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		// 必须是 §8.8 语义证据：裸 "data: first" 不能结束 FirstToken。
+		// 必须是 §8.8 语义证据：裸 "data: first" 不能结束 FirstSemantic。
 		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
 		w.(http.Flusher).Flush()
 		<-release // 之后再不吐东西
@@ -395,7 +395,7 @@ func TestResult_TTFT(t *testing.T) {
 	}
 }
 
-// 长思考场景：首语义来得很慢，但只要在 FirstToken 时限内就必须放过，
+// 长思考场景：首语义来得很慢，但只要在 FirstSemantic 时限内就必须放过，
 // 之后持续吐 delta 也不能被 Idle 超时打断。这是 5 分钟下限要保护的场景。
 func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 	delta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n")
@@ -404,7 +404,7 @@ func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 		w.WriteHeader(200)
 		fl := w.(http.Flusher)
 		fl.Flush()
-		time.Sleep(350 * time.Millisecond) // 慢，但在 FirstToken(600ms) 内
+		time.Sleep(350 * time.Millisecond) // 慢，但在 FirstSemantic(600ms) 内
 		for i := 0; i < 4; i++ {
 			_, _ = w.Write(delta)
 			fl.Flush()
@@ -459,7 +459,7 @@ func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 
 // 回归测试：响应头阶段的时限绝不能误伤「头回得快、body 吐得慢」的长流。
 //
-// 曾经的写法是给请求套一个 FirstToken 的 context，拿到响应头后再 cancel ——
+// 曾经的写法是给请求套一个 FirstSemantic 的 context，拿到响应头后再 cancel ——
 // 但请求是用那个 context 建的，cancel 会连带取消整个响应体读取，
 // 流当场断在第一块。真实的长思考正是这个形状：头秒回，body 慢慢吐。
 func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
@@ -468,7 +468,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200) // 头立刻回
 		w.(http.Flusher).Flush()
-		// 之后每块都比 FirstToken(300ms) 晚，但都在 Idle(400ms) 之内
+		// 之后每块都比 FirstSemantic(300ms) 晚，但都在 Idle(400ms) 之内
 		for i := 0; i < 6; i++ {
 			time.Sleep(200 * time.Millisecond)
 			_, _ = w.Write(delta)
@@ -489,7 +489,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 	}
 }
 
-// 卡在响应头阶段的站要在 FirstToken 时限内识别，而不是等 Total。
+// 卡在响应头阶段的站按 ResponseHead 到期，不等 Total。
 // 这类站在公益站里不罕见：连接建立、请求收下，然后就没有然后了。
 func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 	release := make(chan struct{})
@@ -500,8 +500,8 @@ func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 	defer close(release)
 
 	to := fastTimeouts()
-	to.FirstToken = 300 * time.Millisecond
-	to.Total = 10 * time.Second // 远大于 FirstToken，用来证明不是它兜的底
+	to.ResponseHead = 300 * time.Millisecond
+	to.Total = 10 * time.Second // 远大于 FirstSemantic，用来证明不是它兜的底
 
 	rec := httptest.NewRecorder()
 	f := testForwarder(t, to)
@@ -513,7 +513,7 @@ func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 		t.Errorf("应归类为首 Token 超时，得到 %v", res.Err)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("应在 FirstToken(300ms) 后就放弃，实际等了 %v", elapsed)
+		t.Errorf("应在 FirstSemantic(300ms) 后就放弃，实际等了 %v", elapsed)
 	}
 	// 关键：必须算上游的账，否则死站永远攒不够失败次数
 	if !IsUpstreamFault(res.Err) {
@@ -646,7 +646,7 @@ func TestForward_ClientCancelIsNotUpstreamFault(t *testing.T) {
 	go func() { <-started; cancel() }()
 
 	f := testForwarder(t, Timeouts{Connect: 2 * time.Second,
-		FirstToken: 5 * time.Second, Idle: 5 * time.Second, Total: 10 * time.Second})
+		FirstSemantic: 5 * time.Second, Idle: 5 * time.Second, Total: 10 * time.Second})
 	res := f.Forward(ctx, httptest.NewRecorder(), "POST", up.URL, http.Header{}, []byte("{}"))
 
 	if res.Err == nil {
@@ -724,8 +724,8 @@ func TestHandler_ProxyChangesAffectActualRequests(t *testing.T) {
 func TestRealTimeouts(t *testing.T) {
 	s := model.DefaultSettings()
 	to := RealTimeouts(s)
-	if to.FirstToken != 1200*time.Second {
-		t.Errorf("首 Token 应为 1200s，得到 %v", to.FirstToken)
+	if to.FirstSemantic != 1200*time.Second {
+		t.Errorf("首 Token 应为 1200s，得到 %v", to.FirstSemantic)
 	}
 	if to.Idle != 600*time.Second {
 		t.Errorf("Idle 应为 600s，得到 %v", to.Idle)
@@ -736,9 +736,8 @@ func TestRealTimeouts(t *testing.T) {
 	}
 }
 
-// 配置层只卡 real_first_semantic_sec ≥ 300，但 TimeoutsFrom 取各阶段最小值。
-// 短 response_header / first_byte 若原样落入 FirstToken，会把长思考砍到五分钟以下。
-func TestRealTimeouts_ShortHeaderCannotUndercutSemanticFloor(t *testing.T) {
+// Short header/byte limits do not replace the independent semantic deadline.
+func TestRealTimeouts_ShortHeaderAndByteRemainIndependentOfSemantic(t *testing.T) {
 	s := model.DefaultSettings()
 	s.RealResponseHeaderSec = 60
 	s.RealFirstByteSec = 60
@@ -747,19 +746,18 @@ func TestRealTimeouts_ShortHeaderCannotUndercutSemanticFloor(t *testing.T) {
 		t.Fatalf("合法 settings 必须通过校验：%v", err)
 	}
 	to := RealTimeouts(s)
-	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
-	if to.FirstToken != floor {
-		t.Fatalf("FirstToken = %v, want floor %v", to.FirstToken, floor)
+	if to.FirstSemantic != 1200*time.Second || to.ResponseHead != 60*time.Second || to.FirstByte != 60*time.Second {
+		t.Fatalf("independent phases changed: %+v", to)
 	}
 }
 
-// CapTotal 把剩余总预算夹到低于 5 分钟时，不得把 FirstToken 抬过 Total，
-// 否则共享总预算会失真（TestRetry_SharesTotalTimeBudget 依赖这条）。
+// CapTotal clips the effective deadline even when phase settings are longer.
 func TestTimeoutsFrom_CapTotalBelowFloorNotRaised(t *testing.T) {
 	budget := outbound.RealBudget(model.DefaultSettings()).CapTotal(90 * time.Second)
 	to := TimeoutsFrom(budget)
-	if to.FirstToken != 90*time.Second {
-		t.Fatalf("FirstToken = %v, want remaining total 90s (must not raise above CapTotal)", to.FirstToken)
+	deadline, kind := to.pendingDeadline(time.Unix(1, 0), false, time.Time{}, time.Time{}, time.Time{}, false, 0)
+	if !deadline.Equal(time.Unix(1, 0).Add(90*time.Second)) || kind != responseTotalTimeout {
+		t.Fatalf("effective deadline=%v kind=%d, want shared total", deadline, kind)
 	}
 	if to.Total != 90*time.Second {
 		t.Fatalf("Total = %v, want 90s", to.Total)

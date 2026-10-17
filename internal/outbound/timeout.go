@@ -38,7 +38,7 @@ func RealBudget(settings model.Settings) Budget {
 		Connect:       seconds(settings.RealConnectSec),
 		ResponseHead:  seconds(settings.RealResponseHeaderSec),
 		FirstByte:     seconds(settings.RealFirstByteSec),
-		FirstEvent:    seconds(settings.RealFirstByteSec),
+		FirstEvent:    0, // Real requests record events but expose no first-event setting.
 		FirstSemantic: seconds(settings.RealFirstSemanticSec),
 		Idle:          seconds(settings.RealIdleSec),
 		Total:         seconds(settings.RealTotalSec),

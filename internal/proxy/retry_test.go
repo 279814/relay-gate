@@ -878,11 +878,23 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 		shortStages(hs)
 
 		rec := hs.serve(hs.req())
-		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
-			t.Fatalf("§11.5 短窗口未知时提交原始200头，之后仅终止流：%d %q", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("1s first-byte deadline must expire before the 2s retry inspection window: %d", rec.Code)
 		}
 		if strings.Contains(rec.Body.String(), "must-not-reach") {
 			t.Error("Balanced 不应因 Peek 首字节超时换站")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("balanced undecided short window still commits when byte budget remains", func(t *testing.T) {
+		hs := newMultiHarness(t, stallBody, respondOK(`{"id":"must-not-reach"}`))
+		shortStages(hs)
+		hs.cfg.settings.RealFirstByteSec = 3
+		hs.cfg.settings.RealFirstSemanticSec = 3
+		rec := hs.serve(hs.req())
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Fatalf("2s undecided retry window must commit original headers while 3s stage budget remains: %d %q", rec.Code, rec.Body.String())
 		}
 		hs.assertHits(t, 1, 0)
 	})

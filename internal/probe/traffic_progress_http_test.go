@@ -89,7 +89,7 @@ func TestTrafficProgressHTTP_RawKeepaliveAfterSemanticResetsIdle(t *testing.T) {
 					}
 				}
 			})
-			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 200 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
+			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstSemantic: 200 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
 			if res.Err != nil || !res.SemanticSeen || res.FirstSemanticAt.IsZero() {
 				t.Fatalf("raw keepalives after genuine semantic must keep the stream active: %+v", res)
 			}
@@ -114,7 +114,7 @@ func TestTrafficProgressHTTP_RealSilenceAfterSemanticStillExpiresIdle(t *testing
 				w.(http.Flusher).Flush()
 				<-r.Context().Done()
 			})
-			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 300 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
+			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstSemantic: 300 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
 			if !errors.Is(res.Err, proxy.ErrStreamStalled) || !res.SemanticSeen {
 				t.Fatalf("genuinely silent upstream must expire Idle: %+v", res)
 			}
@@ -167,7 +167,7 @@ func TestTrafficProgressHTTP_CapacityAndCodecFailuresPreserveWireAndOuterLimit(t
 					}
 				}()
 			}
-			res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 50 * time.Millisecond, Idle: 30 * time.Millisecond, Total: time.Second})
+			res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstSemantic: 50 * time.Millisecond, Idle: 30 * time.Millisecond, Total: time.Second})
 			if res.Err != nil || !bytes.Equal(out, wire) || res.ObserverIncomplete == "" {
 				t.Fatalf("observer failure changed upstream bytes or became transport timeout: result=%+v body=%q", res, out)
 			}
@@ -195,7 +195,7 @@ func TestTrafficProgressHTTP_CapacityFallbackStillHonorsOuterTotal(t *testing.T)
 			h.manager.leases <- struct{}{}
 		}
 	}()
-	res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 30 * time.Millisecond, Idle: 20 * time.Millisecond, Total: 120 * time.Millisecond})
+	res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstSemantic: 30 * time.Millisecond, Idle: 20 * time.Millisecond, Total: 120 * time.Millisecond})
 	if !errors.Is(res.Err, proxy.ErrTotalTimeout) || !bytes.Equal(out, []byte{0x1f}) || res.ObserverIncomplete != model.ObserverCapacity {
 		t.Fatalf("outer total was lost: %+v %x", res, out)
 	}
@@ -216,7 +216,7 @@ func TestTrafficProgressHTTP_CapacityFallbackStillHonorsFirstByteLimit(t *testin
 			h.manager.leases <- struct{}{}
 		}
 	}()
-	res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 40 * time.Millisecond, Idle: 20 * time.Millisecond, Total: time.Second})
+	res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstByte: 40 * time.Millisecond, FirstSemantic: time.Second, Idle: 20 * time.Millisecond, Total: time.Second})
 	if !errors.Is(res.Err, proxy.ErrFirstTokenTimeout) || len(out) != 0 {
 		t.Fatalf("observer capacity disabled first-byte bound: %+v %x", res, out)
 	}

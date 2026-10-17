@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -161,8 +162,10 @@ func (at *Attempt) watchResponse() func() {
 		at.wire = newWireEvidence(at.f.Protocol, at.res.RespHeaders, at.f.RespObserver)
 	}
 	done := make(chan struct{})
+	finished := make(chan struct{})
 	closer, sentAt, status := at.resp.Body, at.res.SentAt, at.resp.StatusCode
 	go func() {
+		defer close(finished)
 		timer := time.NewTimer(time.Hour)
 		defer timer.Stop()
 		changes := at.wire.changes
@@ -172,24 +175,26 @@ func (at *Attempt) watchResponse() func() {
 		}
 		for {
 			s := at.wire.snapshot()
-			deadline, kind := sentAt.Add(at.f.Timeouts.FirstToken), int32(1)
-			lastByte := at.wire.lastByte.Load()
-			if lastByte != 0 {
-				if s.Incomplete != "" {
-					deadline = time.Time{}
-				} else if status >= 400 {
-					deadline = time.Unix(0, lastByte).Add(at.f.Timeouts.Idle)
-					kind = 2
-				} else if !s.LastSemanticAt.IsZero() {
-					deadline = time.Unix(0, lastByte).Add(at.f.Timeouts.Idle)
-					kind = 2
-				}
+			firstByte, lastByte := at.wire.firstByte.Load(), at.wire.lastByte.Load()
+			var first, last time.Time
+			if firstByte != 0 {
+				first = time.Unix(0, firstByte)
 			}
+			if lastByte != 0 {
+				last = time.Unix(0, lastByte)
+			}
+			deadline, kind := at.f.Timeouts.pendingDeadline(sentAt, true, first, s.FirstSemanticAt, last, s.Incomplete != "", status)
 			var expired <-chan time.Time
 			if !deadline.IsZero() {
 				delay := time.Until(deadline)
 				if delay < 0 {
 					delay = 0
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
 				timer.Reset(delay)
 				expired = timer.C
@@ -214,33 +219,44 @@ func (at *Attempt) watchResponse() func() {
 				// A progress notification can race the timer; recompute before
 				// closing when reliable new evidence has extended the deadline.
 				now := at.wire.snapshot()
-				if at.wire.lastByte.Load() != 0 && (now.Incomplete != "" || now.LastSemanticAt.After(s.LastSemanticAt) || ((status >= 400 || !now.LastSemanticAt.IsZero()) && at.wire.lastByte.Load() > lastByte)) {
+				var currentFirst, currentLast time.Time
+				if value := at.wire.firstByte.Load(); value != 0 {
+					currentFirst = time.Unix(0, value)
+				}
+				if value := at.wire.lastByte.Load(); value != 0 {
+					currentLast = time.Unix(0, value)
+				}
+				currentDeadline, currentKind := at.f.Timeouts.pendingDeadline(sentAt, true, currentFirst, now.FirstSemanticAt, currentLast, now.Incomplete != "", status)
+				if currentKind != kind || currentDeadline.After(deadline) || time.Now().Before(currentDeadline) {
 					continue
 				}
 				at.stageTimeout.Store(kind)
+				if at.cancel != nil {
+					at.cancel()
+				}
 				_ = closer.Close()
 				return
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() { close(done); <-finished }
 }
 
 func (at *Attempt) readFailure(err error, total int64) error {
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
 	if at.clientCtx.Err() != nil {
+		if errors.Is(context.Cause(at.clientCtx), ErrTotalTimeout) {
+			return ErrTotalTimeout
+		}
 		return ErrCanceled
+	}
+	if kind := at.stageTimeout.Load(); kind != 0 {
+		return responseStageError(kind)
 	}
 	if at.ctx.Err() != nil {
 		return ErrTotalTimeout
 	}
-	switch at.stageTimeout.Load() {
-	case 1:
-		return ErrFirstTokenTimeout
-	case 2:
-		return ErrStreamStalled
+	if errors.Is(err, io.EOF) {
+		return nil
 	}
 	if total == 0 {
 		return ErrUpstreamBroke
