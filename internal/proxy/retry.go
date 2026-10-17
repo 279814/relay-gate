@@ -318,20 +318,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			return oc, true
 		}
 
-		// 换站。这次尝试的健康结论**必须**在这里回写：它是一次真实请求的
-		// 失败证据，而 §3.5 把「真实请求失败立即回写 + 触发即时探活」列为
-		// 最快的故障发现路径 —— 比 dead 状态 20 秒的探活周期快得多。
-		// 丢弃掉就不回写的话，一个刚挂掉的站会因为「重试成功了所以没人报告」
-		// 而一直显示 alive，直到下一个定时探活撞上去。
-		//
-		// TriggerL2 由 Reporter.ReportResult 在判定非 OK 时自己发（见
-		// probe/reporter.go），这里不重复触发。
-		//
-		// 顺序：**先 Discard 再回写**。Discard 才会把错误响应体填进
-		// Result.ErrBody（那段字节是排水时顺手留下的），反过来的话回写拿到
-		// 的永远是空 body —— 于是 ClassifyHTTP 只能看状态码，
-		// 「500 + body 里写着 rate limit」会被判成故障而累计判死，
-		// 本该只是冷却 60 秒。
+		// Discard completes the original response observation before releasing this attempt.
 		la.at.Discard()
 		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
 		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
@@ -340,13 +327,6 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
-		if h.reporter != nil {
-			ep, _ := proto.Endpoint()
-			view := viewOf(la.at.Result(), la.keys, ep)
-			view.CapabilityObserved = h.observers != nil
-			view.HalfOpen = armedHalfOpen(la.cand.Route.ID, attempt)
-			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, view)
-		}
 		la.cand.Release()
 		cand = next
 		held = cand
@@ -510,9 +490,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			h.log.Warn("出站 URL 配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
@@ -531,9 +508,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			h.log.Warn("出站认证配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
@@ -605,15 +579,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
-	tr, err := h.TransportFor(cand.Upstream, realBudget)
+	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
 	if err != nil {
 		if errors.Is(err, outbound.ErrURLConfig) && r.Context().Err() == nil {
 			h.log.Warn("出站网络配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)

@@ -194,7 +194,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 而本地粗算本来就能立刻作答。
 	// CapTotal 只夹 Total，connect 不变 —— 各 Route 尝试共享同一份 total。
 	budget := outbound.CountTokensBudget(pre.settings).CapTotal(remaining)
-	tr, err := h.TransportFor(cand.Upstream, budget)
+	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), budget.Connect))
 	if err != nil {
 		return fmt.Sprintf("取连接池失败: %v", err)
 	}
@@ -279,24 +279,12 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
-		if h.observers == nil && h.countCaps != nil && cand.Route != nil {
-			switch resp.StatusCode {
-			case http.StatusNotFound, http.StatusMethodNotAllowed:
-				h.countCaps.MarkCountTokensUnsupported(cand.Route.ID, cand.HealthGeneration, resp.StatusCode)
-			case http.StatusUnauthorized, http.StatusForbidden:
-				h.countCaps.MarkCountTokensConfigError(cand.Route.ID, cand.HealthGeneration, resp.StatusCode)
-			}
-		}
 		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
 			collapseSpaces(string(safe), maxCountTokensLogBody))
 	}
 
 	// 成功。原样回传上游响应体。
-	if h.observers == nil && h.countCaps != nil && cand.Route != nil && resp.StatusCode == http.StatusOK &&
-		hasPositiveInputTokens(respBody) {
-		h.countCaps.MarkCountTokensSupported(cand.Route.ID, cand.HealthGeneration)
-	}
 	FinalizeClientResponseHeaders(resp.Header, h.credentialsOf(r, cand))
 	dst := w.Header()
 	for k, vs := range resp.Header {
@@ -310,15 +298,6 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 	return ""
-}
-
-// hasPositiveInputTokens 与 probe 的 count_tokens 判据同口径（§8.8）：
-// 只有正整数 input_tokens 才算 supported 的证据。
-func hasPositiveInputTokens(body []byte) bool {
-	var resp struct {
-		InputTokens int64 `json:"input_tokens"`
-	}
-	return json.Unmarshal(body, &resp) == nil && resp.InputTokens > 0
 }
 
 const (
