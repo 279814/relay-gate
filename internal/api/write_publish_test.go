@@ -350,14 +350,29 @@ func TestWrite_EndpointRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 	if rec.Code == http.StatusOK {
 		t.Fatal("Refresh failure must not return 200 while Probe may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want persisted 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	pending := decodeBody[map[string]any](t, rec)
+	if pending["code"] != "config_activation_pending" || pending["persisted"] != true || pending["resource"] != "endpoint" || pending["id"] != float64(warm.ID) || pending["new_revision"] != float64(warm.Revision+1) {
+		t.Fatalf("pending metadata=%v", pending)
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
 		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
 	}
 
+	stored, err := s.st.GetEndpoint(warm.ID)
+	if err != nil || stored.URLOverride != override || stored.Revision != warm.Revision+1 {
+		t.Fatalf("pending SQL did not commit: %+v %v", stored, err)
+	}
+	replay := do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(warm.ID), `{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(warm.Revision)+`}`, true)
+	if replay.Code != http.StatusConflict {
+		t.Fatalf("pending write replay=%d %s", replay.Code, replay.Body.String())
+	}
+	if inv, ref := pub.counts(); inv != afterInv || ref != afterRef {
+		t.Fatal("stale replay retried publisher")
+	}
 	// Re-Invalidate forces get() to reload SQL: override must appear.
 	got, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
 	if err != nil {
@@ -471,14 +486,28 @@ func TestWrite_EndpointDeleteRefreshFailureDoesNotReturnSuccessWithStaleSnapshot
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("Refresh failure must not return 204 while Probe may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want deleted-persisted 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	pending := decodeBody[map[string]any](t, rec)
+	if pending["code"] != "config_activation_pending" || pending["persisted"] != true || pending["resource_id"] != float64(drop.ID) || pending["revision"] != float64(drop.Revision) {
+		t.Fatalf("delete pending identity=%v", pending)
+	}
+	if _, err := s.st.GetEndpoint(drop.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("503 deletion did not persist: %v", err)
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
 		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
 	}
 
+	replay := do(t, h, "DELETE", "/admin/api/upstream-endpoints/"+itoa(drop.ID)+"?expected_revision="+itoa(drop.Revision), "", true)
+	if replay.Code != http.StatusNotFound {
+		t.Fatalf("deleted replay=%d %s", replay.Code, replay.Body.String())
+	}
+	if inv, ref := pub.counts(); inv != afterInv || ref != afterRef {
+		t.Fatal("deleted replay retried publisher")
+	}
 	// Re-Invalidate forces get() to reload SQL: deleted row must be gone.
 	_, err = src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
 	if !errors.Is(err, store.ErrNotFound) {

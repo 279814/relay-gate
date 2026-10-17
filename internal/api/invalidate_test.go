@@ -1229,9 +1229,9 @@ func TestInvalidate_EndpointURLChangeClearsAliveRouteHealth(t *testing.T) {
 	ep := page.Items[0]
 	ep.URLOverride = "https://ep.example.com/v1/custom"
 	body, err := json.Marshal(struct {
-		model.UpstreamEndpoint
+		probe.EndpointMutation
 		ExpectedRevision int64 `json:"expected_revision"`
-	}{UpstreamEndpoint: ep, ExpectedRevision: ep.Revision})
+	}{EndpointMutation: probe.EndpointMutationFrom(ep), ExpectedRevision: ep.Revision})
 	if err != nil {
 		t.Fatal(err)
 	}

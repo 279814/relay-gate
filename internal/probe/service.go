@@ -170,28 +170,6 @@ func (s *Service) GetEndpoint(_ context.Context, id int64) (model.UpstreamEndpoi
 	return *ep, nil
 }
 
-func (s *Service) CreateEndpoint(_ context.Context, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error) {
-	cp := in
-	if err := s.store.CreateEndpoint(&cp); err != nil {
-		return model.UpstreamEndpoint{}, err
-	}
-	if s.invalidator != nil && cp.UpstreamID > 0 {
-		s.invalidator.InvalidateUpstream(cp.UpstreamID)
-	}
-	return cp, nil
-}
-
-func (s *Service) UpdateEndpoint(_ context.Context, id, expectedRevision int64, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error) {
-	in.ID = id
-	if err := s.store.UpdateEndpoint(&in, expectedRevision); err != nil {
-		return model.UpstreamEndpoint{}, err
-	}
-	if s.invalidator != nil && in.UpstreamID > 0 {
-		s.invalidator.InvalidateUpstream(in.UpstreamID)
-	}
-	return in, nil
-}
-
 func (s *Service) DeleteEndpoint(_ context.Context, id, expectedRevision int64) error {
 	return s.store.DeleteEndpoint(id, expectedRevision)
 }

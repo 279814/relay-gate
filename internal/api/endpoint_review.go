@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 )
 
 // postConfirmEndpointReview clears NeedsReview after converting legacy_exact
@@ -37,19 +38,7 @@ func (s *Server) postConfirmEndpointReview(w http.ResponseWriter, r *http.Reques
 		s.writeErr(w, model.WrapValidation("expected_revision 必须为正数"))
 		return
 	}
-	cur, err := s.st.GetEndpoint(id)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	in := *cur
-	in.URLMode = model.EndpointURLCanonical
-	in.URLOverride = body.URLOverride
-	in.LegacyFullURLID = 0
-	in.LegacyFullURLRevision = 0
-	in.LegacyCompatRealOnly = false
-	in.NeedsReview = false
-	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, in)
+	ep, err := s.probeAdmin.ConfirmEndpointReview(r.Context(), id, body.ExpectedRevision, body.URLOverride)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -57,21 +46,8 @@ func (s *Server) postConfirmEndpointReview(w http.ResponseWriter, r *http.Reques
 	s.invalidateUpstream(ep.UpstreamID)
 	// confirm-review 写入 url_override，须立刻发布 livecfg Probe 快照。
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+		s.writeRecipeErr(w, &probe.ActivationPendingError{Resource: "endpoint", ID: ep.ID, Revision: ep.Revision})
 		return
 	}
 	writeJSON(w, http.StatusOK, ep)
-}
-
-// endpointBindingChanged reports whether next alters the URL binding of cur:
-// which endpoint kind it serves, where its URL comes from, and its review flag.
-// Auth profile edits are not part of the binding.
-func endpointBindingChanged(cur, next model.UpstreamEndpoint) bool {
-	return cur.Kind != next.Kind ||
-		cur.URLMode != next.URLMode ||
-		cur.LegacyFullURLID != next.LegacyFullURLID ||
-		cur.LegacyFullURLRevision != next.LegacyFullURLRevision ||
-		cur.URLOverride != next.URLOverride ||
-		cur.FixedQueryTemplate != next.FixedQueryTemplate ||
-		cur.NeedsReview != next.NeedsReview
 }
