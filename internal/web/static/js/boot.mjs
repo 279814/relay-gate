@@ -67,24 +67,12 @@ if (typeof base !== 'function') {
         this.err = this.probeModuleError;
       }
       if (origBoot) await origBoot.call(this);
-      if (this.authed && this.probeModuleReady) {
-        try {
-          const st = await api.get('/state');
-          this.applyStatePayload(st);
-        } catch {
-          /* state 可选 */
-        }
-      }
     };
 
     const origLoadAll = shell.loadAll;
     if (origLoadAll) {
       shell.loadAll = async function loadAll() {
         await origLoadAll.call(this);
-        try {
-          const st = await api.get('/state');
-          this.applyStatePayload(st);
-        } catch { /* */ }
         if (this.probeModuleReady) await this.refreshHealthSide();
         if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };

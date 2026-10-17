@@ -239,13 +239,12 @@ function app() {
     async loadAll() {
       await this.run(async () => {
         // 并发拉取。串行的话首屏要等 6 个往返。
-        const [st] = await Promise.all([
-          this.api('GET', '/state'),
+        await Promise.all([
+          this.refreshState?.(),
           this.loadConfigPage('upstreams', 'reset'),
           this.loadConfigPage('model-names', 'reset'),
           this.loadConfigPage('routes', 'reset'),
         ]);
-        if (typeof this.applyStatePayload === 'function') this.applyStatePayload(st);
       });
       await this.loadHealth();
       await this.loadSettings();

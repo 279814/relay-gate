@@ -15,17 +15,18 @@ export function createSettingsFeature(shell, api) {
     state.loading = true;
     try {
       const data = await api.get('/settings');
-      if (this.authed === false || (!discard && this.settingsDirty())) return false;
+      if (this.settingsState !== state || this.authed === false || (!discard && this.settingsDirty())) return false;
       if (!data || !data.settings || !Number.isSafeInteger(data.revision) || data.revision < 1) throw new Error('设置响应缺少有效版本，请刷新页面');
       this.settings = clone(data.settings);
       this.limits = data.limits || {};
       this.settingsState = { ...emptyState(), revision: data.revision, original: clone(data.settings) };
       return true;
     } catch (error) {
+      if (this.settingsState !== state || this.authed === false) return false;
       this.err = error.message || String(error);
       return false;
     } finally {
-      this.settingsState.loading = false;
+      state.loading = false;
     }
   };
 
@@ -52,13 +53,14 @@ export function createSettingsFeature(shell, api) {
     this.msg = '';
     try {
       const data = await api.put('/settings', { ...patch, expected_revision: state.revision });
-      if (this.authed === false) return false;
+      if (this.settingsState !== state || this.authed === false) return false;
       if (!data || !data.settings || !Number.isSafeInteger(data.revision) || data.revision < 1) throw new Error('设置已提交，但未取得有效版本，请重新加载确认');
       if (JSON.stringify(this.settings) === JSON.stringify(submitted)) this.settings = clone(data.settings);
       this.settingsState = { ...emptyState(), revision: data.revision, original: clone(data.settings) };
       this.msg = `已保存，当前版本 ${data.revision}`;
       return true;
     } catch (error) {
+      if (this.settingsState !== state || this.authed === false) return false;
       if (error.status === 409) {
         state.conflict = true;
         this.err = '设置版本已变化，草稿已保留。请复制需要的修改，再重新加载后保存。';
@@ -71,7 +73,7 @@ export function createSettingsFeature(shell, api) {
       }
       return false;
     } finally {
-      this.settingsState.busy = false;
+      state.busy = false;
     }
   };
 

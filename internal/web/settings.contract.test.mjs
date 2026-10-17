@@ -88,3 +88,46 @@ test('Settings markup binds every new stage and exposes no legacy controls', () 
   assert.ok(html.includes('reloadSettings()'));
   assert.ok(html.includes('settingsState.conflict'));
 });
+
+test('late Settings reads cannot overwrite a new login or unlock its pending read', async () => {
+  let finishOldRead, finishNewRead;
+  let reads = 0;
+  const oldRead = new Promise(resolve => { finishOldRead = resolve; });
+  const newRead = new Promise(resolve => { finishNewRead = resolve; });
+  const shell = await fixture({ get() { return ++reads === 1 ? oldRead : newRead; } });
+  const loading = shell.loadSettings();
+  shell.reset(); shell.authed = true;
+  const newLoading = shell.loadSettings();
+  finishOldRead(snapshot(4));
+  await loading;
+  assert.equal(shell.settings, null);
+  assert.equal(shell.settingsState.revision, 0);
+  assert.equal(shell.settingsState.loading, true);
+  finishNewRead(snapshot(8));
+  await newLoading;
+  assert.equal(shell.settingsState.revision, 8);
+});
+
+test('late Settings write errors do not mark the new login conflicted or unlock its save', async () => {
+  let failOldSave, finishNewSave;
+  let writes = 0, reads = 0;
+  const oldSave = new Promise((resolve, reject) => { failOldSave = reject; });
+  const newSave = new Promise(resolve => { finishNewSave = resolve; });
+  const shell = await fixture({ get() { return Promise.resolve(snapshot(++reads === 1 ? 4 : 8)); }, put() { return ++writes === 1 ? oldSave : newSave; } });
+  await shell.loadSettings();
+  shell.settings.count_tokens_total_sec = 200;
+  const oldSaving = shell.saveSettings();
+  shell.reset(); shell.authed = true;
+  await shell.loadSettings();
+  shell.settings.count_tokens_total_sec = 210;
+  const saving = shell.saveSettings();
+  shell.err = 'new login message';
+  failOldSave(Object.assign(new Error('old conflict'), {status:409}));
+  await oldSaving;
+  assert.equal(shell.settingsState.revision, 8);
+  assert.equal(shell.settingsState.busy, true);
+  assert.equal(shell.settingsState.conflict, false);
+  assert.equal(shell.err, 'new login message');
+  finishNewSave({settings: {...snapshot(8).settings, count_tokens_total_sec:210}, revision:9});
+  await saving;
+});

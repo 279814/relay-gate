@@ -47,3 +47,39 @@ test('successful state change adopts server revision and describes gradual recov
   assert.match(shell.msg,/渐进/);
   assert.ok(!shell.msg.includes('全部 Route 置 unknown'));
 });
+
+test('late state writes cannot change a new login or unlock its active request', async () => {
+  let finishOld, finishNew;
+  let writes = 0;
+  const oldWrite = new Promise(resolve => {finishOld=resolve;});
+  const newWrite = new Promise(resolve => {finishNew=resolve;});
+  const shell=fixture(async()=>++writes===1 ? oldWrite : newWrite);
+  const oldSaving=shell.toggleState();
+  shell.reset(); shell.authed=true;
+  shell.applyStatePayload({state:'paused',revision:8});
+  const saving=shell.toggleState();
+  finishOld({state:'paused',revision:5});
+  await oldSaving;
+  assert.equal(shell.stateRevision,8);
+  assert.equal(shell.stateBusy,true);
+  finishNew({state:'running',revision:9});
+  await saving;
+});
+
+test('background state reads are scoped to the login and cannot roll revision backward', async () => {
+  let finishRead;
+  const shell=fixture(()=>new Promise(resolve=>{finishRead=resolve;}));
+  assert.equal(typeof shell.refreshState,'function');
+  const reading=shell.refreshState();
+  shell.reset(); shell.authed=true;
+  shell.applyStatePayload({state:'paused',revision:8});
+  finishRead({state:'running',revision:5});
+  await reading;
+  assert.equal(shell.stateRevision,8);
+  assert.equal(shell.running,false);
+  shell.applyStatePayload({state:'running',revision:7});
+  assert.equal(shell.stateRevision,8);
+  shell.reset();
+  shell.applyStatePayload({state:'running',revision:9});
+  assert.equal(shell.stateRevision,0);
+});
