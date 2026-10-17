@@ -161,10 +161,10 @@ func (s *Scheduler) nextOrder(ctx context.Context, trigger model.ProbeTrigger) (
 }
 
 // execL1 经 Executor 跑一次站级 L1。
-func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings model.Settings) ExecutionResult {
+func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings model.Settings) (ExecutionResult, *model.ReachabilityExpectation) {
 	order, err := s.nextOrder(ctx, model.TriggerScheduled)
 	if err != nil {
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}, nil
 	}
 	req := ExecutionRequest{
 		ExecutionID:      sample.NewReqID(),
@@ -176,28 +176,28 @@ func (s *Scheduler) execL1(ctx context.Context, up *model.Upstream, settings mod
 		ObservationOrder: order,
 	}
 	if err := s.attachExpectations(ctx, &req, up, nil, nil, model.EndpointModels); err != nil {
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore, Err: err}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore, Err: err}}, nil
 	}
 	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		s.log.Error("L1 执行失败", "upstream", up.Name, "err", err)
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}, nil
 	}
-	return res
+	return res, req.ReachabilityExpectation
 }
 
 // execL2 经 Executor 跑一次 Route 级 L2。
 func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.ModelName,
-	rt *model.Route, settings model.Settings) ExecutionResult {
+	rt *model.Route, settings model.Settings) (ExecutionResult, *model.SemanticExpectation) {
 
 	kind, ok := mn.Protocol.Endpoint()
 	if !ok {
 		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}}
+			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}}, nil
 	}
 	order, err := s.nextOrder(ctx, model.TriggerScheduled)
 	if err != nil {
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}, nil
 	}
 	req := ExecutionRequest{
 		ExecutionID:      sample.NewReqID(),
@@ -211,14 +211,14 @@ func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.Mo
 		ObservationOrder: order,
 	}
 	if err := s.attachExpectations(ctx, &req, up, mn, rt, kind); err != nil {
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore, Err: err}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore, Err: err}}, nil
 	}
 	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		s.log.Error("L2 执行失败", "upstream", up.Name, "model", mn.Name, "err", err)
-		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}
+		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}, nil
 	}
-	return res
+	return res, req.CapabilityExpectation
 }
 
 // attachExpectations binds the actual fixed attempt to one published snapshot.
@@ -464,8 +464,11 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 	}
 	wasUnreachable := s.reach.Effective(up.ID, up.NetworkRevision) == model.ReachabilityUnreachable
 	targets := s.captureL1HealthTargets(up.ID)
-	result := s.execL1(ctx, up, settings)
+	result, expectation := s.execL1(ctx, up, settings)
 	if result.Outcome.Verdict == health.VerdictIgnore || result.Decision.ErrorClass == model.ErrorIgnored || result.Apply.Reachability != model.ApplyCurrent || result.Apply.CommittedReachability == nil {
+		return
+	}
+	if !reachabilityHealthCurrent(s.cfg, expectation) {
 		return
 	}
 	reachable, applicable := l1StationEffect(result.Decision)
@@ -589,9 +592,12 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 	if s.executor == nil {
 		return
 	}
-	result := s.execL2(ctx, up, mn, rt, settings)
+	result, expectation := s.execL2(ctx, up, mn, rt, settings)
 	out := result.Outcome
 	if out.Verdict == health.VerdictIgnore || result.Apply.Capability != model.ApplyCurrent {
+		return
+	}
+	if !capabilityHealthCurrent(s.cfg, expectation) {
 		return
 	}
 	if out.Verdict == health.VerdictOK && (result.Apply.CommittedCapability == nil || result.Apply.CommittedCapability.State != model.CapabilitySupported) {

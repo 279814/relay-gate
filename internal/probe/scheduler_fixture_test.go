@@ -111,6 +111,14 @@ func (f *gatingCfg) ProbeSnapshot() (*livecfg.ProbeSnapshot, error) {
 	return f.inner.ProbeSnapshot()
 }
 
+func (f *fakeCfg) CachedProbeSnapshot() (*livecfg.ProbeSnapshot, error) {
+	return f.ProbeSnapshot()
+}
+
+func (f *gatingCfg) CachedProbeSnapshot() (*livecfg.ProbeSnapshot, error) {
+	return f.inner.CachedProbeSnapshot()
+}
+
 type schedulerFixtureRecorder struct {
 	mu      sync.Mutex
 	reach   *health.ReachabilityTracker
