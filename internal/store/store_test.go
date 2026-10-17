@@ -65,7 +65,7 @@ func TestUpstreamCRUD(t *testing.T) {
 
 	got.Name = "sta-renamed"
 	got.APIKey = "" // 空 = 不改 key
-	if err := st.UpdateUpstream(got); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), got, got.Revision); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := st.GetUpstream(u.ID)
@@ -77,7 +77,7 @@ func TestUpstreamCRUD(t *testing.T) {
 	}
 
 	after.APIKey = "sk-rotated-key-value"
-	if err := st.UpdateUpstream(after); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), after, after.Revision); err != nil {
 		t.Fatal(err)
 	}
 	rotated, _ := st.GetUpstream(u.ID)
@@ -89,7 +89,7 @@ func TestUpstreamCRUD(t *testing.T) {
 	maskedEcho := MaskKey(rotated.APIKey)
 	rotated.Name = "sta-mask-echo"
 	rotated.APIKey = maskedEcho
-	if err := st.UpdateUpstream(rotated); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), rotated, rotated.Revision); err != nil {
 		t.Fatal(err)
 	}
 	afterMask, err := st.GetUpstream(u.ID)
@@ -107,7 +107,10 @@ func TestUpstreamCRUD(t *testing.T) {
 			afterMask.CredentialRevision, rotated.CredentialRevision)
 	}
 
-	if err := st.DeleteUpstream(u.ID); err != nil {
+	if err := st.DeleteUpstreamWithRevision(context.Background(), u.ID, u.Revision); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale creation revision must not delete updated row: %v", err)
+	}
+	if err := st.DeleteUpstreamWithRevision(context.Background(), u.ID, afterMask.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetUpstream(u.ID); !errors.Is(err, ErrNotFound) {
@@ -139,7 +142,7 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 
 	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
 	u.APIKey = short
-	err := st.UpdateUpstream(u)
+	err := st.UpdateUpstreamWithRevision(context.Background(), u, u.Revision)
 	if err == nil {
 		t.Fatal("短于下限的 api_key 应被拒绝")
 	}
@@ -156,7 +159,7 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 
 	exact := strings.Repeat("y", model.MinRedactableKeyLen)
 	u.APIKey = exact
-	if err := st.UpdateUpstream(u); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), u, u.Revision); err != nil {
 		t.Fatalf("恰好下限长度应接受：%v", err)
 	}
 	got, err = st.GetUpstream(u.ID)
@@ -263,16 +266,16 @@ func TestModelNameDeleteRequiresExplicitRouteCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteModelName(m.ID); !errors.Is(err, ErrDependencyConflict) {
+	if err := st.DeleteModelNameWithRevision(context.Background(), m.ID, m.Revision); !errors.Is(err, ErrDependencyConflict) {
 		t.Fatalf("external Route deletion must conflict: %v", err)
 	}
 	if _, err := st.GetRoute(r.ID); err != nil {
 		t.Fatal("refused parent deletion removed Route")
 	}
-	if err := st.DeleteRoute(r.ID); err != nil {
+	if err := st.DeleteRouteWithRevision(context.Background(), r.ID, r.Revision); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeleteModelName(m.ID); err != nil {
+	if err := st.DeleteModelNameWithRevision(context.Background(), m.ID, m.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetModelName(m.ID); !errors.Is(err, ErrNotFound) {
@@ -280,14 +283,14 @@ func TestModelNameDeleteRequiresExplicitRouteCleanup(t *testing.T) {
 	}
 }
 
-func TestListRoutesFilter(t *testing.T) {
+func TestRoutePagesFilterAndUseStableIdentityOrder(t *testing.T) {
 	st := testStore(t)
 	u1 := mkUpstream(t, st, "s1")
 	u2 := mkUpstream(t, st, "s2")
 	m1 := mkModelName(t, st, "m1", model.ProtoAnthropic)
 	m2 := mkModelName(t, st, "m2", model.ProtoOpenAIChat)
 
-	// m1 下两条，优先级刻意倒序插入，验证返回时按 priority 升序
+	// 优先级刻意倒序插入；管理页按稳定 ID，运行时快照另行按 priority 选路。
 	for _, spec := range []struct {
 		mn, up   int64
 		priority int
@@ -303,24 +306,23 @@ func TestListRoutesFilter(t *testing.T) {
 		}
 	}
 
-	all, err := st.ListRoutes(0)
+	allPage, err := st.ListRoutesPage(context.Background(), model.RouteFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 3 {
-		t.Fatalf("应返回全部 3 条，得到 %d", len(all))
+	if len(allPage.Items) != 3 {
+		t.Fatalf("应返回全部 3 条，得到 %d", len(allPage.Items))
 	}
 
-	only, err := st.ListRoutes(m1.ID)
+	onlyPage, err := st.ListRoutesPage(context.Background(), model.RouteFilter{ModelNameID: m1.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(only) != 2 {
-		t.Fatalf("m1 下应有 2 条，得到 %d", len(only))
+	if len(onlyPage.Items) != 2 {
+		t.Fatalf("m1 下应有 2 条，得到 %d", len(onlyPage.Items))
 	}
-	if only[0].Priority != 1 || only[1].Priority != 2 {
-		t.Errorf("应按 priority 升序返回（与选路顺序一致），得到 %d,%d",
-			only[0].Priority, only[1].Priority)
+	if onlyPage.Items[0].Priority != 2 || onlyPage.Items[1].Priority != 1 || onlyPage.Items[0].ID >= onlyPage.Items[1].ID {
+		t.Fatal("管理页未保持稳定 ID 次序或丢失 priority")
 	}
 }
 
@@ -427,11 +429,11 @@ func TestNotFoundOnMissingRows(t *testing.T) {
 	if _, err := st.GetModelName(999); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetModelName: 得到 %v", err)
 	}
-	if err := st.DeleteRoute(999); !errors.Is(err, ErrNotFound) {
+	if err := st.DeleteRouteWithRevision(context.Background(), 999, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("DeleteRoute: 得到 %v", err)
 	}
-	if err := st.UpdateUpstream(&model.Upstream{
-		ID: 999, Name: "x", BaseURL: "https://a.com", APIKey: "k"}); !errors.Is(err, ErrNotFound) {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), &model.Upstream{
+		ID: 999, Name: "x", BaseURL: "https://a.com", APIKey: "k"}, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateUpstream: 得到 %v", err)
 	}
 }
@@ -439,16 +441,16 @@ func TestNotFoundOnMissingRows(t *testing.T) {
 // 空列表必须序列化成 [] 而不是 null，否则前端要多写一处判空。
 func TestEmptyListsAreNotNil(t *testing.T) {
 	st := testStore(t)
-	ups, err := st.ListUpstreams()
-	if err != nil || ups == nil {
+	ups, err := st.ListUpstreamsPage(context.Background(), model.UpstreamFilter{})
+	if err != nil || ups.Items == nil {
 		t.Errorf("ListUpstreams 空结果应为非 nil 切片，得到 %v %v", ups, err)
 	}
-	mns, err := st.ListModelNames()
-	if err != nil || mns == nil {
+	mns, err := st.ListModelNamesPage(context.Background(), model.ModelNameFilter{})
+	if err != nil || mns.Items == nil {
 		t.Errorf("ListModelNames 空结果应为非 nil 切片")
 	}
-	rts, err := st.ListRoutes(0)
-	if err != nil || rts == nil {
+	rts, err := st.ListRoutesPage(context.Background(), model.RouteFilter{})
+	if err != nil || rts.Items == nil {
 		t.Errorf("ListRoutes 空结果应为非 nil 切片")
 	}
 }
@@ -524,16 +526,16 @@ func TestModelNameDeleteDoesNotCascadeExternalRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteModelName(mn.ID); !errors.Is(err, ErrDependencyConflict) {
+	if err := st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision); !errors.Is(err, ErrDependencyConflict) {
 		t.Fatalf("external Route deletion must conflict: %v", err)
 	}
 	if _, err := st.GetRoute(r.ID); err != nil {
 		t.Fatal("refused parent deletion removed Route")
 	}
-	if err := st.DeleteRoute(r.ID); err != nil {
+	if err := st.DeleteRouteWithRevision(context.Background(), r.ID, r.Revision); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeleteModelName(mn.ID); err != nil {
+	if err := st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetModelName(mn.ID); !errors.Is(err, ErrNotFound) {
@@ -574,7 +576,7 @@ func TestDeleteModelName_RollbackKeepsChildRouteRecipes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = st.DeleteModelName(mn.ID)
+	err = st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision)
 	if err == nil {
 		t.Fatal("DeleteModelName must fail while calibration_run pins the route")
 	}

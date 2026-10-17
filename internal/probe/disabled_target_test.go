@@ -38,7 +38,7 @@ func TestRunManual_RejectsDisabledUpstream(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	up.Enabled = false
-	if err := st.UpdateUpstream(up); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
 		t.Fatal(err)
 	}
 	svc, counter := newManualProbeService(t, st, func(*http.Request) (*http.Response, error) {
@@ -62,7 +62,7 @@ func TestRunManual_RejectsDisabledRoute(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	rt.Enabled = false
-	if err := st.UpdateRoute(rt); err != nil {
+	if err := st.UpdateRouteWithRevision(context.Background(), rt, rt.Revision); err != nil {
 		t.Fatal(err)
 	}
 	svc, counter := newManualProbeService(t, st, func(*http.Request) (*http.Response, error) {

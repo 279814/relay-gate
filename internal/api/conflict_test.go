@@ -81,7 +81,7 @@ func TestEnableIncompleteUpstreamReturns409(t *testing.T) {
 		t.Fatalf("建 Upstream = %d: %s", created.Code, created.Body.String())
 	}
 
-	upstreams, err := server.st.ListUpstreams()
+	upstreams, err := fixtureUpstreams(server.st)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -788,21 +788,9 @@ func TestInvalidate_DeleteUpstreamPreservesChildRouteHealth(t *testing.T) {
 	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
+		Semantic:         sem,
+		Inner:            inner,
+		RoutesOfUpstream: s.routeIDsOfUpstream,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"del-up-u","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
@@ -856,19 +844,9 @@ func TestInvalidate_DeleteModelNamePreservesChildRouteHealth(t *testing.T) {
 	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := s.st.ListRoutes(modelNameID)
-			if err != nil {
-				return nil
-			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
-			}
-			return ids
-		},
+		Semantic:          sem,
+		Inner:             inner,
+		RoutesOfModelName: s.routeIDsOfModelName,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"del-mn-u","base_url":"https://c.example.com","api_key":"sk-cccccccccccc"}`)
@@ -955,32 +933,10 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	sem := health.NewSemanticInvalidator(tr, recGate, caps, nil, nil)
 	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, reach: reach}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
-		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := s.st.ListRoutes(modelNameID)
-			if err != nil {
-				return nil
-			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
-			}
-			return ids
-		},
+		Semantic:          sem,
+		Inner:             inner,
+		RoutesOfUpstream:  s.routeIDsOfUpstream,
+		RoutesOfModelName: s.routeIDsOfModelName,
 	}).Routes(testAdminPW)
 
 	upA := mkUpstreamViaAPI(t, h, `{"name":"keep-h-a","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
@@ -1235,21 +1191,9 @@ func TestInvalidate_EndpointURLChangeClearsAliveRouteHealth(t *testing.T) {
 	inner := &recordingInvalidator{}
 	probeAdmin := probe.NewService(s.st, nil, nil, nil, nil, nil)
 	h := s.WithProbeAdmin(probeAdmin).WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
+		Semantic:         sem,
+		Inner:            inner,
+		RoutesOfUpstream: s.routeIDsOfUpstream,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"ep-url-u","base_url":"https://ep.example.com","api_key":"sk-eeeeeeeeeeee"}`)

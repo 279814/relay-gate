@@ -96,7 +96,7 @@ func TestPublicAdmin_RejectsCrossOriginBeforeMutatingStorage(t *testing.T) {
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin session write status=%d", response.Code)
 	}
-	values, err := s.st.ListUpstreams()
+	values, err := fixtureUpstreams(s.st)
 	if err != nil || len(values) != 0 {
 		t.Fatalf("cross-origin write reached database: count=%d err=%v", len(values), err)
 	}

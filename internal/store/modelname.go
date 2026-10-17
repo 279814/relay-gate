@@ -23,24 +23,6 @@ func scanModelName(sc interface{ Scan(...any) error }) (*model.ModelName, error)
 	return &m, nil
 }
 
-func (s *Store) ListModelNames() ([]*model.ModelName, error) {
-	rows, err := s.db.Query(`SELECT ` + modelNameCols + ` FROM model_name ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []*model.ModelName{}
-	for rows.Next() {
-		m, err := scanModelName(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
-
 func (s *Store) ListModelNamesPage(ctx context.Context, filter model.ModelNameFilter) (model.Page[*model.ModelName], error) {
 	limit, err := normalizePageLimit(filter.Limit)
 	if err != nil {
@@ -134,14 +116,6 @@ func (s *Store) CreateModelName(m *model.ModelName) error {
 	return err
 }
 
-func (s *Store) UpdateModelName(m *model.ModelName) error {
-	current, err := s.GetModelName(m.ID)
-	if err != nil {
-		return err
-	}
-	return s.UpdateModelNameWithRevision(context.Background(), m, current.Revision)
-}
-
 func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.ModelName, expectedRevision int64) (err error) {
 	value.Defaults()
 	if err := value.Validate(); err != nil {
@@ -206,11 +180,6 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 	return tx.Commit()
 }
 
-// DeleteModelName removes only a ModelName with no external Routes or history.
-func (s *Store) DeleteModelName(id int64) error {
-	return s.deleteModelName(context.Background(), id, 0)
-}
-
 // DeleteModelNameWithRevision rejects a stale administrator view in the same
 // transaction as detaching references and deleting the row.
 func (s *Store) DeleteModelNameWithRevision(ctx context.Context, id, expectedRevision int64) error {
@@ -234,7 +203,7 @@ func (s *Store) deleteModelName(ctx context.Context, id, expectedRevision int64)
 	if err != nil {
 		return err
 	}
-	if expectedRevision > 0 && revision != expectedRevision {
+	if revision != expectedRevision {
 		return ErrRevisionConflict
 	}
 	if err = requireEntityDeleteUnreferenced(ctx, tx, "model_name", id); err != nil {

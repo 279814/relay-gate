@@ -156,7 +156,7 @@ func TestCommitCalibrationSuccess_CredentialChangeRequiresRetest(t *testing.T) {
 
 	// 测试后改凭据：commit 必须 409，不能把旧 key 的成功固化成 Auth Profile。
 	up.APIKey = "sk-cal-cred-rotated-key"
-	if err := st.UpdateUpstream(up); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err = st.GetCalibrationRun(ctx, run.ID)

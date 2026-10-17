@@ -36,7 +36,7 @@ func TestMasterRotation_MaintenanceRejectsEncryptedAdminWrites(t *testing.T) {
 	if created.Code != http.StatusConflict {
 		t.Fatalf("maintenance admitted an encrypted write: status=%d body=%s", created.Code, created.Body.String())
 	}
-	values, err := s.st.ListUpstreams()
+	values, err := fixtureUpstreams(s.st)
 	if err != nil || len(values) != 0 {
 		t.Fatalf("rejected write reached storage: count=%d err=%v", len(values), err)
 	}
