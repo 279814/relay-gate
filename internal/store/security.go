@@ -8,18 +8,21 @@ import (
 	"github.com/279814/relay-gate/internal/security"
 )
 
-// InsertSecurityFinding persists one finding (plain-text evidence only).
-// Callers must already redact secrets from Detail (§14.5 / §16.4); this
-// method stores the provided fields as-is.
+// InsertSecurityFinding seals Detail under the independent Security Data Key.
+// Callers still redact known credentials before this persistence boundary.
 func (s *Store) InsertSecurityFinding(f security.Finding) error {
 	if s == nil {
 		return fmt.Errorf("store nil")
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO security_finding (
+	detail, err := s.cipher.encryptDataBlob(securityKeyPurpose, []byte(f.Detail))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO security_finding (
 		id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
 		scanner_version, rule_version, bytes_scanned, incomplete_reason
 	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		f.ID, f.AtMS, string(f.Severity), f.Category, f.Summary, f.Detail,
+		f.ID, f.AtMS, string(f.Severity), f.Category, f.Summary, detail,
 		f.Upstream, f.RouteID, f.ReqID, f.Source,
 		f.ScannerVersion, f.RuleVersion, f.BytesScanned, f.IncompleteReason,
 	)
@@ -60,6 +63,13 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 			return nil, err
 		}
 		f.Severity = security.Severity(sev)
+		if f.Detail != "" {
+			plain, err := s.cipher.decryptDataBlob(securityKeyPurpose, []byte(f.Detail))
+			if err != nil {
+				return nil, fmt.Errorf("security evidence 解密失败")
+			}
+			f.Detail = string(plain)
+		}
 		out = append(out, f)
 	}
 	return out, rows.Err()

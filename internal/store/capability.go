@@ -364,7 +364,26 @@ func (store *Store) reduceCapabilityTx(ctx context.Context, tx *sql.Tx, executio
 	if currentRow != nil && currentRow.LastObservationOrder >= execution.ObservationOrder {
 		return model.ApplySuperseded, nil, nil
 	}
-	reduced, err := callCapabilityReducer(reducer, currentRow, execution, *value.CapabilityPolicy)
+	prior := currentRow
+	if currentRow != nil && currentRow.State == model.CapabilityConfigError && currentRow.PolicySelector != expectation.PolicySelector {
+		// A real request and a synthetic probe use different timeout policies,
+		// hence different tokens. Preserve a sticky error only when rebuilding
+		// this same configuration under the old selector proves its identity.
+		settings, settingsErr := loadSettingsTx(ctx, tx)
+		if settingsErr != nil {
+			return "", nil, settingsErr
+		}
+		policy, policyErr := revisioncodec.BuildCapabilityEvidencePolicy(settings, currentRow.PolicySelector)
+		if policyErr == nil {
+			oldRevision := expectation.Revision
+			oldRevision.ProbeSettingsFingerprint = revisioncodec.ProbeSettingsFingerprint(policy)
+			if revisioncodec.NewObservationToken(oldRevision) == currentRow.ObservationToken {
+				prior = cloneCapability(currentRow)
+				prior.ObservationToken = execution.CapabilityToken
+			}
+		}
+	}
+	reduced, err := callCapabilityReducer(reducer, prior, execution, *value.CapabilityPolicy)
 	if err != nil {
 		return "", nil, err
 	}

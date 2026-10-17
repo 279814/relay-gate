@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
@@ -350,15 +349,11 @@ func (s *Scheduler) ObserveRealSuccess(key ScheduleKey, observedAt time.Time) {
 	if observedAt.IsZero() {
 		observedAt = time.Now()
 	}
-	generation := ensureRouteGeneration(s.track, key.ScopeID)
-	s.track.Report(health.Report{
-		RouteID: key.ScopeID, Generation: generation,
-		Verdict: health.VerdictOK, Source: health.SourceReal,
-	})
-	if completer, ok := s.track.(interface {
-		CompleteL2(routeID int64, completedAt time.Time, jitter float64)
-	}); ok {
-		completer.CompleteL2(key.ScopeID, observedAt, s.jitterFactor())
+	// The committed Capability row owns success evidence. Wake the scheduler
+	// without manufacturing a due task or counting every HTTP success as a skip.
+	select {
+	case s.realWake <- struct{}{}:
+	default:
 	}
 }
 

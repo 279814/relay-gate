@@ -34,6 +34,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/state", s.getState)
 	mux.HandleFunc("POST /admin/api/state", s.setState)
 	mux.HandleFunc("GET /admin/api/runtime", s.getRuntime)
+	mux.HandleFunc("GET /admin/api/public-https", s.getPublicHTTPSStatus)
 
 	// 探活（§4）。健康看板是排查「为什么这个模型不可用」的主入口，
 	// 手动探活对应 §4.5 的「UI 手动点测试」。
@@ -117,7 +118,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/transform-bindings", s.listTransformBindings)
 	mux.HandleFunc("GET /admin/api/transform-executions", s.listTransformExecutions)
 
-	guarded := s.requireAdmin(mux)
+	guarded := s.requireAdmin(s.guardMutations(mux))
 
 	// 会话端点挂在鉴权**之外**。
 	//

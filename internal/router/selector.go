@@ -92,6 +92,7 @@ type ReachabilityView interface {
 
 // Snapshot 是选路依赖的配置快照。调用方从 store 读一次，避免每请求查库。
 type Snapshot struct {
+	Generation uint64
 	ModelNames []*model.ModelName
 	Upstreams  map[int64]*model.Upstream
 	// RoutesByModelName[modelNameID] = 该 ModelName 下的所有 Route

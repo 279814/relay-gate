@@ -53,7 +53,9 @@ FROM alpine:3.21
 #
 # su-exec 用于 entrypoint 里降权（见 deploy/entrypoint.sh）。
 # 它比 gosu 小得多（约 10KB），做的是同一件事。
-RUN apk add --no-cache ca-certificates tzdata su-exec
+# Apply security revisions published after the base image was built.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates tzdata su-exec
 
 # 非 root 运行。容器逃逸不是主要威胁模型，真正的理由更直接：
 # 库文件权限收到 0600（store.restrictPerms）之后，以 root 跑等于

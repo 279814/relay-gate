@@ -7,9 +7,19 @@
 
 # 运行时数据：加密凭据、样本正文与仍敏感的元数据，以及解密所需的 secrets/。
 data/
+data-public/
 *.db
 *.db-shm
 *.db-wal
+**/backups
+**/secrets
+**/.secrets-restore-*
+**/isolated-*
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.restore-staging
+**/restore-intent.json*
 
 # 环境变量：ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD 都在这里
 .env
@@ -31,6 +41,8 @@ mock-*.log
 # 拷进去既没用又会让上下文多几十 MB
 /relay-gate
 /relay-gate.exe
+/relay-public-edge
+/relay-public-edge.exe
 /dist/
 
 # 版本控制与 CI 配置，构建用不到

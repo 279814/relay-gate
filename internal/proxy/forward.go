@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 )
@@ -111,6 +112,8 @@ type Result struct {
 	// 要么盲目写（于是把错误 JSON 塞进已经开始的 SSE 流里）。
 	HeadersSent bool
 	Err         error
+	// Raw transport failure remains distinguishable from a local transform error.
+	upstreamReadErr error
 
 	// ErrBody 是响应体的开头若干字节，供健康判定：
 	//   - Status >= 400：始终填充；
@@ -182,6 +185,8 @@ type Forwarder struct {
 	// 也不改变 flush 时序 —— 采集是旁路，不是管线的一环。
 	// 它的写入错误一律忽略：丢一份样本远好过中断一次真实转发。
 	RespTee io.Writer
+	// RespObserver consumes upstream bytes, independently of client transforms.
+	RespObserver health.AttemptObserver
 
 	// RequestHost 覆盖 Host 头。空表示用 URL 自己的 host。
 	//
@@ -582,6 +587,12 @@ func (at *Attempt) respTee() io.Writer {
 	if at.f == nil {
 		return nil
 	}
+	if at.f.RespObserver != nil {
+		if at.f.RespTee == nil {
+			return observerTee{at.f.RespObserver}
+		}
+		return io.MultiWriter(at.f.RespTee, observerTee{at.f.RespObserver})
+	}
 	return at.f.RespTee
 }
 
@@ -677,6 +688,9 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 			if canFlush {
 				flusher.Flush()
 			}
+			if f.RespObserver != nil {
+				_, _ = (observerTee{f.RespObserver}).Write(buf[:n])
+			}
 			// 采集放在 flush 之后：放前面会把「攒副本」的耗时插进
 			// 客户端可感知的延迟里，违反「不改变 flush 时序」。
 			if f.RespTee != nil {
@@ -754,14 +768,14 @@ func (f *Forwarder) streamBody(ctx, clientCtx context.Context, w http.ResponseWr
 // 分这么细是因为它们对健康状态的含义完全不同：
 // 上游连不上要标 dead，客户端断开则完全不该影响健康状态。
 var (
-	ErrConnect           = errors.New("连接上游失败")
-	ErrFirstTokenTimeout = errors.New("首 Token 超时")
-	ErrStreamStalled     = errors.New("流内静默超时")
-	ErrTotalTimeout      = errors.New("超过总时限")
-	ErrUpstreamBroke     = errors.New("上游未返回任何数据即断开")
-	ErrStreamBroke       = errors.New("流式传输中途断开")
-	ErrClientGone        = errors.New("客户端已断开")
-	ErrCanceled          = errors.New("请求被取消")
+	ErrConnect           = health.ErrConnect
+	ErrFirstTokenTimeout = health.ErrFirstTokenTimeout
+	ErrStreamStalled     = health.ErrStreamStalled
+	ErrTotalTimeout      = health.ErrTotalTimeout
+	ErrUpstreamBroke     = health.ErrUpstreamBroke
+	ErrStreamBroke       = health.ErrStreamBroke
+	ErrClientGone        = health.ErrClientGone
+	ErrCanceled          = health.ErrCanceled
 )
 
 // IsUpstreamFault 判断该错误是否应计入上游的健康失败。
@@ -771,13 +785,7 @@ var (
 // 那些超时到期正是「这个站太慢/已死」的证据，不算进去的话
 // 一个真死的站永远攒不够失败次数，主动探活就失去了意义。
 func IsUpstreamFault(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, ErrClientGone) || errors.Is(err, ErrCanceled) {
-		return false
-	}
-	return true
+	return health.IsUpstreamFault(err)
 }
 
 // classifyTransportErr 判断响应头阶段的失败该算谁的账。

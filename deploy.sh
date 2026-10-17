@@ -6,6 +6,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+if [[ "${1:-}" == "--public" ]]; then
+  shift
+  exec bash "$ROOT/deploy-public.sh" "$@"
+fi
+if (( $# != 0 )); then
+  echo "Usage: ./deploy.sh [--public [--ip PUBLIC_IP] [--confirm-ip PUBLIC_IP]]" >&2
+  exit 2
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required. Install Docker, then re-run ./deploy.sh" >&2
   exit 2

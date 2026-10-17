@@ -22,6 +22,8 @@ go.sum text eol=lf
 # 部署模板固定 LF，避免复制 .env.example 或跨平台执行时引入行尾差异。
 # 当前安装为 HTTP IP:port，Compose 使用 .env 做插值；主密钥读取会 TrimSpace。
 compose.yaml    text eol=lf
+deploy/compose.public.yaml text eol=lf
+deploy/Dockerfile.public text eol=lf
 .env.example    text eol=lf
 Caddyfile       text eol=lf
 

@@ -10,10 +10,10 @@ import (
 )
 
 // sampleBlobChunk 与 sample.fullSpillAt（默认 1 MiB）对齐：分块加密封顶缓冲。
-// 测试可调低以覆盖 v1m 分帧路径。
+// 测试可调低以覆盖 v2m 分帧路径。
 var sampleBlobChunk = 1 << 20
 
-// sampleMultipartPrefix marks chunked sample body BLOBs (spill insert path).
+// sampleMultipartPrefix marks legacy Master-encrypted multipart history.
 const sampleMultipartPrefix = "v1m:"
 
 func isSampleMultipart(raw []byte) bool {
@@ -22,7 +22,7 @@ func isSampleMultipart(raw []byte) bool {
 }
 
 // encryptSampleBodyFile 把明文 spill 按 sampleBlobChunk 分块封成信封文件。
-// 单块不超过窗口时仍写单个 v1: 信封；多块写 v1m: 分帧，避免整文件进一个 []byte。
+// 单块不超过窗口时写 v2: 信封；多块写 v2m: 分帧，避免整文件进一个 []byte。
 func (s *Store) encryptSampleBodyFile(srcPath string) (encPath string, err error) {
 	srcPath, err = model.ConfinedSpillPath(srcPath)
 	if err != nil {
@@ -81,34 +81,8 @@ func (s *Store) encryptSampleBodyFile(srcPath string) (encPath string, err error
 		return encPath, nil
 	}
 
-	kid := s.cipher.KeyID()
-	header := sampleMultipartPrefix + kid + ":\n"
-	if _, err := io.WriteString(dst, header); err != nil {
+	if err := encryptDataStream(s.cipher, sampleKeyPurpose, dst, src, fi.Size(), chunk); err != nil {
 		return "", err
-	}
-	buf := make([]byte, chunk)
-	var lenBuf [4]byte
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			enc, err := s.cipher.EncryptSampleBlob(buf[:n])
-			if err != nil {
-				return "", err
-			}
-			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(enc)))
-			if _, err := dst.Write(lenBuf[:]); err != nil {
-				return "", err
-			}
-			if _, err := dst.Write(enc); err != nil {
-				return "", err
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return "", readErr
-		}
 	}
 	ok = true
 	return encPath, nil

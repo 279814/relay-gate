@@ -7,10 +7,9 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
-// Reporter 把真实请求的结果翻译成健康判定，是 proxy.HealthReporter 的实现。
+// Reporter 把真实请求的结果翻译成健康判定，是 health.ResultReporter 的实现。
 //
 // P0-10：Capability/Reachability 的权威写回走 ResultRecorder + CommitProbeObservation；
 // 本 Reporter 仍是临时 adapter，只把真实流量结果喂给旧 RouteHealth Tracker
@@ -41,7 +40,10 @@ func (r *Reporter) WithCapabilityRegistry(caps *CapabilityRegistry) *Reporter {
 // 非阻塞：全程只做内存里的状态更新，没有 I/O。
 // generation 来自选路占位；与当前 RouteHealth 世代不一致则丢弃
 // （含 §8.12 真实流量 config_error，避免 Forget 后同 id 新 Route 被污染）。
-func (r *Reporter) ReportResult(routeID int64, generation uint64, res *proxy.ResultView) {
+func (r *Reporter) ReportResult(routeID int64, generation uint64, res *health.ResultView) {
+	if res != nil && res.CapabilityObserved {
+		return
+	}
 	// §8.12：结构化 model_not_found 与探活同口径 — Route config_error，
 	// 排除该 Route；不改 Upstream Reachability，不伪装成 dead。
 	if r.recordRealModelNotFound(routeID, generation, res) {
@@ -89,7 +91,7 @@ func (r *Reporter) TriggerProbe(routeID int64) { r.track.TriggerL2(routeID) }
 // 最后要求 SemanticSeen（§6.8 / §8.8）—— 有字节的 HTML/空壳流也不能 piggyback。
 // 顺序不能反 —— 传输层失败时 Status 可能是 0（连响应头都没拿到），按状态码
 // 判会当成「未知的成功」；结构化 error 若按 200 判活会跳过 L2 并把 Route 拉活。
-func classifyReal(res *proxy.ResultView) Outcome {
+func classifyReal(res *health.ResultView) Outcome {
 	if res == nil {
 		return Outcome{Verdict: health.VerdictIgnore}
 	}
@@ -122,7 +124,7 @@ func classifyReal(res *proxy.ResultView) Outcome {
 		ct = res.Header.Get("Content-Type")
 	}
 	// §8.12：HTTP 200 结构化 error 按错误码细分，不得按 200 判活。
-	if proxy.IsStructuredErrorPayload(res.ErrBody, ct) {
+	if structuredRemoteErrorFromBody(res.ErrBody, ct).Kind == EventRemoteError {
 		out := classifyStructured200(res)
 		out.TTFT = res.TTFT
 		return out
@@ -162,7 +164,7 @@ func classifyReal(res *proxy.ResultView) Outcome {
 // 与 ResponseClassifier.applyRemoteError 对齐限流特征；其余一律 Unavailable
 // （累计失败，不按 200 拉活）。鉴权/形态类不走 VerdictFatal：§8.12 的
 // config_error 不伪装成 dead，完整 Capability 回写另有路径。
-func classifyStructured200(res *proxy.ResultView) Outcome {
+func classifyStructured200(res *health.ResultView) Outcome {
 	body := res.ErrBody
 	if len(body) > maxClassifyBody {
 		body = body[:maxClassifyBody]
@@ -185,4 +187,4 @@ func classifyStructured200(res *proxy.ResultView) Outcome {
 
 // 确保 Reporter 满足 proxy 的接缝。放一个编译期断言而不是靠装配时
 // 才发现：改了任一侧的签名，编译就会在这里失败，而不是在 main.go 里。
-var _ proxy.HealthReporter = (*Reporter)(nil)
+var _ health.ResultReporter = (*Reporter)(nil)

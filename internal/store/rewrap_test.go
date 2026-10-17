@@ -3,8 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,8 +169,11 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, env.ID).Scan(&rawEnvBefore); err != nil {
 		t.Fatal(err)
 	}
-	if !IsSampleEnvelope(rawEnvBefore) || !strings.Contains(string(rawEnvBefore), "v1:"+oldID+":") {
+	if !bytes.HasPrefix(rawEnvBefore, []byte("v2:")) || strings.Contains(string(rawEnvBefore), oldID) {
 		t.Fatalf("pre-rewrap envelope want key-id %s, got %q", oldID, rawEnvBefore)
+	}
+	if _, err := st.MigrateSampleEnvelopes(); err != nil {
+		t.Fatal(err)
 	}
 	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, plainID).Scan(&rawPlainBefore); err != nil {
 		t.Fatal(err)
@@ -201,7 +202,7 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	if err := st2.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, env.ID).Scan(&rawEnvAfter); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(rawEnvAfter), "v1:"+newID+":") {
+	if !bytes.Equal(rawEnvBefore, rawEnvAfter) {
 		t.Fatalf("post-rewrap envelope want new key-id %s, got %q", newID, rawEnvAfter)
 	}
 	if strings.Contains(string(rawEnvAfter), "v1:"+oldID+":") {
@@ -213,8 +214,8 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	if !bytes.Equal(rawPlainAfter, rawPlainBefore) {
 		t.Fatal("rewrap mutated legacy plaintext sample row")
 	}
-	if IsSampleEnvelope(rawPlainAfter) {
-		t.Fatal("rewrap must not envelope leftover plaintext rows")
+	if !IsSampleEnvelope(rawPlainAfter) {
+		t.Fatal("migrated legacy sample lost its Data Key envelope")
 	}
 
 	gotEnv, err := st2.GetSample(env.ID)
@@ -233,140 +234,63 @@ func TestRewrapDirectSecrets_SampleEnvelopeNewMasterAlone(t *testing.T) {
 	}
 }
 
-// TestRewrapSampleField_MultipartPerFrameNoAssemble pins master rotation
-// resealing v1m frames one at a time: peak plaintext held is one frame, the
-// blob stays multipart, and GetSample bytes match. A small v1 sample still
-// rewraps as a single envelope.
-func TestRewrapSampleField_MultipartPerFrameNoAssemble(t *testing.T) {
-	prevChunk := sampleBlobChunk
-	sampleBlobChunk = 4 << 10 // 4 KiB
-	defer func() { sampleBlobChunk = prevChunk }()
-
-	oldMaster := "old-master-multipart-rewrap-aaaa"
-	newMaster := "new-master-multipart-rewrap-bbbb"
-	oldC, err := NewCipher(oldMaster)
+// Rotation must never update any sample body, including multipart spill BLOBs.
+func TestMasterRotationPreservesMultipartCiphertext(t *testing.T) {
+	previous := sampleBlobChunk
+	sampleBlobChunk = 4096
+	defer func() { sampleBlobChunk = previous }()
+	oldCipher, _ := NewCipher("multipart-master-old-at-least-16")
+	database := filepath.Join(t.TempDir(), "multipart.db")
+	st, err := Open(database, oldCipher)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(filepath.Join(t.TempDir(), "multipart-rewrap.db"), oldC)
-	if err != nil {
+	defer st.Close()
+	want := bytes.Repeat([]byte("multipart body"), 2000)
+	spill := filepath.Join(t.TempDir(), "body.tmp")
+	if err := os.WriteFile(spill, want, 0600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
-
-	want := bytes.Repeat([]byte("abcdefghij"), 2000) // 20 KiB > 2 chunks
-	spillPath := filepath.Join(t.TempDir(), "spill.tmp")
-	if err := os.WriteFile(spillPath, want, 0o600); err != nil {
+	sample := mkSample(42)
+	sample.InBody, sample.OutBody, sample.RespBody = nil, nil, nil
+	sample.RespBodyFile = spill
+	if err := st.InsertSample(sample); err != nil {
 		t.Fatal(err)
 	}
-	s := mkSample(42)
-	s.InBody, s.OutBody, s.RespBody = nil, nil, nil
-	s.RespBodyFile = spillPath
-	if err := st.InsertSample(s); err != nil {
+	var before []byte
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, sample.ID).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-
-	var raw []byte
-	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, s.ID).Scan(&raw); err != nil {
-		t.Fatal(err)
+	if !bytes.HasPrefix(before, []byte("v2m:")) {
+		t.Fatal("spill did not use multipart Data Key envelope")
 	}
-	if !isSampleMultipart(raw) {
-		t.Fatalf("want v1m before rewrap, got prefix %q", raw[:min(16, len(raw))])
-	}
-	framesBefore, err := countSampleMultipartFrames(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if framesBefore < 2 {
-		t.Fatalf("need ≥2 frames to pin per-frame rewrap, got %d", framesBefore)
-	}
-
-	rewrapMultipartPlainPeak = 0
-	neu, err := rewrapSampleField(oldC, newMaster, raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isSampleMultipart(neu) {
-		t.Fatalf("multipart rewrap must stay v1m, got prefix %q", neu[:min(16, len(neu))])
-	}
-	framesAfter, err := countSampleMultipartFrames(neu)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if framesAfter != framesBefore {
-		t.Fatalf("frame count: got %d want %d", framesAfter, framesBefore)
-	}
-	if rewrapMultipartPlainPeak <= 0 {
-		t.Fatal("expected rewrap to record a plaintext peak")
-	}
-	if rewrapMultipartPlainPeak > sampleBlobChunk {
-		t.Fatalf("rewrap plaintext peak %d exceeds one frame (%d)", rewrapMultipartPlainPeak, sampleBlobChunk)
-	}
-	if rewrapMultipartPlainPeak >= len(want) {
-		t.Fatalf("rewrap assembled whole body into one slice (%d)", rewrapMultipartPlainPeak)
-	}
-
-	onlyNew, err := NewCipher(newMaster)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := onlyNew.DecryptSampleBlob(neu)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("GetSample bytes after per-frame rewrap: want %d got %d", len(want), len(got))
-	}
-
-	smallPlain := []byte(`{"tiny":true}`)
-	smallEnc, err := oldC.EncryptSampleBlob(smallPlain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	smallNeu, err := rewrapSampleField(oldC, newMaster, smallEnc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isSampleMultipart(smallNeu) || !IsSampleEnvelope(smallNeu) {
-		t.Fatalf("small sample must stay single v1 envelope, got %q", smallNeu[:min(24, len(smallNeu))])
-	}
-	gotSmall, err := onlyNew.DecryptSampleBlob(smallNeu)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(gotSmall, smallPlain) {
-		t.Fatalf("small rewrap plaintext: got %q want %q", gotSmall, smallPlain)
-	}
-}
-
-func countSampleMultipartFrames(raw []byte) (int, error) {
-	if !isSampleMultipart(raw) {
-		return 0, fmt.Errorf("not multipart")
-	}
-	rest := raw[len(sampleMultipartPrefix):]
-	colon := -1
-	for i := 0; i < len(rest); i++ {
-		if rest[i] == ':' {
-			colon = i
-			break
+	for _, statement := range []string{
+		`CREATE TEMP TRIGGER prevent_sample_request_rewrite BEFORE UPDATE OF in_body ON sample_request BEGIN SELECT RAISE(ABORT,'sample body must not be reencrypted'); END`,
+		`CREATE TEMP TRIGGER prevent_sample_attempt_rewrite BEFORE UPDATE OF out_body,resp_body ON sample_attempt BEGIN SELECT RAISE(ABORT,'sample body must not be reencrypted'); END`,
+	} {
+		if _, err := st.db.Exec(statement); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if colon < 0 || colon+1 >= len(rest) || rest[colon+1] != '\n' {
-		return 0, fmt.Errorf("分块样本信封格式无效")
+	if err := st.RewrapDirectSecrets("multipart-master-new-at-least-16", "multipart-rid"); err != nil {
+		t.Fatal(err)
 	}
-	payload := rest[colon+2:]
-	nFrames := 0
-	for len(payload) > 0 {
-		if len(payload) < 4 {
-			return 0, fmt.Errorf("分块样本信封截断")
-		}
-		n := int(binary.BigEndian.Uint32(payload[:4]))
-		payload = payload[4:]
-		if n < 0 || n > len(payload) {
-			return 0, fmt.Errorf("分块样本信封长度无效")
-		}
-		payload = payload[n:]
-		nFrames++
+	var after []byte
+	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, sample.ID).Scan(&after); err != nil {
+		t.Fatal(err)
 	}
-	return nFrames, nil
+	if !bytes.Equal(before, after) {
+		t.Fatal("Master rotation changed multipart ciphertext")
+	}
+	st.Close()
+	newCipher, _ := NewCipher("multipart-master-new-at-least-16")
+	reopened, err := Open(database, newCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.GetSample(sample.ID)
+	if err != nil || !bytes.Equal(got.RespBody, want) {
+		t.Fatalf("restart with only new Master failed: %v", err)
+	}
 }

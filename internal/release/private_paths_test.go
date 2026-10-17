@@ -29,6 +29,14 @@ func TestReleaseGateRejectsTrackedPrivatePaths(t *testing.T) {
 		{"environment", ".env", true},
 		{"nested upstreams", "scripts/upstreams.tsv", true},
 		{"Unicode matrix", "docs/02-上游能力矩阵.md", true},
+		{"custom DB backup secrets", "custom-runtime/backups/rotation/secrets.json", true},
+		{"custom DB backup database", "custom-runtime/backups/rotation/database.sqlite", true},
+		{"restore staging secrets", "custom-runtime/.secrets-restore-123/keyring.json", true},
+		{"isolated old secrets", "custom-runtime/isolated-20261018/secrets/keyring.json", true},
+		{"live keyring outside data", "custom-runtime/secrets/keyring.json", true},
+		{"public TLS private key", "data-public/tls/version/key.pem", true},
+		{"private live capture", ".local/p0/capture.json", true},
+		{"private editor artifacts", ".vs/probe-input.json", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()

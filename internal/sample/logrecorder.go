@@ -1,6 +1,7 @@
 package sample
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"log/slog"
@@ -43,7 +44,7 @@ const logPruneEvery = 200
 // 复用的是**形状**而不是实例 —— 两个类型的字段几乎相同，但那是因为
 // 「有界 channel + 单 writer」本来就是这个问题的正确答案，不是重复。
 type LogRecorder struct {
-	ch  chan *model.RequestLog
+	ch  chan requestLogWrite
 	w   LogWriter
 	log *slog.Logger
 
@@ -60,6 +61,11 @@ type LogRecorder struct {
 	done     chan struct{}
 }
 
+type requestLogWrite struct {
+	log     *model.RequestLog
+	barrier chan struct{}
+}
+
 // NewLogRecorder 创建并启动后台 writer。调用方必须在关闭时调用 Close。
 //
 // s 只用于取队列大小（channel 容量，改它必须重启）；
@@ -72,7 +78,7 @@ func NewLogRecorder(w LogWriter, s model.Settings, retention RetentionSource,
 		size = 1
 	}
 	r := &LogRecorder{
-		ch:        make(chan *model.RequestLog, size),
+		ch:        make(chan requestLogWrite, size),
 		w:         w,
 		log:       log,
 		retention: retention,
@@ -86,7 +92,7 @@ func NewLogRecorder(w LogWriter, s model.Settings, retention RetentionSource,
 // Record 非阻塞投递。队列满时丢弃并计数，**绝不阻塞调用方**。
 func (r *LogRecorder) Record(l *model.RequestLog) {
 	select {
-	case r.ch <- l:
+	case r.ch <- requestLogWrite{log: l}:
 	default:
 		n := r.dropped.Add(1)
 		// 只在头几次与每 100 次记一条：满队列往往持续一段时间，
@@ -106,14 +112,46 @@ func (r *LogRecorder) Stats() (written, dropped int64) {
 	return r.written.Load(), r.dropped.Load()
 }
 
+// Flush establishes a FIFO write barrier after proxy admission has stopped.
+// It does not close the recorder or make request-side Record calls wait.
+func (r *LogRecorder) Flush(ctx context.Context) error {
+	barrier := make(chan struct{})
+	select {
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case r.ch <- requestLogWrite{barrier: barrier}:
+	}
+	select {
+	case <-barrier:
+		return nil
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *LogRecorder) consume(value requestLogWrite) bool {
+	if value.barrier != nil {
+		close(value.barrier)
+		return false
+	}
+	r.write(value.log)
+	return true
+}
+
 func (r *LogRecorder) loop() {
 	defer close(r.done)
 	var since int
 	for {
 		select {
-		case l := <-r.ch:
-			r.write(l)
-			if since++; since >= logPruneEvery {
+		case value := <-r.ch:
+			if r.consume(value) {
+				since++
+			}
+			if since >= logPruneEvery {
 				since = 0
 				r.prune()
 			}
@@ -122,8 +160,8 @@ func (r *LogRecorder) loop() {
 			// 往往正是导致关闭的那次故障的现场。
 			for {
 				select {
-				case l := <-r.ch:
-					r.write(l)
+				case value := <-r.ch:
+					r.consume(value)
 				default:
 					r.prune()
 					return

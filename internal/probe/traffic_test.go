@@ -36,7 +36,7 @@ func TestDrainPersist_ReturnsWhenContextCancelled(t *testing.T) {
 	started := make(chan struct{})
 	rec := &blockUntilCancelRecorder{started: started}
 	m := NewTrafficObserverManager(stubProbeSnap{}, nil, rec, discardLogger())
-	m.queue <- &model.ProbeObservation{Execution: model.ProbeExecution{UpstreamID: 1}}
+	m.queue <- trafficWrite{observation: &model.ProbeObservation{Execution: model.ProbeExecution{UpstreamID: 1}}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -60,12 +60,13 @@ func TestDrainPersist_ReturnsWhenContextCancelled(t *testing.T) {
 }
 
 func TestTrafficObserver_CapacityFallsBackWithoutBlocking(t *testing.T) {
-	m := NewTrafficObserverManager(stubProbeSnap{}, nil, nil, discardLogger())
+	h := newCountTrafficHarness(t)
+	m := h.manager
 	for i := 0; i < fullObserverLeases; i++ {
 		<-m.leases
 	}
 	instr := m.PrepareAttempt(context.Background(), health.AttemptTarget{
-		RouteID: 1, UpstreamID: 2, Endpoint: model.EndpointMessages,
+		RouteID: h.route.ID, UpstreamID: h.up.ID, Endpoint: model.EndpointMessages,
 	}, health.AttemptRequestView{})
 	if instr.Observer == nil || instr.Retry == nil {
 		t.Fatal("容量不足时仍应返回 instrumentation")
@@ -78,6 +79,15 @@ func TestTrafficObserver_CapacityFallsBackWithoutBlocking(t *testing.T) {
 	}
 	instr.Observer.TryHeaders(200, nil, time.Now())
 	instr.Observer.Finish(health.AttemptFinish{})
+}
+
+func TestTrafficPrepare_InvalidIdentityIsNoop(t *testing.T) {
+	m := NewTrafficObserverManager(stubProbeSnap{}, nil, nil, discardLogger())
+	instrument := m.PrepareAttempt(context.Background(), health.AttemptTarget{RouteID: 1, UpstreamID: 2, Endpoint: model.EndpointMessages}, health.AttemptRequestView{})
+	if instrument.Trace != nil || m.Stats().FullObserversInFlight != 0 {
+		t.Fatal("invalid observation identity allocated a trace or full worker")
+	}
+	instrument.Observer.Finish(health.AttemptFinish{})
 }
 
 func TestRetryDecider_KeepOnUndecidedPrefix(t *testing.T) {

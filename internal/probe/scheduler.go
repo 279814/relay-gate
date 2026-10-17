@@ -84,7 +84,9 @@ type Scheduler struct {
 
 	// cost 累计探活开销（§5.2d）。可以为 nil —— 测试里多数用例不关心计数，
 	// 而记账失败绝不该影响探活本身。
-	cost *Cost
+	cost      *Cost
+	piggyback PiggybackRecorder
+	realWake  chan struct{}
 
 	// executor 是 P0-09 的单发执行器。装配后 L1/L2/ProbeNow 一律走它，
 	// 不再各自构造 &Prober{Transport}（§P0-09 目标）。为 nil 时（多数单元
@@ -159,6 +161,7 @@ func NewScheduler(cfg ConfigSource, tr TransportSource, track Tracker,
 		l1Scheduled: map[int64]bool{},
 		l1Followers: map[uint64][]int64{},
 		lastRunning: store.StateRunning,
+		realWake:    make(chan struct{}, 1),
 	}
 }
 
@@ -362,6 +365,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			s.tick(ctx)
+		case <-s.realWake:
+			s.tick(ctx)
 		}
 	}
 }
@@ -469,8 +474,17 @@ func (s *Scheduler) maybeProbe(ctx context.Context, up *model.Upstream,
 	if !s.gate.OKAt(up.ID, up.NetworkRevision) {
 		return
 	}
-	gen, ok := s.track.ClaimL2(rt.ID)
+	claim := s.track.ClaimL2
+	if s.ensureP012().capReg != nil {
+		if current, ok := s.track.(interface{ ClaimL2WithoutPiggyback(int64) (uint64, bool) }); ok {
+			claim = current.ClaimL2WithoutPiggyback
+		}
+	}
+	gen, ok := claim(rt.ID)
 	if !ok {
+		return
+	}
+	if s.tryPiggyback(rt.ID, gen, time.Now()) {
 		return
 	}
 	hold, ok := s.beginL2(up.ID, rt.ID)

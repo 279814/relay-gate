@@ -60,6 +60,47 @@ func (registry *CapabilityRegistry) RestoreConfigErrors(ctx context.Context, row
 	return restored, nil
 }
 
+// RestoreRealSuccesses restores only current piggyback evidence. Positive
+// capability itself is demoted to unknown until another real/probe observation.
+func (registry *CapabilityRegistry) RestoreRealSuccesses(ctx context.Context, rows CapabilityRowSource,
+	configs PublishedConfigSource, recipes *RecipeResolver) (int, error) {
+	if registry == nil || rows == nil || configs == nil || recipes == nil {
+		return 0, nil
+	}
+	list, err := rows.ListEndpointCapabilitiesByState(ctx, model.CapabilitySupported)
+	if err != nil {
+		return 0, err
+	}
+	pub, err := configs.Bundle()
+	if err != nil {
+		return 0, err
+	}
+	if pub == nil || pub.Probe == nil {
+		return 0, livecfg.ErrProbeSnapshotUnavailable
+	}
+	count := 0
+	for _, row := range list {
+		if row == nil || row.ScopeType != model.RecipeScopeRoute || row.Endpoint == model.EndpointCountTokens || row.LastRealOKAt <= 0 || row.LastRealOKToken == "" {
+			continue
+		}
+		primary, ok := currentCapabilityToken(ctx, pub.Probe, recipes, row)
+		if !ok || primary != row.ObservationToken {
+			continue
+		}
+		real := *row
+		real.PolicySelector = model.EvidencePolicySelector{Kind: model.EvidenceRealTraffic, Endpoint: row.Endpoint}
+		realToken, ok := currentCapabilityToken(ctx, pub.Probe, recipes, &real)
+		if !ok || realToken != row.LastRealOKToken {
+			continue
+		}
+		restored := *row
+		restored.State = model.CapabilityUnknown
+		registry.ApplyCommitted(&restored)
+		count++
+	}
+	return count, nil
+}
+
 func currentCapabilityToken(ctx context.Context, snap *livecfg.ProbeSnapshot, recipes *RecipeResolver,
 	row *model.EndpointCapability) (string, bool) {
 
@@ -101,6 +142,8 @@ func currentCapabilityExpectation(ctx context.Context, snap *livecfg.ProbeSnapsh
 	var expectation *model.SemanticExpectation
 	if route == nil {
 		_, _, expectation, _, err = buildL1Expectations(snap, upstreamID, recipe)
+	} else if row.PolicySelector.Kind == model.EvidenceRealTraffic {
+		_, _, expectation, _, err = buildRealExpectations(snap, &model.Upstream{ID: upstreamID}, route, row.Endpoint, recipe)
 	} else {
 		_, _, expectation, _, err = buildL2Expectations(snap, &model.Upstream{ID: upstreamID}, route, row.Endpoint, recipe)
 	}

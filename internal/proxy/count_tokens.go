@@ -213,10 +213,12 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	req.ContentLength = int64(len(outBody))
 	instr := health.NoopInstrumentation()
 	if h.observers != nil {
-		instr = h.observers.PrepareAttempt(ctx, health.AttemptTarget{
+		instr = prepareInstrumentation(h.observers, ctx, health.AttemptTarget{
 			Protocol: model.ProtoAnthropic, Endpoint: model.EndpointCountTokens,
 			UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID,
+			HealthGeneration: cand.HealthGeneration,
 			Config: health.AttemptConfigFacts{
+				Generation: pre.snapshot.Generation,
 				EndpointID: target.EndpointID, EndpointRevision: target.EndpointRevision,
 				AuthProfileRevision:        target.AuthProfile.Revision,
 				UpstreamNetworkRevision:    cand.Upstream.NetworkRevision,
@@ -227,7 +229,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 				ModelCapabilityRevision:    cand.ModelName.CapabilityRevision,
 				ResolvedURLHash:            target.ResolvedURLHash,
 			},
-		}, health.AttemptRequestView{})
+		}, health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
 	}
 	var readErr error
 	defer func() {
@@ -264,7 +266,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		return fmt.Sprintf("读响应失败: %v", err)
 	}
 	if instr.Observer != nil {
-		instr.Observer.TryChunk(sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand)), time.Now())
+		instr.Observer.TryChunk(respBody, time.Now())
 	}
 
 	// 4xx/5xx 对客户端一律降级到本地估算（拿不到准确值）。Capability 写回

@@ -99,6 +99,12 @@ func runServer() error {
 		return err
 	}
 	defer instanceLock.Close()
+	// A restore may have isolated secrets/ immediately before a crash. Finish
+	// installing the verified DB+secrets group before first-run bootstrap can
+	// mistake that intermediate state for a new deployment.
+	if err := store.ResumePendingRestore(dbPath); err != nil {
+		return fmt.Errorf("恢复未完成数据库还原: %w", err)
+	}
 	if err := credential.MaybeBootstrap(dataDir, os.Stdout); err != nil {
 		return fmt.Errorf("首次凭据: %w", err)
 	}
@@ -261,6 +267,9 @@ func runServer() error {
 	} else if n > 0 {
 		log.Info("已恢复 config_error 能力状态", "rows", n)
 	}
+	if _, err := capRegistry.RestoreRealSuccesses(context.Background(), st, cfgSrc, recipes); err != nil {
+		return fmt.Errorf("恢复真实成功探活证据: %w", err)
+	}
 
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
@@ -321,7 +330,8 @@ func runServer() error {
 	defer seq.Close()
 	sched.WithSequencer(seq)
 
-	traffic := probe.NewTrafficObserverManager(cfgSrc, seq, resultRecorder, log).WithScheduler(sched)
+	traffic := probe.NewTrafficObserverManager(cfgSrc, seq, resultRecorder, log).WithScheduler(sched).WithHealthTracker(tracker).WithLearner(probe.NewLearner(st)).WithPiggybackStore(st)
+	sched.WithPiggybackRecorder(traffic)
 	fwd.WithObservers(traffic)
 	janitor := probe.NewRetentionJanitor(st, log)
 
@@ -396,7 +406,27 @@ func runServer() error {
 		WithSecurityCenter(secCenter).
 		WithAlertMailer(mailer).
 		WithTransformRegistry(xform).
-		WithCredentials(credSvc, kr)
+		WithPublicHTTPSStatusFile(cfg.PublicHTTPSStatusFile).
+		WithCredentials(credSvc, kr).
+		WithMasterKeyEnvironmentOverride(strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")) != "").
+		WithRotationQuiescer(func(ctx context.Context) (func(), error) {
+			// EnterMaintenance already requests synthetic cancellation. Require
+			// its actual drain here as well; a timeout cannot authorize rewrap.
+			if err := coordinator.CancelSynthetic(ctx, context.Canceled); err != nil {
+				return nil, err
+			}
+			release, err := fwd.Quiesce(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for _, flush := range []func(context.Context) error{traffic.Flush, recorder.Flush, logRecorder.Flush, secObs.Flush} {
+				if err := flush(ctx); err != nil {
+					release()
+					return nil, err
+				}
+			}
+			return release, nil
+		})
 	if hash, err := credential.LoadAdminHash(dataDir); err == nil {
 		adminAPI = adminAPI.WithAdminHash(hash, dataDir)
 	}
@@ -424,9 +454,13 @@ func runServer() error {
 		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)
 	})
 
+	handler := http.Handler(mux)
+	if cfg.TrustedEdge != nil {
+		handler = cfg.TrustedEdge.Wrap(handler)
+	}
 	srv := &http.Server{
 		Addr:    cfg.Addr,
-		Handler: mux,
+		Handler: handler,
 		// 不设 WriteTimeout：真实请求的首 Token 可达 20 分钟（§4.2），
 		// 一个粗粒度的写超时会把正常的长思考直接掐断。
 		// 超时控制在转发层按三段独立实现，不靠 Server 级的钝刀。

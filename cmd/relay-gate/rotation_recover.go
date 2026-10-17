@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -22,18 +23,49 @@ func recoverMasterRotation(dataDir, dbPath string) (bool, keyring.Status, error)
 		return false, keyring.Status{}, err
 	}
 	var dbRID string
-	if st.Phase == keyring.PhasePrepared || st.Phase == keyring.PhaseDBCommitted {
+	if st.Phase == keyring.PhasePrepared || st.Phase == keyring.PhaseDBCommitted || st.Phase == keyring.PhaseKeyActivated {
 		dbRID, err = store.CommittedMasterRotation(dbPath)
 		if err != nil {
 			return true, st, fmt.Errorf("读取 SQLite rotation_id: %w", err)
 		}
-		if st.Phase == keyring.PhaseDBCommitted || (st.RotationID != "" && st.RotationID == dbRID) {
+	}
+	rollForward := st.RotationID != "" && st.RotationID == dbRID
+	return kr.RecoverUnfinishedValidated(dbRID, func(master string) error {
+		if err := store.ValidateDatabaseEncryption(context.Background(), dbPath, master); err != nil {
+			return err
+		}
+		current, err := kr.Status()
+		if err != nil {
+			return err
+		}
+		if rollForward && current.HasPending {
 			if err := resealPersistedRelayUnderPending(kr, dataDir); err != nil {
-				return true, st, err
+				return err
 			}
 		}
+		return verifyPersistedRelayMaster(dataDir, master)
+	})
+}
+
+func verifyPersistedRelayMaster(dataDir, master string) error {
+	doc, err := credential.LoadPersistedFile(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return kr.RecoverUnfinishedAgainst(dbRID)
+	if err != nil {
+		return err
+	}
+	if doc.RelayKey == "" || !credential.IsRelayKeyEnvelope(doc.RelayKey) {
+		return nil
+	}
+	cipher, err := store.NewCipher(master)
+	if err != nil {
+		return err
+	}
+	if _, err := credential.OpenPersistedRelayKey(doc.RelayKey, cipher); err != nil {
+		return fmt.Errorf("持久 Relay Key 与候选 Master Key 不匹配: %w", err)
+	}
+	return nil
 }
 
 // resealPersistedRelayUnderPending rewrites bootstrap-credentials.json's
@@ -47,12 +79,19 @@ func resealPersistedRelayUnderPending(kr *keyring.File, dataDir string) error {
 	if err != nil {
 		return err
 	}
-	if !credential.IsRelayKeyEnvelope(doc.RelayKey) {
+	if doc.RelayKey == "" {
 		return nil
 	}
 	pending, err := kr.LoadPending()
 	if err != nil {
 		return err
+	}
+	if !credential.IsRelayKeyEnvelope(doc.RelayKey) {
+		sealed, err := store.SealEnvelopeUnder(pending, doc.RelayKey)
+		if err != nil {
+			return err
+		}
+		return credential.ReplacePersistedRelayKey(dataDir, sealed)
 	}
 	next, err := store.NewCipher(pending)
 	if err != nil {

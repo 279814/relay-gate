@@ -1,0 +1,23 @@
+# Reviewed synthetic test credentials and historical deployment examples only.
+# Each exception pins one commit, path, rule and line. New values remain gated.
+# See docs/14-安全扫描与历史示例.md for scope and review rationale.
+43d883fa2e6aaed642a32a6b77a9029764dfbd69:internal/sample/tee_test.go:generic-api-key:329
+43d883fa2e6aaed642a32a6b77a9029764dfbd69:internal/sample/tee_test.go:generic-api-key:357
+43d883fa2e6aaed642a32a6b77a9029764dfbd69:scripts/smoke-m2.ps1:generic-api-key:59
+58c0e07f7e481b3fa49d13016d27475be53954c6:scripts/smoke-m3.ps1:generic-api-key:92
+9c373c11f325922b243874eeef7fcd006ad0b08b:scripts/smoke-m7.ps1:generic-api-key:125
+9c373c11f325922b243874eeef7fcd006ad0b08b:scripts/smoke-m7.ps1:generic-api-key:295
+a506a2bc14c4fcad89cf8fed593c91fc216899cc:scripts/smoke-m7.ps1:generic-api-key:176
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:curl-auth-header:342
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:curl-auth-header:693
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:161
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:162
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:163
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:344
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:694
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:736
+cc181fac1e0254fd163de28fb59375390a88c156:docs/03-部署与配置.md:generic-api-key:744
+cc7204487ec212a286d55671296182da08208770:internal/store/endpoint_test.go:generic-api-key:223
+d8a69c8c34475269fd0fa1676421d08940aafdd0:scripts/smoke-m6.ps1:generic-api-key:108
+de52935f845abf50837a10c2e9e973b7463ad41c:internal/probe/executor_reachability_test.go:generic-api-key:38
+ff5be6e727d19c70c481505a23e6c856bf98b20b:internal/api/probe_redact_test.go:generic-api-key:45

@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
@@ -214,6 +216,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	var logs []*model.RequestLog
 	// trail 在交给 forwardOutcome 之前归本函数所有；任何提前返回都要释放。
 	var trail []*liveAttempt
+	var observing *liveAttempt
+	defer func() { finishObserver(observing, health.AttemptFinish{ServiceCanceled: true}) }()
 	defer func() { closeSampleTrail(trail) }()
 	localSkips := 0
 	attempt := 0
@@ -221,7 +225,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	for {
 		plan.tried[cand.Route.ID] = true
 
-		la, status := h.dispatch(w, r, proto, pre, cand, time.Until(plan.deadline))
+		la, status := h.dispatch(w, r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline))
+		observing = la
 		if status == dispatchFatal {
 			cand.Release()
 			held = nil
@@ -296,7 +301,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			} else {
 				la.at.Discard()
 			}
-			finishObserver(la, health.AttemptFinish{ClientCommitted: oc.res != nil && oc.res.BytesWritten > 0})
+			finishObserver(la, health.AttemptFinish{ClientCommitted: oc.res != nil && oc.res.BytesWritten > 0, HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
 			la.cand.Release()
 			held = nil
 
@@ -331,7 +336,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
 		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
 		trail = append(trail, la)
-		finishObserver(la, health.AttemptFinish{})
+		finishObserver(la, health.AttemptFinish{HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
@@ -450,7 +455,7 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // dispatchSent：已发出上游请求，la 非空。
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
-	budget time.Duration) (*liveAttempt, dispatchStatus) {
+	reqID string, attempt int, budget time.Duration) (*liveAttempt, dispatchStatus) {
 
 	settings := pre.settings
 
@@ -477,9 +482,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	}
 	instr := health.NoopInstrumentation()
 	if h.observers != nil {
-		instr = h.observers.PrepareAttempt(r.Context(), health.AttemptTarget{
-			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID,
+		instr = prepareInstrumentation(h.observers, r.Context(), health.AttemptTarget{
+			ReqID: reqID, Attempt: attempt,
+			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, HealthGeneration: cand.HealthGeneration,
 			Config: health.AttemptConfigFacts{
+				Generation:                 pre.snapshot.Generation,
 				UpstreamNetworkRevision:    cand.Upstream.NetworkRevision,
 				UpstreamCredentialRevision: cand.Upstream.CredentialRevision,
 				UpstreamCreatedAt:          cand.Upstream.CreatedAt, RouteCreatedAt: cand.Route.CreatedAt,
@@ -592,6 +599,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			}
 		}
 	}
+	// Edge identity is local metadata even if a published transform tries to
+	// reintroduce it after the inbound blacklist was applied.
+	edge.StripForwardingHeaders(outHeader)
 	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
@@ -651,7 +661,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	case secTee != nil:
 		fwd.RespTee = secTee
 	}
+	fwd.RespObserver = instr.Observer
 
+	if requestObserver, ok := instr.Observer.(health.AttemptRequestObserver); ok {
+		requestObserver.TryRequest(health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
+	}
 	sendCtx := r.Context()
 	if instr.Trace != nil {
 		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
@@ -734,6 +748,17 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 	if la == nil || la.at == nil {
 		return false
 	}
+	// With observation installed, payload replay belongs solely to its bounded
+	// structured parser. A failed/no-op decider must not fall back to heuristics.
+	if res := la.at.Result(); h.observers != nil && res != nil && res.Err == nil && res.Status >= 200 && res.Status < 300 {
+		if policy.Normalize() != model.RetryPolicyAggressive || la.instr.Retry == nil {
+			return false
+		}
+		prefix := la.at.Peek()
+		if res.Err == nil {
+			return safeRetryAdvice(la.instr.Retry, r.Context(), res.Status, res.RespHeaders, prefix).Disposition == health.RetryTryNextRoute
+		}
+	}
 	base := retryable(la.at)
 	if !base {
 		return false
@@ -772,23 +797,17 @@ func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy mode
 			return false
 		}
 	}
-	if la.instr.Retry == nil {
-		return true
-	}
-	res := la.at.Result()
-	if res == nil {
-		return true
-	}
-	prefix := la.at.Peek()
-	advice := la.instr.Retry.DecidePeek(r.Context(), res.Status, res.RespHeaders, prefix, true)
-	if advice.Disposition == health.RetryTryNextRoute {
-		return true
-	}
-	// KeepAttempt from decider does not widen beyond base; Safe already filtered.
-	if policy == model.RetryPolicyAggressive {
-		return base
-	}
 	return base
+}
+
+func safeRetryAdvice(decider health.RetryDecider, ctx context.Context, status int, header http.Header, prefix []byte) (advice health.RetryAdvice) {
+	advice.Disposition = health.RetryKeepAttempt
+	defer func() {
+		if recover() != nil {
+			advice = health.RetryAdvice{Disposition: health.RetryKeepAttempt}
+		}
+	}()
+	return decider.DecidePeek(ctx, status, header, prefix, true)
 }
 
 // safeRetryEvidence is true only when nothing proves the request reached the upstream (§11.2 Safe).
@@ -908,12 +927,16 @@ func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
 	}
 	if la.at != nil && la.at.Result() != nil {
 		res := la.at.Result()
-		fin.ReadErr = res.Err
+		fin.ReadErr = res.upstreamReadErr
 		fin.ClientCanceled = errors.Is(res.Err, ErrCanceled) || errors.Is(res.Err, ErrClientGone)
-		if len(res.ErrBody) > 0 {
-			// ErrBody is already bounded by forwarding; normal model streams
-			// retain no body copy. The observer receives only redacted errors.
-			la.instr.Observer.TryChunk(sample.RedactDiagnostic(res.ErrBody, la.keys), time.Now())
+		if fin.ReadErr == nil && res.Err != nil && !fin.ClientCanceled {
+			if errors.Is(res.Err, ErrConnect) || errors.Is(res.Err, ErrFirstTokenTimeout) || errors.Is(res.Err, ErrStreamStalled) ||
+				errors.Is(res.Err, ErrTotalTimeout) || errors.Is(res.Err, ErrUpstreamBroke) || errors.Is(res.Err, ErrStreamBroke) {
+				fin.ReadErr = res.Err
+			} else {
+				// Local response-transform failures provide no upstream health evidence.
+				fin.ServiceCanceled = true
+			}
 		}
 	}
 	la.instr.Observer.Finish(fin)

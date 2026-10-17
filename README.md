@@ -145,6 +145,10 @@ python scripts/deploy.contract.test.py
 
 Go 版本以 `go.mod` 为准。检查脚本需要 Bash、Python 3、Node.js 和 PowerShell 7（`pwsh`）；它们只用于验证，运行服务不需要。Windows 无 CGO 时不要用 `-race`，竞态检测与容器冒烟由 Linux CI 执行。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
 
+### 公网 IP HTTPS
+
+Linux 公网部署支持 `./deploy.sh --public --ip <公网IP>`，确认目标后只发布 Nginx 边缘的 80/443，后端保持私网访问。签发与链/SAN/私钥/有效期校验成功前只提供 ACME 挑战；证书续期独立于网关暂停状态。命令、恢复与验收边界见 [公网 IP HTTPS](docs/13-公网IP-HTTPS.md)。真实公网签发和多日运行尚待对应主机上的验收记录。
+
 ### 离线备份检查与恢复
 
 先停止容器或二进制进程，并备份完整 `data/`（SQLite、WAL/SHM 与 `secrets/` 一起保留）。确认备份 manifest 指定的配对 image/binary 可用，再执行只读检查；不要在服务运行时直接复制或覆盖数据库。
@@ -164,6 +168,8 @@ relay-gate db restore --database /abs/path/data/relay.db \
 ```
 
 使用输出要求的配对 image/binary 启动并检查 `/healthz`；恢复会保留原数据库的隔离目录，不要在验证前删除。schema 3→2 需要 manifest 指定的 P0 compatible reader；恢复 schema 1 到 pre-P0 程序会放弃该备份之后的新配置。完整限制见需求基线中的恢复章节。
+
+schema 8 备份将数据库和 `secrets/` 配对保存。轮换之后恢复旧 Master Key 的备份时，可在上述两个命令中显式加 `--use-backup-keyring`，仅使用经 manifest 哈希校验并与数据库配对的归档 active Master；默认仍使用当前配置并在不匹配时拒绝。恢复命令仍需全部数据替换授权。备份中的 `secrets.json` 含真实密钥，应按敏感文件保管。迁移与恢复契约见 [数据密钥与恢复说明](docs/12-数据密钥与恢复.md)。
 
 ## 安全
 

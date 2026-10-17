@@ -18,7 +18,7 @@ import (
 //
 // 调用方（sample.Recorder）已在后台单 goroutine 里，所以这里不必再考虑并发；
 // 但**必须假设 body 已脱敏** —— 本函数不做脱敏，那是 sample 包的职责。
-// Body BLOBs are stored as v1 envelopes when a Cipher is configured.
+// Body BLOBs use independent Data Key envelopes when a Cipher is configured.
 // RespBodyFile（spill）按 sampleBlobChunk 分块加密写入，不把全文读进一个 []byte。
 func (s *Store) InsertSample(smp *model.Sample) error {
 	if smp != nil {
@@ -883,97 +883,12 @@ func decryptSampleBody(cipher *Cipher, raw []byte) ([]byte, error) {
 	return cipher.DecryptSampleBlob(raw)
 }
 
-// MigrateSampleEnvelopes rewrites legacy plaintext sample body BLOBs
-// (sample_request.in_body, sample_attempt.out_body/resp_body) into v1
-// envelopes in place. Rows are never deleted; already-enveloped fields are
-// left alone. Returns the number of Sample Groups that had at least one field
-// rewritten.
+// MigrateSampleEnvelopes upgrades legacy plaintext/v1/v1m bodies to Data Key
+// envelopes without treating a chunked ciphertext as plaintext. Already-current
+// bodies are authenticated and left byte-for-byte unchanged.
 func (s *Store) MigrateSampleEnvelopes() (int64, error) {
 	if s.cipher == nil {
-		return 0, fmt.Errorf("sample envelope migration requires Cipher")
+		return 0, ErrNoKey
 	}
-	touched := map[int64]struct{}{}
-
-	type reqRow struct {
-		id int64
-		in []byte
-	}
-	var reqTodo []reqRow
-	rows, err := s.db.Query(`SELECT id, in_body FROM sample_request`)
-	if err != nil {
-		return 0, err
-	}
-	for rows.Next() {
-		var r reqRow
-		if err := rows.Scan(&r.id, &r.in); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		if len(r.in) > 0 && !IsSampleEnvelope(r.in) {
-			reqTodo = append(reqTodo, r)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, err
-	}
-	rows.Close()
-	for _, r := range reqTodo {
-		in, err := s.cipher.EncryptSampleBlob(r.in)
-		if err != nil {
-			return int64(len(touched)), fmt.Errorf("encrypt sample %d in_body: %w", r.id, err)
-		}
-		if _, err := s.db.Exec(`UPDATE sample_request SET in_body=? WHERE id=?`, in, r.id); err != nil {
-			return int64(len(touched)), fmt.Errorf("update sample %d: %w", r.id, err)
-		}
-		touched[r.id] = struct{}{}
-	}
-
-	type attRow struct {
-		id, requestID  int64
-		out, resp      []byte
-		needOut, needR bool
-	}
-	var attTodo []attRow
-	rows, err = s.db.Query(`SELECT id, request_id, out_body, resp_body FROM sample_attempt`)
-	if err != nil {
-		return int64(len(touched)), err
-	}
-	for rows.Next() {
-		var r attRow
-		if err := rows.Scan(&r.id, &r.requestID, &r.out, &r.resp); err != nil {
-			rows.Close()
-			return int64(len(touched)), err
-		}
-		r.needOut = len(r.out) > 0 && !IsSampleEnvelope(r.out)
-		r.needR = len(r.resp) > 0 && !IsSampleEnvelope(r.resp)
-		if r.needOut || r.needR {
-			attTodo = append(attTodo, r)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return int64(len(touched)), err
-	}
-	rows.Close()
-	for _, r := range attTodo {
-		out, resp := r.out, r.resp
-		var err error
-		if r.needOut {
-			if out, err = s.cipher.EncryptSampleBlob(r.out); err != nil {
-				return int64(len(touched)), fmt.Errorf("encrypt sample attempt %d out_body: %w", r.id, err)
-			}
-		}
-		if r.needR {
-			if resp, err = s.cipher.EncryptSampleBlob(r.resp); err != nil {
-				return int64(len(touched)), fmt.Errorf("encrypt sample attempt %d resp_body: %w", r.id, err)
-			}
-		}
-		if _, err := s.db.Exec(`UPDATE sample_attempt SET out_body=?, resp_body=? WHERE id=?`,
-			out, resp, r.id); err != nil {
-			return int64(len(touched)), fmt.Errorf("update sample attempt %d: %w", r.id, err)
-		}
-		touched[r.requestID] = struct{}{}
-	}
-	return int64(len(touched)), nil
+	return s.migrateDataBodies()
 }

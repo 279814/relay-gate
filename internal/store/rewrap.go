@@ -1,11 +1,10 @@
 package store
 
 import (
-	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,11 +14,10 @@ import (
 
 // RewrapDirectSecrets re-encrypts Master-Key–sealed direct secrets under
 // newMaster in one SQLite transaction (§12.7 step 7): upstream api_key,
-// probe_secret, SMTP password, legacy_full_url, and enveloped sample body
-// BLOBs. Legacy plaintext sample rows are left untouched (dual-read). Does
-// not switch the live Cipher — caller ActivateMaster after Keyring
-// key_activated. Failed rewrap rolls back the TX so activation never leaves
-// half the samples on the old key.
+// probe_secret, SMTP password, legacy_full_url, and the two Data Key wrappers.
+// Sample/security body ciphertext stays byte-for-byte unchanged. The entire
+// state must decrypt with the pending master alone before the TX can commit.
+// The caller activates the live Cipher only after the Keyring advances.
 //
 // rotationID is written in the same TX (§12.7 step 7) so startup recovery can
 // tell "prepared, DB not committed" (abort) from "prepared, DB committed"
@@ -53,15 +51,66 @@ func (s *Store) RewrapDirectSecrets(newMaster, rotationID string) error {
 	if err := rewrapLegacyURLs(tx, s.cipher, newMaster); err != nil {
 		return fmt.Errorf("rewrap legacy_full_url: %w", err)
 	}
-	if err := rewrapSampleBodies(tx, s.cipher, newMaster); err != nil {
-		return fmt.Errorf("rewrap sample: %w", err)
+	if err := rewrapDataKeys(tx, s.cipher, newMaster); err != nil {
+		return fmt.Errorf("rewrap Data Key: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO setting (key, value, updated_at) VALUES (?,?,?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		keyMasterRotation, rotationID, nowMS()); err != nil {
 		return fmt.Errorf("rewrap rotation_id: %w", err)
 	}
+	pending, err := NewCipher(newMaster)
+	if err != nil {
+		return err
+	}
+	keys, err := readDataKeys(context.Background(), tx, pending)
+	if err != nil {
+		return err
+	}
+	pending.installDataKeys(keys)
+	if err := validateEncryptedState(context.Background(), tx, pending); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func rewrapDataKeys(tx *sql.Tx, current *Cipher, newMaster string) error {
+	rows, err := tx.Query(`SELECT purpose,wrapped_key FROM data_key ORDER BY purpose`)
+	if err != nil {
+		return err
+	}
+	type value struct{ purpose, wrapped string }
+	var values []value
+	for rows.Next() {
+		var v value
+		if err := rows.Scan(&v.purpose, &v.wrapped); err != nil {
+			rows.Close()
+			return err
+		}
+		values = append(values, v)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(values) != 2 {
+		return errors.New("Data Key 包装不完整")
+	}
+	for _, v := range values {
+		plain, err := current.DecryptEnvelope(v.wrapped)
+		if err != nil {
+			return err
+		}
+		wrapped, err := encryptEnvelopeUnder(newMaster, plain)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE data_key SET wrapped_key=? WHERE purpose=?`, wrapped, v.purpose); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const keyMasterRotation = "master_rotation_id"
@@ -251,162 +300,6 @@ func rewrapLegacyURLs(tx *sql.Tx, c *Cipher, newMaster string) error {
 		}
 	}
 	return nil
-}
-
-// rewrapSampleBodies reseals v1 sample body envelopes under newMaster.
-// Plaintext rows stay as-is so dual-read history is not corrupted.
-func rewrapSampleBodies(tx *sql.Tx, c *Cipher, newMaster string) error {
-	if err := rewrapSampleTable(tx, c, newMaster, "sample_request", "in_body"); err != nil {
-		return err
-	}
-	return rewrapSampleTable(tx, c, newMaster, "sample_attempt", "out_body", "resp_body")
-}
-
-// rewrapSampleTable reseals the named body columns of one sample table.
-// table/cols are code literals, never user input.
-func rewrapSampleTable(tx *sql.Tx, c *Cipher, newMaster, table string, cols ...string) error {
-	rows, err := tx.Query(`SELECT id, ` + strings.Join(cols, ", ") + ` FROM ` + table)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type row struct {
-		id     int64
-		fields [][]byte
-	}
-	var batch []row
-	for rows.Next() {
-		r := row{fields: make([][]byte, len(cols))}
-		dest := []any{&r.id}
-		for i := range r.fields {
-			dest = append(dest, &r.fields[i])
-		}
-		if err := rows.Scan(dest...); err != nil {
-			return err
-		}
-		batch = append(batch, r)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_ = rows.Close()
-	sets := make([]string, len(cols))
-	for i, col := range cols {
-		sets[i] = col + "=?"
-	}
-	update := `UPDATE ` + table + ` SET ` + strings.Join(sets, ", ") + ` WHERE id=?`
-	for _, r := range batch {
-		changed := false
-		args := make([]any, 0, len(cols)+1)
-		for i, raw := range r.fields {
-			neu, err := rewrapSampleField(c, newMaster, raw)
-			if err != nil {
-				return fmt.Errorf("%s id=%d %s: %w", table, r.id, cols[i], err)
-			}
-			if !bytes.Equal(neu, raw) {
-				changed = true
-			}
-			args = append(args, neu)
-		}
-		if !changed {
-			continue
-		}
-		if _, err := tx.Exec(update, append(args, r.id)...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// rewrapMultipartPlainPeak records the largest plaintext buffer held while
-// rewrapping one v1m frame. Tests assert it stays within a single frame.
-var rewrapMultipartPlainPeak int
-
-func rewrapSampleField(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
-	if len(raw) == 0 {
-		return raw, nil
-	}
-	if isSampleMultipart(raw) {
-		return rewrapSampleMultipart(c, newMaster, raw)
-	}
-	if !IsSampleEnvelope(raw) {
-		return raw, nil
-	}
-	plain, err := c.DecryptSampleBlob(raw)
-	if err != nil {
-		return nil, err
-	}
-	neu, err := encryptEnvelopeUnder(newMaster, string(plain))
-	if err != nil {
-		return nil, err
-	}
-	return []byte(neu), nil
-}
-
-// rewrapSampleMultipart reseals each v1m frame under newMaster without
-// assembling the whole plaintext into one slice (rotation must not spike to
-// the disk-quota size).
-func rewrapSampleMultipart(c *Cipher, newMaster string, raw []byte) ([]byte, error) {
-	rest := raw[len(sampleMultipartPrefix):]
-	colon := -1
-	for i := 0; i < len(rest); i++ {
-		if rest[i] == ':' {
-			colon = i
-			break
-		}
-	}
-	if colon < 0 || colon+1 >= len(rest) || rest[colon+1] != '\n' {
-		return nil, fmt.Errorf("分块样本信封格式无效")
-	}
-	payload := rest[colon+2:]
-
-	_, root, err := deriveMaster(newMaster)
-	if err != nil {
-		return nil, err
-	}
-
-	var out bytes.Buffer
-	out.Grow(len(raw) + 64)
-	if _, err := out.WriteString(sampleMultipartPrefix + keyIDOf(root) + ":\n"); err != nil {
-		return nil, err
-	}
-
-	var lenBuf [4]byte
-	peak := 0
-	for len(payload) > 0 {
-		if len(payload) < 4 {
-			return nil, fmt.Errorf("分块样本信封截断")
-		}
-		n := int(binary.BigEndian.Uint32(payload[:4]))
-		payload = payload[4:]
-		if n < 0 || n > len(payload) {
-			return nil, fmt.Errorf("分块样本信封长度无效")
-		}
-		frame := payload[:n]
-		payload = payload[n:]
-
-		plain, err := c.DecryptSampleBlob(frame)
-		if err != nil {
-			return nil, err
-		}
-		if len(plain) > peak {
-			peak = len(plain)
-		}
-		neu, err := encryptEnvelopeUnder(newMaster, string(plain))
-		if err != nil {
-			return nil, err
-		}
-		enc := []byte(neu)
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(enc)))
-		if _, err := out.Write(lenBuf[:]); err != nil {
-			return nil, err
-		}
-		if _, err := out.Write(enc); err != nil {
-			return nil, err
-		}
-	}
-	rewrapMultipartPlainPeak = peak
-	return out.Bytes(), nil
 }
 
 func encryptUnder(passphrase, plain string) (string, error) {

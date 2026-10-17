@@ -2,7 +2,7 @@
 # 部署清单的静态检查。不需要 Docker，因此能进 CI。
 #
 # 盯的是「一旦写错就有实际后果、但不会报错」的不变量：
-# HTTP IP:port 发布、无域名/ACME/登录 IP 白名单、凭据不进构建上下文、
+# 默认 HTTP IP:port 与独立公网 HTTPS 入口、凭据不进构建上下文、
 # ENTRYPOINT exec 形式、无 CGO、可选 .env 三项凭据。
 #
 # 跑法：sh scripts/check-deploy.sh
@@ -26,7 +26,7 @@ fail() {
 pass() { echo "  [PASS] $1"; }
 
 echo "=== 宿主机端口发布到所有接口（HTTP IP:port）==="
-# 支持的安装形态是 http://IP:port，不再绑 127.0.0.1 或经 Caddy/nginx。
+# 默认 compose.yaml 支持 HTTP IP:port；公网 HTTPS 使用独立 compose.public.yaml。
 if grep -qE '^[[:space:]]*-[[:space:]]*"\$\{RELAY_PORT:-[0-9]+\}:[0-9]+"' "$compose"; then
     pass '网关 ports 发布到所有接口（无 127.0.0.1 前缀）'
 else
@@ -38,7 +38,7 @@ else
     pass 'compose 未把端口限制在 127.0.0.1'
 fi
 
-echo "=== 已移除域名 / ACME / 登录 IP 白名单部署入口 ==="
+echo "=== 已移除旧域名 / 登录 IP 白名单部署入口 ==="
 if [ -e "$caddyfile" ]; then
     fail "仍存在 deploy/Caddyfile —— 旧域名/ACME 路径应已删除"
 else
@@ -62,7 +62,7 @@ fi
 if grep -qE 'profiles:[[:space:]]*\[["'"'"']public' "$compose" || grep -qE 'caddy:' "$compose"; then
     fail 'compose 仍含 public profile / caddy 服务'
 else
-    pass 'compose 仅单容器网关（无 Caddy）'
+    pass '默认 HTTP compose 仅单容器网关（公网入口另行编排）'
 fi
 
 echo "=== 优雅关闭的宽限期要大于进程自己的收尾时间 ==="
@@ -75,7 +75,7 @@ else
 fi
 
 echo "=== 构建上下文不含凭据 ==="
-for pat in 'data/' '.env' 'scripts/upstreams.tsv'; do
+for pat in 'data/' 'data-public/' '.env' 'scripts/upstreams.tsv'; do
     if sed 's/#.*//' "$dockerignore" | sed 's/[[:space:]]*$//' |
         grep -qxF "$pat"; then
         pass ".dockerignore 排除了 $pat"

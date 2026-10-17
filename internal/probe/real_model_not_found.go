@@ -1,13 +1,10 @@
 package probe
 
 import (
-	"bytes"
-	"encoding/json"
-	"strings"
 	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
@@ -20,7 +17,7 @@ import (
 // Forget, a late in-flight result must not ApplyCommitted onto a new Route that
 // reused the same numeric id (probe CommitProbeObservation uses RouteCreatedAt
 // for the same incarnation hole).
-func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res *proxy.ResultView) bool {
+func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res *health.ResultView) bool {
 	if r == nil || r.caps == nil || res == nil || routeID <= 0 {
 		return false
 	}
@@ -28,7 +25,7 @@ func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res
 		return false
 	}
 	// Transport / client errors are not model-not-found evidence.
-	if res.Err != nil && !proxy.IsUpstreamFault(res.Err) {
+	if res.Err != nil && !health.IsUpstreamFault(res.Err) {
 		return false
 	}
 	ct := ""
@@ -113,61 +110,26 @@ func (r *Reporter) applyRouteModelNotFound(routeID int64, endpoint model.Endpoin
 // gate as classifyReal's IsStructuredErrorPayload path — so assistant text
 // that merely mentions "model_not_found" never matches.
 func structuredRemoteErrorFromBody(body []byte, contentType string) ProtocolEvent {
-	if !proxy.IsStructuredErrorPayload(body, contentType) {
+	if len(body) == 0 || len(body) > 64<<10 {
 		return ProtocolEvent{}
 	}
-	raw := extractStructuredErrorJSON(body, contentType)
-	if len(raw) == 0 {
+	decoder, err := NewDecoder(DecoderSpec{Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, WireAuto, 64<<10, 64<<10)
+	if err != nil {
 		return ProtocolEvent{}
 	}
-	return remoteErrorEvent("", raw)
-}
-
-func extractStructuredErrorJSON(body []byte, contentType string) json.RawMessage {
-	payload := body
-	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
-		payload = firstSSEErrorData(body)
-		if len(payload) == 0 {
-			return nil
+	events, err := decoder.Feed(body)
+	if err != nil {
+		return ProtocolEvent{}
+	}
+	tail, err := decoder.Finish()
+	if err != nil {
+		return ProtocolEvent{}
+	}
+	events = append(events, tail...)
+	for _, event := range events {
+		if event.Kind == EventRemoteError {
+			return event
 		}
 	}
-	payload = bytes.TrimSpace(payload)
-	if len(payload) == 0 || payload[0] != '{' {
-		return nil
-	}
-	var top map[string]json.RawMessage
-	if json.Unmarshal(payload, &top) != nil {
-		return nil
-	}
-	// Decoder path: nested error object is the classification input.
-	if nested, ok := top["error"]; ok && len(bytes.TrimSpace(nested)) > 0 &&
-		!bytes.Equal(bytes.TrimSpace(nested), []byte("null")) {
-		trimmed := bytes.TrimSpace(nested)
-		if len(trimmed) > 0 && trimmed[0] == '{' {
-			return nested
-		}
-	}
-	return payload
-}
-
-func firstSSEErrorData(body []byte) []byte {
-	var curEvent []byte
-	for _, raw := range bytes.Split(body, []byte("\n")) {
-		line := bytes.TrimRight(raw, "\r")
-		switch {
-		case len(bytes.TrimSpace(line)) == 0:
-			curEvent = nil
-		case bytes.HasPrefix(line, []byte("event:")):
-			curEvent = bytes.TrimSpace(line[len("event:"):])
-		case bytes.HasPrefix(line, []byte("data:")):
-			data := bytes.TrimSpace(line[len("data:"):])
-			if bytes.Equal(curEvent, []byte("error")) {
-				return data
-			}
-			if proxy.IsStructuredErrorPayload(data, "application/json") {
-				return data
-			}
-		}
-	}
-	return nil
+	return ProtocolEvent{}
 }

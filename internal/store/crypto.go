@@ -21,13 +21,14 @@ import (
 // 选 GCM 而不是 CBC：GCM 自带完整性校验，密文被改过会解密失败而不是静默返回垃圾。
 // 若返回垃圾 key，症状是上游 401，你会以为是站挂了 —— 那种排查方向完全是错的。
 //
-// ActivateMaster 在 Master Key 轮换完成后就地切换 active；previous 仅用于解密
-// 轮换前写成的信封（§5.4：不重加密全部大样本）。加密始终只用 active。
+// ActivateMaster 在轮换时就地切换 active；previous 只在全量验证、最终清理前
+// 暂留旧 Master。样本与安全证据使用独立 Data Key，轮换不改正文密文。
 type Cipher struct {
 	mu       sync.RWMutex
 	aead     cipher.AEAD
 	rootKey  [sha256.Size]byte
 	previous []retiredMaster
+	dataKeys map[string]*dataCipher // immutable independent sample/security keys
 }
 
 type retiredMaster struct {

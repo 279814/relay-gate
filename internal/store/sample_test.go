@@ -846,12 +846,12 @@ func TestInsertSampleWithinQuota_SpillFileChunkedNoAssemble(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT resp_body FROM sample_attempt WHERE request_id=?`, s.ID).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	if !isSampleMultipart(raw) {
+	if !bytes.HasPrefix(raw, []byte("v2m:")) {
 		prefix := raw
 		if len(prefix) > 16 {
 			prefix = prefix[:16]
 		}
-		t.Fatalf("大于分块窗口的 spill 应存 v1m 分帧信封，got prefix %q", prefix)
+		t.Fatalf("大于分块窗口的 spill 应存 v2m 分帧信封，got prefix %q", prefix)
 	}
 
 	got, err := st.GetSample(s.ID)

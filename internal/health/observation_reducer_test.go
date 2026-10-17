@@ -7,6 +7,26 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
+func TestRealSuccess_UsesMonotonicCompletionTime(t *testing.T) {
+	reducer := NewObservationReducer(func() time.Time { return time.UnixMilli(9000) })
+	prior := &model.EndpointCapability{State: model.CapabilitySupported, LastRealOKAt: 4000, LastRealOKToken: "prior"}
+	row, err := reducer.ReduceCapability(prior, model.ProbeExecution{
+		Trigger: model.TriggerRealTraffic, Success: true, Capability: model.CapabilitySupported, CapabilityToken: "current", DoneAtMS: 3000,
+	}, model.CapabilityReductionPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.LastRealOKAt != 4000 || row.LastRealOKToken != "current" {
+		t.Fatalf("completion evidence not monotonic: %+v", row)
+	}
+	row, err = reducer.ReduceCapability(row, model.ProbeExecution{
+		Trigger: model.TriggerRealTraffic, Success: true, Capability: model.CapabilitySupported, CapabilityToken: "current", DoneAtMS: 5000,
+	}, model.CapabilityReductionPolicy{})
+	if err != nil || row.LastRealOKAt != 5000 {
+		t.Fatalf("used wall clock rather than completion: %+v err=%v", row, err)
+	}
+}
+
 func TestReduceReachability_HTTPResponseIsReachable(t *testing.T) {
 	reducer := NewObservationReducer(func() time.Time {
 		return time.UnixMilli(1_700_000_000_000)

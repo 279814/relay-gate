@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/279814/relay-gate/internal/edge"
 )
 
 // sessionCookie 是会话 Cookie 的名字。
-const sessionCookie = "relay_session"
+const sessionCookie = edge.SessionCookieName
 
 // sessionTTL 是会话有效期。
 //
@@ -34,7 +36,7 @@ const sessionTTL = 7 * 24 * time.Hour
 //
 // §12.9：「登录按来源 IP 和全局进行退避」。两边都计连续失败，任一侧
 // 超过阈值就延迟；换 IP 绕不过全局，单 IP 狂打也会被自己的桶挡住。
-// 来源 IP 取 TCP 对端（RemoteAddr 去端口），不读转发头。
+// 默认来源 IP 取 TCP 对端；只有显式可信 HTTPS 边缘验证后的 context 可覆盖。
 // loginIPFailCap 限制 per-IP map 体积；满了只忽略新 key，全局计数照常。
 const (
 	loginLockThreshold = 3
@@ -198,6 +200,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	peer := clientHost(r.RemoteAddr)
+	if forwarded, trusted := edge.ClientIP(r); trusted {
+		peer = forwarded
+	}
 
 	// 无可用凭据（无 env 明文且无 Argon2id 哈希）时无人能登录，理由同 bearerOK。
 	if !s.passwordOK(body.Password) {
@@ -207,7 +212,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.sessions.throttle(peer)
 		// 不区分「口令为空」与「口令错误」：两者都是没登录成功，
 		// 分开说等于告诉调用方「这次至少格式对了」。
-		s.log.Warn("管理界面登录失败", "remote", r.RemoteAddr)
+		s.log.Warn("管理界面登录失败", "remote", peer)
 		writeJSON(w, http.StatusUnauthorized, errBody{"口令错误"})
 		return
 	}
@@ -227,13 +232,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		// SameSite=Strict：跨站请求一律不带上它。管理接口全是状态变更操作，
 		// 没有任何需要跨站携带凭据的合理场景。
 		SameSite: http.SameSiteStrictMode,
-		// 不设 Secure：这个网关的默认监听地址是 127.0.0.1，本地 HTTP 访问
-		// 时带 Secure 的 Cookie 会被浏览器直接丢弃 —— 那会让本地部署
-		// （§8 明确的主路径）根本登不上。上公网时 TLS 由 M7 的反代终结，
-		// 届时应在反代上加 Secure。
+		// HTTP remains usable locally. Only actual TLS or authenticated edge
+		// metadata can mark the session secure; external XFP is never trusted.
+		Secure: edge.IsHTTPS(r),
 		MaxAge: int(sessionTTL.Seconds()),
 	})
-	s.log.Info("管理界面登录成功", "remote", r.RemoteAddr)
+	s.log.Info("管理界面登录成功", "remote", peer)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -244,7 +248,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	// MaxAge < 0 让浏览器立刻删掉它。
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: edge.IsHTTPS(r), MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

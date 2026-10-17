@@ -165,7 +165,7 @@ func TestSchemaSeven_MigratesLegacySampleAsSingleFinalAttempt(t *testing.T) {
 	if err := initializeEmptySchemaSix(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	encIn, err := cipher.EncryptSampleBlob([]byte(`{"model":"legacy-in"}`))
+	encIn, err := cipher.EncryptEnvelope(`{"model":"legacy-in"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestSchemaSeven_MigratesLegacySampleAsSingleFinalAttempt(t *testing.T) {
 	}
 	defer st.Close()
 	state, err := inspectSchemaState(context.Background(), st.db)
-	if err != nil || state.Version != 7 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("state=%+v err=%v", state, err)
 	}
 

@@ -1,6 +1,7 @@
 package sample
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -39,7 +40,7 @@ const pruneEvery = 50
 // 宁可丢样本，也绝不让「记日志」拖慢或拖垮转发。这是主次关系，不能倒置：
 // 一个丢掉的样本只是少一条诊断数据，一个被拖慢的请求是用户可感知的故障。
 type Recorder struct {
-	ch  chan *model.Sample
+	ch  chan sampleWrite
 	w   Writer
 	log *slog.Logger
 
@@ -61,6 +62,11 @@ type Recorder struct {
 	done     chan struct{}
 }
 
+type sampleWrite struct {
+	sample  *model.Sample
+	barrier chan struct{}
+}
+
 // RetentionSource 提供当前的保留策略。由 livecfg 实现（带 2s 缓存），
 // 所以每次清理时现读的代价可以忽略 —— 而清理本身每 50 条才跑一次。
 type RetentionSource interface {
@@ -79,7 +85,7 @@ func NewRecorder(w Writer, s model.Settings, retention RetentionSource,
 		size = 1
 	}
 	r := &Recorder{
-		ch:        make(chan *model.Sample, size),
+		ch:        make(chan sampleWrite, size),
 		w:         w,
 		log:       log,
 		retention: retention,
@@ -93,7 +99,7 @@ func NewRecorder(w Writer, s model.Settings, retention RetentionSource,
 // Record 非阻塞投递。队列满时丢弃并计数，**绝不阻塞调用方**。
 func (r *Recorder) Record(s *model.Sample) {
 	select {
-	case r.ch <- s:
+	case r.ch <- sampleWrite{sample: s}:
 	default:
 		if s != nil {
 			s.ReleaseTempFiles()
@@ -113,14 +119,47 @@ func (r *Recorder) Stats() (written, dropped int64) {
 	return r.written.Load(), r.dropped.Load()
 }
 
+// Flush waits for records admitted before this barrier. Proxy admission must
+// already be frozen by the caller. Record stays nonblocking while a barrier
+// waits on SQLite, and cancellation never starts another writer goroutine.
+func (r *Recorder) Flush(ctx context.Context) error {
+	barrier := make(chan struct{})
+	select {
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case r.ch <- sampleWrite{barrier: barrier}:
+	}
+	select {
+	case <-barrier:
+		return nil
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *Recorder) consume(value sampleWrite) bool {
+	if value.barrier != nil {
+		close(value.barrier)
+		return false
+	}
+	r.write(value.sample)
+	return true
+}
+
 func (r *Recorder) loop() {
 	defer close(r.done)
 	var since int
 	for {
 		select {
-		case s := <-r.ch:
-			r.write(s)
-			if since++; since >= pruneEvery {
+		case value := <-r.ch:
+			if r.consume(value) {
+				since++
+			}
+			if since >= pruneEvery {
 				since = 0
 				r.prune()
 			}
@@ -129,8 +168,8 @@ func (r *Recorder) loop() {
 			// 往往正是导致关闭的那次故障的现场。
 			for {
 				select {
-				case s := <-r.ch:
-					r.write(s)
+				case value := <-r.ch:
+					r.consume(value)
 				default:
 					r.prune()
 					return

@@ -2,10 +2,10 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,20 +37,24 @@ type RestoreResult struct {
 }
 
 type restoreIntent struct {
-	FormatVersion      int    `json:"format_version"`
-	Phase              string `json:"phase"`
-	DatabasePath       string `json:"database_path"`
-	ManifestPath       string `json:"manifest_path"`
-	BackupDatabasePath string `json:"backup_database_path"`
-	StagingPath        string `json:"staging_path"`
-	IsolationDirectory string `json:"isolation_directory"`
-	DatabaseSHA256     string `json:"database_sha256"`
-	DatabaseSize       int64  `json:"database_size"`
-	SourceSchema       int    `json:"source_schema"`
-	PairedBuildID      string `json:"paired_build_id"`
-	ReaderContract     string `json:"reader_contract"`
-	LegacyCipherID     string `json:"legacy_cipher_id"`
-	UpdatedAt          string `json:"updated_at"`
+	FormatVersion           int    `json:"format_version"`
+	Phase                   string `json:"phase"`
+	DatabasePath            string `json:"database_path"`
+	ManifestPath            string `json:"manifest_path"`
+	BackupDatabasePath      string `json:"backup_database_path"`
+	StagingPath             string `json:"staging_path"`
+	IsolationDirectory      string `json:"isolation_directory"`
+	DatabaseSHA256          string `json:"database_sha256"`
+	DatabaseSize            int64  `json:"database_size"`
+	SourceSchema            int    `json:"source_schema"`
+	PairedBuildID           string `json:"paired_build_id"`
+	ReaderContract          string `json:"reader_contract"`
+	LegacyCipherID          string `json:"legacy_cipher_id"`
+	UpdatedAt               string `json:"updated_at"`
+	SecretsStagingDirectory string `json:"secrets_staging_directory,omitempty"`
+	SecretsFile             string `json:"secrets_file,omitempty"`
+	SecretsSize             int64  `json:"secrets_size,omitempty"`
+	SecretsSHA256           string `json:"secrets_sha256,omitempty"`
 }
 
 // CheckBackup validates a migration backup without moving any files.
@@ -139,28 +143,44 @@ func RestoreDatabase(ctx context.Context, databasePath, manifestPath string, cip
 		_ = os.Remove(stagingPath)
 		return nil, err
 	}
-
-	intent := restoreIntent{
-		FormatVersion:      restoreIntentVersion,
-		Phase:              restorePhasePrepared,
-		DatabasePath:       absDB,
-		ManifestPath:       absManifest,
-		BackupDatabasePath: backupDB,
-		StagingPath:        stagingPath,
-		IsolationDirectory: isolationDir,
-		DatabaseSHA256:     manifest.DatabaseSHA256,
-		DatabaseSize:       manifest.DatabaseSize,
-		SourceSchema:       manifest.SourceSchema,
-		PairedBuildID:      manifest.PairedBuildID,
-		ReaderContract:     manifest.ReaderContract,
-		LegacyCipherID:     manifest.LegacyCipherID,
-		UpdatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if err := writeRestoreIntent(intentPath, intent); err != nil {
+	secretStage, err := stageBackupSecrets(filepath.Dir(absDB), filepath.Dir(absManifest), manifest)
+	if err != nil {
 		_ = os.Remove(stagingPath)
 		return nil, err
 	}
+
+	intent := restoreIntent{
+		FormatVersion:           restoreIntentVersion,
+		Phase:                   restorePhasePrepared,
+		DatabasePath:            absDB,
+		ManifestPath:            absManifest,
+		BackupDatabasePath:      backupDB,
+		StagingPath:             stagingPath,
+		IsolationDirectory:      isolationDir,
+		DatabaseSHA256:          manifest.DatabaseSHA256,
+		DatabaseSize:            manifest.DatabaseSize,
+		SourceSchema:            manifest.SourceSchema,
+		PairedBuildID:           manifest.PairedBuildID,
+		ReaderContract:          manifest.ReaderContract,
+		LegacyCipherID:          manifest.LegacyCipherID,
+		UpdatedAt:               time.Now().UTC().Format(time.RFC3339Nano),
+		SecretsStagingDirectory: secretStage,
+		SecretsFile:             manifest.SecretsFile, SecretsSize: manifest.SecretsSize, SecretsSHA256: manifest.SecretsSHA256,
+	}
+	if err := writeRestoreIntent(intentPath, intent); err != nil {
+		_ = os.Remove(stagingPath)
+		if secretStage != "" {
+			_ = os.RemoveAll(secretStage)
+		} // newly created private staging only
+		return nil, err
+	}
 	return resumeRestoreIntent(ctx, intentPath, cipher)
+}
+
+// ResumePendingRestore must run under the instance lock before bootstrap reads
+// or creates secrets/. Only verified restore artifacts are installed.
+func ResumePendingRestore(databasePath string) error {
+	return resumeIncompleteRestoreIfAny(context.Background(), databasePath, nil)
 }
 
 // resumeIncompleteRestoreIfAny continues a crash-interrupted restore before Open migrates.
@@ -298,7 +318,10 @@ func validateBackupPaths(databasePath, manifestPath string) (absDB, absManifest,
 	if m.DatabaseFile == "" || m.DatabaseSHA256 == "" || m.ReaderContract == "" || m.PairedBuildID == "" {
 		return "", "", "", nil, fmt.Errorf("%w: manifest 缺少必要字段", ErrRestoreRejected)
 	}
-	if m.SourceSchema < 0 || m.TargetSchema != m.SourceSchema+1 {
+	if m.SourceSchema == 8 && m.ReaderContract != "schema-8-data-key-v2-reader" {
+		return "", "", "", nil, fmt.Errorf("%w: schema 8 backup requires schema-8-data-key-v2-reader", ErrRestoreRejected)
+	}
+	if m.SourceSchema < 0 || (m.TargetSchema != m.SourceSchema+1 && !(m.SourceSchema == 8 && m.TargetSchema == 8 && m.SourceValidator == "schema-8-data-key-v2")) {
 		return "", "", "", nil, fmt.Errorf("%w: manifest schema 边界无效 source=%d target=%d", ErrRestoreRejected, m.SourceSchema, m.TargetSchema)
 	}
 	backupDB = filepath.Join(filepath.Dir(absManifest), filepath.Base(m.DatabaseFile))
@@ -308,6 +331,18 @@ func validateBackupPaths(databasePath, manifestPath string) (absDB, absManifest,
 	relDB, relDBErr := filepath.Rel(backupRoot, backupDB)
 	if relDBErr != nil || strings.HasPrefix(relDB, "..") {
 		return "", "", "", nil, fmt.Errorf("%w: backup 数据库必须位于 backups/ 子树", ErrRestoreRejected)
+	}
+	values, err := readBackupSecrets(filepath.Dir(absManifest), &m)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	}
+	// An archive that includes a keyring will replace the live credential root.
+	// Validate its stable active master even when the caller supplied a cipher;
+	// otherwise a decryptable DB could be installed with an unrelated keyring.
+	if _, present := values["keyring.json"]; present {
+		if _, err := cipherFromArchivedKeyring(values, &m); err != nil {
+			return "", "", "", nil, err
+		}
 	}
 	return absDB, absManifest, backupDB, &m, nil
 }
@@ -324,7 +359,14 @@ func verifyBackupEvidence(path string, manifest *BackupManifest) error {
 }
 
 func validateBackupDatabase(ctx context.Context, path string, cipher *Cipher, manifest *BackupManifest) error {
-	db, err := sql.Open("sqlite", path+connPragmas)
+	values, err := readBackupSecrets(filepath.Dir(path), manifest)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	}
+	if err := validateArchivedCredentials(values, cipher, manifest.SourceSchema); err != nil {
+		return err
+	}
+	db, err := openReadOnlySQLite(path)
 	if err != nil {
 		return fmt.Errorf("打开 backup 数据库: %w", err)
 	}
@@ -351,8 +393,23 @@ func validateBackupDatabase(ctx context.Context, path string, cipher *Cipher, ma
 	if manifest.SourceFingerprint != "" && state.Fingerprint != manifest.SourceFingerprint {
 		return fmt.Errorf("%w: backup fingerprint 与 manifest 不符", ErrRestoreRejected)
 	}
-	if err := validateLegacyUpstreamKeys(ctx, db, cipher); err != nil {
-		return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	if state.Version >= 8 {
+		validationCipher := cipher.cloneMasterCipher()
+		keys, err := readDataKeys(ctx, db, validationCipher)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
+		validationCipher.installDataKeys(keys)
+		if err := validateEncryptedState(ctx, db, validationCipher); err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
+	} else {
+		if err := validateDirectSecrets(ctx, db, cipher); err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
+		if err := validateLegacySampleBodies(ctx, db, cipher, state.Version); err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
 	}
 	return nil
 }
@@ -379,15 +436,46 @@ func isolateLiveDatabaseGroup(intent restoreIntent) error {
 			return fmt.Errorf("隔离 %s: %w", src, err)
 		}
 	}
+	if intent.SecretsStagingDirectory != "" {
+		source := filepath.Join(filepath.Dir(intent.DatabasePath), "secrets")
+		if _, err := os.Lstat(source); err == nil {
+			if err := rejectSymlinkOrReparse(source); err != nil {
+				return err
+			}
+			if err := os.Rename(source, filepath.Join(intent.IsolationDirectory, "secrets")); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return syncDirectory(filepath.Dir(intent.DatabasePath))
 }
 
 func installStagedDatabase(intent restoreIntent) error {
-	if _, err := os.Lstat(intent.StagingPath); err != nil {
-		return fmt.Errorf("staging 库缺失: %w", err)
+	if _, err := os.Lstat(intent.StagingPath); err == nil {
+		if err := os.Rename(intent.StagingPath, intent.DatabasePath); err != nil {
+			return fmt.Errorf("安装恢复库: %w", err)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		size, hash, evidenceErr := fileEvidence(intent.DatabasePath)
+		if evidenceErr != nil || size != intent.DatabaseSize || hash != intent.DatabaseSHA256 {
+			return fmt.Errorf("staging 库缺失且正式库不匹配")
+		}
+	} else {
+		return err
 	}
-	if err := os.Rename(intent.StagingPath, intent.DatabasePath); err != nil {
-		return fmt.Errorf("安装恢复库: %w", err)
+	if intent.SecretsStagingDirectory != "" {
+		if _, err := os.Lstat(intent.SecretsStagingDirectory); err == nil {
+			if err := os.Rename(intent.SecretsStagingDirectory, filepath.Join(filepath.Dir(intent.DatabasePath), "secrets")); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := verifyInstalledSecrets(intent); err != nil {
+			return err
+		}
 	}
 	return syncDirectory(filepath.Dir(intent.DatabasePath))
 }
@@ -411,6 +499,9 @@ func finalizeInstalledDatabase(intent restoreIntent) error {
 	if err := os.Chmod(intent.DatabasePath, 0o600); err != nil {
 		return err
 	}
+	if err := verifyInstalledSecrets(intent); err != nil {
+		return err
+	}
 	return syncDirectory(filepath.Dir(intent.DatabasePath))
 }
 
@@ -429,6 +520,22 @@ func loadRestoreIntent(path string) (restoreIntent, error) {
 	}
 	if intent.FormatVersion != restoreIntentVersion {
 		return restoreIntent{}, fmt.Errorf("不支持的 restore intent version=%d", intent.FormatVersion)
+	}
+	if intent.Phase != restorePhaseComplete {
+		dataDir := filepath.Dir(path)
+		if !filepath.IsAbs(intent.DatabasePath) || !sameFilesystemPath(filepath.Dir(intent.DatabasePath), dataDir) || !sameFilesystemPath(intent.StagingPath, intent.DatabasePath+".restore-staging") || !sameFilesystemPath(filepath.Dir(intent.IsolationDirectory), dataDir) || !strings.HasPrefix(filepath.Base(intent.IsolationDirectory), "isolated-") {
+			return restoreIntent{}, fmt.Errorf("%w: restore intent 路径身份无效", ErrRestoreRejected)
+		}
+		if intent.SecretsStagingDirectory != "" && (!sameFilesystemPath(filepath.Dir(intent.SecretsStagingDirectory), dataDir) || !strings.HasPrefix(filepath.Base(intent.SecretsStagingDirectory), ".secrets-restore-")) {
+			return restoreIntent{}, fmt.Errorf("%w: restore secrets staging 路径无效", ErrRestoreRejected)
+		}
+		_, _, backupDB, m, err := validateBackupPaths(intent.DatabasePath, intent.ManifestPath)
+		if err != nil {
+			return restoreIntent{}, err
+		}
+		if !sameFilesystemPath(backupDB, intent.BackupDatabasePath) || m.DatabaseSHA256 != intent.DatabaseSHA256 || m.DatabaseSize != intent.DatabaseSize || m.SourceSchema != intent.SourceSchema || m.PairedBuildID != intent.PairedBuildID || m.ReaderContract != intent.ReaderContract || m.LegacyCipherID != intent.LegacyCipherID || m.SecretsFile != intent.SecretsFile || m.SecretsSize != intent.SecretsSize || m.SecretsSHA256 != intent.SecretsSHA256 {
+			return restoreIntent{}, fmt.Errorf("%w: restore intent 与配对 manifest 不匹配", ErrRestoreRejected)
+		}
 	}
 	return intent, nil
 }
@@ -491,11 +598,36 @@ func rejectSymlinkOrReparse(path string) error {
 }
 
 func copyFileRestricted(src, dst string) error {
-	content, err := os.ReadFile(src)
+	source, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return writeSyncedFile(dst, content, 0o600)
+	defer source.Close()
+	target, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		target.Close()
+		if !ok {
+			os.Remove(dst)
+		}
+	}()
+	if _, err := io.Copy(target, source); err != nil {
+		return err
+	}
+	if err := target.Sync(); err != nil {
+		return err
+	}
+	if err := target.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(dst, 0600); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 func removeIfExists(path string) error {

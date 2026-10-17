@@ -147,6 +147,15 @@ func l1IntervalFor(rs *routeState, s model.Settings, now time.Time) time.Duratio
 // 跳过时同样要推进 nextL2At，否则下个 tick 会立刻再判一次 —— 那样
 // piggyback 就从「省一次探活」变成了「每个 tick 都白跑一遍判定逻辑」。
 func (t *Tracker) ClaimL2(routeID int64) (generation uint64, ok bool) {
+	return t.claimL2(routeID, true)
+}
+
+// ClaimL2WithoutPiggyback leaves token-aware suppression to Scheduler.
+func (t *Tracker) ClaimL2WithoutPiggyback(routeID int64) (uint64, bool) {
+	return t.claimL2(routeID, false)
+}
+
+func (t *Tracker) claimL2(routeID int64, legacyPiggyback bool) (generation uint64, ok bool) {
 	s := t.currentSettings()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -167,7 +176,7 @@ func (t *Tracker) ClaimL2(routeID int64) (generation uint64, ok bool) {
 	// Tracker 侧 piggyback 仅按时间窗粗判；P0-12 Scheduler 以
 	// LastRealOKToken == current SemanticRevision 为权威跳过条件。
 	// 这里保留时间窗以避免无 Scheduler 装配时的旧路径空转。
-	if s.PiggybackEnabled && rs.state != model.StateDead && !rs.lastRealOKAt.IsZero() {
+	if legacyPiggyback && s.PiggybackEnabled && rs.state != model.StateDead && !rs.lastRealOKAt.IsZero() {
 		if now.Sub(rs.lastRealOKAt) < l2 {
 			rs.nextL2At = rs.lastRealOKAt.Add(l2)
 			return 0, false
@@ -176,6 +185,17 @@ func (t *Tracker) ClaimL2(routeID int64) (generation uint64, ok bool) {
 
 	rs.nextL2At = now.Add(l2)
 	return rs.generation, true
+}
+
+func (t *Tracker) DeferL2Until(routeID int64, generation uint64, until time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rs := t.state[routeID]
+	if rs == nil || rs.generation != generation {
+		return false
+	}
+	rs.nextL2At = until
+	return true
 }
 
 // TriggerL2 清掉 L2 的预占，让下一个 tick 立刻探它（§4.4b / §4.5）。

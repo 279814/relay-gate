@@ -13,6 +13,7 @@ package probe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,7 +48,8 @@ type preparedProbe struct {
 	// 而用户之后把 l1_path 改回 /v1/models 时只有 url_override 被重译，
 	// 那份不可变的配方仍是 HEAD。于是「看方法」会让这个站的 L1 对 500 判通，
 	// 站级门禁放行、L2 继续往一个已死的站上烧 token，而界面显示健康。
-	connectionOnly bool
+	connectionOnly   bool
+	outputTokenLimit int
 }
 
 // prepare 解析并渲染出一次探活请求。
@@ -165,20 +167,20 @@ func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *mode
 	request.ContentLength = int64(len(rendered.Body))
 
 	return &preparedProbe{
-		recipe:          resolved,
-		request:         request,
-		resolvedURLHash: target.ResolvedURLHash,
-		requestURLHash:  target.RequestURLHash,
-		connectionOnly:  connectionOnly,
+		recipe:           resolved,
+		request:          request,
+		resolvedURLHash:  target.ResolvedURLHash,
+		requestURLHash:   target.RequestURLHash,
+		connectionOnly:   connectionOnly,
+		outputTokenLimit: ProbeRequestOutputTokenLimit(rendered.Body),
 	}, resolved, nil
 }
 
 // estimatedTokens 是这次探活的估算 token 上界（§5.2d）。
 //
 // 命中内置层时用 manifest 的声明值：那是这份模板的作者按它实际的 body 写的，
-// 比在这里数一遍字节更准。其余三层回落到按 ModelName 粗算 —— 用户配的 recipe
-// 里没有「预计多少 token」这一项，而要求他填一个会让创建 recipe 多一道
-// 没人能填准的坎（P0-14 的 API 层若加上这一项，这里跟着改）。
+// 比在这里数一遍字节更准。其余三层使用已渲染请求的输出上限，至少为
+// ModelName 配置值；输入仍按 probe prompt 和协议固定开销粗算。
 //
 // mn 为 nil（L1）时回 0：models 端点零 token。
 func (prepared *preparedProbe) estimatedTokens(mn *model.ModelName) int {
@@ -191,7 +193,41 @@ func (prepared *preparedProbe) estimatedTokens(mn *model.ModelName) int {
 	if mn == nil {
 		return 0
 	}
-	return estimateL2Tokens(mn)
+	copy := *mn
+	if prepared.outputTokenLimit > copy.ProbeMaxTokens {
+		copy.ProbeMaxTokens = prepared.outputTokenLimit
+	}
+	return estimateL2Tokens(&copy)
+}
+
+// ProbeRequestOutputTokenLimit reads the rendered output bound for cost previews
+// and execution. Multiple protocol aliases use the largest declared limit.
+func ProbeRequestOutputTokenLimit(body []byte) int {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil {
+		return 0
+	}
+	limit := 0
+	for _, name := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens"} {
+		var number json.Number
+		if json.Unmarshal(fields[name], &number) != nil {
+			continue
+		}
+		value, err := number.Float64()
+		if err != nil || value <= 0 {
+			continue
+		}
+		// Leave room for prompt/overhead arithmetic even for an unreasonable
+		// custom template. Ordinary API limits are far below this bound.
+		ceiling := int(^uint(0)>>1) / 4
+		if value >= float64(ceiling) {
+			return ceiling
+		}
+		if int(value) > limit {
+			limit = int(value)
+		}
+	}
+	return limit
 }
 
 // newProbeRequest 包一层只为处理「没有 body 时必须传 nil」。

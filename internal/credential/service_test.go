@@ -415,15 +415,26 @@ func TestResealActiveRelayUnder_BeforeActivateSurvivesRecovery(t *testing.T) {
 	}
 	// Crash window: db_committed, then RecoverUnfinished → ActivatePending
 	// drops old active. Persisted relay must already be under new.
-	hold, st, err := kr.RecoverUnfinished()
+	hold, st, err := kr.RecoverUnfinishedValidated(rid, func(master string) error {
+		candidate, err := store.NewCipher(master)
+		if err != nil {
+			return err
+		}
+		persisted, err := LoadPersistedFile(dir)
+		if err != nil {
+			return err
+		}
+		_, err = OpenPersistedRelayKey(persisted.RelayKey, candidate)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hold {
 		t.Fatalf("recovery hold=%v status=%+v", hold, st)
 	}
-	if st.Phase != keyring.PhaseKeyActivated {
-		t.Fatalf("db_committed recovery must activate forward, phase=%q", st.Phase)
+	if st.Phase != keyring.PhaseCleaned {
+		t.Fatalf("verified db_committed recovery must finish forward, phase=%q", st.Phase)
 	}
 	kid, active, err := kr.LoadActive()
 	if err != nil {

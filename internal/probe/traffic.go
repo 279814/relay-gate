@@ -27,19 +27,28 @@ const (
 
 // TrafficObserverManager 是进程级真实流量旁路限流与持久化入口。
 type TrafficObserverManager struct {
-	cfg    ProbeSnapshotSource
-	seq    *observationseq.Sequencer
-	record ExecutionRecorder
-	sched  interface {
+	cfg            ProbeSnapshotSource
+	seq            *observationseq.Sequencer
+	record         ExecutionRecorder
+	tracker        Tracker
+	learner        *Learner
+	piggybackStore CostDailyStore
+	sched          interface {
 		ObserveRealSuccess(key ScheduleKey, observedAt time.Time)
 	}
 	log *slog.Logger
 
-	leases    chan struct{}
-	copyBytes atomic.Int64
-	queue     chan *model.ProbeObservation
-	stop      chan struct{}
-	wg        sync.WaitGroup
+	leases               chan struct{}
+	copyBytes            atomic.Int64
+	queue                chan trafficWrite
+	stop                 chan struct{}
+	observerMu           sync.Mutex
+	active               map[*trafficObserver]struct{}
+	workersIdle          chan struct{}
+	stopOnce             sync.Once
+	stopping, runStarted bool
+	runCancel            context.CancelFunc
+	runDone              chan struct{}
 
 	capacityDrops  atomic.Uint64
 	persistDrops   atomic.Uint64
@@ -58,19 +67,66 @@ func NewTrafficObserverManager(
 		log = slog.Default()
 	}
 	m := &TrafficObserverManager{
-		cfg:       cfg,
-		seq:       seq,
-		record:    record,
-		log:       log,
-		leases:    make(chan struct{}, fullObserverLeases),
-		queue:     make(chan *model.ProbeObservation, persistQueueCap),
-		stop:      make(chan struct{}),
-		startedAt: time.Now(),
+		cfg:         cfg,
+		seq:         seq,
+		record:      record,
+		log:         log,
+		leases:      make(chan struct{}, fullObserverLeases),
+		queue:       make(chan trafficWrite, persistQueueCap),
+		stop:        make(chan struct{}),
+		startedAt:   time.Now(),
+		active:      make(map[*trafficObserver]struct{}),
+		workersIdle: make(chan struct{}),
+		runDone:     make(chan struct{}),
 	}
+	close(m.workersIdle)
 	for i := 0; i < fullObserverLeases; i++ {
 		m.leases <- struct{}{}
 	}
 	return m
+}
+
+type trafficWrite struct {
+	observation *model.ProbeObservation
+	target      health.AttemptTarget
+	finish      health.AttemptFinish
+	barrier     chan error
+	shape       model.ClientRequestShape
+	piggyback   *model.ProbeCostDaily
+	eventID     string
+}
+
+func (m *TrafficObserverManager) WithHealthTracker(tracker Tracker) *TrafficObserverManager {
+	m.tracker = tracker
+	return m
+}
+
+func (m *TrafficObserverManager) WithLearner(learner *Learner) *TrafficObserverManager {
+	m.learner = learner
+	return m
+}
+
+func (m *TrafficObserverManager) WithPiggybackStore(store CostDailyStore) *TrafficObserverManager {
+	m.piggybackStore = store
+	return m
+}
+
+func (m *TrafficObserverManager) RecordPiggybackSkip(eventID string, value model.ProbeCostDaily) bool {
+	if m.piggybackStore == nil {
+		return false
+	}
+	select {
+	case <-m.stop:
+		return false
+	default:
+	}
+	select {
+	case m.queue <- trafficWrite{eventID: eventID, piggyback: &value}:
+		return true
+	default:
+		m.persistDrops.Add(1)
+		return false
+	}
 }
 
 // WithScheduler 注入 piggyback 通知面。
@@ -83,29 +139,30 @@ func (m *TrafficObserverManager) WithScheduler(s interface {
 
 // Run 启动 persistence worker；ctx 取消时有界 drain。
 func (m *TrafficObserverManager) Run(ctx context.Context) {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				m.drainPersist(ctx)
-				return
-			case <-m.stop:
-				m.drainPersist(ctx)
-				return
-			case item := <-m.queue:
-				m.persistOne(ctx, item)
-			}
-		}
-	}()
-	<-ctx.Done()
-	select {
-	case <-m.stop:
-	default:
-		close(m.stop)
+	m.observerMu.Lock()
+	if m.runStarted {
+		m.observerMu.Unlock()
+		return
 	}
-	m.wg.Wait()
+	m.runStarted = true
+	workerCtx, cancel := context.WithCancel(ctx)
+	m.runCancel = cancel
+	if m.stopping {
+		cancel()
+	}
+	m.observerMu.Unlock()
+	defer close(m.runDone)
+	defer cancel()
+	for {
+		select {
+		case <-workerCtx.Done():
+			m.stopObservers()
+			m.drainPersist(workerCtx)
+			return
+		case item := <-m.queue:
+			m.persistOne(workerCtx, item)
+		}
+	}
 }
 
 func (m *TrafficObserverManager) drainPersist(ctx context.Context) {
@@ -122,23 +179,75 @@ func (m *TrafficObserverManager) drainPersist(ctx context.Context) {
 	}
 }
 
-func (m *TrafficObserverManager) persistOne(ctx context.Context, item *model.ProbeObservation) {
-	if m.record == nil || item == nil {
+func (m *TrafficObserverManager) persistOne(ctx context.Context, item trafficWrite) {
+	defer func() {
+		if recover() != nil {
+			m.persistDrops.Add(1)
+			m.log.Warn("真实流量观察后台回调失败")
+		}
+	}()
+	if item.barrier != nil {
+		item.barrier <- nil
 		return
 	}
-	if _, err := m.record.Record(ctx, item); err != nil {
+	if item.piggyback != nil {
+		if err := m.piggybackStore.RecordProbePiggybackSaving(ctx, item.eventID, *item.piggyback); err != nil {
+			m.persistDrops.Add(1)
+			m.log.Warn("真实成功节省成本记录失败")
+		}
+		return
+	}
+	if m.record == nil || item.observation == nil {
+		return
+	}
+	result, err := m.record.Record(ctx, item.observation)
+	if err != nil {
+		m.persistDrops.Add(1)
 		m.log.Warn("真实流量观察落库失败", "err", err)
+		return
+	}
+	m.applyHealth(item, result)
+	if m.learner != nil && item.observation.Execution.Success && item.observation.Execution.RealRequestShapeLearnable &&
+		result.Capability == model.ApplyCurrent && result.CommittedCapability != nil && result.CommittedCapability.State == model.CapabilitySupported {
+		if err := m.learner.ObserveSuccessful(ctx, item.observation.Execution.UpstreamID, item.observation.Execution.Endpoint, item.shape); err != nil {
+			m.candidateDrops.Add(1)
+			m.log.Warn("真实流量候选学习未保存")
+		}
 	}
 }
 
 // Close 停止接收。
 func (m *TrafficObserverManager) Close() {
-	select {
-	case <-m.stop:
-	default:
-		close(m.stop)
+	m.stopObservers()
+	m.observerMu.Lock()
+	running := m.runStarted
+	m.observerMu.Unlock()
+	if running {
+		<-m.runDone
 	}
-	m.wg.Wait()
+}
+
+func (m *TrafficObserverManager) stopObservers() {
+	m.observerMu.Lock()
+	m.stopping = true
+	m.stopOnce.Do(func() { close(m.stop) })
+	cancel := m.runCancel
+	observers := make([]*trafficObserver, 0, len(m.active))
+	for observer := range m.active {
+		observers = append(observers, observer)
+	}
+	idle := m.workersIdle
+	m.observerMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	for _, observer := range observers {
+		observer.Finish(health.AttemptFinish{ServiceCanceled: true})
+	}
+	select {
+	case <-idle:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 // Stats 返回 since-start 诊断（不含请求数据）。
@@ -161,6 +270,11 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 	_ = request
 	if m == nil {
 		return health.NoopInstrumentation()
+	}
+	select {
+	case <-m.stop:
+		return health.NoopInstrumentation()
+	default:
 	}
 	var snap *livecfg.ProbeSnapshot
 	var err error
@@ -188,6 +302,10 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 	}
 
 	trace := &outbound.AttemptTrace{}
+	capability := prepareCapabilityTraffic(ctx, snap, target, order)
+	if capability == nil {
+		return health.NoopInstrumentation()
+	}
 	full := false
 	select {
 	case <-m.leases:
@@ -204,10 +322,23 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 		full:       full,
 		queue:      make(chan trafficEvent, perAttemptQueue),
 		stop:       make(chan struct{}),
-		capability: prepareCapabilityTraffic(ctx, snap, target, order),
+		capability: capability,
+	}
+	if len(request.Body) > 0 || len(request.Header) > 0 {
+		obs.TryRequest(request)
 	}
 	if full {
-		obs.wg.Add(1)
+		m.observerMu.Lock()
+		if m.stopping {
+			m.observerMu.Unlock()
+			m.leases <- struct{}{}
+			return health.NoopInstrumentation()
+		}
+		if len(m.active) == 0 {
+			m.workersIdle = make(chan struct{})
+		}
+		m.active[obs] = struct{}{}
+		m.observerMu.Unlock()
 		go obs.worker()
 	}
 	return health.AttemptInstrumentation{
@@ -233,17 +364,18 @@ type trafficObserver struct {
 	full       bool
 	capability *capabilityTraffic
 
-	mu         sync.Mutex
-	incomplete string
-	status     int
-	header     http.Header
-	finished   bool
-	copyUsed   int64
-	finishView health.AttemptFinish
+	mu          sync.Mutex
+	incomplete  model.ObserverIncompleteReason
+	status      int
+	header      http.Header
+	finished    bool
+	copyUsed    int64
+	wireBytes   int64
+	firstByteAt time.Time
+	finishView  health.AttemptFinish
 
 	queue chan trafficEvent
 	stop  chan struct{}
-	wg    sync.WaitGroup
 }
 
 func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Time) bool {
@@ -253,11 +385,29 @@ func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Tim
 		return false
 	}
 	o.status = status
-	if header != nil {
-		o.header = header.Clone()
-	}
 	if o.trace != nil {
 		o.trace.MarkResponseHeader(at)
+	}
+	bytes, valuesCount := 0, 0
+	for name, values := range header {
+		bytes += len(name)
+		if bytes > 16<<10 {
+			o.incomplete = model.ObserverInputLimit
+			o.m.capacityDrops.Add(1)
+			return false
+		}
+		for _, value := range values {
+			bytes += len(value)
+			valuesCount++
+			if bytes > 16<<10 || valuesCount > 128 {
+				o.incomplete = model.ObserverInputLimit
+				o.m.capacityDrops.Add(1)
+				return false
+			}
+		}
+	}
+	if header != nil {
+		o.header = header.Clone()
 	}
 	if !o.full {
 		return true
@@ -265,7 +415,7 @@ func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Tim
 	select {
 	case o.queue <- trafficEvent{kind: "headers", status: status, header: o.header, at: at}:
 	default:
-		o.incomplete = "observer_incomplete"
+		o.incomplete = model.ObserverQueueFull
 	}
 	return true
 }
@@ -273,18 +423,25 @@ func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Tim
 func (o *trafficObserver) TryChunk(chunk []byte, at time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.finished || o.incomplete != "" || !o.full || len(chunk) == 0 {
+	if o.finished || len(chunk) == 0 {
 		return false
 	}
 	n := len(chunk)
+	o.wireBytes += int64(n)
+	if o.firstByteAt.IsZero() {
+		o.firstByteAt = at
+	}
+	if o.incomplete != "" || !o.full {
+		return false
+	}
 	if o.copyUsed+int64(n) > perAttemptCopyBudget {
-		o.incomplete = "observer_incomplete"
+		o.incomplete = model.ObserverInputLimit
 		return false
 	}
 	for {
 		cur := o.m.copyBytes.Load()
 		if cur+int64(n) > globalCopyBudget {
-			o.incomplete = "observer_incomplete"
+			o.incomplete = model.ObserverCapacity
 			o.m.capacityDrops.Add(1)
 			return false
 		}
@@ -301,7 +458,7 @@ func (o *trafficObserver) TryChunk(chunk []byte, at time.Time) bool {
 	default:
 		o.m.copyBytes.Add(-int64(n))
 		o.copyUsed -= int64(n)
-		o.incomplete = "observer_incomplete"
+		o.incomplete = model.ObserverQueueFull
 		return false
 	}
 }
@@ -314,8 +471,6 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 	}
 	o.finished = true
 	o.finishView = v
-	status := o.status
-	incomplete := o.incomplete
 	full := o.full
 	o.mu.Unlock()
 
@@ -323,58 +478,8 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 		o.trace.MarkDone(time.Now())
 	}
 	close(o.stop)
-	if o.capability != nil {
-		if !full {
-			o.queueCapabilityObservation()
-		}
-		return // the existing worker drains and queues without delaying forwarding
-	}
-	if full {
-		o.wg.Wait()
-		select {
-		case o.m.leases <- struct{}{}:
-		default:
-		}
-	}
-
-	snap := o.trace.Snapshot()
-	exec := model.ProbeExecution{
-		ObservationOrder:      o.order,
-		Trigger:               model.TriggerRealTraffic,
-		UpstreamID:            o.target.UpstreamID,
-		RouteID:               o.target.RouteID,
-		Endpoint:              o.target.Endpoint,
-		EndpointID:            o.target.Config.EndpointID,
-		StatusCode:            status,
-		ResolvedURLHash:       o.target.Config.ResolvedURLHash,
-		SentAtMS:              msOrZero(snap.SentAt),
-		GotConnAtMS:           msOrZero(snap.GotConnAt),
-		ResponseHeaderAtMS:    msOrZero(snap.ResponseHeaderAt),
-		DoneAtMS:              msOrZero(snap.DoneAt),
-		TLSHandshakeStartAtMS: msOrZero(snap.TLSStartAt),
-		TLSHandshakeDoneAtMS:  msOrZero(snap.TLSDoneAt),
-	}
-	if incomplete != "" {
-		exec.ObserverIncomplete = true
-		exec.ErrorClass = model.ErrorIgnored
-		exec.RedactedDetail = incomplete
-	}
-	if v.ClientCanceled || v.ServiceCanceled {
-		exec.ErrorClass = model.ErrorIgnored
-	}
-	// §6.8 / §8.12：旁路观察器当前不解析 body（TryChunk 未接线），不得仅凭
-	// 2xx 置 Success 或调用 ObserveRealSuccess —— 否则 `{"type":"error"}`
-	// 会把 Route 拉活并 piggyback 掉合成 L2。真实成功由 ReportResult →
-	// classifyReal → VerdictOK 写入 lastRealOKAt（§8.10）。
-	if status > 0 && exec.ErrorClass == "" {
-		exec.Reachable = true
-	}
-
-	obs := &model.ProbeObservation{Execution: exec}
-	select {
-	case o.m.queue <- obs:
-	default:
-		o.m.persistDrops.Add(1)
+	if !full {
+		o.queueCapabilityObservation()
 	}
 }
 
@@ -386,33 +491,62 @@ func msOrZero(t time.Time) int64 {
 }
 
 func (o *trafficObserver) worker() {
-	defer o.wg.Done()
-	if o.capability != nil {
-		defer func() {
-			o.m.leases <- struct{}{}
-			o.queueCapabilityObservation()
-		}()
-	}
+	defer func() {
+		o.m.observerMu.Lock()
+		delete(o.m.active, o)
+		if len(o.m.active) == 0 {
+			close(o.m.workersIdle)
+		}
+		o.m.observerMu.Unlock()
+	}()
+	defer func() {
+		if recover() != nil {
+			o.mu.Lock()
+			o.incomplete = model.ObserverPanic
+			o.mu.Unlock()
+			o.capability.decodeErr = errTrafficObserverPanic
+		}
+		<-o.stop
+		for {
+			select {
+			case event := <-o.queue:
+				if len(event.chunk) > 0 {
+					o.m.copyBytes.Add(-int64(len(event.chunk)))
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+		o.m.leases <- struct{}{}
+		o.queueCapabilityObservation()
+	}()
 	for {
 		select {
 		case <-o.stop:
 			for {
 				select {
 				case ev := <-o.queue:
-					o.capability.consume(ev)
-					if len(ev.chunk) > 0 {
-						o.m.copyBytes.Add(-int64(len(ev.chunk)))
-					}
+					o.consume(ev)
 				default:
 					return
 				}
 			}
 		case ev := <-o.queue:
-			o.capability.consume(ev)
-			if len(ev.chunk) > 0 {
-				o.m.copyBytes.Add(-int64(len(ev.chunk)))
-			}
+			o.consume(ev)
 		}
+	}
+}
+
+func (o *trafficObserver) consume(event trafficEvent) {
+	defer func() {
+		if len(event.chunk) > 0 {
+			o.m.copyBytes.Add(-int64(len(event.chunk)))
+		}
+	}()
+	o.capability.consume(event)
+	if event.kind == "headers" && o.capability.decodeErr == nil && o.capability.encoding != "" && o.capability.encoding != "identity" {
+		o.decodeCompressed()
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
-	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/sample"
 )
 
@@ -117,10 +116,10 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	if err != nil {
 		// 不包装 RoundTrip 原文（含 ctx 到期分支）：*url.Error 含完整请求 URL（可带 query Secret），
 		// 会经 Scheduler「上游 L1 失败」日志与 route_health.last_error 外泄。
-		if out, ok := ctxOutcome(ctx, proxy.ErrConnect); ok {
+		if out, ok := ctxOutcome(ctx, health.ErrConnect); ok {
 			return out
 		}
-		return Outcome{Verdict: health.VerdictUnavailable, Err: proxy.ErrConnect}
+		return Outcome{Verdict: health.VerdictUnavailable, Err: health.ErrConnect}
 	}
 	defer resp.Body.Close()
 
@@ -201,17 +200,17 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		headerTimer.Stop()
 		headerCancel()
 		// 同 L1：ctx 到期分支也不带 RoundTrip 原文。
-		if out, ok := ctxOutcome(ctx, proxy.ErrConnect); ok {
+		if out, ok := ctxOutcome(ctx, health.ErrConnect); ok {
 			return out
 		}
 		// headerCtx 到期但外层 ctx 还没到 —— 是首 Token 超时，算上游的账。
 		if headerCtx.Err() != nil {
 			return Outcome{Verdict: health.VerdictUnavailable,
 				Err: fmt.Errorf("%w: 响应头超过 %ds 未返回",
-					proxy.ErrFirstTokenTimeout, s.L2FirstTokenSec)}
+					health.ErrFirstTokenTimeout, s.L2FirstTokenSec)}
 		}
 		// 同 L1：不包装 RoundTrip 原文，避免 URL / query Secret 进日志与 last_error。
-		return Outcome{Verdict: health.VerdictUnavailable, Err: proxy.ErrConnect}
+		return Outcome{Verdict: health.VerdictUnavailable, Err: health.ErrConnect}
 	}
 	// 判定一出就关流，停止消耗上游 token（§4.1）。cancel 也要调 ——
 	// 只 Close 不 cancel 会让 headerCtx 泄漏到 GC 才回收。
@@ -263,14 +262,14 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 			return Outcome{
 				Verdict: health.VerdictUnavailable,
 				Err: fmt.Errorf("%w: 响应头已返回但 %ds 内无有效内容",
-					proxy.ErrFirstTokenTimeout, s.L2FirstTokenSec),
+					health.ErrFirstTokenTimeout, s.L2FirstTokenSec),
 				TTFT:   ttft,
 				Status: resp.StatusCode,
 			}
 		}
 		return Outcome{
 			Verdict: health.VerdictUnavailable,
-			Err:     fmt.Errorf("%w: %v", proxy.ErrStreamBroke, sr.scanErr),
+			Err:     fmt.Errorf("%w: %v", health.ErrStreamBroke, sr.scanErr),
 			TTFT:    ttft,
 			Status:  resp.StatusCode,
 		}

@@ -106,7 +106,7 @@ func TestCapabilityTraffic_PrepareAndFinishDoNotWaitForDatabase(t *testing.T) {
 	conn.Close()
 	select {
 	case observation := <-h.manager.queue:
-		if _, err := h.manager.record.Record(context.Background(), observation); err != nil {
+		if _, err := h.manager.record.Record(context.Background(), observation.observation); err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):

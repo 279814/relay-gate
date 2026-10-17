@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/279814/relay-gate/internal/credential"
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
@@ -20,12 +24,42 @@ func (s *Server) WithCredentials(cred *credential.Service, keys *keyring.File) *
 	return s
 }
 
+// WithRotationQuiescer connects the real proxy admission fence and background
+// write barriers. The release handle is held until activation or a safe abort.
+func (s *Server) WithRotationQuiescer(quiesce func(context.Context) (func(), error)) *Server {
+	s.rotationQuiesce = quiesce
+	return s
+}
+
+// WithMasterKeyEnvironmentOverride records startup configuration precedence.
+// Rotation must not leave a new keyring paired with an older environment key.
+func (s *Server) WithMasterKeyEnvironmentOverride(overridden bool) *Server {
+	s.masterKeyEnvironmentOverride = overridden
+	return s
+}
+
+const masterEnvironmentBlockedReason = "Master Key 仍由 ENCRYPTION_KEY 环境变量提供。请先运行 credentials migrate，移除旧 ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD 并重启，再进行轮换。"
+
+func (s *Server) masterRotationAvailability() (bool, string) {
+	if s.masterKeyEnvironmentOverride {
+		return false, masterEnvironmentBlockedReason
+	}
+	if s.runState == nil || s.rotationQuiesce == nil || s.keyring == nil {
+		return false, "轮换所需维护与写入收敛尚未装配"
+	}
+	if s.runState.InMaintenance() {
+		return false, "维护中禁止重复触发 Master Key 轮换"
+	}
+	return true, ""
+}
+
 func (s *Server) getCredentialsStatus(w http.ResponseWriter, r *http.Request) {
 	if s.creds == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"credentials 未装配"})
 		return
 	}
 	out := s.creds.Status()
+	out["rotation_allowed"], out["blocked_reason"] = s.masterRotationAvailability()
 	if s.keyring != nil {
 		if st, err := s.keyring.Status(); err == nil {
 			out["keyring"] = st
@@ -196,7 +230,7 @@ func (s *Server) postResetAdminPassword(w http.ResponseWriter, r *http.Request) 
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: edge.IsHTTPS(r),
 		MaxAge: int(sessionTTL.Seconds()),
 	})
 	w.Header().Set("Cache-Control", "no-store")
@@ -234,98 +268,105 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, model.WrapValidation("new_master 至少 16 字符"))
 		return
 	}
-	if s.runState != nil {
-		if err := s.runState.EnterMaintenance("master_key_rotation"); err != nil {
-			if errors.Is(err, runstate.ErrMaintenanceActive) {
-				writeJSON(w, http.StatusConflict, map[string]any{
-					"code":  runstate.MaintenanceActiveCode,
-					"error": err.Error(),
-				})
-				return
-			}
-			s.writeErr(w, err)
-			return
-		}
-		exitMaint := true
-		defer func() {
-			if exitMaint {
-				_ = s.runState.ExitMaintenance()
-			}
-		}()
-		rid, err := s.keyring.BeginRotation(body.NewMaster)
-		if err != nil {
-			s.writeErr(w, err)
-			return
-		}
-		// §12.7 step 7: re-encrypt direct secrets + persisted Relay Key under
-		// pending before MarkDBCommitted / ActivatePending. Failure on SQLite
-		// rewrap aborts prepared (DB unchanged). Relay reseal after SQLite
-		// commit keeps pending for recovery (same class as MarkDBCommitted fail).
-		if err := s.st.RewrapDirectSecrets(body.NewMaster, rid); err != nil {
-			_ = s.keyring.AbortPrepared(rid)
-			s.writeErr(w, err)
-			return
-		}
-		if s.creds != nil {
-			if err := s.creds.ResealActiveRelayUnder(func(plain string) (string, error) {
-				return store.SealEnvelopeUnder(body.NewMaster, plain)
-			}); err != nil {
-				exitMaint = false
-				s.writeErr(w, err)
-				return
-			}
-		}
-		if err := s.keyring.MarkDBCommitted(rid); err != nil {
-			// DB already under new master — keep pending + maintenance for recovery.
-			exitMaint = false
-			s.writeErr(w, err)
-			return
-		}
-		newID, err := s.keyring.ActivatePending(rid)
-		if err != nil {
-			exitMaint = false // db_committed+：保持 maintenance 直至恢复（§12.7）
-			s.writeErr(w, err)
-			return
-		}
-		// Live Cipher must follow key_activated (same class as stale relay-key map).
-		if err := s.st.ActivateMaster(body.NewMaster); err != nil {
-			exitMaint = false
-			s.writeErr(w, err)
-			return
-		}
-		if s.creds != nil {
-			s.creds.ClearMasterReveal()
-		}
-		if err := s.keyring.MarkCleaned(rid); err != nil {
-			exitMaint = false
-			s.writeErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"rotation_id": rid,
-			"new_key_id":  newID,
-			"phase":       keyring.PhaseCleaned,
-			"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 与样本信封已重封",
-		})
+	if s.masterKeyEnvironmentOverride {
+		writeJSON(w, http.StatusConflict, map[string]any{"code": "master_key_environment_override", "error": masterEnvironmentBlockedReason})
 		return
 	}
-	rid, err := s.keyring.BeginRotation(body.NewMaster)
+	if s.runState == nil || s.rotationQuiesce == nil || s.creds == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"轮换所需维护与写入收敛尚未装配"})
+		return
+	}
+	if err := s.runState.EnterMaintenance("master_key_rotation"); err != nil {
+		if errors.Is(err, runstate.ErrMaintenanceActive) {
+			writeJSON(w, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "轮换已在进行"})
+		} else {
+			s.writeErr(w, err)
+		}
+		return
+	}
+	exitMaintenance := true
+	defer func() {
+		if exitMaintenance {
+			_ = s.runState.ExitMaintenance()
+		}
+	}()
+	drainCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	releaseWrites, err := s.mutations.freeze(drainCtx)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"管理写入尚未收敛，轮换未开始"})
+		return
+	}
+	defer releaseWrites()
+	releaseRuntime, err := s.rotationQuiesce(drainCtx)
+	if err != nil || releaseRuntime == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"真实请求与后台写入尚未收敛，轮换未开始"})
+		return
+	}
+	defer releaseRuntime()
+	_, oldMaster, err := s.keyring.LoadActive()
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.RewrapDirectSecrets(body.NewMaster, rid); err != nil {
-		_ = s.keyring.AbortPrepared(rid)
+	if err := validateRotationRelay(filepath.Dir(s.st.DatabasePath()), oldMaster); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if s.creds != nil {
-		if err := s.creds.ResealActiveRelayUnder(func(plain string) (string, error) {
-			return store.SealEnvelopeUnder(body.NewMaster, plain)
-		}); err != nil {
-			s.writeErr(w, err)
-			return
+	if err := s.st.ValidateEncryptedState(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	backup, err := s.st.CreateRotationBackup(r.Context())
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	backupCipher, err := store.NewCipher(oldMaster)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if _, err := store.CheckBackup(r.Context(), s.st.DatabasePath(), backup.ManifestPath, backupCipher); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.creds.Note("master_rotation_backup", "backup="+filepath.Base(backup.Directory))
+	rid, err := s.keyring.BeginRotation(body.NewMaster)
+	if err != nil {
+		status, statusErr := s.keyring.Status()
+		exitMaintenance = statusErr == nil && (status.Phase == keyring.PhaseIdle || status.Phase == keyring.PhaseCleaned)
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.st.RewrapDirectSecrets(body.NewMaster, rid); err != nil {
+		// A failed Commit may have an uncertain outcome. Never discard the
+		// only pending decryptor until SQLite proves this rotation uncommitted.
+		committedID, inspectErr := store.CommittedMasterRotation(s.st.DatabasePath())
+		if inspectErr != nil || committedID == rid {
+			exitMaintenance = false
+		} else if abortErr := s.keyring.AbortPrepared(rid); abortErr != nil {
+			exitMaintenance = false
 		}
+		s.writeErr(w, err)
+		return
+	}
+	// From this point the database is committed under pending. Every failure
+	// keeps maintenance and its journal; recovery may only roll forward.
+	exitMaintenance = false
+	if err := store.ValidateDatabaseEncryption(r.Context(), s.st.DatabasePath(), body.NewMaster); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.creds.ResealActiveRelayUnder(func(plain string) (string, error) {
+		return store.SealEnvelopeUnder(body.NewMaster, plain)
+	}); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := validateRotationRelay(filepath.Dir(s.st.DatabasePath()), body.NewMaster); err != nil {
+		s.writeErr(w, err)
+		return
 	}
 	if err := s.keyring.MarkDBCommitted(rid); err != nil {
 		s.writeErr(w, err)
@@ -340,19 +381,53 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
-	if s.creds != nil {
-		s.creds.ClearMasterReveal()
+	if err := s.st.ValidateEncryptedState(); err != nil {
+		s.writeErr(w, err)
+		return
 	}
+	if err := validateRotationRelay(filepath.Dir(s.st.DatabasePath()), body.NewMaster); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.creds.ClearMasterReveal()
 	if err := s.keyring.MarkCleaned(rid); err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	s.st.ForgetRetiredMasterKeys()
+	exitMaintenance = true
 	writeJSON(w, http.StatusOK, map[string]any{
-		"rotation_id": rid,
-		"new_key_id":  newID,
-		"phase":       keyring.PhaseCleaned,
-		"note":        "Keyring active 与 live Cipher 已切换；直接 Secret 与样本信封已重封",
+		"rotation_id":     rid,
+		"new_key_id":      newID,
+		"phase":           keyring.PhaseCleaned,
+		"backup_manifest": backup.ManifestPath,
+		"note":            "已验证一致备份、直接凭据与 Data Key 重封；样本正文保持原字节",
 	})
+}
+
+func validateRotationRelay(dataDir, master string) error {
+	doc, err := credential.LoadPersistedFile(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // Legacy environment-only deployments have no persisted relay.
+	}
+	if err != nil {
+		return err
+	}
+	if doc.FormatVersion != 1 {
+		return errors.New("持久凭据格式无效，不能完成 Master Key 轮换")
+	}
+	if doc.RelayKey == "" {
+		return nil
+	}
+	if !credential.IsRelayKeyEnvelope(doc.RelayKey) {
+		return errors.New("持久 Relay Key 尚未加密，不能完成 Master Key 轮换")
+	}
+	cipher, err := store.NewCipher(master)
+	if err != nil {
+		return err
+	}
+	_, err = credential.OpenPersistedRelayKey(doc.RelayKey, cipher)
+	return err
 }
 
 func (s *Server) passwordOK(got string) bool {

@@ -1,12 +1,14 @@
 package store
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"strings"
 )
 
-// sampleEnvelopePrefix marks AES-GCM sample body BLOBs (§5.4 / P5).
+// sampleEnvelopePrefix is the legacy Master envelope marker, still used for
+// direct secrets and wrapping independent Data Keys.
 const sampleEnvelopePrefix = "v1:"
 
 // EncryptEnvelope returns v1:<key-id>:<base64(nonce||ciphertext)> (§12.4).
@@ -23,8 +25,8 @@ func (c *Cipher) EncryptEnvelope(plain string) (string, error) {
 
 // DecryptEnvelope accepts v1:key-id:payload or legacy bare base64 from Encrypt.
 // After ActivateMaster, envelopes whose key-id matches a retired master still
-// decrypt in-process. Durable rotation reseals sample envelopes in
-// RewrapDirectSecrets so a restart with only the new master succeeds.
+// decrypt in-process until verified rotation cleanup. Sample bodies now use
+// independent v2 Data Key envelopes; only their small wrappers are resealed.
 func (c *Cipher) DecryptEnvelope(encoded string) (string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -60,23 +62,31 @@ func (c *Cipher) DecryptEnvelope(encoded string) (string, error) {
 	return "", err
 }
 
-// EncryptSampleBlob wraps sample body bytes in a v1 envelope. Empty stays empty.
+// EncryptSampleBlob uses the independent Sample Data Key. Larger in-memory
+// bodies use authenticated v2m frames just like spill files. Empty stays empty.
 func (c *Cipher) EncryptSampleBlob(plain []byte) ([]byte, error) {
-	if len(plain) == 0 {
-		return plain, nil
+	if len(plain) > dataChunkLimit {
+		var out bytes.Buffer
+		if err := encryptDataStream(c, sampleKeyPurpose, &out, bytes.NewReader(plain), int64(len(plain)), dataChunkLimit); err != nil {
+			return nil, err
+		}
+		return out.Bytes(), nil
 	}
-	enc, err := c.EncryptEnvelope(string(plain))
-	if err != nil {
-		return nil, err
-	}
-	return []byte(enc), nil
+	return c.encryptDataBlob(sampleKeyPurpose, plain)
 }
 
-// DecryptSampleBlob accepts v1 envelopes, v1m chunked envelopes, or legacy plaintext.
-// Plaintext history is never refused so unread rows survive migration.
+// DecryptSampleBlob dual-reads legacy plaintext/v1/v1m and current v2/v2m.
+// Startup migration authenticates legacy frames before upgrading them; schema8
+// full-state validation requires every non-empty stored body to use a Data Key.
 func (c *Cipher) DecryptSampleBlob(raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return raw, nil
+	}
+	if strings.HasPrefix(string(raw[:min(len(raw), 4)]), "v2:") {
+		return c.decryptDataBlob(sampleKeyPurpose, raw)
+	}
+	if strings.HasPrefix(string(raw[:min(len(raw), 4)]), "v2m:") {
+		return decryptDataMultipart(c, sampleKeyPurpose, raw)
 	}
 	if isSampleMultipart(raw) {
 		if c == nil {
@@ -94,8 +104,7 @@ func (c *Cipher) DecryptSampleBlob(raw []byte) ([]byte, error) {
 	return []byte(plain), nil
 }
 
-// IsSampleEnvelope reports whether a sample BLOB already uses the v1 envelope.
+// IsSampleEnvelope recognizes legacy/current single-message envelopes.
 func IsSampleEnvelope(raw []byte) bool {
-	return len(raw) >= len(sampleEnvelopePrefix) &&
-		string(raw[:len(sampleEnvelopePrefix)]) == sampleEnvelopePrefix
+	return len(raw) >= 3 && (string(raw[:3]) == sampleEnvelopePrefix || string(raw[:3]) == "v2:")
 }

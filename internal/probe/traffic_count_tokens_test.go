@@ -120,7 +120,7 @@ func (h *countTrafficHarness) commitQueued(t *testing.T) {
 	t.Helper()
 	select {
 	case observation := <-h.manager.queue:
-		if _, err := h.manager.record.Record(context.Background(), observation); err != nil {
+		if _, err := h.manager.record.Record(context.Background(), observation.observation); err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
@@ -286,7 +286,7 @@ func TestCapabilityTraffic_FinishRejectsDifferentResolvedEndpoint(t *testing.T) 
 		t.Fatal("current configuration was not observable")
 	}
 	changed := health.AttemptConfigFacts{EndpointRevision: observation.req.CapabilityExpectation.Revision.EndpointRevision + 1}
-	if got := observation.observation(health.AttemptFinish{ConfigError: true, ConfigFacts: &changed}, sendTiming{}, false, 0, nil, ""); got != nil {
+	if got := observation.observation(health.AttemptFinish{ConfigError: true, ConfigFacts: &changed}, sendTiming{}, "", 0, nil, ""); got != nil {
 		t.Fatal("local failure used the token of a different endpoint configuration")
 	}
 }

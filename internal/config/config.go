@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/credential"
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/store"
 )
@@ -23,6 +24,9 @@ type Config struct {
 	// RelayKeys 是本服务发放给客户端的 key（可多个，逗号分隔）。
 	// 必须非空——空表示任何人都能白用你所有上游 key。
 	RelayKeys []string
+
+	TrustedEdge           *edge.Policy
+	PublicHTTPSStatusFile string
 }
 
 func Load() (*Config, error) {
@@ -38,6 +42,15 @@ func Load() (*Config, error) {
 		if k = strings.TrimSpace(k); k != "" {
 			c.RelayKeys = append(c.RelayKeys, k)
 		}
+	}
+	var err error
+	c.TrustedEdge, err = edge.NewPolicy(os.Getenv("RELAY_TRUSTED_PROXY_IPS"), os.Getenv("RELAY_PUBLIC_ORIGIN"))
+	if err != nil {
+		return nil, err
+	}
+	c.PublicHTTPSStatusFile = strings.TrimSpace(os.Getenv("RELAY_PUBLIC_HTTPS_STATUS_FILE"))
+	if c.PublicHTTPSStatusFile != "" && (c.TrustedEdge == nil || !filepath.IsAbs(c.PublicHTTPSStatusFile)) {
+		return nil, errors.New("RELAY_PUBLIC_HTTPS_STATUS_FILE requires a trusted edge and an absolute metadata file path")
 	}
 	if err := c.fillFromSecretsArtifacts(); err != nil {
 		return nil, err

@@ -85,6 +85,10 @@ export function createCredentialsFeature(shell, api) {
       this.err = '维护中禁止重复触发 Master Key 轮换';
       return;
     }
+    if (!this.canRotateMasterKey()) {
+      this.err = this.credentials.status?.blocked_reason || '请先刷新凭据状态，确认轮换条件';
+      return;
+    }
     try {
       const data = await api.post('/credentials/rotate-master', {
         password: this.credentials.password,
@@ -105,6 +109,11 @@ export function createCredentialsFeature(shell, api) {
         if (typeof this.applyStatePayload === 'function') this.applyStatePayload(st);
       } catch { /* */ }
     }
+  };
+
+  shell.canRotateMasterKey = function canRotateMasterKey() {
+    return this.displayState !== 'maintenance' && !this.credentials.loading &&
+      this.credentials.status?.rotation_allowed === true;
   };
 }
 
