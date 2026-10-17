@@ -42,7 +42,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/relay-gate ./cmd/relay-gate
 
 # ── 运行阶段 ─────────────────────────────────────────────
-FROM alpine:3.21
+FROM alpine:3.24
 
 # ca-certificates 是必需的：出站要连公益站的 HTTPS，没有根证书链
 # 一律 x509 校验失败。alpine 基础镜像默认不带它。
