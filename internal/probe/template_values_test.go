@@ -26,8 +26,17 @@ func testValues() TemplateValues {
 		SessionID:      probetemplate.ResolvedValue{Plain: []byte("sess-abc"), Revision: 7},
 		Timestamp:      fixedTime,
 		Secrets: map[string]probetemplate.ResolvedValue{
-			"tenant": {Plain: []byte("tenant-42"), Revision: 9},
+			"tenant": {Plain: []byte("tenant-secret-42"), Revision: 9},
 		},
+	}
+}
+
+func TestTemplateValuesRejectShortSecretBeforeRendering(t *testing.T) {
+	values := testValues()
+	values.Secrets["tenant"] = probetemplate.ResolvedValue{Plain: []byte("short-value"), Revision: 1}
+	value, err := values.ResolveValue(context.Background(), "SECRET:tenant")
+	if !errors.Is(err, ErrTemplateValue) || len(value.Plain) != 0 || (err != nil && strings.Contains(err.Error(), "short-value")) {
+		t.Fatal("short Secret was exposed or remained usable by a Recipe template")
 	}
 }
 
@@ -51,7 +60,7 @@ func TestTemplateValues_ResolvesEveryBuiltInPlaceholder(t *testing.T) {
 		{"MODEL_NAME", "haiku", 5},
 		{"PROBE_PROMPT", "1+1=?", 6},
 		{"SESSION_ID", "sess-abc", 7},
-		{"SECRET:tenant", "tenant-42", 9},
+		{"SECRET:tenant", "tenant-secret-42", 9},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.placeholder, func(t *testing.T) {
@@ -166,7 +175,7 @@ func TestTemplateValues_MissingSecretFailsWithoutLeakingPlaintext(t *testing.T) 
 		t.Errorf("错误应指名是哪个 Secret（否则无法排查），得到 %v", err)
 	}
 	// 已装配的那个 Secret 的明文绝不能出现在错误里。
-	if strings.Contains(err.Error(), "tenant-42") {
+	if strings.Contains(err.Error(), "tenant-secret-42") {
 		t.Errorf("错误文本泄漏了 Secret 明文: %v", err)
 	}
 }
@@ -217,7 +226,7 @@ func TestTemplateValues_RendersInHeaderQueryAndBody(t *testing.T) {
 		t.Fatalf("渲染失败: %v", err)
 	}
 
-	if want := "key=sk-up-key-12&tenant=tenant-42"; rendered.RawQuery != want {
+	if want := "key=sk-up-key-12&tenant=tenant-secret-42"; rendered.RawQuery != want {
 		t.Errorf("query want %q got %q", want, rendered.RawQuery)
 	}
 	if got := rendered.Header.Get("X-Session"); got != "sess-abc" {
@@ -239,7 +248,7 @@ func TestTemplateValues_RendersInHeaderQueryAndBody(t *testing.T) {
 func TestTemplateValues_QuerySecretIsPercentEncoded(t *testing.T) {
 	values := testValues()
 	values.Secrets = map[string]probetemplate.ResolvedValue{
-		"tenant": {Plain: []byte("a&b=c/d"), Revision: 9},
+		"tenant": {Plain: []byte("fixture-a&b=c/d"), Revision: 9},
 	}
 
 	compiled, err := probetemplate.CompileContent(model.EndpointModels, probetemplate.TemplateContent{
@@ -253,7 +262,7 @@ func TestTemplateValues_QuerySecretIsPercentEncoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("渲染失败: %v", err)
 	}
-	if want := "tenant=a%26b%3Dc%2Fd"; rendered.RawQuery != want {
+	if want := "tenant=fixture-a%26b%3Dc%2Fd"; rendered.RawQuery != want {
 		t.Errorf("query 侧 Secret 必须 percent-encode，want %q got %q", want, rendered.RawQuery)
 	}
 }
@@ -283,7 +292,7 @@ func TestBindSecrets_RejectsSameNameDifferentSecretID(t *testing.T) {
 func TestBindSecrets_AcceptsMatchingRefAndStripsSecretIdentity(t *testing.T) {
 	refs := []model.RequiredSecretRef{{Name: "tenant", BoundSecretID: 11}}
 	resolved := map[string]probetemplate.ResolvedSecret{
-		"tenant": {ID: 11, Plain: []byte("tenant-42"), Revision: 9},
+		"tenant": {ID: 11, Plain: []byte("tenant-secret-42"), Revision: 9},
 	}
 
 	bound, err := BindSecrets(refs, resolved)
@@ -294,7 +303,7 @@ func TestBindSecrets_AcceptsMatchingRefAndStripsSecretIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("应含 tenant")
 	}
-	if string(value.Plain) != "tenant-42" || value.Revision != 9 {
+	if string(value.Plain) != "tenant-secret-42" || value.Revision != 9 {
 		t.Errorf("绑定后的值不对: %q@%d", value.Plain, value.Revision)
 	}
 }

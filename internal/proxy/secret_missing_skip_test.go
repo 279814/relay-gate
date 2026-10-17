@@ -19,9 +19,14 @@ const (
 	presentSecretVal  = "tok-present-secret-value"
 )
 
+type secretRouteStore struct {
+	*store.Store
+	bindings map[int64][]model.SecretRevision
+}
+
 // secretStore opens a real Store holding presentSecretName, plus a Secret
 // named missingSecretName that is created and then deleted.
-func secretStore(t *testing.T) *store.Store {
+func secretStore(t *testing.T) *secretRouteStore {
 	t.Helper()
 	cipher, err := store.NewCipher("test-encryption-key-32-bytes-long")
 	if err != nil {
@@ -32,7 +37,8 @@ func secretStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	if _, err := st.CreateProbeSecret(presentSecretName, []byte(presentSecretVal)); err != nil {
+	present, err := st.CreateProbeSecret(presentSecretName, []byte(presentSecretVal))
+	if err != nil {
 		t.Fatal(err)
 	}
 	gone, err := st.CreateProbeSecret(missingSecretName, []byte("tok-deleted-secret-value"))
@@ -42,12 +48,17 @@ func secretStore(t *testing.T) *store.Store {
 	if err := st.DeleteProbeSecret(gone.ID, gone.Revision); err != nil {
 		t.Fatal(err)
 	}
-	return st
+	// Keep the identities captured before deletion; Endpoint metadata may not
+	// silently resolve a newer Secret by its name when the request starts.
+	return &secretRouteStore{st, map[int64][]model.SecretRevision{
+		10: {{ID: gone.ID, Name: gone.Name, Revision: gone.Revision, Resolved: true}},
+		11: {{ID: present.ID, Name: present.Name, Revision: present.Revision, Resolved: true}},
+	}}
 }
 
 // setupSecretRoutes: Route 100 (Upstream 10) references missingSecretName in
 // its fixed query; Route 101 (Upstream 11) references presentSecretName.
-func setupSecretRoutes(t *testing.T, hs *harness, secrets outbound.SecretSource, twoRoutes bool) *routeConfigCaps {
+func setupSecretRoutes(t *testing.T, hs *harness, secrets *secretRouteStore, twoRoutes bool) *routeConfigCaps {
 	t.Helper()
 	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
 		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
@@ -65,7 +76,8 @@ func setupSecretRoutes(t *testing.T, hs *harness, secrets outbound.SecretSource,
 	hs.cfg.snap = router.BuildSnapshot([]*model.ModelName{mn}, ups, routes)
 	hs.cfg.settings.RetryMaxAttempts = 1
 	provider := outbound.NewProvider(perUpstreamEndpoints{
-		base: testEndpoints{cfg: hs.cfg},
+		base:     testEndpoints{cfg: hs.cfg},
+		bindings: secrets.bindings,
 		queries: map[int64]string{
 			10: "token={{SECRET:" + missingSecretName + "}}",
 			11: "token={{SECRET:" + presentSecretName + "}}",
