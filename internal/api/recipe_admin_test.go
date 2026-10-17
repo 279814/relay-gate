@@ -437,6 +437,42 @@ func TestClientProfileHTTPFailureDoesNotEnableCandidate(t *testing.T) {
 	}
 }
 
+func TestClientProfileHTTPRejectsSecretDeclarationsBeforeSanitizerDropsHeader(t *testing.T) {
+	s, h, source, _, calls, _, _, route := recipeHTTPFixture(t)
+	if _, err := s.st.CreateProbeSecret("profile-hidden-secret", []byte("fixture-only-profile-secret")); err != nil {
+		t.Fatal(err)
+	}
+	profile := &model.ClientProbeProfile{UpstreamID: route.UpstreamID, Endpoint: model.EndpointChatCompletions, ClientFamily: "generic", ShapeHash: "fixture-profile-with-secret", SeenCount: 1, SafeHeaders: []model.HeaderTemplate{{Name: "X-Probe-Secret", Values: []string{"{{SECRET:profile-hidden-secret}}"}}}}
+	if err := s.st.CreateClientProfileCandidate(context.Background(), profile); err != nil {
+		t.Fatal(err)
+	}
+	source.Invalidate()
+	if err := source.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/admin/api/client-profiles/%d", profile.ID)
+	for _, action := range []string{"preview", "test"} {
+		body := fmt.Sprintf(`{"route_id":%d}`, route.ID)
+		if action == "test" {
+			body = fmt.Sprintf(`{"expected_revision":1,"route_id":%d}`, route.ID)
+		}
+		response := do(t, h, "POST", path+"/"+action, body, true)
+		if response.Code != 400 {
+			t.Errorf("raw Secret declaration bypassed automatic-profile validation during %s: %d %s", action, response.Code, response.Body.String())
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("unsafe candidate reached upstream")
+	}
+	current, err := s.st.GetClientProfile(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != model.ProfileCandidate {
+		t.Fatal("profile unusable by automatic resolver was enabled")
+	}
+}
+
 func TestRecipeAndProfileHTTPRejectUnsafeDTOAndReturnOnlySanitizedShape(t *testing.T) {
 	s, h, source, _, calls, recipeID, version, route := recipeHTTPFixture(t)
 	for _, body := range []string{`{"expected_revision":2,"method":"POST","origin":"learned","timeout_profile":"l2_standard"}`, `{"expected_revision":2,"method":"POST","body_text":"x","body_base64":"eA==","timeout_profile":"l2_standard"}`, `{"expected_revision":2,"method":"POST","body_base64":"!bad","timeout_profile":"l2_standard"}`, `{"expected_revision":2,"method":"POST","headers":{"X":"wrong-shape"},"timeout_profile":"l2_standard"}`, `{"expected_revision":2,"method":"POST","timeout_profile":"l2_standard"}{"extra":true}`} {
