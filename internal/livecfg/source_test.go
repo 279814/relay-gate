@@ -84,8 +84,8 @@ func TestSource_LoadsFullConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.RealFirstTokenSec != model.DefaultSettings().RealFirstTokenSec {
-		t.Errorf("应返回默认设置，得到 %d", settings.RealFirstTokenSec)
+	if settings.RealFirstSemanticSec != model.DefaultSettings().RealFirstSemanticSec {
+		t.Errorf("应返回默认设置，得到 %d", settings.RealFirstSemanticSec)
 	}
 	state, err := s.RunState()
 	if err != nil {
@@ -272,8 +272,8 @@ func TestSource_InvalidSettingsFallsBackToDefaults(t *testing.T) {
 
 	// 直接写库绕过 SaveSettings 的校验
 	_, err := st.DB().Exec(
-		`INSERT INTO setting (key, value, updated_at) VALUES ('settings', ?, 0)`,
-		`{"real_first_token_sec":1,"real_total_sec":1}`)
+		`UPDATE setting SET value=?,updated_at=0 WHERE key='settings'`,
+		`{"real_first_semantic_sec":1,"real_total_sec":1}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,9 +283,9 @@ func TestSource_InvalidSettingsFallsBackToDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RealFirstTokenSec < model.MinRealFirstTokenSec {
+	if got.RealFirstSemanticSec < model.MinRealFirstSemanticSec {
 		t.Errorf("不合法的 settings 应降级为默认值，得到 real_first_token_sec=%d",
-			got.RealFirstTokenSec)
+			got.RealFirstSemanticSec)
 	}
 }
 

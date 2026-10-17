@@ -166,7 +166,7 @@ func TestHandler_HalfOpenGatewayErrorCarriesHeader(t *testing.T) {
 		time.Sleep(5 * time.Second)
 	})
 	hs.cfg.settings.HalfOpenEnabled = true
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1

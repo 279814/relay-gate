@@ -39,15 +39,15 @@ func TestSettingsAndRunStateRevisionCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revision != 0 {
-		t.Fatalf("missing settings revision = %d, want 0", revision)
+	if revision != 1 {
+		t.Fatalf("startup settings revision = %d, want 1", revision)
 	}
 	settings.L1ConnectSec++
 	newRevision, err := store.SaveSettingsWithRevision(settings, revision)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if newRevision != 1 {
+	if newRevision != 2 {
 		t.Fatalf("new settings revision = %d", newRevision)
 	}
 	if _, err := store.SaveSettingsWithRevision(settings, revision); !errors.Is(err, ErrRevisionConflict) {

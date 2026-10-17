@@ -171,7 +171,7 @@ func TestSchedulerCommittedReturnRechecksOnlyItsCurrentEvidencePolicy(t *testing
 			settings.OKThreshold, settings.FailThreshold = 1, 1
 			settings.L1ConnectSec, settings.L1TotalSec = 1, 5
 			settings.L2ConnectSec, settings.L2TotalSec, settings.L2IdleSec = 1, 5, 1
-			settings.L2FirstTokenSec, settings.L2ResponseHeaderSec, settings.L2FirstByteSec, settings.L2FirstEventSec, settings.L2FirstSemanticSec = 2, 1, 1, 1, 2
+			settings.L2ResponseHeaderSec, settings.L2FirstByteSec, settings.L2FirstEventSec, settings.L2FirstSemanticSec = 1, 1, 1, 2
 			if _, err := st.SaveSettingsWithRevision(settings, revision); err != nil {
 				t.Fatal(err)
 			}

@@ -428,7 +428,7 @@ func TestRetry_SharesTotalTimeBudget(t *testing.T) {
 	// FirstByte, …, Total). Leaving ResponseHeaderSec at testSettings' 2s
 	// while Total=2s makes header timer and Total race → intermittent 502
 	// (ErrConnect) instead of 504 (ErrFirstTokenTimeout) under -race.
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1
@@ -468,7 +468,7 @@ func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 	hs := newMultiHarness(t, stall, stall)
 	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
 	hs.cfg.settings.RetryMaxAttempts = 2
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1
@@ -696,7 +696,7 @@ func TestRetry_StopsWhenClientGone(t *testing.T) {
 		},
 		respondOK(`{"id":"should-not-reach"}`))
 	hs.cfg.settings.RetryMaxAttempts = 3
-	hs.cfg.settings.RealFirstTokenSec = 5
+	hs.cfg.settings.RealFirstSemanticSec = 5
 	hs.cfg.settings.RealTotalSec = 30
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -847,7 +847,7 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 		time.Sleep(5 * time.Second)
 	}
 	shortStages := func(hs *multiHarness) {
-		hs.cfg.settings.RealFirstTokenSec = 1
+		hs.cfg.settings.RealFirstSemanticSec = 1
 		hs.cfg.settings.RealResponseHeaderSec = 1
 		hs.cfg.settings.RealFirstByteSec = 1
 		hs.cfg.settings.RealFirstSemanticSec = 1

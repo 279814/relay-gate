@@ -38,9 +38,10 @@ type SampleStats interface {
 }
 
 type Server struct {
-	st          *store.Store
-	log         *slog.Logger
-	configAdmin ConfigAdmin
+	st            *store.Store
+	log           *slog.Logger
+	configAdmin   ConfigAdmin
+	settingsAdmin SettingsAdmin
 	// inFlight、samples 与 reqLogs 可以为 nil（测试里常只关心 CRUD），
 	// runtime 端点会据此把对应字段留空而不是崩。
 	inFlight InFlightView
@@ -104,7 +105,7 @@ func (s *Server) WithAdminHash(hash, dataDir string) *Server {
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), sampleCandidates: probe.NewSampleCandidateBuilder(st), sessions: newSessionStore()}
+	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), settingsAdmin: configadmin.NewSettings(st), sampleCandidates: probe.NewSampleCandidateBuilder(st), sessions: newSessionStore()}
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，

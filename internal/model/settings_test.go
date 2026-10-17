@@ -65,7 +65,7 @@ func TestSettingsValidateP0StageBudgets(t *testing.T) {
 
 // 首 Token 超时的 5 分钟硬下限是刻意设计的约束（§4.2），
 // 不是随手取的数字，所以要有测试守住它，防止日后被「顺手改小一点」。
-func TestRealFirstTokenFloor(t *testing.T) {
+func TestRealFirstSemanticFloor(t *testing.T) {
 	cases := []struct {
 		name    string
 		sec     int
@@ -83,7 +83,7 @@ func TestRealFirstTokenFloor(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := DefaultSettings()
-			s.RealFirstTokenSec = c.sec
+			s.RealFirstSemanticSec = c.sec
 			// 总时长必须容得下首 Token，否则会先撞另一条校验，测不到本条
 			if c.sec > s.RealTotalSec {
 				s.RealTotalSec = c.sec
@@ -98,7 +98,7 @@ func TestRealFirstTokenFloor(t *testing.T) {
 					t.Errorf("错误应可被 errors.Is(ErrValidation) 识别，否则 API 层会回 500 而非 400；得到 %v", err)
 				}
 				// 错误信息要指出正确的替代做法，否则用户只会反复改这一个值
-				if !strings.Contains(err.Error(), "l2_first_token_sec") {
+				if !strings.Contains(err.Error(), "l2_first_semantic_sec") {
 					t.Errorf("错误信息应提示改探活超时，得到：%v", err)
 				}
 			} else if err != nil {
@@ -118,14 +118,14 @@ func TestDefaultSettingsAreValid(t *testing.T) {
 // 总时长小于首 Token 超时时，总超时会先触发，导致首 Token 超时形同虚设。
 func TestTotalMustCoverFirstToken(t *testing.T) {
 	s := DefaultSettings()
-	s.RealFirstTokenSec = 1200
+	s.RealFirstSemanticSec = 1200
 	s.RealTotalSec = 600
 	if err := s.Validate(); err == nil {
 		t.Fatal("total < first_token 应被拒绝")
 	}
 
 	s = DefaultSettings()
-	s.L2FirstTokenSec = 200
+	s.L2FirstSemanticSec = 200
 	s.L2TotalSec = 100
 	if err := s.Validate(); err == nil {
 		t.Fatal("l2_total < l2_first_token 应被拒绝")
@@ -142,7 +142,7 @@ func TestSettingsRejectNonPositive(t *testing.T) {
 		{"fail_threshold", func(s *Settings) { s.FailThreshold = 0 }},
 		{"global_l2_concurrency", func(s *Settings) { s.GlobalL2Concurrency = 0 }},
 		{"sample_queue_size", func(s *Settings) { s.SampleQueueSize = 0 }},
-		{"l2_first_token_sec 负数", func(s *Settings) { s.L2FirstTokenSec = -5 }},
+		{"l2_first_token_sec 负数", func(s *Settings) { s.L2FirstSemanticSec = -5 }},
 		// 0 不是「关闭重试」而是「一次都不发」。关闭重试是 1。
 		{"retry_max_attempts", func(s *Settings) { s.RetryMaxAttempts = 0 }},
 	} {

@@ -351,12 +351,12 @@ func TestTrafficHTTP_SamplesDisabledStillObserveAndLearn(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}]}`)
 	})
-	settings, err := h.store.GetSettings()
+	settings, settingsRevision, err := h.store.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings.SampleEnabled = false
-	if err := h.store.SaveSettings(settings); err != nil {
+	if _, err := h.store.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {
@@ -402,12 +402,12 @@ func TestTrafficHTTP_DiscardedAndFinalAttemptsEachCommitExecution(t *testing.T) 
 	if err := h.store.CreateRoute(route); err != nil {
 		t.Fatal(err)
 	}
-	settings, err := h.store.GetSettings()
+	settings, settingsRevision, err := h.store.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings.RetryPolicy = model.RetryPolicyBalanced
-	if err := h.store.SaveSettings(settings); err != nil {
+	if _, err := h.store.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {

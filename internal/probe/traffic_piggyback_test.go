@@ -138,12 +138,12 @@ func TestTrafficHTTP_RealSuccessMetadataRestoresWithoutPromotingHealth(t *testin
 	if saved != 1 {
 		t.Fatalf("piggyback skip not idempotent: saved=%d", saved)
 	}
-	settings, err := h.store.GetSettings()
+	settings, settingsRevision, err := h.store.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings.RealTotalSec++
-	if err := h.store.SaveSettings(settings); err != nil {
+	if _, err := h.store.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	if err := cfg.Refresh(); err != nil {

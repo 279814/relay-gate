@@ -133,7 +133,6 @@ func testSettings() model.Settings {
 	// 读出来的配置两套都填好了。但这里是手工构造 Settings，只设旧字段的话
 	// 新字段仍是默认的 1200 秒 —— 于是「首 Token 超时 2 秒」静默变成 1200 秒，
 	// 被 total 兜住，而依赖它换站的重试用例会因为一个与本意无关的原因失败。
-	s.RealFirstTokenSec = 2
 	s.RealResponseHeaderSec = 2
 	s.RealFirstByteSec = 2
 	s.RealFirstSemanticSec = 2
@@ -1759,7 +1758,7 @@ func TestHandler_HeaderPhaseStallIsNot200(t *testing.T) {
 		<-release // 连响应头都不回
 	})
 	defer close(release)
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealTotalSec = 30
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))

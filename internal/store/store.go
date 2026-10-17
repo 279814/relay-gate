@@ -172,6 +172,10 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化探活保留索引: %w", err)
 	}
+	if err := initializeCurrentSettings(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化分阶段设置: %w", err)
+	}
 	return st, nil
 }
 

@@ -37,7 +37,7 @@ func fastSettings() model.Settings {
 	s.L2TotalSec = 2
 	s.L2ConnectSec = 1
 	s.L2IdleSec = 1
-	s.L2FirstTokenSec = 1
+	s.L2FirstSemanticSec = 1
 	s.L2ResponseHeaderSec = 1
 	s.L2FirstByteSec = 1
 	s.L2FirstEventSec = 1
@@ -448,7 +448,7 @@ func TestL2_FirstTokenTimeout(t *testing.T) {
 	defer srv.Close()
 
 	s := fastSettings()
-	s.L2FirstTokenSec = 1
+	s.L2FirstSemanticSec = 1
 	s.L2TotalSec = 10
 
 	start := time.Now()
@@ -460,7 +460,7 @@ func TestL2_FirstTokenTimeout(t *testing.T) {
 		t.Errorf("首 Token 超时应判不可用，得到 %s", out.Verdict)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("应在 L2FirstTokenSec(1s) 附近超时，实际用了 %v", elapsed)
+		t.Errorf("应在 L2FirstSemanticSec(1s) 附近超时，实际用了 %v", elapsed)
 	}
 	// 主动断流的证据：服务端的 request context 被取消了
 	select {
