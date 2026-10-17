@@ -125,13 +125,11 @@ func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, model.WrapValidation("state 必须是 running 或 paused"))
 		return
 	}
-	expected := int64(0)
-	if body.ExpectedRevision != nil {
-		expected = *body.ExpectedRevision
-	} else {
-		expected = s.runState.Current().Revision
+	if body.ExpectedRevision == nil || requireRevision(*body.ExpectedRevision) != nil {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须是正整数，请先读取服务状态"))
+		return
 	}
-	snap, err := s.runState.Set(r.Context(), state, expected)
+	snap, err := s.runState.Set(r.Context(), state, *body.ExpectedRevision)
 	if err != nil {
 		var pending *runstate.TransitionPendingError
 		if errors.As(err, &pending) {

@@ -25,6 +25,7 @@ async function main() {
   const { createRuntimeStateFeature } = await import(pathToFileURL(path.join(dir, 'js', 'runtime.mjs')).href);
   const { createCountTokensFeature } = await import(pathToFileURL(path.join(dir, 'js', 'count_tokens.mjs')).href);
   const { createRecipeAdminFeature } = await import(pathToFileURL(path.join(dir, 'js', 'recipe_admin.mjs')).href);
+  const { createSettingsFeature } = await import(pathToFileURL(path.join(dir, 'js', 'settings.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
@@ -41,6 +42,7 @@ async function main() {
   mergeTransformsTab(inst);
   createCountTokensFeature(inst);
   createRecipeAdminFeature(inst, api);
+  createSettingsFeature(inst, api);
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([

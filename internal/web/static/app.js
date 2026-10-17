@@ -57,6 +57,7 @@ function app() {
     expandedLogs: {},
 
     settings: null,
+    settingsModuleReady: false,
     limits: {},
 
     upForm: null,
@@ -243,7 +244,7 @@ function app() {
           this.loadConfigPage('model-names', 'reset'),
           this.loadConfigPage('routes', 'reset'),
         ]);
-        this.running = st.state === 'running';
+        if (typeof this.applyStatePayload === 'function') this.applyStatePayload(st);
       });
       await this.loadHealth();
       await this.loadSettings();
@@ -331,11 +332,8 @@ function app() {
     },
 
     async loadSettings() {
-      try {
-        const s = await this.api('GET', '/settings');
-        this.settings = s.settings;
-        this.limits = s.limits || {};
-      } catch (e) { this.err = e.message; }
+      // The revision-aware module supplies this method before Alpine boots.
+      this.settings = null;
     },
 
     async loadCost() {
@@ -491,19 +489,7 @@ function app() {
 
     // ── 总闸（§4.8）───────────────────────────────────
 
-    async toggleState() {
-      const next = this.running ? 'paused' : 'running';
-      const { ok } = await this.run(
-        () => this.api('POST', '/state', { state: next }),
-        next === 'paused'
-          ? '已暂停：新请求返回 503，探活全停。进行中的流式对话会正常收完'
-          : '已恢复：全部 Route 置 unknown 并立即重新探活',
-      );
-      if (ok) {
-        this.running = next === 'running';
-        this.loadHealth();
-      }
-    },
+    async toggleState() { this.err = '状态模块未就绪，请刷新页面'; },
 
     // ── 上游 CRUD ────────────────────────────────────
 
@@ -642,10 +628,8 @@ function app() {
     // ── 设置 ─────────────────────────────────────────
 
     async saveSettings() {
-      await this.run(
-        () => this.api('PUT', '/settings', this.settings),
-        '已保存，立即生效',
-      );
+      this.err = '设置模块未就绪，请刷新页面';
+      return false;
     },
 
     // ── 探活 ─────────────────────────────────────────

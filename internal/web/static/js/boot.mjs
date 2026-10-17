@@ -15,6 +15,7 @@ import { createTransformsFeature, mergeTransformsTab } from './transforms.mjs';
 import { createRuntimeStateFeature } from './runtime.mjs';
 import { createCountTokensFeature } from './count_tokens.mjs';
 import { createRecipeAdminFeature } from './recipe_admin.mjs';
+import { createSettingsFeature } from './settings.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -50,6 +51,7 @@ if (typeof base !== 'function') {
       mergeTransformsTab(shell);
       createCountTokensFeature(shell);
       createRecipeAdminFeature(shell, api);
+      createSettingsFeature(shell, api);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -128,45 +130,6 @@ if (typeof base !== 'function') {
         this.refreshHealthSide();
       } else if (tab === 'upstreams') {
         this.loadHealth();
-      }
-    };
-
-    // 总闸带 revision；409 刷新 revision。maintenance 禁止切换。
-    shell.toggleState = async function toggleState() {
-      if (this.displayState === 'maintenance') {
-        this.err = '维护中不可切换启停（Master Key 轮换等）';
-        return;
-      }
-      const next = this.running ? 'paused' : 'running';
-      const pauseMsg = '已暂停：新请求与合成探活停止；真实在途请求不终止';
-      const resumeMsg = '已恢复：将渐进复核 Route，暖机完成前不暗示全部已验证';
-      try {
-        this.busy = true;
-        this.err = '';
-        const data = await api.post('/state', {
-          state: next,
-          expected_revision: this.stateRevision || 0,
-        });
-        this.applyStatePayload(data);
-        this.msg = next === 'paused' ? pauseMsg : resumeMsg;
-        this.loadHealth();
-      } catch (e) {
-        if (e.status === 409) {
-          try {
-            const st = await api.get('/state');
-            this.applyStatePayload(st);
-          } catch { /* */ }
-          this.err = '状态 revision 冲突，已刷新当前 revision，请重试';
-        } else if (e.status === 503 && e.data && e.data.code === 'pause_drain_pending') {
-          this.stateRevision = e.data.new_revision || this.stateRevision;
-          this.running = false;
-          this.displayState = 'paused';
-          this.msg = '暂停已持久化，正在排空 synthetic…';
-        } else {
-          this.err = e.message;
-        }
-      } finally {
-        this.busy = false;
       }
     };
 
