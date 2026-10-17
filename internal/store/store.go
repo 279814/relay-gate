@@ -168,6 +168,10 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化 Auth Secret 绑定元数据: %w", err)
 	}
+	if err := ensureProbeRetentionIndexes(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化探活保留索引: %w", err)
+	}
 	return st, nil
 }
 
