@@ -11,7 +11,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/relay-public-edge 
  && CGO_ENABLED=0 go test -c -o /out/acmeip.test ./internal/acmeip
 
 FROM certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20 AS runtime
-RUN apk add --no-cache nginx ca-certificates \
+RUN apk upgrade --no-cache \
+ && apk add --no-cache nginx ca-certificates \
  && mkdir -p /webroot /state \
  && chmod 755 /webroot && chmod 700 /state
 COPY --from=builder /out/relay-public-edge /usr/local/bin/relay-public-edge
