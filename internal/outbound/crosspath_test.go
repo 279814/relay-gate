@@ -13,16 +13,22 @@ package outbound_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
@@ -45,13 +51,12 @@ const (
 // 而那三样恰好都是上游行为的差异来源。
 type crossPathCase struct {
 	name string
-	// basePath 追加在测试服务器地址之后，模拟带公共路径前缀的网关。
+	// basePath is materialized into Endpoint overrides for a shared gateway prefix.
 	basePath string
-	// fullURLMode 为 true 时 base_url 即完整端点，不再拼 messages 路径；
-	// L1 接到 origin，不得叠到完整端点路径后面。
-	fullURLMode bool
-	// l1Path 为空表示只探连接层（HEAD base_url）。
-	l1Path     string
+	// modelsAtOrigin places models at the origin while model Endpoints keep the prefix.
+	modelsAtOrigin bool
+	// modelsPath is materialized as the explicit models Endpoint URL override.
+	modelsPath string
 	fixedQuery string
 	// incomingQuery 是客户端带来的 query（探活没有客户端，故不参与探活断言）。
 	incomingQuery string
@@ -81,7 +86,7 @@ func crossPathCases() []crossPathCase {
 	return []crossPathCase{
 		{
 			name:             "canonical",
-			l1Path:           "/v1/models",
+			modelsPath:       "/v1/models",
 			incomingQuery:    "beta=true",
 			wantPath:         "/v1/messages",
 			wantCountPath:    "/v1/messages/count_tokens",
@@ -94,7 +99,7 @@ func crossPathCases() []crossPathCase {
 			// 全部打到根下的 /v1/*，表现为 404 而配置看起来完全正确。
 			name:             "base 带公共路径前缀",
 			basePath:         "/api",
-			l1Path:           "/v1/models",
+			modelsPath:       "/v1/models",
 			incomingQuery:    "beta=true",
 			wantPath:         "/api/v1/messages",
 			wantCountPath:    "/api/v1/messages/count_tokens",
@@ -105,7 +110,7 @@ func crossPathCases() []crossPathCase {
 		{
 			name:             "base 带尾斜杠",
 			basePath:         "/",
-			l1Path:           "/v1/models",
+			modelsPath:       "/v1/models",
 			incomingQuery:    "beta=true",
 			wantPath:         "/v1/messages",
 			wantCountPath:    "/v1/messages/count_tokens",
@@ -117,7 +122,7 @@ func crossPathCases() []crossPathCase {
 			// key 放在 query 里的站（§7.1 FixedQueryTemplate）。三条路径都必须带上它，
 			// 漏掉任何一条的症状都是「配了 key 却一直 401」。
 			name:           "固定 query 带 key",
-			l1Path:         "/v1/models",
+			modelsPath:     "/v1/models",
 			fixedQuery:     "key={{UPSTREAM_API_KEY}}",
 			incomingQuery:  "beta=true",
 			wantPath:       "/v1/messages",
@@ -131,7 +136,7 @@ func crossPathCases() []crossPathCase {
 		},
 		{
 			name:           "固定 query 多参数保序",
-			l1Path:         "/v1/models",
+			modelsPath:     "/v1/models",
 			fixedQuery:     "z=1&a=2",
 			incomingQuery:  "m=3&z=9",
 			wantPath:       "/v1/messages",
@@ -143,8 +148,8 @@ func crossPathCases() []crossPathCase {
 			wantProbeModelsQuery: "z=1&a=2",
 		},
 		{
-			name:             "自定义 l1_path 只影响 models",
-			l1Path:           "/status",
+			name:             "自定义 models Endpoint 只影响 models",
+			modelsPath:       "/status",
 			incomingQuery:    "beta=true",
 			wantPath:         "/v1/messages",
 			wantCountPath:    "/v1/messages/count_tokens",
@@ -153,13 +158,12 @@ func crossPathCases() []crossPathCase {
 			wantProbeL2Query: probeRecipeQuery,
 		},
 		{
-			// full_url_mode 不推断协议端点（§19.2）：无 override 时是
-			// base 路径 + canonical 路径。L1 接到 origin，
-			// 不得变成 /custom/entry/v1/models 或 /custom/entry/status。
-			name:             "full_url_mode 不叠 L1 路径",
+			// One upstream can publish distinct absolute Endpoint overrides:
+			// model requests retain the shared prefix, models targets the origin.
+			name:             "models 显式 origin override 不叠 base 前缀",
 			basePath:         "/custom/entry",
-			fullURLMode:      true,
-			l1Path:           "/v1/models",
+			modelsAtOrigin:   true,
+			modelsPath:       "/v1/models",
 			incomingQuery:    "beta=true",
 			wantPath:         "/custom/entry/v1/messages",
 			wantCountPath:    "/custom/entry/v1/messages/count_tokens",
@@ -265,7 +269,7 @@ func TestAllOutboundPathsSendExactlyOneAuthHeader(t *testing.T) {
 					present = append(present, header)
 				}
 			}
-			// crossEndpoints 配的是 x_api_key，所以恰好一个头。
+			// Persisted Endpoint profiles explicitly choose x_api_key.
 			if len(present) != 1 || present[0] != "X-Api-Key" {
 				t.Errorf("应恰好发一个 X-Api-Key，实际带了 %v", present)
 			}
@@ -281,6 +285,61 @@ func TestAllOutboundPathsSendExactlyOneAuthHeader(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAllOutboundPathsUseScenarioBudgetPools(t *testing.T) {
+	fixture := newCrossPathFixture(t, crossPathCases()[0])
+	for index, scenario := range []struct {
+		name    string
+		connect time.Duration
+		drive   func(*testing.T) recordedRequest
+	}{
+		{"real", time.Second, fixture.driveRealForward},
+		{"count_tokens", 2 * time.Second, fixture.driveCountTokens},
+		{"L1", 3 * time.Second, fixture.driveProbeL1},
+		{"L2", 4 * time.Second, fixture.driveProbeL2},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			if !scenario.drive(t).seen {
+				t.Fatal("path did not send its real HTTP request")
+			}
+			if got := fixture.transports.PoolCount(); got != index+1 {
+				t.Fatalf("scenario did not select its independent budget pool: pools=%d want=%d", got, index+1)
+			}
+			network := outbound.NetworkFor(fixture.upstream.ProbeConfig(), scenario.connect)
+			pool, err := fixture.transports.Transport(network)
+			if err != nil {
+				t.Fatal(err)
+			}
+			again, err := fixture.transports.Transport(network)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pool != again || fixture.transports.PoolCount() != index+1 {
+				t.Fatal("the HTTP path used another network/budget identity or did not reuse its Manager pool")
+			}
+		})
+	}
+}
+
+func TestAllOutboundPathsSharePoolForEqualConnectBudget(t *testing.T) {
+	fixture := newCrossPathFixture(t, crossPathCases()[0])
+	fixture.settings.RealConnectSec = 2
+	fixture.settings.CountTokensConnectSec = 2
+	fixture.settings.L1ConnectSec = 2
+	fixture.settings.L2ConnectSec = 2
+	fixture.saveSettings(t)
+	if err := fixture.source.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	for _, drive := range []func(*testing.T) recordedRequest{fixture.driveRealForward, fixture.driveCountTokens, fixture.driveProbeL1, fixture.driveProbeL2} {
+		if !drive(t).seen {
+			t.Fatal("path did not perform its HTTP operation")
+		}
+		if got := fixture.transports.PoolCount(); got != 1 {
+			t.Fatalf("same network and connect budget split the shared Manager: pools=%d", got)
+		}
 	}
 }
 
@@ -317,6 +376,10 @@ type crossPathFixture struct {
 	settings   model.Settings
 	targets    *outbound.Provider
 	transports *outbound.Manager
+	store      *store.Store
+	source     *livecfg.Source
+	executor   *probe.Executor
+	scheduler  *probe.Scheduler
 
 	mu   sync.Mutex
 	last recordedRequest
@@ -333,52 +396,118 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 			path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone()}
 		fixture.mu.Unlock()
 
-		// 回一个能让三条路径都判成功的响应：
-		// count_tokens 要 input_tokens（否则会降级本地粗算），
-		// 探活 L2 要一个语义事件（否则判假活）。
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w,
-			"event: content_block_delta\ndata: {\"input_tokens\":7,\"delta\":{\"text\":\"2\"}}\n\n")
+		// Each real protocol must complete; arbitrary bytes cannot stand in
+		// for models, count_tokens and semantic model evidence simultaneously.
+		if strings.HasSuffix(r.URL.Path, "/messages/count_tokens") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"input_tokens":7}`)
+		} else if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		} else {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		}
 	}))
 	t.Cleanup(fixture.server.Close)
 
-	fixture.upstream = &model.Upstream{
-		ID: 10, Name: "mock", BaseURL: fixture.server.URL + testCase.basePath,
-		APIKey: crossUpstreamKey, AuthStyle: model.AuthXAPIKey,
-		FullURLMode: testCase.fullURLMode,
-		L1Path:      testCase.l1Path, Enabled: true, CredentialRevision: 1,
+	cipher, err := store.NewCipher("cross-path-fixture-master-key")
+	if err != nil {
+		t.Fatal(err)
 	}
-	modelName := &model.ModelName{ID: 1, Name: "claude-opus-5",
-		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	fixture.store, err = store.Open(filepath.Join(t.TempDir(), "crosspath.db"), cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fixture.store.Close() })
+	fixture.upstream = &model.Upstream{Name: "mock", BaseURL: fixture.server.URL, APIKey: crossUpstreamKey, Enabled: true, ProbeMode: model.ProbeModeActive}
+	endpoints := make([]*model.UpstreamEndpoint, 0, 5)
+	for _, kind := range []model.EndpointKind{model.EndpointModels, model.EndpointMessages, model.EndpointResponses, model.EndpointChatCompletions, model.EndpointCountTokens} {
+		endpoint := &model.UpstreamEndpoint{Kind: kind, URLMode: model.EndpointURLCanonical, FixedQueryTemplate: testCase.fixedQuery,
+			AuthProfile: model.EndpointAuthProfile{Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1}, Revision: 1}
+		if testCase.basePath != "" && testCase.basePath != "/" {
+			endpoint.URLOverride = fixture.server.URL + testCase.basePath + kind.CanonicalPath()
+		} else if testCase.basePath == "/" {
+			fixture.upstream.BaseURL = fixture.server.URL + "/"
+		}
+		if kind == model.EndpointModels {
+			switch {
+			case testCase.modelsAtOrigin:
+				endpoint.URLOverride = fixture.server.URL + testCase.modelsPath
+			case testCase.modelsPath != "/v1/models":
+				endpoint.URLOverride = fixture.server.URL + strings.TrimRight(testCase.basePath, "/") + testCase.modelsPath
+			}
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	if err := fixture.store.CreateUpstreamWithEndpoints(context.Background(), fixture.upstream, endpoints); err != nil {
+		t.Fatal(err)
+	}
+	modelName := &model.ModelName{Name: "claude-opus-5", Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
 	modelName.Defaults()
-	route := &model.Route{ID: 100, ModelNameID: 1, UpstreamID: 10,
-		Priority: 1, Weight: 100, Enabled: true}
-
-	fixture.snapshot = router.BuildSnapshot([]*model.ModelName{modelName},
-		[]*model.Upstream{fixture.upstream}, []*model.Route{route})
+	if err := fixture.store.CreateModelName(modelName); err != nil {
+		t.Fatal(err)
+	}
+	route := &model.Route{ModelNameID: modelName.ID, UpstreamID: fixture.upstream.ID, Priority: 1, Weight: 100, Enabled: true}
+	if err := fixture.store.CreateRoute(route); err != nil {
+		t.Fatal(err)
+	}
 
 	fixture.settings = model.DefaultSettings()
-	fixture.settings.RealConnectSec = 2
-	fixture.settings.RealFirstTokenSec = 2
-	fixture.settings.RealIdleSec = 2
-	fixture.settings.RealTotalSec = 5
-	fixture.settings.CountTokensSec = 5
+	// Four distinct valid connect budgets prove the production paths select
+	// their own scenario pools within the single shared Manager.
+	fixture.settings.RealConnectSec = 1
+	fixture.settings.CountTokensConnectSec = 2
+	fixture.settings.CountTokensTotalSec = 5
+	fixture.settings.L1ConnectSec = 3
 	fixture.settings.L1TotalSec = 5
+	fixture.settings.L2ConnectSec = 4
 	fixture.settings.L2TotalSec = 5
 	fixture.settings.L2FirstTokenSec = 3
+	fixture.settings.L2ResponseHeaderSec = 3
+	fixture.settings.L2FirstByteSec = 3
+	fixture.settings.L2FirstEventSec = 3
+	fixture.settings.L2FirstSemanticSec = 3
+	fixture.settings.L2IdleSec = 1
 	fixture.settings.SampleEnabled = false
 	fixture.settings.HalfOpenEnabled = false
-
-	// 与 main.go 同构的装配：一个 Provider + 一个 Resolver + 一个 Manager，
-	// 三条路径共用。Manager 共用是必须的 —— 探活与真实请求各建一套连接池
-	// 就丢掉了「探活顺带把连接热着」这份收益，而那是首字节延迟的可观部分。
-	fixture.targets = outbound.NewProvider(
-		crossEndpoints{upstream: fixture.upstream, fixedQuery: testCase.fixedQuery},
-		nil, outbound.NewResolver(crossHasher{}))
+	fixture.saveSettings(t)
+	fixture.source = livecfg.New(fixture.store, discardLogger())
+	if err := fixture.source.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.snapshot, err = fixture.source.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.upstream = fixture.snapshot.Upstreams[fixture.upstream.ID]
+	fixture.targets = outbound.NewProvider(fixture.source, nil, outbound.NewResolver(crossHasher{}))
 	fixture.transports = outbound.NewManager()
 	t.Cleanup(fixture.transports.CloseIdleConnections)
+	recipes := probe.NewRecipeResolver(fixture.store).WithNotFound(func(err error) bool { return errors.Is(err, store.ErrNotFound) })
+	tracker := health.NewTracker(fixture.source)
+	reach := health.NewReachabilityTracker(fixture.source)
+	caps := probe.NewCapabilityRegistry(fixture.source).WithRouteGeneration(tracker)
+	recorder := probe.NewResultRecorder(fixture.store, health.NewObservationReducer(nil), reach, caps)
+	fixture.executor = probe.NewExecutor(fixture.targets, fixture.store, recipes, probe.ManagerTransports{Manager: fixture.transports}, recorder, probe.AlwaysOpenAdmission(), probe.WallClock(), discardLogger())
+	seq, err := observationseq.Open(context.Background(), fixture.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(seq.Close)
+	fixture.scheduler = probe.NewScheduler(fixture.source, tracker, reach, discardLogger()).WithRecipes(recipes).WithExecutor(fixture.executor).WithSequencer(seq)
 	return fixture
+}
+
+func (fixture *crossPathFixture) saveSettings(t *testing.T) {
+	t.Helper()
+	_, revision, err := fixture.store.GetSettingsWithRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.SaveSettingsWithRevision(fixture.settings, revision); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (fixture *crossPathFixture) take() recordedRequest {
@@ -390,9 +519,9 @@ func (fixture *crossPathFixture) take() recordedRequest {
 }
 
 func (fixture *crossPathFixture) handler() *proxy.Handler {
-	return proxy.NewHandler(fixture, alwaysAliveHealth{}, nil,
+	return proxy.NewHandler(fixture.source, alwaysAliveHealth{}, nil,
 		[]string{crossRelayKey}, discardLogger()).
-		WithTargets(fixture.targets, nil).
+		WithTargets(fixture.targets, fixture.store).
 		WithTransports(fixture.transports)
 }
 
@@ -415,70 +544,53 @@ func (fixture *crossPathFixture) serveHTTP(t *testing.T, path string) recordedRe
 		target += "?" + fixture.testCase.incomingQuery
 	}
 	request := httptest.NewRequest(http.MethodPost, target,
-		strings.NewReader(`{"model":"claude-opus-5","max_tokens":1}`))
+		strings.NewReader(`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"1+1=?"}],"stream":true}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Api-Key", crossRelayKey)
 
 	mux := http.NewServeMux()
 	handler.Routes(mux)
-	mux.ServeHTTP(httptest.NewRecorder(), request)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != 200 || response.Header().Get("X-Relay-Count-Tokens") != "" {
+		t.Fatalf("path failed or silently used local count estimate: status=%d body=%s", response.Code, response.Body.String())
+	}
 	return fixture.take()
 }
 
-// prober 造一个与真实转发共用同一份 Manager 的 Prober。
-//
-// 用 Manager 而不是 http.DefaultTransport：探活与真实请求必须共用连接池，
-// 而这条门禁的职责就是「三条路径不分叉」—— 连接池是其中一个维度。
-func (fixture *crossPathFixture) prober(t *testing.T) *probe.Prober {
+// Preparation uses the same published Store/Source facts and sequencer as the
+// production Scheduler, then the Executor alone performs the HTTP operation.
+func (fixture *crossPathFixture) driveProbe(t *testing.T, endpoint model.EndpointKind) recordedRequest {
 	t.Helper()
-	transport, err := fixture.transports.Transport(
-		outbound.NetworkFor(fixture.upstream.ProbeConfig(),
-			outbound.L2Budget(fixture.settings).Connect))
-	if err != nil {
-		t.Fatalf("取探活连接池: %v", err)
+	request := probe.ExecutionRequest{ExecutionID: fmt.Sprintf("cross-%s-%d", endpoint, time.Now().UnixNano()), Trigger: model.TriggerManual,
+		Upstream: fixture.upstream, Endpoint: endpoint, Mode: probe.ObserveProbe}
+	if endpoint != model.EndpointModels {
+		request.ModelName = fixture.snapshot.ModelNames[0]
+		request.Route = fixture.snapshot.RoutesByModelName[request.ModelName.ID][0]
 	}
-	return &probe.Prober{Transport: transport, Targets: fixture.targets}
+	if err := fixture.scheduler.PrepareManual(context.Background(), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.ObservationOrder <= 0 || request.CapabilityExpectation == nil || request.ReachabilityExpectation == nil {
+		t.Fatal("probe was not bound to current persisted configuration/order")
+	}
+	result, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Execution.Success || !result.Apply.ExecutionStored || result.Apply.Capability != model.ApplyCurrent || result.Apply.Reachability != model.ApplyCurrent {
+		t.Fatalf("probe failed or observation was not committed: execution=%+v apply=%+v", result.Execution, result.Apply)
+	}
+	return fixture.take()
 }
 
 func (fixture *crossPathFixture) driveProbeL2(t *testing.T) recordedRequest {
 	t.Helper()
-	modelName := fixture.snapshot.ModelNames[0]
-	route := fixture.snapshot.RoutesByModelName[modelName.ID][0]
-	fixture.prober(t).L2(context.Background(), fixture.upstream, modelName, route, fixture.settings)
-	return fixture.take()
+	return fixture.driveProbe(t, model.EndpointMessages)
 }
-
 func (fixture *crossPathFixture) driveProbeL1(t *testing.T) recordedRequest {
 	t.Helper()
-	fixture.prober(t).L1(context.Background(), fixture.upstream, fixture.settings)
-	return fixture.take()
-}
-
-// proxy.ConfigSource / probe.ConfigSource
-func (fixture *crossPathFixture) Snapshot() (*router.Snapshot, error) { return fixture.snapshot, nil }
-func (fixture *crossPathFixture) Settings() (model.Settings, error)   { return fixture.settings, nil }
-func (fixture *crossPathFixture) RunState() (store.RunState, error)   { return store.StateRunning, nil }
-
-// crossEndpoints 与 Store 的 canonicalEndpointBundle 同构：override 由
-// model.EndpointURLOverride 翻译，保证测试与生产读到的是同一套 Endpoint。
-type crossEndpoints struct {
-	upstream   *model.Upstream
-	fixedQuery string
-}
-
-func (source crossEndpoints) Endpoint(_ context.Context, upstreamID int64,
-	kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
-
-	return &model.UpstreamEndpoint{
-		ID: 1, UpstreamID: upstreamID, Kind: kind,
-		URLMode:            model.EndpointURLCanonical,
-		URLOverride:        source.upstream.EndpointURLOverride(kind),
-		FixedQueryTemplate: source.fixedQuery,
-		AuthProfile: model.EndpointAuthProfile{
-			Mode: model.AuthModeXAPIKey, SecretRef: "upstream_api_key", Revision: 1,
-		},
-		Revision: 1,
-	}, nil
+	return fixture.driveProbe(t, model.EndpointModels)
 }
 
 type crossHasher struct{}
