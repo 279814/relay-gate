@@ -1,0 +1,27 @@
+# Official Certbot 5.8.0 includes IP + webroot support. Runtime capability checks
+# still reject missing IP/profile/plugin support before contacting the ACME CA.
+FROM golang:1.26.9-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+ARG GOPROXY=https://proxy.golang.org,direct
+RUN go mod download
+COPY internal/acmeip ./internal/acmeip
+COPY cmd/relay-public-edge ./cmd/relay-public-edge
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/relay-public-edge ./cmd/relay-public-edge \
+ && CGO_ENABLED=0 go test -c -o /out/acmeip.test ./internal/acmeip
+
+FROM certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20 AS runtime
+RUN apk add --no-cache nginx ca-certificates \
+ && mkdir -p /webroot /state \
+ && chmod 755 /webroot && chmod 700 /state
+COPY --from=builder /out/relay-public-edge /usr/local/bin/relay-public-edge
+STOPSIGNAL SIGTERM
+
+# CI runs actual Nginx + local test CA here; no public CA or host credentials.
+FROM runtime AS test
+COPY --from=builder /out/acmeip.test /usr/local/bin/acmeip.test
+ENV RELAY_PUBLIC_NGINX_TEST=1
+ENTRYPOINT ["/usr/local/bin/acmeip.test"]
+
+FROM runtime AS production
+ENTRYPOINT ["/usr/local/bin/relay-public-edge"]

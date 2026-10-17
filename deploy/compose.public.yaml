@@ -1,0 +1,72 @@
+# Independent public deployment. The default compose.yaml remains HTTP-only.
+services:
+  relay-gate:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: relay-gate:${VERSION:-dev}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      RELAY_KEYS: ${RELAY_KEYS:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      RELAY_ADDR: 0.0.0.0:18787
+      RELAY_TRUSTED_PROXY_IPS: 172.30.187.2
+      RELAY_PUBLIC_ORIGIN: ${RELAY_PUBLIC_ORIGIN:?confirmed public origin required}
+      RELAY_PUBLIC_HTTPS_STATUS_FILE: /run/relay-public-status/state.json
+    volumes:
+      - ./data:/app/data
+      - ./data-public/status:/run/relay-public-status:ro
+    networks:
+      internal:
+        ipv4_address: 172.30.187.3
+      upstream: {}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18787/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  public-edge:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.public
+      target: production
+    restart: unless-stopped
+    environment:
+      RELAY_PUBLIC_IP: ${RELAY_PUBLIC_IP:?confirmed public IP required}
+      RELAY_CONFIRMED_PUBLIC_IP: ${RELAY_CONFIRMED_PUBLIC_IP:?explicit target confirmation required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data-public:/state
+    networks:
+      internal:
+        ipv4_address: 172.30.187.2
+      acme: {}
+    stop_grace_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.187.0/28
+  # Gateway upstream traffic and edge ACME traffic have separate egress networks.
+  upstream: {}
+  acme: {}

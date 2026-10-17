@@ -116,3 +116,22 @@ jobs:
           python-version: '3.x'
       - name: 安装脚本离线行为回归
         run: python scripts/deploy.contract.test.py
+      - name: 公网安装脚本离线行为回归
+        run: python scripts/deploy-public.contract.test.py
+
+  public-edge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate independent public Compose definition
+        env:
+          RELAY_PUBLIC_IP: 8.8.8.8
+          RELAY_CONFIRMED_PUBLIC_IP: 8.8.8.8
+          RELAY_PUBLIC_ORIGIN: https://8.8.8.8
+        run: docker compose --project-directory "$PWD" -f deploy/compose.public.yaml config --quiet
+      - name: Build pinned Certbot and real Nginx test image
+        run: docker build -f deploy/Dockerfile.public --target test -t relay-public-edge-test .
+      - name: Local CA, real Nginx, streaming and Certbot capability integration
+        # No published host ports, public ACME requests or production data.
+        run: docker run --rm relay-public-edge-test -test.v -test.count=1 -test.timeout=3m

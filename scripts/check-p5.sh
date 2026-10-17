@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # P5 release validation gate（离线）：schema 8 终态、Keyring、备份拒绝门、
 # 安全扫描不改字节、Transform 未绑定透传、RecoveryGate single-flight、
-# IP 证书续期可观测（fake RenewWatch；不冒充真实公网签发）。
+# IP 证书续期离线回归；真实 Nginx/本地 CA 由 public-edge CI 验证，
+# 两者都不冒充真实公网签发。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -12,7 +13,8 @@ go test ./internal/release/ -count=1
 echo "== release docs present =="
 test -f docs/RELEASE-NOTES-v1.0.0.md
 test -f docs/09-P5-发布验证.md
-# Old domain/cert deploy guide must stay deleted for HTTP IP:port install.
+# Only the obsolete domain/allowlist paths remain forbidden. The independent
+# deploy-public.sh + deploy/compose.public.yaml IP-HTTPS path is supported.
 if [ -e docs/03-部署与配置.md ]; then
   echo "docs/03 should remain deleted" >&2
   exit 1
