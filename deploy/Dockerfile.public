@@ -15,6 +15,9 @@ COPY deploy/requirements-public-security.txt /tmp/requirements-public-security.t
 RUN apk upgrade --no-cache \
  && apk add --no-cache nginx ca-certificates \
  && uv pip install --system --no-cache --no-deps --require-hashes -r /tmp/requirements-public-security.txt \
+ # Certbot's fixed webroot runtime does not need pip. Its bundled vendor copies
+ # remain vulnerable even after upgrading the separately installed packages.
+ && uv pip uninstall --system pip \
  && uv pip check --system \
  && mkdir -p /webroot /state \
  && chmod 755 /webroot && chmod 700 /state
