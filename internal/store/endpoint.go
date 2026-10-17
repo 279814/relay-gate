@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -178,7 +179,11 @@ func insertEndpointTx(ctx context.Context, tx *sql.Tx, endpoint *model.UpstreamE
 	if err != nil {
 		return err
 	}
-	return replaceEndpointSecretRefs(ctx, tx, endpoint)
+	if err := replaceEndpointSecretRefs(ctx, tx, endpoint); err != nil {
+		return err
+	}
+	endpoint.BoundSecrets, err = loadEndpointBindingMetadata(ctx, tx, endpoint.ID)
+	return err
 }
 
 func (store *Store) CreateEndpoint(endpoint *model.UpstreamEndpoint) (err error) {
@@ -214,7 +219,7 @@ func (store *Store) CreateEndpoint(endpoint *model.UpstreamEndpoint) (err error)
 }
 
 func (store *Store) GetEndpoint(id int64) (*model.UpstreamEndpoint, error) {
-	return scanEndpoint(store.db.QueryRow(`SELECT `+endpointColumns+` FROM upstream_endpoint WHERE id=?`, id))
+	return store.getBoundEndpoint(context.Background(), `id=?`, id)
 }
 
 // Endpoint 按 (upstream, kind) 取一条 Endpoint，满足 outbound.EndpointConfigSource。
@@ -227,9 +232,27 @@ func (store *Store) Endpoint(ctx context.Context, upstreamID int64,
 	if !kind.Valid() {
 		return nil, model.WrapValidation("endpoint 无效: %q", kind)
 	}
-	return scanEndpoint(store.db.QueryRowContext(ctx,
-		`SELECT `+endpointColumns+` FROM upstream_endpoint WHERE upstream_id=? AND endpoint=?`,
-		upstreamID, kind))
+	return store.getBoundEndpoint(ctx, `upstream_id=? AND endpoint=?`, upstreamID, kind)
+}
+
+func (store *Store) getBoundEndpoint(ctx context.Context, predicate string, args ...any) (*model.UpstreamEndpoint, error) {
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	endpoint, err := scanEndpoint(tx.QueryRowContext(ctx, `SELECT `+endpointColumns+` FROM upstream_endpoint WHERE `+predicate, args...))
+	if err != nil {
+		return nil, err
+	}
+	endpoint.BoundSecrets, err = loadEndpointBindingMetadata(ctx, tx, endpoint.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return endpoint, nil
 }
 
 func scanEndpoint(scanner interface{ Scan(...any) error }) (*model.UpstreamEndpoint, error) {
@@ -377,6 +400,10 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 	if err = replaceEndpointSecretRefs(context.Background(), tx, endpoint); err != nil {
 		return err
 	}
+	endpoint.BoundSecrets, err = loadEndpointBindingMetadata(context.Background(), tx, endpoint.ID)
+	if err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -400,6 +427,15 @@ func replaceEndpointSecretRefs(ctx context.Context, tx *sql.Tx, endpoint *model.
 	if err != nil {
 		return err
 	}
+	placeholder, err := endpoint.AuthProfile.SecretPlaceholder()
+	if err != nil {
+		return err
+	}
+	if name, ok := strings.CutPrefix(placeholder, "SECRET:"); ok {
+		required = append(required, name)
+	}
+	slices.Sort(required)
+	required = slices.Compact(required)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM endpoint_active_secret_ref WHERE endpoint_id=?`, endpoint.ID); err != nil {
 		return err
 	}

@@ -99,6 +99,10 @@ func applyAuthMode(ctx context.Context, header http.Header, in AuthInput) ([]str
 	if !in.Profile.Mode.Valid() {
 		return nil, fmt.Errorf("%w: auth mode 无效 %q", ErrAuthConfig, in.Profile.Mode)
 	}
+	placeholder, err := in.Profile.SecretPlaceholder()
+	if err != nil {
+		return nil, fmt.Errorf("%w: auth secret_ref 无效", ErrAuthConfig)
+	}
 
 	mode := in.Profile.Mode
 	if mode == model.AuthModeAutoCalibrated {
@@ -138,7 +142,10 @@ func applyAuthMode(ctx context.Context, header http.Header, in AuthInput) ([]str
 			return nil, fmt.Errorf("%w: 旧 auth_style=auto 尚未校准，"+
 				"合成探活不能猜认证方式；请先运行一次校准", ErrAuthConfig)
 		}
-		key, err := upstreamKey(ctx, in.Values)
+		if placeholder != "UPSTREAM_API_KEY" {
+			return nil, fmt.Errorf("%w: legacy auth 只能引用原 Upstream API Key", ErrAuthConfig)
+		}
+		key, err := authCredential(ctx, in.Values, placeholder)
 		if err != nil {
 			return nil, err
 		}
@@ -147,7 +154,7 @@ func applyAuthMode(ctx context.Context, header http.Header, in AuthInput) ([]str
 		return []string{"X-Api-Key", "Authorization"}, nil
 
 	case model.AuthModeBearer, model.AuthModeXAPIKey, model.AuthModeAPIKey:
-		key, err := upstreamKey(ctx, in.Values)
+		key, err := authCredential(ctx, in.Values, placeholder)
 		if err != nil {
 			return nil, err
 		}
@@ -178,19 +185,25 @@ func singleAuthHeader(mode model.AuthMode, key string) (string, string) {
 // 值的字节校验不在这里：ApplyAuth 的出口统一验一次它写进 header 的每个值。
 // 两处都验的话，其中一处必然逐渐与另一处分叉，而分叉的那一半是死代码 ——
 // 看起来有防护，实际从没生效过。
-func upstreamKey(ctx context.Context, values ValueResolver) (string, error) {
+func authCredential(ctx context.Context, values ValueResolver, placeholder string) (string, error) {
 	if values == nil {
 		return "", fmt.Errorf("%w: 未提供凭据来源", ErrAuthConfig)
 	}
-	resolved, err := values.ResolveValue(ctx, "UPSTREAM_API_KEY")
+	resolved, err := values.ResolveValue(ctx, placeholder)
 	if err != nil {
+		if errors.Is(err, ErrSecretSourceRead) {
+			return "", &authSecretReadError{header: "auth secret_ref", cause: err}
+		}
 		// 不复述下层错误文本：它可能带凭据明文（见 valueError 的说明）。
-		return "", fmt.Errorf("%w: 上游 api_key 不可用", ErrAuthConfig)
+		return "", fmt.Errorf("%w: 选定的认证凭据不可用", ErrAuthConfig)
 	}
 	if len(resolved.Plain) == 0 {
 		// 绝不静默发一个无认证请求：那会得到一个难以归因的 401 ——
 		// 用户看到「认证失败」，而真正的问题是「key 没配」。
-		return "", fmt.Errorf("%w: 上游 api_key 为空", ErrAuthConfig)
+		return "", fmt.Errorf("%w: 选定的认证凭据为空", ErrAuthConfig)
+	}
+	if len(resolved.Plain) < model.MinRedactableKeyLen {
+		return "", fmt.Errorf("%w: 认证凭据短于安全脱敏下限 %d", ErrAuthConfig, model.MinRedactableKeyLen)
 	}
 	return string(resolved.Plain), nil
 }
@@ -323,7 +336,7 @@ type authSecretReadError struct {
 }
 
 func (err *authSecretReadError) Error() string {
-	return fmt.Sprintf("manual auth header %q 引用的 Probe Secret 读取失败", err.header)
+	return fmt.Sprintf("认证字段 %q 引用的 Probe Secret 读取失败", err.header)
 }
 
 func (err *authSecretReadError) Unwrap() error { return err.cause }

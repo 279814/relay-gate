@@ -186,6 +186,26 @@ type EndpointAuthProfile struct {
 	Revision       int64            `json:"revision"`
 }
 
+// SecretPlaceholder maps the closed configuration vocabulary to the shared
+// value resolver. A literal credential is never a valid reference.
+func (profile EndpointAuthProfile) SecretPlaceholder() (string, error) {
+	if profile.SecretRef == "upstream_api_key" {
+		return "UPSTREAM_API_KEY", nil
+	}
+	name, ok := strings.CutPrefix(profile.SecretRef, "probe:")
+	if !ok || name == "" {
+		return "", WrapValidation("auth secret_ref 必须为 upstream_api_key 或 probe:<name>")
+	}
+	for _, character := range []byte(name) {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || strings.ContainsRune("-_.", rune(character)) {
+			continue
+		}
+		return "", WrapValidation("auth secret_ref 的 Probe Secret 名称无效")
+	}
+	return "SECRET:" + name, nil
+}
+
 type UpstreamEndpoint struct {
 	ID                    int64               `json:"id"`
 	UpstreamID            int64               `json:"upstream_id"`
@@ -197,10 +217,13 @@ type UpstreamEndpoint struct {
 	URLOverride           string              `json:"url_override,omitempty"`
 	FixedQueryTemplate    string              `json:"fixed_query_template,omitempty"`
 	AuthProfile           EndpointAuthProfile `json:"auth_profile"`
-	Revision              int64               `json:"revision"`
-	NeedsReview           bool                `json:"needs_review"`
-	CreatedAt             int64               `json:"created_at"`
-	UpdatedAt             int64               `json:"updated_at"`
+	// BoundSecrets belongs to the same captured database generation as this
+	// Endpoint. It contains identity/revision metadata only, never plaintext.
+	BoundSecrets []SecretRevision `json:"-"`
+	Revision     int64            `json:"revision"`
+	NeedsReview  bool             `json:"needs_review"`
+	CreatedAt    int64            `json:"created_at"`
+	UpdatedAt    int64            `json:"updated_at"`
 }
 
 type LegacyFullURL struct {

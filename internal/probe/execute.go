@@ -50,6 +50,7 @@ type preparedProbe struct {
 	// 站级门禁放行、L2 继续往一个已死的站上烧 token，而界面显示健康。
 	connectionOnly   bool
 	outputTokenLimit int
+	redactSecrets    []string
 }
 
 // prepare 解析并渲染出一次探活请求。
@@ -165,6 +166,10 @@ func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *mode
 		request.Host = target.RequestHost
 	}
 	request.ContentLength = int64(len(rendered.Body))
+	redactSecrets := target.ResolvedSecrets()
+	for _, secret := range values.Secrets {
+		redactSecrets = append(redactSecrets, string(secret.Plain))
+	}
 
 	return &preparedProbe{
 		recipe:           resolved,
@@ -173,6 +178,7 @@ func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *mode
 		requestURLHash:   target.RequestURLHash,
 		connectionOnly:   connectionOnly,
 		outputTokenLimit: ProbeRequestOutputTokenLimit(rendered.Body),
+		redactSecrets:    redactSecrets,
 	}, resolved, nil
 }
 
@@ -330,9 +336,13 @@ func (p *Prober) applyProbeHeaders(ctx context.Context, header http.Header, up *
 	target outbound.ResolvedTarget) error {
 
 	applyUpstreamHeaderOverrides(header, up)
+	values := target.CredentialValues
+	if values == nil {
+		values = p.values(up)
+	}
 	return outbound.ApplyAuth(ctx, header, outbound.AuthInput{
 		Profile: target.AuthProfile,
-		Values:  p.values(up),
+		Values:  values,
 		Use:     outbound.ResolveSyntheticProbe,
 	})
 }

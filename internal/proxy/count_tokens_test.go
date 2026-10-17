@@ -901,8 +901,8 @@ func TestCountTokens_EmptyKeyFailsClosedAndFallsBackLocally(t *testing.T) {
 		t.Errorf("应标明这是估算值，得到 %q", got)
 	}
 	// 日志要说清是「认证配置」的问题，否则用户对着一个笼统的失败无从下手。
-	if !strings.Contains(logs.String(), "api_key") {
-		t.Errorf("日志应指出 api_key 未配置:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "认证") {
+		t.Errorf("日志应指出所选认证凭据不可用:\n%s", logs.String())
 	}
 }
 

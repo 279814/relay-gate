@@ -110,6 +110,9 @@ func (values TemplateValues) secret(name string) (probetemplate.ResolvedValue, e
 		return probetemplate.ResolvedValue{},
 			fmt.Errorf("%w: Probe Secret %q 未装配", ErrTemplateValue, name)
 	}
+	if len(value.Plain) < model.MinRedactableKeyLen {
+		return probetemplate.ResolvedValue{}, fmt.Errorf("%w: Probe Secret 短于安全脱敏下限 %d", ErrTemplateValue, model.MinRedactableKeyLen)
+	}
 	return copyValue(value), nil
 }
 

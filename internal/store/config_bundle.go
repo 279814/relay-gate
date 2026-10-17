@@ -92,6 +92,7 @@ func (store *Store) LoadConfigBundle(ctx context.Context) (*ConfigBundle, error)
 	if bundle.ClientProfileSecretRefs, err = loadBundleClientProfileSecretRefs(ctx, tx); err != nil {
 		return nil, err
 	}
+	materializeEndpointBindings(bundle)
 
 	if err := tx.Commit(); err != nil {
 		return nil, err

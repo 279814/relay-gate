@@ -68,6 +68,10 @@ func (s *ProbeSnapshot) Endpoint(_ context.Context, upstreamID int64, endpoint m
 		return nil, store.ErrNotFound
 	}
 	copyValue := *ep
+	copyValue.BoundSecrets = append([]model.SecretRevision(nil), ep.BoundSecrets...)
+	if ep.AuthProfile.ManualHeaders != nil {
+		copyValue.AuthProfile.ManualHeaders = cloneHeaderTemplates(ep.AuthProfile.ManualHeaders)
+	}
 	return &copyValue, nil
 }
 
@@ -274,6 +278,7 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 	}
 	for _, ep := range bundle.Endpoints {
 		copyEP := *ep
+		copyEP.BoundSecrets = append([]model.SecretRevision(nil), ep.BoundSecrets...)
 		// AuthProfile.ManualHeaders 是 slice；HeaderTemplate.Values 也是 slice。
 		// 只拷外层会与 bundle 共享 Values backing。
 		if ep.AuthProfile.ManualHeaders != nil {
