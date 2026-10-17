@@ -23,15 +23,15 @@ API 均位于 `/admin/api` 并受现有管理鉴权/同源保护：
 | `GET/POST /probe-recipes` | 分页筛选 / 创建 draft |
 | `GET /probe-recipes/{id}` | 状态、revision 和版本指针 |
 | `GET/POST /probe-recipes/{id}/versions` | 分页版本 / 新增 manual 不可变版本 |
-| `GET /probe-recipes/{id}/versions/{version_id}` | 校验父子关系后读取版本 |
-| `POST .../versions/{version_id}/preview` | 脱敏差异和成本估算 |
-| `POST .../versions/{version_id}/test` | 单次显式测试，要求 expected_revision |
-| `POST .../versions/{version_id}/publish` | 独立发布，要求 expected_revision、test_execution_id；失败需 force |
+| `GET /probe-recipe-versions/{id}` | 按不可变版本ID读取 |
+| `POST /probe-recipe-versions/{id}/preview` | 脱敏差异和成本估算 |
+| `POST /probe-recipe-versions/{id}/test` | 单次显式测试，要求 expected_revision |
+| `POST /probe-recipes/{recipe_id}/versions/{version_id}/publish` | 校验父子关系后独立发布，要求 expected_revision、test_execution_id；失败需 force |
 | `POST /probe-recipes/{id}/disable`、`/archive` | 带 expected_revision 停用 / 归档 |
-| `GET /client-profiles`、`/{id}` | 分页筛选 / 安全详情 |
-| `POST /client-profiles/{id}/preview` | 候选脱敏差异与成本 |
-| `POST /client-profiles/{id}/test` | 单次测试成功后原子启用，要求 expected_revision |
-| `POST /client-profiles/{id}/disable` | 带 expected_revision 停用 |
+| `GET /client-probe-profiles`、`/{id}` | 分页筛选 / 安全详情 |
+| `POST /client-probe-profiles/{id}/preview` | 候选脱敏差异与成本 |
+| `POST /client-probe-profiles/{id}/test` | 单次测试成功后原子启用，要求 expected_revision |
+| `POST /client-probe-profiles/{id}/disable` | 带 expected_revision 停用 |
 
 版本写入仅接受 method、fixed_raw_query、有序 headers/values、互斥 body_text/body_base64、stream_expected、timeout_profile 和 expected_revision；不能伪造 source/origin。未知字段、尾随 JSON、坏 Base64、跨父版本和旧 revision 会失败。Recipe、版本及 Profile 列表使用服务端 SQL 过滤和绑定资源/筛选的 cursor；坏格式、跨资源、改变筛选复用 cursor 或非法 limit 返回 400。
 

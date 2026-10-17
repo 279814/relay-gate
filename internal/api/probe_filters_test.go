@@ -182,7 +182,7 @@ func TestProbeListsRealHTTPFilterScopeAndBoundedPages(t *testing.T) {
 		{"capabilities", "state=expired"}, {"capabilities", "expired=1"}, {"reachability", "current=1"}, {"reachability", "state=bogus"},
 		{"calibrations", "state=bogus"}, {"calibrations", "route_id=bad"}, {"probe-costs", "day_from=bad"}, {"probe-costs", "day_from=2099-02-01&day_to=2099-01-01"}, {"probe-costs", "origin=bogus"},
 		{"probe-recipes", "limit=0"}, {"probe-recipes", "upstream_id=1&upstream_id=2"},
-		{"client-profiles", "limit=invalid"}, {"client-profiles", "status=bogus"}, {"client-profiles", "upstream_id=1&upstream_id=2"},
+		{"client-probe-profiles", "limit=invalid"}, {"client-probe-profiles", "status=bogus"}, {"client-probe-profiles", "upstream_id=1&upstream_id=2"},
 		{"probe-recipes/1/versions", "limit=1&limit=2"}, {"probe-recipes/1/versions", "origin=manual&origin=learned"},
 	} {
 		if status, _ := get(test.path, test.query, true); status != 400 {

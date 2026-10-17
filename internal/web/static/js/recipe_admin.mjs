@@ -3,7 +3,7 @@ import { focusFirst } from './modal.mjs';
 
 const read = (row, name) => field(row, name, name.split('_').map(part => ['id', 'url', 'ms', 'api'].includes(part) ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1)).join(''));
 const recipePath = (editor) => `/probe-recipes/${read(editor.recipe, 'id')}`;
-const versionPath = (editor) => `${recipePath(editor)}/versions/${editor.selected.id}`;
+const versionPath = (editor) => `/probe-recipe-versions/${editor.selected.id}`;
 const emptyPage = () => ({ items: [], next_cursor: '', loading: false });
 
 function initialDraft(endpoint) {
@@ -142,7 +142,7 @@ export function createRecipeAdminFeature(shell, api) {
       if (force ? !this.canForceRecipe() : !read(editor.execution, 'success')) return;
       if (!confirm(force ? '该测试失败。确认仍将此版本设为自动探活配方？Force 不会跳过配置身份与版本校验。' : '将该成功测试版本发布到所选作用域？')) return;
       await this.recipeAdminAction(editor, async () => {
-        editor.recipe = await api.post(`${versionPath(editor)}/publish`, { expected_revision: read(editor.recipe, 'revision'), test_execution_id: read(editor.execution, 'id'), force });
+        editor.recipe = await api.post(`${recipePath(editor)}/versions/${editor.selected.id}/publish`, { expected_revision: read(editor.recipe, 'revision'), test_execution_id: read(editor.execution, 'id'), force });
         this.clearRecipeEvidence(); this.msg = force ? '已显式强制发布；失败测试记录保留' : '已发布测试版本'; await this.loadRecipes(true);
       });
     },
@@ -165,29 +165,29 @@ export function createRecipeAdminFeature(shell, api) {
         const query = new URLSearchParams({ limit: '25' });
         for (const [key, value] of Object.entries(this.profileFilters)) if (String(value).trim()) query.set(key, value);
         if (!reset && this.profiles.next_cursor) query.set('cursor', this.profiles.next_cursor);
-        const page = await api.get('/client-profiles?' + query);
+        const page = await api.get('/client-probe-profiles?' + query);
         this.profiles.items = reset ? page.items : [...this.profiles.items, ...page.items]; this.profiles.next_cursor = page.next_cursor || '';
       } catch (error) { this.err = error.message; if (error.status === 400) this.profiles.next_cursor = ''; }
       finally { this.profiles.loading = false; }
     },
     async openClientProfile(id) {
-      try { this.profileView = { profile: await api.get('/client-profiles/' + id), routeId: '', preview: null, execution: null, busy: false, conflict: false }; this._lockModal?.(() => this.closeClientProfile()); this.$nextTick?.(() => focusFirst(this.$refs?.clientProfileDialog)); }
+      try { this.profileView = { profile: await api.get('/client-probe-profiles/' + id), routeId: '', preview: null, execution: null, busy: false, conflict: false }; this._lockModal?.(() => this.closeClientProfile()); this.$nextTick?.(() => focusFirst(this.$refs?.clientProfileDialog)); }
       catch (error) { this.err = error.message; }
     },
     closeClientProfile() { if (this.profileView?.busy) return; this.profileView = null; this._unlockModal?.(); },
     async previewClientProfile() {
       const view = this.profileView; if (!view) return;
-      await this.recipeAdminAction(view, async () => { view.preview = await api.post(`/client-profiles/${view.profile.id}/preview`, { route_id: Number(view.routeId) || 0 }); view.execution = null; });
+      await this.recipeAdminAction(view, async () => { view.preview = await api.post(`/client-probe-profiles/${view.profile.id}/preview`, { route_id: Number(view.routeId) || 0 }); view.execution = null; });
     },
     async testClientProfile() {
       const view = this.profileView;
       if (!view?.preview || view.profile.status !== 'candidate' || !this.canRunCandidate()) return;
       if (!confirm('发送一次真实测试（可能消耗 token）。成功后启用此候选作为 fallback，并替换同站同端点的旧 tested profile；失败仍为 candidate。继续？')) return;
-      await this.recipeAdminAction(view, async () => { view.execution = await api.post(`/client-profiles/${view.profile.id}/test`, { route_id: Number(view.routeId) || 0, expected_revision: view.profile.revision }); view.profile = await api.get('/client-profiles/' + view.profile.id); await this.loadProfiles(true); });
+      await this.recipeAdminAction(view, async () => { view.execution = await api.post(`/client-probe-profiles/${view.profile.id}/test`, { route_id: Number(view.routeId) || 0, expected_revision: view.profile.revision }); view.profile = await api.get('/client-probe-profiles/' + view.profile.id); await this.loadProfiles(true); });
     },
     async disableClientProfile() {
       const view = this.profileView; if (!view || !confirm('停用此 Profile？历史测试记录会保留。')) return;
-      await this.recipeAdminAction(view, async () => { view.profile = await api.post(`/client-profiles/${view.profile.id}/disable`, { expected_revision: view.profile.revision }); view.preview = null; view.execution = null; await this.loadProfiles(true); });
+      await this.recipeAdminAction(view, async () => { view.profile = await api.post(`/client-probe-profiles/${view.profile.id}/disable`, { expected_revision: view.profile.revision }); view.preview = null; view.execution = null; await this.loadProfiles(true); });
     },
   });
   const originalReset = shell.reset;

@@ -181,11 +181,19 @@ func (s *Server) nestedRecipeVersion(r *http.Request) (model.ProbeRecipeVersion,
 	return version, nil
 }
 
+func (s *Server) requestedRecipeVersion(r *http.Request) (model.ProbeRecipeVersion, error) {
+	id, err := pathID(r)
+	if err != nil {
+		return model.ProbeRecipeVersion{}, err
+	}
+	return s.probeAdmin.GetVersion(r.Context(), id)
+}
+
 func (s *Server) previewRecipeVersion(w http.ResponseWriter, r *http.Request) {
 	if !s.probeAdminReady(w) {
 		return
 	}
-	version, err := s.nestedRecipeVersion(r)
+	version, err := s.requestedRecipeVersion(r)
 	if err != nil {
 		s.writeRecipeErr(w, err)
 		return
@@ -209,7 +217,7 @@ func (s *Server) testRecipeVersion(w http.ResponseWriter, r *http.Request) {
 	if !s.probeAdminReady(w) {
 		return
 	}
-	version, err := s.nestedRecipeVersion(r)
+	version, err := s.requestedRecipeVersion(r)
 	if err != nil {
 		s.writeRecipeErr(w, err)
 		return
@@ -260,7 +268,7 @@ func (s *Server) getRecipeVersion(w http.ResponseWriter, r *http.Request) {
 	if !s.probeAdminReady(w) {
 		return
 	}
-	version, err := s.nestedRecipeVersion(r)
+	version, err := s.requestedRecipeVersion(r)
 	if err != nil {
 		s.writeRecipeErr(w, err)
 		return

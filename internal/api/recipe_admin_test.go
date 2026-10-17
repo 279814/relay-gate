@@ -133,8 +133,9 @@ func recipeHTTPFixture(t *testing.T) (*Server, http.Handler, *livecfg.Source, *p
 func TestRecipeHTTPTestAndPublishAreSeparateRealExecutions(t *testing.T) {
 	s, h, _, coordinator, calls, recipeID, version, route := recipeHTTPFixture(t)
 	path := fmt.Sprintf("/admin/api/probe-recipes/%d/versions/%d", recipeID, version.ID)
+	versionPath := fmt.Sprintf("/admin/api/probe-recipe-versions/%d", version.ID)
 	body := fmt.Sprintf(`{"expected_revision":2,"route_id":%d}`, route.ID)
-	response := do(t, h, "POST", path+"/test", body, true)
+	response := do(t, h, "POST", versionPath+"/test", body, true)
 	if response.Code != 200 {
 		t.Fatalf("explicit single test missing: %d %s", response.Code, response.Body.String())
 	}
@@ -165,7 +166,7 @@ func TestRecipeHTTPTestAndPublishAreSeparateRealExecutions(t *testing.T) {
 		t.Fatal("publish sent another probe")
 	}
 	coordinator.CloseAdmission()
-	paused := do(t, h, "POST", path+"/test", fmt.Sprintf(`{"expected_revision":3,"route_id":%d}`, route.ID), true)
+	paused := do(t, h, "POST", versionPath+"/test", fmt.Sprintf(`{"expected_revision":3,"route_id":%d}`, route.ID), true)
 	if paused.Code != 503 || calls.Load() != 1 {
 		t.Fatalf("paused test was not rejected with zero sends: %d %s", paused.Code, paused.Body.String())
 	}
@@ -181,7 +182,7 @@ func TestClientProfileHTTPTestsExactCandidateAndEnablesOnlySuccess(t *testing.T)
 	if err := source.Refresh(); err != nil {
 		t.Fatal(err)
 	}
-	path := fmt.Sprintf("/admin/api/client-profiles/%d", profile.ID)
+	path := fmt.Sprintf("/admin/api/client-probe-profiles/%d", profile.ID)
 	read := do(t, h, "GET", path, "", true)
 	if read.Code != 200 {
 		t.Fatalf("profile detail missing: %d %s", read.Code, read.Body.String())
@@ -269,7 +270,7 @@ func TestRecipePreviewIsSecretIndependentAndUsesDeclaredTokenCeiling(t *testing.
 		t.Fatal(err)
 	}
 	h := s.WithProbeAdmin(probe.NewService(previewOnlyStore{s.st}, nil, nil, previewOnlySource{source}, nil, nil)).Routes(testAdminPW)
-	path := fmt.Sprintf("/admin/api/probe-recipes/%d/versions/%d/preview", id, version.ID)
+	path := fmt.Sprintf("/admin/api/probe-recipe-versions/%d/preview", version.ID)
 	body := fmt.Sprintf(`{"route_id":%d}`, route.ID)
 	first := do(t, h, "POST", path, body, true)
 	if first.Code != 200 {
@@ -309,10 +310,10 @@ func TestRecipePreviewIsSecretIndependentAndUsesDeclaredTokenCeiling(t *testing.
 func TestClientProfileHTTPCollectionRequiresAdminAndReturnsPage(t *testing.T) {
 	s, _ := newTestServer(t)
 	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
-	if response := do(t, h, "GET", "/admin/api/client-profiles", "", false); response.Code != 401 {
+	if response := do(t, h, "GET", "/admin/api/client-probe-profiles", "", false); response.Code != 401 {
 		t.Fatalf("profile auth=%d", response.Code)
 	}
-	response := do(t, h, "GET", "/admin/api/client-profiles?limit=1", "", true)
+	response := do(t, h, "GET", "/admin/api/client-probe-profiles?limit=1", "", true)
 	if response.Code != 200 {
 		t.Fatalf("profile collection missing: %d %s", response.Code, response.Body.String())
 	}
@@ -372,7 +373,7 @@ func TestRecipeAndProfileListsHonorFiltersAndRejectMalformedPagination(t *testin
 	if cursor == "" {
 		t.Fatal("first page lacked cursor")
 	}
-	bad := []string{"/admin/api/probe-recipes?limit=oops", "/admin/api/probe-recipes?limit=-1", "/admin/api/probe-recipes?upstream_id=bad", "/admin/api/probe-recipes?cursor=bad", "/admin/api/probe-recipes?endpoint=models&cursor=" + cursor, "/admin/api/client-profiles?limit=nope", "/admin/api/client-profiles?cursor=" + cursor, fmt.Sprintf("/admin/api/probe-recipes/%d/versions?limit=nope", version.RecipeID)}
+	bad := []string{"/admin/api/probe-recipes?limit=oops", "/admin/api/probe-recipes?limit=-1", "/admin/api/probe-recipes?upstream_id=bad", "/admin/api/probe-recipes?cursor=bad", "/admin/api/probe-recipes?endpoint=models&cursor=" + cursor, "/admin/api/client-probe-profiles?limit=nope", "/admin/api/client-probe-profiles?cursor=" + cursor, fmt.Sprintf("/admin/api/probe-recipes/%d/versions?limit=nope", version.RecipeID)}
 	for _, path := range bad {
 		response := do(t, h, "GET", path, "", true)
 		if response.Code != 400 {
@@ -388,7 +389,8 @@ func TestRecipeHTTPForceRequiresAnActualFailedExplicitTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := fmt.Sprintf("/admin/api/probe-recipes/%d/versions/%d", recipeID, failedVersion.ID)
-	result := do(t, h, "POST", path+"/test", fmt.Sprintf(`{"expected_revision":3,"route_id":%d}`, route.ID), true)
+	versionPath := fmt.Sprintf("/admin/api/probe-recipe-versions/%d", failedVersion.ID)
+	result := do(t, h, "POST", versionPath+"/test", fmt.Sprintf(`{"expected_revision":3,"route_id":%d}`, route.ID), true)
 	if result.Code != 200 {
 		t.Fatalf("failed explicit test=%d %s", result.Code, result.Body.String())
 	}
@@ -420,7 +422,7 @@ func TestClientProfileHTTPFailureDoesNotEnableCandidate(t *testing.T) {
 	if err := source.Refresh(); err != nil {
 		t.Fatal(err)
 	}
-	result := do(t, h, "POST", fmt.Sprintf("/admin/api/client-profiles/%d/test", profile.ID), fmt.Sprintf(`{"expected_revision":1,"route_id":%d}`, route.ID), true)
+	result := do(t, h, "POST", fmt.Sprintf("/admin/api/client-probe-profiles/%d/test", profile.ID), fmt.Sprintf(`{"expected_revision":1,"route_id":%d}`, route.ID), true)
 	if result.Code != 200 {
 		t.Fatalf("failed profile test=%d %s", result.Code, result.Body.String())
 	}
@@ -450,7 +452,7 @@ func TestClientProfileHTTPRejectsSecretDeclarationsBeforeSanitizerDropsHeader(t 
 	if err := source.Refresh(); err != nil {
 		t.Fatal(err)
 	}
-	path := fmt.Sprintf("/admin/api/client-profiles/%d", profile.ID)
+	path := fmt.Sprintf("/admin/api/client-probe-profiles/%d", profile.ID)
 	for _, action := range []string{"preview", "test"} {
 		body := fmt.Sprintf(`{"route_id":%d}`, route.ID)
 		if action == "test" {
@@ -481,7 +483,7 @@ func TestRecipeAndProfileHTTPRejectUnsafeDTOAndReturnOnlySanitizedShape(t *testi
 			t.Errorf("unsafe version mutation accepted: %d %s", response.Code, response.Body.String())
 		}
 	}
-	wrong := do(t, h, "POST", fmt.Sprintf("/admin/api/probe-recipes/%d/versions/%d/test", recipeID+999, version.ID), `{"expected_revision":2}`, true)
+	wrong := do(t, h, "POST", fmt.Sprintf("/admin/api/probe-recipes/%d/versions/%d/publish", recipeID+999, version.ID), `{"expected_revision":2}`, true)
 	if wrong.Code != 400 || calls.Load() != 0 {
 		t.Fatal("cross-parent version request reached network")
 	}
@@ -497,7 +499,7 @@ func TestRecipeAndProfileHTTPRejectUnsafeDTOAndReturnOnlySanitizedShape(t *testi
 	if err := source.Refresh(); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/admin/api/client-profiles", fmt.Sprintf("/admin/api/client-profiles/%d", profile.ID)} {
+	for _, path := range []string{"/admin/api/client-probe-profiles", fmt.Sprintf("/admin/api/client-probe-profiles/%d", profile.ID)} {
 		response := do(t, h, "GET", path, "", true)
 		if response.Code != 200 {
 			t.Fatalf("safe read=%d %s", response.Code, response.Body.String())
