@@ -65,7 +65,7 @@ func newTrafficPrivacyHarness(t *testing.T, remote http.HandlerFunc) *trafficPri
 	t.Cleanup(logs.Close)
 	targets := outbound.NewProvider(h.manager.cfg.(outbound.EndpointConfigSource), nil, outbound.NewResolver(testHasher{}))
 	h.handler = proxy.NewHandler(cfg, h.tracker, samples, []string{"test-relay-key"}, logger).
-		WithTargets(targets, h.store).WithObservers(h.manager).WithCountTokensCapability(h.caps).WithLogSink(logs)
+		WithRunState(fixtureController(t, h.store)).WithTargets(targets, h.store).WithObservers(h.manager).WithCountTokensCapability(h.caps).WithLogSink(logs)
 	mux := http.NewServeMux()
 	h.handler.Routes(mux)
 	gate := httptest.NewServer(mux)

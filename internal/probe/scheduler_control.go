@@ -12,7 +12,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // ScheduleKey 标识一次可调度的合成探活目标（§4.11）。
@@ -65,7 +64,7 @@ func (s *Scheduler) ensureP012() *schedulerP012 {
 	return s.p012
 }
 
-// WithRunState 注入热路径总闸（优先于 livecfg TTL）。
+// WithRunState 注入唯一的热路径总闸；未装配时不调度。
 func (s *Scheduler) WithRunState(r runstate.Reader) *Scheduler {
 	s.ensureP012().runState = r
 	return s
@@ -85,16 +84,16 @@ func (s *Scheduler) WithRNG(r *rand.Rand) *Scheduler {
 	return s
 }
 
-func (s *Scheduler) currentRunState() store.RunState {
+func (s *Scheduler) currentRunState() model.RunState {
 	p := s.ensureP012()
-	if p.runState != nil {
-		return store.RunState(p.runState.Current().State)
+	if p.runState == nil {
+		return model.RunStatePaused
 	}
-	state, err := s.cfg.RunState()
-	if err != nil {
-		return store.StateRunning
+	snapshot := p.runState.Current()
+	if !snapshot.Admitting() {
+		return model.RunStatePaused
 	}
-	return state
+	return snapshot.State
 }
 
 func (s *Scheduler) jitterFactor() float64 {
@@ -185,7 +184,7 @@ func (s *Scheduler) staggerResume() {
 // 因此开启一轮恢复复核波，让每站的首个复核 L1 也受同一个全局上限。
 func (s *Scheduler) ResumeGradually() {
 	s.mu.Lock()
-	s.lastRunning = store.StateRunning
+	s.lastRunning = model.RunStateRunning
 	s.mu.Unlock()
 	p := s.ensureP012()
 	p.mu.Lock()

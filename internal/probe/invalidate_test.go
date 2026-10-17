@@ -7,7 +7,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // errBoom 是测试用的哨兵错误，只为触发「读配置失败」的分支。
@@ -34,7 +33,7 @@ func invHarness() (*Scheduler, *recordingTracker, *fakeCfg) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := newRecordingTracker()
 	sched := NewScheduler(cfg, track, health.NewReachabilityTracker(nil), discardLogger())

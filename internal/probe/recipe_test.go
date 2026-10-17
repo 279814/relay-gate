@@ -20,7 +20,7 @@ import (
 // 而不是等到 main 装配时才发现。
 //
 // 断言放在 probe 侧而不是 store 侧：probe 已经 import store
-// （scheduler.go 用 store.RunState），反向 import 会成环 —— 连测试文件
+// （scheduler.go 用 model.RunState），反向 import 会成环 —— 连测试文件
 // 也不行，Go 的 import cycle 检查覆盖测试包。
 var _ RecipeSource = (*store.Store)(nil)
 

@@ -33,6 +33,7 @@ import (
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -377,6 +378,7 @@ type crossPathFixture struct {
 	targets    *outbound.Provider
 	transports *outbound.Manager
 	store      *store.Store
+	runState   *runstate.Controller
 	source     *livecfg.Source
 	executor   *probe.Executor
 	scheduler  *probe.Scheduler
@@ -420,6 +422,11 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = fixture.store.Close() })
+	fixture.runState, err = runstate.NewController(fixture.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(fixture.runState.Close)
 	fixture.upstream = &model.Upstream{Name: "mock", BaseURL: fixture.server.URL, APIKey: crossUpstreamKey, Enabled: true, ProbeMode: model.ProbeModeActive}
 	endpoints := make([]*model.UpstreamEndpoint, 0, 5)
 	for _, kind := range []model.EndpointKind{model.EndpointModels, model.EndpointMessages, model.EndpointResponses, model.EndpointChatCompletions, model.EndpointCountTokens} {
@@ -521,7 +528,7 @@ func (fixture *crossPathFixture) take() recordedRequest {
 func (fixture *crossPathFixture) handler() *proxy.Handler {
 	return proxy.NewHandler(fixture.source, alwaysAliveHealth{}, nil,
 		[]string{crossRelayKey}, discardLogger()).
-		WithTargets(fixture.targets, fixture.store).
+		WithRunState(fixture.runState).WithTargets(fixture.targets, fixture.store).
 		WithTransports(fixture.transports)
 }
 

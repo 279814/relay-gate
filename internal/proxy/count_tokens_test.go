@@ -15,7 +15,6 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // memoryCountCaps is an in-memory CountTokensCapability for §10.3 tests.
@@ -684,7 +683,7 @@ func TestCountTokens_RequiresAuth(t *testing.T) {
 // 暂停的语义是「不用时不浪费额度」，而放行会继续打到上游。
 func TestCountTokens_RejectedWhenPaused(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.cfg.state = store.StatePaused
+	hs.cfg.state = model.RunStatePaused
 
 	rec := hs.serve(hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`))
 

@@ -21,7 +21,6 @@ type ConfigBundle struct {
 	Routes                  []*model.Route
 	Settings                model.Settings
 	SettingsRowRevision     int64
-	RunState                RunState
 	Endpoints               []*model.UpstreamEndpoint
 	LegacyFullURLs          []*model.LegacyFullURL
 	Recipes                 []*model.ProbeRecipe
@@ -60,9 +59,6 @@ func (store *Store) LoadConfigBundle(ctx context.Context) (*ConfigBundle, error)
 		return nil, err
 	}
 	if bundle.Settings, bundle.SettingsRowRevision, err = loadBundleSettings(ctx, tx); err != nil {
-		return nil, err
-	}
-	if bundle.RunState, err = loadBundleRunState(ctx, tx); err != nil {
 		return nil, err
 	}
 	if bundle.Endpoints, err = loadBundleEndpoints(ctx, tx); err != nil {
@@ -168,22 +164,6 @@ func loadBundleSettings(ctx context.Context, tx *sql.Tx) (model.Settings, int64,
 		return model.Settings{}, 0, err
 	}
 	return settings, revision, nil
-}
-
-func loadBundleRunState(ctx context.Context, tx *sql.Tx) (RunState, error) {
-	var raw string
-	err := tx.QueryRowContext(ctx, `SELECT value FROM setting WHERE key=?`, keyRunState).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return StateRunning, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	state := RunState(raw)
-	if state != StateRunning && state != StatePaused {
-		return StateRunning, nil
-	}
-	return state, nil
 }
 
 func loadBundleEndpoints(ctx context.Context, tx *sql.Tx) ([]*model.UpstreamEndpoint, error) {

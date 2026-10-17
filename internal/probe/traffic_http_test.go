@@ -73,7 +73,7 @@ func newTrafficHTTPHarnessFor(t *testing.T, protocol model.Protocol, upstream ht
 	t.Cleanup(func() { cancel(); <-done })
 	targets := outbound.NewProvider(cfg, nil, outbound.NewResolver(testHasher{}))
 	handler := proxy.NewHandler(cfg, tracker, nil, []string{"test-relay-key"}, discardLogger()).
-		WithTargets(targets, st).WithObservers(manager).WithCountTokensCapability(caps)
+		WithRunState(fixtureController(t, st)).WithTargets(targets, st).WithObservers(manager).WithCountTokensCapability(caps)
 	mux := http.NewServeMux()
 	handler.Routes(mux)
 	gate := httptest.NewServer(mux)

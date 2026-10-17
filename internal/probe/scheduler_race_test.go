@@ -11,7 +11,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // 确定性复现 TestScheduler_CoalescesL1PerUpstream 的竞态（Issue #21）。
@@ -53,7 +52,7 @@ func TestScheduler_CoalescesL1PerUpstream_RaceDeterministic(t *testing.T) {
 	ct := &countingErrTransport{}
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 		settings: fastSettings(),
 	}
 	sched := newSchedulerFixture(t, cfg, ct, track, reach, discardLogger())

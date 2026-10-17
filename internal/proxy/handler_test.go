@@ -20,7 +20,6 @@ import (
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // ── 测试替身 ──────────────────────────────────────────────
@@ -29,7 +28,7 @@ import (
 type fakeConfig struct {
 	snap     *router.Snapshot
 	settings model.Settings
-	state    store.RunState
+	state    model.RunState
 	err      error // 非 nil 时三个方法都返回它，用于测内部错误路径
 }
 
@@ -45,11 +44,8 @@ func (f *fakeConfig) Settings() (model.Settings, error) {
 	}
 	return f.settings, nil
 }
-func (f *fakeConfig) RunState() (store.RunState, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.state, nil
+func (f *fakeConfig) Current() runstate.Snapshot {
+	return runstate.Snapshot{State: f.state, Revision: 1}
 }
 
 // countingHealth 是测试用的健康视图：默认全部可用、不冷却，
@@ -239,11 +235,11 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 	hs.cfg = &fakeConfig{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, []*model.Route{rt}),
 		settings: testSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	// 默认关掉半开，让旧测试不受影响。需要半开的测试自己开。
 	hs.cfg.settings.HalfOpenEnabled = false
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(hs.cfg).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
@@ -481,7 +477,7 @@ func TestHandler_AcceptsKeyInAllThreePlaces(t *testing.T) {
 // 未配置任何 relay key 时必须全拒。「没配就放开」是最危险的默认值。
 func TestHandler_NoRelayKeysConfiguredRejectsAll(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).WithRunState(hs.cfg)
 
 	r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
 	if rec := hs.serve(r); rec.Code != 401 {
@@ -499,7 +495,7 @@ func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
 	if err := creds.SetActiveRelayKey(hs.relayPW); err != nil {
 		t.Fatal(err)
 	}
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).WithRunState(hs.cfg).
 		WithRelayKeyValidator(creds).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
@@ -558,7 +554,7 @@ func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
 
 func TestHandler_PausedRejectsNewRequests(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.cfg.state = store.StatePaused
+	hs.cfg.state = model.RunStatePaused
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 	if rec.Code != 503 {
@@ -580,7 +576,7 @@ func (m maintSnap) Current() runstate.Snapshot { return m.snap }
 
 func TestHandler_MaintenanceRejectsNewRequests(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.cfg.state = store.StateRunning
+	hs.cfg.state = model.RunStateRunning
 	hs.h.WithRunState(maintSnap{snap: runstate.Snapshot{
 		State: model.RunStateRunning, Revision: 1, Maintenance: true,
 		MaintenanceReason: "master_key_rotation",

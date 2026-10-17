@@ -81,7 +81,7 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := health.NewTracker(cfg)
 	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
@@ -93,13 +93,13 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 		t.Fatal("暖机 tick 应发出探活")
 	}
 
-	cfg.setState(store.StatePaused)
+	cfg.setState(model.RunStatePaused)
 	sched.tick(context.Background())
 	sched.wg.Wait()
 
 	sched.PrepareResume()
 	before := time.Now()
-	cfg.setState(store.StateRunning)
+	cfg.setState(model.RunStateRunning)
 	sched.ResumeGradually()
 	base := hits.Load()
 	sched.tick(context.Background())
@@ -131,7 +131,7 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 		t.Fatal("各 Route 的首轮 L2 应带 jitter 分散")
 	}
 
-	cfg.setState(store.StatePaused)
+	cfg.setState(model.RunStatePaused)
 	for _, rt := range routes {
 		track.TriggerL1(rt.ID)
 		track.TriggerL2(rt.ID)
@@ -174,7 +174,7 @@ func TestP012_ResumeDoesNotRepeatL1BeforeFirstL2(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: settings,
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := health.NewTracker(cfg)
 	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
@@ -182,11 +182,11 @@ func TestP012_ResumeDoesNotRepeatL1BeforeFirstL2(t *testing.T) {
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
-	cfg.setState(store.StatePaused)
+	cfg.setState(model.RunStatePaused)
 	sched.tick(context.Background())
 
 	sched.PrepareResume()
-	cfg.setState(store.StateRunning)
+	cfg.setState(model.RunStateRunning)
 	sched.ResumeGradually()
 	base := models.Load()
 	deadline := time.Now().Add(time.Duration(settings.L1IntervalAliveSec)*time.Second/10 + 2*time.Second)
@@ -229,9 +229,9 @@ func TestP012_ResumeL1WaveHonorsGlobalLimit(t *testing.T) {
 	hs.cfg.settings.GlobalL2Concurrency = limit
 	hs.track.l2Allowed = map[int64]bool{}
 
-	hs.cfg.setState(store.StatePaused)
+	hs.cfg.setState(model.RunStatePaused)
 	hs.sched.tick(context.Background())
-	hs.cfg.setState(store.StateRunning)
+	hs.cfg.setState(model.RunStateRunning)
 	hs.sched.tick(context.Background())
 	hs.sched.wg.Wait()
 
@@ -293,7 +293,7 @@ func TestP012_ScheduleKeyPendingCoalesces(t *testing.T) {
 }
 
 func TestP012_JitterRangeReproducible(t *testing.T) {
-	sched := newSchedulerFixture(t, &fakeCfg{state: store.StateRunning}, newFakeTransport(),
+	sched := newSchedulerFixture(t, &fakeCfg{state: model.RunStateRunning}, newFakeTransport(),
 		newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(42)))
 	a := make([]float64, 20)
@@ -303,7 +303,7 @@ func TestP012_JitterRangeReproducible(t *testing.T) {
 			t.Fatalf("jitter %v 超出 [0.9,1.1]", a[i])
 		}
 	}
-	sched2 := newSchedulerFixture(t, &fakeCfg{state: store.StateRunning}, newFakeTransport(),
+	sched2 := newSchedulerFixture(t, &fakeCfg{state: model.RunStateRunning}, newFakeTransport(),
 		newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(42)))
 	for i := range a {
@@ -322,7 +322,7 @@ func TestP012_ResumePrepareBeforeRunningVisible(t *testing.T) {
 	defer ctrl.Close()
 	coord := NewSyntheticCoordinator(model.RunStatePaused)
 	track := newRecordingTracker()
-	sched := newSchedulerFixture(t, &fakeCfg{state: store.StatePaused}, newFakeTransport(),
+	sched := newSchedulerFixture(t, &fakeCfg{state: model.RunStatePaused}, newFakeTransport(),
 		track, health.NewReachabilityTracker(nil), discardLogger())
 	watch := &resumeGateWatch{Scheduler: sched, ctrl: ctrl, saw: &atomic.Bool{}}
 	if err := coord.BindResumeTarget(watch); err != nil {

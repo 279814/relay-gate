@@ -16,7 +16,6 @@ import (
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // tickInterval 是调度轮询周期。
@@ -40,7 +39,6 @@ var (
 type ConfigSource interface {
 	Snapshot() (*router.Snapshot, error)
 	Settings() (model.Settings, error)
-	RunState() (store.RunState, error)
 }
 
 // ProbeSnapshotSource 是 P0-10 起 Scheduler 构造 expectation 的来源。
@@ -83,7 +81,7 @@ type Scheduler struct {
 	// Settings.GlobalL2Concurrency 现读（§4.3 Settings 快照；改值无需重启），
 	// 在途占用自然收尾，不因缩容而提前释放。
 	l2Inflight  int
-	lastRunning store.RunState
+	lastRunning model.RunState
 
 	// l1Scheduled 收敛同一轮 tick 内「同时到期」的多条 Route。
 	//
@@ -131,7 +129,7 @@ func NewScheduler(cfg ConfigSource, track Tracker, reach *health.ReachabilityTra
 	if reach == nil {
 		reach = health.NewReachabilityTracker(cfg)
 	}
-	return &Scheduler{cfg: cfg, track: track, reach: reach, log: log, busyUp: map[int64]uint64{}, inflightL1: map[int64]uint64{}, inflightL2: map[int64]uint64{}, l1Scheduled: map[int64]bool{}, l1Followers: map[uint64][]int64{}, lastRunning: store.StateRunning, realWake: make(chan struct{}, 1)}
+	return &Scheduler{cfg: cfg, track: track, reach: reach, log: log, busyUp: map[int64]uint64{}, inflightL1: map[int64]uint64{}, inflightL2: map[int64]uint64{}, l1Scheduled: map[int64]bool{}, l1Followers: map[uint64][]int64{}, lastRunning: model.RunStateRunning, realWake: make(chan struct{}, 1)}
 }
 
 // WithExecutor 注入 P0-09 的单发执行器（§P0-09 目标）。
@@ -331,16 +329,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 // 阻塞的话一个卡住的站（L1 给了 25 秒）会拖住整个调度循环，
 // 其余站的探活全部延后 —— 而那正是最需要探活的时候。
 func (s *Scheduler) tick(ctx context.Context) {
+	if s.currentRunState() != model.RunStateRunning {
+		s.onPaused()
+		return
+	}
 	settings, err := s.cfg.Settings()
 	if err != nil {
 		s.log.Error("探活调度读取设置失败，本轮跳过", "err", err)
-		return
-	}
-	state := s.currentRunState()
-
-	// §4.8：暂停时探活全停。目的是「不用时不浪费探活额度」。
-	if state == store.StatePaused {
-		s.onPaused()
 		return
 	}
 	s.onRunning()
@@ -817,31 +812,26 @@ func (s *Scheduler) l2Limit() int {
 
 // onPaused 在进入暂停时记一次日志。
 //
-// 不在这里取消在途探活：探活本身有 Total 超时（L1 25s / L2 150s），
-// 自己会收尾。为了「立刻停」而额外维护一组 cancel func，换来的只是
-// 几十秒的差别，代价是一份需要与 goroutine 生命周期保持同步的状态。
+// Controller 经 SyntheticCoordinator 取消并排空在途合成探活；这里仅记录
+// 读到的运行状态，不维护另一份取消/持久化入口。
 func (s *Scheduler) onPaused() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastRunning == store.StatePaused {
+	if s.lastRunning == model.RunStatePaused {
 		return
 	}
-	s.lastRunning = store.StatePaused
+	s.lastRunning = model.RunStatePaused
 	s.log.Info("服务已暂停，探活全停")
 }
 
-// onRunning 在从暂停恢复时把状态清回 unknown（§4.8）。
-//
-// 必须清：暂停期间站点可能恢复也可能挂掉，暂停前的状态已经过期了。
-// 清成 unknown 而不是保留，还顺带实现了「暖机窗口」—— unknown 是乐观的
-// （视为可用），所以恢复瞬间就能承接流量，不会出现「刚点开就 503」。
+// onRunning 在从暂停恢复时降级旧正结论，保留负状态并渐进复核。
 func (s *Scheduler) onRunning() {
 	s.mu.Lock()
-	if s.lastRunning == store.StateRunning {
+	if s.lastRunning == model.RunStateRunning {
 		s.mu.Unlock()
 		return
 	}
-	s.lastRunning = store.StateRunning
+	s.lastRunning = model.RunStateRunning
 	s.mu.Unlock()
 
 	s.PrepareResume()
