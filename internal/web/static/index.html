@@ -35,7 +35,9 @@
               x-text="stateLabel()"></span>
         <span class="grow"></span>
         <span class="note" x-show="warmupNote()" x-text="warmupNote()"></span>
-        <button @click="toggleState()" :disabled="busy || displayState === 'maintenance'"
+        <span class="note" x-show="stateBlocked">状态待确认</span>
+        <button @click="reloadState()" :disabled="busy || stateBusy">重新加载服务状态</button>
+        <button @click="toggleState()" :disabled="busy || stateBusy || stateBlocked || stateRevision < 1 || displayState === 'maintenance'"
                 x-text="running ? '暂停服务' : '启动服务'"></button>
         <button @click="logout()">登出</button>
       </header>
@@ -969,61 +971,92 @@
               <strong>全局设置</strong>
               <span class="dim">热生效，无需重启（队列容量类的除外，已注明）</span>
               <span class="grow"></span>
-              <button class="primary" @click="saveSettings()" :disabled="busy">保存</button>
+              <span class="dim" x-text="settingsModuleReady ? '版本 ' + settingsState.revision : '设置模块未就绪'"></span>
+              <button @click="reloadSettings()" :disabled="!settingsModuleReady || busy || settingsState.busy || settingsState.loading">重新加载</button>
+              <button id="settings-save" class="primary" @click="saveSettings()" :disabled="!settingsModuleReady || busy || settingsState.busy || settingsState.loading || settingsState.conflict || settingsState.pending || !settings">保存</button>
             </div>
 
-            <template x-if="settings">
+            <p class="note" x-show="settingsModuleReady && settingsState.conflict">草稿版本已落后；重新加载会替换当前草稿，请先复制需要保留的修改。</p>
+            <p class="note" x-show="settingsModuleReady && settingsState.pending">设置已保存，激活待确认；请重新加载保存的版本，确认后再操作。</p>
+            <template x-if="settings && settingsModuleReady">
               <div>
                 <h3 style="font-size:13px;margin:14px 0 8px">真实请求超时</h3>
+                <p class="note" x-text="`首语义硬下限 ${limits.min_real_first_semantic_sec || 300}s；各阶段从请求发送时起算，总时长始终是上限。`"></p>
                 <div class="row">
                   <div class="field">
                     <label>连接 (s)</label>
-                    <input type="number" x-model.number="settings.real_connect_sec">
+                    <input type="number" min="1" data-settings-stage="real_connect_sec" x-model.number="settings.real_connect_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
-                    <label>首 Token (s)</label>
-                    <input type="number" x-model.number="settings.real_first_token_sec">
-                    <!-- 这个下限是硬的，后端会 400。先说清比提交后才报错好 -->
-                    <div class="note" x-text="`硬下限 ${limits.min_real_first_token_sec || 300}s。调小会把正常的长思考拦腰砍断，还会因此把好站判死`"></div>
+                    <label>响应头 (s)</label>
+                    <input type="number" min="1" data-settings-stage="real_response_header_sec" x-model.number="settings.real_response_header_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>首字节 (s)</label>
+                    <input type="number" min="1" data-settings-stage="real_first_byte_sec" x-model.number="settings.real_first_byte_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>首语义 (s)</label>
+                    <input type="number" min="1" data-settings-stage="real_first_semantic_sec" x-model.number="settings.real_first_semantic_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
                     <label>流内静默 (s)</label>
-                    <input type="number" x-model.number="settings.real_idle_sec">
+                    <input type="number" min="1" data-settings-stage="real_idle_sec" x-model.number="settings.real_idle_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
                     <label>总时长 (s)</label>
-                    <input type="number" x-model.number="settings.real_total_sec">
+                    <input type="number" min="1" data-settings-stage="real_total_sec" x-model.number="settings.real_total_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                 </div>
-
-                <h3 style="font-size:13px;margin:18px 0 8px">探活超时</h3>
-                <p class="dim" style="margin:0 0 8px">
-                  与真实请求分开 —— 这正是「容忍长思考」与「快速判死」能同时成立的原因。
-                </p>
+                <h3 style="font-size:13px;margin:18px 0 8px">模型探活超时</h3>
+                <p class="note">独立于真实请求。标准最小配方可使用较短观察窗；原生长思考配方首语义至少等待 300 秒。</p>
                 <div class="row">
                   <div class="field">
                     <label>L2 连接 (s)</label>
-                    <input type="number" x-model.number="settings.l2_connect_sec">
+                    <input type="number" min="1" data-settings-stage="l2_connect_sec" x-model.number="settings.l2_connect_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
-                    <label>L2 首 Token (s)</label>
-                    <input type="number" x-model.number="settings.l2_first_token_sec">
+                    <label>L2 响应头 (s)</label>
+                    <input type="number" min="1" data-settings-stage="l2_response_header_sec" x-model.number="settings.l2_response_header_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>L2 首字节 (s)</label>
+                    <input type="number" min="1" data-settings-stage="l2_first_byte_sec" x-model.number="settings.l2_first_byte_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>L2 首事件 (s)</label>
+                    <input type="number" min="1" data-settings-stage="l2_first_event_sec" x-model.number="settings.l2_first_event_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>L2 首语义 (s)</label>
+                    <input type="number" min="1" data-settings-stage="l2_first_semantic_sec" x-model.number="settings.l2_first_semantic_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>L2 流内静默 (s)</label>
+                    <input type="number" min="1" data-settings-stage="l2_idle_sec" x-model.number="settings.l2_idle_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
                     <label>L2 总时长 (s)</label>
-                    <input type="number" x-model.number="settings.l2_total_sec">
+                    <input type="number" min="1" data-settings-stage="l2_total_sec" x-model.number="settings.l2_total_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
+                </div>
+                <h3 style="font-size:13px;margin:18px 0 8px">轻量端点超时</h3>
+                <div class="row">
                   <div class="field">
                     <label>L1 连接 (s)</label>
-                    <input type="number" x-model.number="settings.l1_connect_sec">
+                    <input type="number" min="1" data-settings-stage="l1_connect_sec" x-model.number="settings.l1_connect_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
                     <label>L1 总时长 (s)</label>
-                    <input type="number" x-model.number="settings.l1_total_sec">
+                    <input type="number" min="1" data-settings-stage="l1_total_sec" x-model.number="settings.l1_total_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                   <div class="field">
-                    <label>count_tokens (s)</label>
-                    <input type="number" x-model.number="settings.count_tokens_sec">
+                    <label>count_tokens 连接 (s)</label>
+                    <input type="number" min="1" data-settings-stage="count_tokens_connect_sec" x-model.number="settings.count_tokens_connect_sec" :disabled="settingsState.busy || settingsState.loading">
+                  </div>
+                  <div class="field">
+                    <label>count_tokens 总时长 (s)</label>
+                    <input type="number" min="1" data-settings-stage="count_tokens_total_sec" x-model.number="settings.count_tokens_total_sec" :disabled="settingsState.busy || settingsState.loading">
                   </div>
                 </div>
 
@@ -1048,7 +1081,7 @@
                   <div class="field">
                     <label>全局 L2 并发</label>
                     <input type="number" x-model.number="settings.global_l2_concurrency">
-                    <div class="note">改这个要重启（它是 channel 容量）</div>
+                    <div class="note">应用于后续探活调度</div>
                   </div>
                 </div>
                 <div class="row" style="margin-top:4px">

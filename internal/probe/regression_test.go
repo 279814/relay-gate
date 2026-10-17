@@ -37,7 +37,7 @@ func TestL2_FirstTokenTimeoutIsNotReportedAsFakeAlive(t *testing.T) {
 	defer srv.Close()
 
 	s := fastSettings()
-	s.L2FirstTokenSec = 1
+	s.L2FirstSemanticSec = 1
 	s.L2TotalSec = 10
 
 	executor := testProbeExecutor()
@@ -73,7 +73,7 @@ func TestL2_MidStreamBreakIsNotReportedAsFakeAlive(t *testing.T) {
 	defer srv.Close()
 
 	s := fastSettings()
-	s.L2FirstTokenSec = 5
+	s.L2FirstSemanticSec = 5
 	s.L2TotalSec = 10
 
 	executor := testProbeExecutor()

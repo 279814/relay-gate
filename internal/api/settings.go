@@ -1,12 +1,9 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
@@ -29,100 +26,59 @@ func (s *Server) WithRunState(ctrl RunStateAdmin) *Server {
 	return s
 }
 
+// SettingsAdmin is the settings management boundary; HTTP never replaces a
+// client-held revision with a freshly read one.
+type SettingsAdmin interface {
+	GetSettings(context.Context) (model.Settings, int64, error)
+	UpdateSettings(context.Context, model.Settings, int64) (model.Settings, int64, error)
+}
+
+func (s *Server) WithSettingsAdmin(admin SettingsAdmin) *Server { s.settingsAdmin = admin; return s }
+
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
-	st, err := s.st.GetSettings()
+	settings, revision, err := s.settingsAdmin.GetSettings(r.Context())
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"settings": st,
-		"limits": map[string]int{
-			"min_real_first_token_sec": model.MinRealFirstTokenSec,
-			"max_retry_attempts":       model.MaxRetryAttempts,
-		},
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "revision": revision, "limits": map[string]int{
+		"min_real_first_semantic_sec": model.MinRealFirstSemanticSec, "max_retry_attempts": model.MaxRetryAttempts,
+	}})
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	cur, revision, err := s.st.GetSettingsWithRevision()
+	current, readRevision, err := s.settingsAdmin.GetSettings(r.Context())
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	cur, err = decodeSettingsUpdate(r, cur)
+	input := struct {
+		model.Settings
+		ExpectedRevision *int64 `json:"expected_revision"`
+	}{Settings: current}
+	if err := decodeJSON(r, &input); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if input.ExpectedRevision == nil || requireRevision(*input.ExpectedRevision) != nil {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须是正整数，请先读取设置"))
+		return
+	}
+	if *input.ExpectedRevision != readRevision {
+		s.writeErr(w, store.ErrRevisionConflict)
+		return
+	}
+	updated, revision, err := s.settingsAdmin.UpdateSettings(r.Context(), input.Settings, *input.ExpectedRevision)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if _, err := s.st.SaveSettingsWithRevision(cur, revision); err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	// Settings live in the same livecfg PublishedConfig preamble reads
-	// (timeouts, retry_policy, sample knobs). Without Invalidate+Refresh the
-	// next new request can keep the pre-write values for up to DefaultTTL.
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "设置已保存，激活待重试，请重新读取后确认", "code": "config_activation_pending", "persisted": true, "resource": "settings", "resource_id": "settings", "new_revision": revision})
 		return
 	}
-	s.log.Info("更新全局设置", "real_first_token_sec", cur.RealFirstTokenSec,
-		"sample_enabled", cur.SampleEnabled)
-	writeJSON(w, http.StatusOK, cur)
-}
-
-// A partial update starts from one captured revision. Legacy aliases expand
-// only when explicitly supplied, and explicit stage fields take precedence.
-func decodeSettingsUpdate(r *http.Request, current model.Settings) (model.Settings, error) {
-	var raw json.RawMessage
-	if err := decodeJSON(r, &raw); err != nil {
-		return current, err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&current); err != nil {
-		return current, model.WrapValidation("请求体不是合法 JSON")
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return current, model.WrapValidation("请求体不是合法 JSON")
-	}
-	present := func(name string) bool {
-		for key, value := range fields {
-			// Match encoding/json's case-insensitive field names and its
-			// existing null-as-no-change behavior for numeric Settings.
-			if strings.EqualFold(key, name) && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-				return true
-			}
-		}
-		return false
-	}
-	fillUnspecified := func(name string, target *int, value int) {
-		if !present(name) {
-			*target = value
-		}
-	}
-	if present("real_first_token_sec") {
-		fillUnspecified("real_response_header_sec", &current.RealResponseHeaderSec, current.RealFirstTokenSec)
-		fillUnspecified("real_first_byte_sec", &current.RealFirstByteSec, current.RealFirstTokenSec)
-		fillUnspecified("real_first_semantic_sec", &current.RealFirstSemanticSec, current.RealFirstTokenSec)
-	}
-	if present("l2_first_token_sec") {
-		fillUnspecified("l2_response_header_sec", &current.L2ResponseHeaderSec, current.L2FirstTokenSec)
-		fillUnspecified("l2_first_byte_sec", &current.L2FirstByteSec, current.L2FirstTokenSec)
-		fillUnspecified("l2_first_event_sec", &current.L2FirstEventSec, current.L2FirstTokenSec)
-		fillUnspecified("l2_first_semantic_sec", &current.L2FirstSemanticSec, current.L2FirstTokenSec)
-	}
-	if present("count_tokens_sec") {
-		fillUnspecified("count_tokens_connect_sec", &current.CountTokensConnectSec, current.CountTokensSec)
-		fillUnspecified("count_tokens_total_sec", &current.CountTokensTotalSec, current.CountTokensSec)
-	}
-	// Persisted settings omit aliases; match their canonical read-side values
-	// in the unchanged Settings response as well.
-	current.RealFirstTokenSec = current.RealFirstSemanticSec
-	current.L2FirstTokenSec = current.L2FirstSemanticSec
-	current.CountTokensSec = current.CountTokensTotalSec
-	return current, nil
+	s.log.Info("更新全局设置", "revision", revision, "real_first_semantic_sec", updated.RealFirstSemanticSec, "sample_enabled", updated.SampleEnabled)
+	writeJSON(w, http.StatusOK, map[string]any{"settings": updated, "revision": revision})
 }
 
 // getState / setState 是服务总闸（§4.8 / §P0-12）。
@@ -169,13 +125,11 @@ func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, model.WrapValidation("state 必须是 running 或 paused"))
 		return
 	}
-	expected := int64(0)
-	if body.ExpectedRevision != nil {
-		expected = *body.ExpectedRevision
-	} else {
-		expected = s.runState.Current().Revision
+	if body.ExpectedRevision == nil || requireRevision(*body.ExpectedRevision) != nil {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须是正整数，请先读取服务状态"))
+		return
 	}
-	snap, err := s.runState.Set(r.Context(), state, expected)
+	snap, err := s.runState.Set(r.Context(), state, *body.ExpectedRevision)
 	if err != nil {
 		var pending *runstate.TransitionPendingError
 		if errors.As(err, &pending) {

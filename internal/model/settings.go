@@ -1,6 +1,11 @@
 package model
 
-// MinRealFirstTokenSec 是真实请求首 Token 超时的**硬下限**：5 分钟。
+import (
+	"strings"
+	"time"
+)
+
+// MinRealFirstSemanticSec 是真实请求首语义超时的**硬下限**：5 分钟。
 //
 // 低于该值的配置一律拒绝保存，而不是静默取整——静默修正会让人误以为改生效了。
 //
@@ -14,9 +19,9 @@ package model
 // 但实测是乐观下界（空上下文、无扩展思考），真实场景可能到分钟级，故留此余量。
 const MinRealFirstSemanticSec = 300
 
-// MinRealFirstTokenSec is kept for the schema-1/API compatibility adapter.
-// New code must use MinRealFirstSemanticSec.
-const MinRealFirstTokenSec = MinRealFirstSemanticSec
+// MaxTimeoutSeconds is the largest whole-second value representable by the
+// time.Duration used by actual timers and connection-pool identities.
+const MaxTimeoutSeconds = int64((time.Duration(1<<63 - 1)) / time.Second)
 
 // MaxRetryAttempts 是 RetryMaxAttempts 的上限。
 //
@@ -36,7 +41,6 @@ const MaxRetryAttempts = 5
 type Settings struct {
 	// ── 真实请求超时（§4.2）────────────────────────────────
 	RealConnectSec        int `json:"real_connect_sec"`
-	RealFirstTokenSec     int `json:"real_first_token_sec"` // 有 300s 硬下限
 	RealResponseHeaderSec int `json:"real_response_header_sec"`
 	RealFirstByteSec      int `json:"real_first_byte_sec"`
 	RealFirstSemanticSec  int `json:"real_first_semantic_sec"`
@@ -45,18 +49,15 @@ type Settings struct {
 
 	// ── 探活超时 ──────────────────────────────────────────
 	// L2 独立于真实请求：这正是「容忍长思考」与「快速判死」能同时成立的原因。
-	L2ConnectSec        int `json:"l2_connect_sec"`
-	L2FirstTokenSec     int `json:"l2_first_token_sec"`
-	L2ResponseHeaderSec int `json:"l2_response_header_sec"`
-	L2FirstByteSec      int `json:"l2_first_byte_sec"`
-	L2FirstEventSec     int `json:"l2_first_event_sec"`
-	L2FirstSemanticSec  int `json:"l2_first_semantic_sec"`
-	L2IdleSec           int `json:"l2_idle_sec"`
-	L2TotalSec          int `json:"l2_total_sec"`
-	L1ConnectSec        int `json:"l1_connect_sec"`
-	L1TotalSec          int `json:"l1_total_sec"`
-
-	CountTokensSec        int `json:"count_tokens_sec"`
+	L2ConnectSec          int `json:"l2_connect_sec"`
+	L2ResponseHeaderSec   int `json:"l2_response_header_sec"`
+	L2FirstByteSec        int `json:"l2_first_byte_sec"`
+	L2FirstEventSec       int `json:"l2_first_event_sec"`
+	L2FirstSemanticSec    int `json:"l2_first_semantic_sec"`
+	L2IdleSec             int `json:"l2_idle_sec"`
+	L2TotalSec            int `json:"l2_total_sec"`
+	L1ConnectSec          int `json:"l1_connect_sec"`
+	L1TotalSec            int `json:"l1_total_sec"`
 	CountTokensConnectSec int `json:"count_tokens_connect_sec"`
 	CountTokensTotalSec   int `json:"count_tokens_total_sec"`
 
@@ -135,7 +136,6 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		RealConnectSec:        30,
-		RealFirstTokenSec:     1200, // 20 分钟
 		RealResponseHeaderSec: 1200,
 		RealFirstByteSec:      1200,
 		RealFirstSemanticSec:  1200,
@@ -143,7 +143,6 @@ func DefaultSettings() Settings {
 		RealTotalSec:          1800, // 30 分钟
 
 		L2ConnectSec:        30,
-		L2FirstTokenSec:     120, // 实测 1+1=? 只需 3-6s，120s 已是 20 倍余量
 		L2ResponseHeaderSec: 300,
 		L2FirstByteSec:      300,
 		L2FirstEventSec:     300,
@@ -153,7 +152,6 @@ func DefaultSettings() Settings {
 		L1ConnectSec:        30,
 		L1TotalSec:          90,
 
-		CountTokensSec:        60,
 		CountTokensConnectSec: 30,
 		CountTokensTotalSec:   180,
 
@@ -194,14 +192,8 @@ func DefaultSettings() Settings {
 
 func (s *Settings) Validate() error {
 	// 唯一有硬下限的项，单独且显式地校验，错误信息说清为什么。
-	if s.RealFirstTokenSec < MinRealFirstTokenSec {
-		return invalid("real_first_token_sec 不得低于 %d 秒（5 分钟）。"+
-			"收到 %d。调小的代价是正常长思考被砍断并把好站判死；"+
-			"若目的是让死站更快被发现，请调 l2_first_token_sec，探活与真实请求的超时是分开的",
-			MinRealFirstTokenSec, s.RealFirstTokenSec)
-	}
 	if s.RealFirstSemanticSec < MinRealFirstSemanticSec {
-		return invalid("real_first_semantic_sec 不得低于 %d 秒（5 分钟），收到 %d",
+		return invalid("real_first_semantic_sec 不得低于 %d 秒（5 分钟），收到 %d；探活预算请调整 l2_first_semantic_sec",
 			MinRealFirstSemanticSec, s.RealFirstSemanticSec)
 	}
 
@@ -216,7 +208,6 @@ func (s *Settings) Validate() error {
 		{"real_idle_sec", s.RealIdleSec},
 		{"real_total_sec", s.RealTotalSec},
 		{"l2_connect_sec", s.L2ConnectSec},
-		{"l2_first_token_sec", s.L2FirstTokenSec},
 		{"l2_response_header_sec", s.L2ResponseHeaderSec},
 		{"l2_first_byte_sec", s.L2FirstByteSec},
 		{"l2_first_event_sec", s.L2FirstEventSec},
@@ -225,7 +216,6 @@ func (s *Settings) Validate() error {
 		{"l2_total_sec", s.L2TotalSec},
 		{"l1_connect_sec", s.L1ConnectSec},
 		{"l1_total_sec", s.L1TotalSec},
-		{"count_tokens_sec", s.CountTokensSec},
 		{"count_tokens_connect_sec", s.CountTokensConnectSec},
 		{"count_tokens_total_sec", s.CountTokensTotalSec},
 		{"l1_interval_alive_sec", s.L1IntervalAliveSec},
@@ -257,6 +247,9 @@ func (s *Settings) Validate() error {
 		if p.val < 1 {
 			return invalid("%s 必须为正数，收到 %d", p.name, p.val)
 		}
+		if strings.HasSuffix(p.name, "_sec") && int64(p.val) > MaxTimeoutSeconds {
+			return invalid("%s 超过计时器可表示的上限 %d 秒", p.name, MaxTimeoutSeconds)
+		}
 	}
 	if s.RetryMaxAttempts > MaxRetryAttempts {
 		return invalid("retry_max_attempts 不得超过 %d，收到 %d。"+
@@ -283,22 +276,24 @@ func (s *Settings) Validate() error {
 	}
 
 	// 总时长必须容得下首 Token，否则总超时会先触发，首 Token 超时形同虚设。
-	if s.RealTotalSec < s.RealFirstTokenSec {
-		return invalid("real_total_sec(%d) 不能小于 real_first_token_sec(%d)，"+
-			"否则总超时先触发，首 Token 超时不起作用", s.RealTotalSec, s.RealFirstTokenSec)
-	}
 	if s.RealResponseHeaderSec > s.RealTotalSec || s.RealFirstByteSec > s.RealTotalSec || s.RealFirstSemanticSec > s.RealTotalSec {
 		return invalid("real_total_sec(%d) 必须覆盖 response_header(%d)、first_byte(%d) 与 first_semantic(%d)",
 			s.RealTotalSec, s.RealResponseHeaderSec, s.RealFirstByteSec, s.RealFirstSemanticSec)
-	}
-	if s.L2TotalSec < s.L2FirstTokenSec {
-		return invalid("l2_total_sec(%d) 不能小于 l2_first_token_sec(%d)",
-			s.L2TotalSec, s.L2FirstTokenSec)
 	}
 	if s.L2ResponseHeaderSec > s.L2TotalSec || s.L2FirstByteSec > s.L2TotalSec ||
 		s.L2FirstEventSec > s.L2TotalSec || s.L2FirstSemanticSec > s.L2TotalSec {
 		return invalid("l2_total_sec(%d) 必须覆盖 response_header(%d)、first_byte(%d)、first_event(%d) 与 first_semantic(%d)",
 			s.L2TotalSec, s.L2ResponseHeaderSec, s.L2FirstByteSec, s.L2FirstEventSec, s.L2FirstSemanticSec)
+	}
+	for _, budget := range []struct {
+		name           string
+		connect, total int
+	}{
+		{"real", s.RealConnectSec, s.RealTotalSec}, {"l1", s.L1ConnectSec, s.L1TotalSec}, {"l2", s.L2ConnectSec, s.L2TotalSec},
+	} {
+		if budget.connect > budget.total {
+			return invalid("%s_connect_sec(%d) 不能超过 %s_total_sec(%d)", budget.name, budget.connect, budget.name, budget.total)
+		}
 	}
 	if s.CountTokensConnectSec > s.CountTokensTotalSec {
 		return invalid("count_tokens_total_sec(%d) 不能小于 count_tokens_connect_sec(%d)",

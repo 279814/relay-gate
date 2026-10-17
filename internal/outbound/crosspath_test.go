@@ -463,7 +463,7 @@ func newCrossPathFixture(t *testing.T, testCase crossPathCase) *crossPathFixture
 	fixture.settings.L1TotalSec = 5
 	fixture.settings.L2ConnectSec = 4
 	fixture.settings.L2TotalSec = 5
-	fixture.settings.L2FirstTokenSec = 3
+	fixture.settings.L2FirstSemanticSec = 3
 	fixture.settings.L2ResponseHeaderSec = 3
 	fixture.settings.L2FirstByteSec = 3
 	fixture.settings.L2FirstEventSec = 3

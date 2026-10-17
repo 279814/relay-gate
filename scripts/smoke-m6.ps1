@@ -122,11 +122,13 @@ try {
     Say '配置：坏站优先级 1、好站优先级 2'
     # 关掉探活：否则坏站会被判 dead 而在选路时被跳过，重试就撞不上它了。
     # 而这个脚本要验证的恰恰是「撞上去、失败、换站」。
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 60; l1_interval_dead_sec = 60
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
@@ -350,11 +352,13 @@ try {
     # ── 关掉日志开关 ─────────────────────────────────────────
     Say '关掉日志开关后零写入'
     $before = (Admin GET '/admin/api/request-logs?limit=1').total
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 60; l1_interval_dead_sec = 60
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5

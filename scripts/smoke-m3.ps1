@@ -105,11 +105,13 @@ try {
 
     Say '配置：3 个站 + 1 个 ModelName + 3 条 Route'
     # 探活间隔压到最短，让验证不必等分钟级
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 2; l1_interval_dead_sec = 2
         l2_interval_alive_sec = 3; l2_interval_dead_sec = 2
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5

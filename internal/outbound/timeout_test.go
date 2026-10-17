@@ -200,7 +200,6 @@ func TestBudgets_ProbeTimeoutsDoNotAffectReal(t *testing.T) {
 func TestL2BudgetForProfile_LongThinkRaisesFirstSemanticFloor(t *testing.T) {
 	settings := model.DefaultSettings()
 	settings.L2FirstSemanticSec = 120
-	settings.L2FirstTokenSec = 120
 	settings.L2TotalSec = 600
 
 	standard := L2BudgetForProfile(settings, model.TimeoutL2Standard)

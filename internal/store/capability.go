@@ -750,7 +750,7 @@ func loadSettingsTx(ctx context.Context, tx *sql.Tx) (model.Settings, error) {
 	} else if err != nil {
 		return model.Settings{}, err
 	}
-	return usableSettings(DecodeLegacySettings(raw))
+	return usableSettings(decodeCurrentSettings(raw))
 }
 
 func insertProbeExecutionTx(ctx context.Context, tx *sql.Tx, execution *model.ProbeExecution) error {

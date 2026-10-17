@@ -161,9 +161,9 @@ func TestPublishRecipeVersionRejectsChangesAfterTest(t *testing.T) {
 			case "endpoint-secret":
 				_, err = st.UpdateProbeSecret(endpointSecret.ID, endpointSecret.Revision, []byte("after-endpoint-secret"))
 			case "settings":
-				settings, _ := st.GetSettings()
+				settings, settingsRevision, _ := st.GetSettingsWithRevision()
 				settings.L1TotalSec++
-				err = st.SaveSettings(settings)
+				_, err = st.SaveSettingsWithRevision(settings, settingsRevision)
 			case "recipe":
 				other := &model.ProbeRecipeVersion{RecipeID: recipeID, Origin: model.RecipeManual, Method: "HEAD", TimeoutProfile: model.TimeoutL1}
 				err = st.AddRecipeVersion(other, recipe.Revision)
@@ -258,9 +258,9 @@ func TestMarkClientProfileTestedRejectsChangedTarget(t *testing.T) {
 			case "endpoint-secret":
 				_, err = st.UpdateProbeSecret(endpointSecret.ID, endpointSecret.Revision, []byte("after-profile-endpoint-secret"))
 			case "settings":
-				settings, _ := st.GetSettings()
+				settings, settingsRevision, _ := st.GetSettingsWithRevision()
 				settings.L2TotalSec++
-				err = st.SaveSettings(settings)
+				_, err = st.SaveSettingsWithRevision(settings, settingsRevision)
 			case "reenable":
 				up.Enabled = false
 				if err = st.UpdateUpstream(up); err == nil {
@@ -384,9 +384,9 @@ func TestPublishRecipeForceCannotBypassCurrentToken(t *testing.T) {
 	if err := st.InsertProbeExecution(context.Background(), &execution); err != nil {
 		t.Fatal(err)
 	}
-	settings, _ := st.GetSettings()
+	settings, settingsRevision, _ := st.GetSettingsWithRevision()
 	settings.L1TotalSec++
-	if err := st.SaveSettings(settings); err != nil {
+	if _, err := st.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.PublishRecipeVersion(recipeID, version.ID, execution.ID, 2, true); !errors.Is(err, ErrRevisionConflict) {

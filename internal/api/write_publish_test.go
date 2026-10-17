@@ -536,7 +536,7 @@ func TestWrite_SettingsVisibleBeforeHandlerReturns(t *testing.T) {
 
 	beforeInv, beforeRef := pub.counts()
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive","sample_enabled":false}`, true)
+		`{"expected_revision":1,"retry_policy":"aggressive","sample_enabled":false}`, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("update settings: %d %s", rec.Code, rec.Body.String())
 	}
@@ -556,7 +556,7 @@ func TestWrite_SettingsVisibleBeforeHandlerReturns(t *testing.T) {
 	// Validation failure must leave the published snapshot unchanged.
 	beforeInv, beforeRef = pub.counts()
 	rec = do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"not-a-policy"}`, true)
+		`{"expected_revision":2,"retry_policy":"not-a-policy"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("invalid retry_policy must be rejected")
 	}
@@ -592,12 +592,12 @@ func TestWrite_SettingsRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 
 	beforeInv, beforeRef := pub.counts()
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive"}`, true)
+		`{"expected_revision":1,"retry_policy":"aggressive"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("Refresh failure must not return 200 while Settings may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
@@ -617,9 +617,9 @@ func TestWrite_SettingsRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 func TestWrite_SettingsFailedStoreDoesNotPublish(t *testing.T) {
 	s, h, _, pub := newLivecfgServer(t)
 
-	// First PUT inserts the settings row; subsequent PUTs UPDATE it.
+	// Startup initialized revision 1; every client PUT carries its own revision.
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"safe"}`, true)
+		`{"expected_revision":1,"retry_policy":"safe"}`, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed settings: %d %s", rec.Code, rec.Body.String())
 	}
@@ -627,7 +627,7 @@ func TestWrite_SettingsFailedStoreDoesNotPublish(t *testing.T) {
 	beforeInv, beforeRef := pub.counts()
 	forceTableUpdateFail(t, s, "setting")
 	rec = do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive"}`, true)
+		`{"expected_revision":2,"retry_policy":"aggressive"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("expected settings update failure, got 200")
 	}

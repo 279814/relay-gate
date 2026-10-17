@@ -28,10 +28,13 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	settings := model.DefaultSettings()
+	settings, settingsRevision, err := st.GetSettingsWithRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings.OKThreshold = 1
 	settings.FailThreshold = 1
-	if err := st.SaveSettings(settings); err != nil {
+	if _, err := st.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	up := &model.Upstream{

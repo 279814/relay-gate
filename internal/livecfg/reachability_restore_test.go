@@ -117,17 +117,17 @@ func TestDurableNegativeReachabilityRestoresOnlyVerifiedCurrentIncarnation(t *te
 	if _, err := st.DB().Exec(`UPDATE upstream SET network_revision=network_revision-1 WHERE id=?`, up.ID); err != nil {
 		t.Fatal(err)
 	}
-	settings, err := st.GetSettings()
+	settings, settingsRevision, err := st.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings.FailThreshold++
-	if err := st.SaveSettings(settings); err != nil {
+	if settingsRevision, err = st.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	restore(model.ReachabilityUnknown)
 	settings.FailThreshold--
-	if err := st.SaveSettings(settings); err != nil {
+	if settingsRevision, err = st.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate damaged/imported reused numeric IDs with reset revisions. The

@@ -328,33 +328,33 @@ func TestSettingsPersistence(t *testing.T) {
 	st := testStore(t)
 
 	// 未初始化时返回默认值，让首次启动不依赖初始化步骤
-	got, err := st.GetSettings()
+	got, settingsRevision, err := st.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RealFirstTokenSec != 1200 {
-		t.Errorf("首次读取应得默认 1200，得到 %d", got.RealFirstTokenSec)
+	if got.RealFirstSemanticSec != 1200 {
+		t.Errorf("首次读取应得默认 1200，得到 %d", got.RealFirstSemanticSec)
 	}
 
-	got.RealFirstTokenSec = 900
+	got.RealFirstSemanticSec = 900
 	got.SampleEnabled = false
-	if err := st.SaveSettings(got); err != nil {
+	if settingsRevision, err = st.SaveSettingsWithRevision(got, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	back, _ := st.GetSettings()
-	if back.RealFirstTokenSec != 900 || back.SampleEnabled {
+	if back.RealFirstSemanticSec != 900 || back.SampleEnabled {
 		t.Errorf("设置未正确持久化：%+v", back)
 	}
 
 	// 低于硬下限必须被拒，且库里的值保持不变
 	bad := back
-	bad.RealFirstTokenSec = 60
-	if err := st.SaveSettings(bad); !errors.Is(err, model.ErrValidation) {
+	bad.RealFirstSemanticSec = 60
+	if _, err := st.SaveSettingsWithRevision(bad, settingsRevision); !errors.Is(err, model.ErrValidation) {
 		t.Fatalf("低于 300s 应被拒绝，得到 %v", err)
 	}
 	unchanged, _ := st.GetSettings()
-	if unchanged.RealFirstTokenSec != 900 {
-		t.Errorf("校验失败不应写入，库中值变成了 %d", unchanged.RealFirstTokenSec)
+	if unchanged.RealFirstSemanticSec != 900 {
+		t.Errorf("校验失败不应写入，库中值变成了 %d", unchanged.RealFirstSemanticSec)
 	}
 }
 
@@ -364,7 +364,7 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 	st := testStore(t)
 	// 模拟旧版本只存了一个字段
 	if _, err := st.DB().Exec(
-		`INSERT INTO setting (key, value, updated_at) VALUES ('settings', '{"real_idle_sec":123}', 0)`,
+		`UPDATE setting SET value='{"real_idle_sec":123}',updated_at=0 WHERE key='settings'`,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -375,9 +375,9 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 	if got.RealIdleSec != 123 {
 		t.Errorf("已存字段应读出，得到 %d", got.RealIdleSec)
 	}
-	if got.RealFirstTokenSec != 1200 {
+	if got.RealFirstSemanticSec != 1200 {
 		t.Errorf("缺失字段应回落默认 1200，得到 %d（若为 0 说明升级会破坏配置）",
-			got.RealFirstTokenSec)
+			got.RealFirstSemanticSec)
 	}
 	if !got.SampleEnabled {
 		t.Error("缺失的 bool 也应回落默认（true）")

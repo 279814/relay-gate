@@ -163,7 +163,7 @@ func loadBundleSettings(ctx context.Context, tx *sql.Tx) (model.Settings, int64,
 	if err != nil {
 		return model.Settings{}, 0, err
 	}
-	settings, err := usableSettings(DecodeLegacySettings([]byte(raw)))
+	settings, err := usableSettings(decodeCurrentSettings([]byte(raw)))
 	if err != nil {
 		return model.Settings{}, 0, err
 	}
