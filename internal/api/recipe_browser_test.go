@@ -31,6 +31,14 @@ func TestRecipeAdminBrowserFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.WithRunState(controller).WithHealth(health.NewTracker(source), health.NewReachabilityTracker(source))
+	now := time.Now().UnixMilli()
+	sample := &model.Sample{UpstreamID: route.UpstreamID, RouteID: route.ID, ModelNameID: route.ModelNameID, ModelIn: "test-model", ModelOut: "test-model",
+		Endpoint: "/v1/chat/completions", InMethod: "POST", InPath: "/v1/chat/completions", InHeaders: http.Header{"Content-Type": {"application/json"}, "User-Agent": {"OpenAI/Python/1.1.0"}, "Authorization": {"Bearer fixture-private-value"}},
+		InBody: []byte(`{"model":"test-model","messages":[{"role":"user","content":"fixture business text"}],"stream":false,"max_tokens":2}`),
+		TSRecv: now, TSSent: now, TSFirstByte: now + 1, TSDone: now + 2, RespStatus: 200, Outcome: model.OutcomeOK}
+	if err := s.st.InsertSample(sample); err != nil {
+		t.Fatal(err)
+	}
 	profile := &model.ClientProbeProfile{UpstreamID: route.UpstreamID, Endpoint: model.EndpointChatCompletions, ClientFamily: "generic", ShapeHash: "browser-fixture-shape", SeenCount: 1}
 	if err := s.st.CreateClientProfileCandidate(context.Background(), profile); err != nil {
 		t.Fatal(err)

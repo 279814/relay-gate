@@ -83,6 +83,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
+	mux.HandleFunc("POST /admin/api/samples/{id}/view", s.viewSample)
 	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)
 	mux.HandleFunc("DELETE /admin/api/samples", s.clearSamples)
 	// 从样本导出探活头模板（§3.6.4）。改探活指纹的正确方式是从真实样本导，

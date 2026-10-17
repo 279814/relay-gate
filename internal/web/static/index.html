@@ -1587,6 +1587,24 @@
 
       </main>
 
+      <template x-if="sampleAccess">
+        <div class="mask" @click.self="closeSampleAccess()">
+          <form class="modal" role="dialog" aria-modal="true" aria-labelledby="sample-access-title" @submit.prevent="confirmSampleAccess()">
+            <h3 id="sample-access-title" x-text="sampleAccess.kind === 'view' ? '查看样本正文' : sampleAccess.kind === 'pin' ? '更改样本置顶' : '清空未置顶样本'"></h3>
+            <p class="dim">样本可能包含私有对话，请再次输入管理口令。口令仅用于本次操作。</p>
+            <div class="field">
+              <label for="sample-access-password">管理口令</label>
+              <input id="sample-access-password" x-ref="samplePasswordInput" type="password" autocomplete="current-password" x-model="samplePassword" :disabled="busy" required>
+            </div>
+            <p class="err" role="alert" x-show="err" x-text="err"></p>
+            <footer>
+              <button type="button" @click="closeSampleAccess()" :disabled="busy">取消</button>
+              <button class="primary" type="submit" :disabled="busy || !samplePassword">确认本次操作</button>
+            </footer>
+          </form>
+        </div>
+      </template>
+
       <!-- ── Endpoint 表单 ─────────────────────────────────── -->
       <template x-if="endpointForm">
         <div class="mask" @click.self="endpointForm = null">

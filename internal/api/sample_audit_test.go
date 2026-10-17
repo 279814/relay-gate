@@ -68,11 +68,11 @@ func TestSampleActions_WriteAuditOnSuccessOnly(t *testing.T) {
 	if rec := do(t, h, "GET", "/admin/api/samples/"+id, badPW, true); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("view wrong password want 401, got %d", rec.Code)
 	}
-	if rec := do(t, h, "POST", "/admin/api/samples/"+id+"/pin", `{"pinned":true,"password":"not-the-admin"}`, true); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("pin wrong password want 401, got %d", rec.Code)
+	if rec := do(t, h, "POST", "/admin/api/samples/"+id+"/pin", `{"pinned":true,"password":"not-the-admin"}`, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("pin wrong password want 403, got %d", rec.Code)
 	}
-	if rec := do(t, h, "DELETE", "/admin/api/samples", badPW, true); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("clear wrong password want 401, got %d", rec.Code)
+	if rec := do(t, h, "DELETE", "/admin/api/samples", badPW, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("clear wrong password want 403, got %d", rec.Code)
 	}
 	if got := sampleAuditActions(t, h); len(got) != 0 {
 		t.Fatalf("failed re-auth must not write audit, got %+v", got)

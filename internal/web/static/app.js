@@ -63,6 +63,8 @@ function app() {
     mnForm: null,
     rtForm: null,
     sample: null,
+    sampleAccess: null,
+    samplePassword: '',
     hdrExport: null,
     probeResult: null,
     probing: 0,
@@ -222,6 +224,9 @@ function app() {
       this.mnForm = null;
       this.rtForm = null;
       this.sample = null;
+      this.sampleAccess = null;
+      this.samplePassword = '';
+      this._unlockModal?.();
       this.hdrExport = null;
       this.probeResult = null;
       this.tab = 'health';
@@ -682,24 +687,49 @@ function app() {
 
     async openSample(id) {
       this.hdrExport = null;
-      await this.run(async () => { this.sample = await this.api('GET', '/samples/' + id); });
+      this.sample = null;
+      this.beginSampleAccess({kind: 'view', id});
     },
 
-    async togglePin(s) {
-      const { ok, data } = await this.run(
-        () => this.api('POST', `/samples/${s.id}/pin`, { pinned: !s.pinned }),
-      );
-      // 用后端返回的值而不是自己再取反一次：两边各算一遍的话，
-      // 一旦后端将来对这个操作加了条件（比如置顶数量上限），
-      // 界面就会显示一个并没有生效的状态。
-      if (ok && data) s.pinned = data.pinned;
+    async togglePin(row) {
+      this.beginSampleAccess({kind: 'pin', id: row.id, pinned: !row.pinned, row});
     },
 
     async clearSamples() {
       if (!confirm('清空样本？置顶的会保留。')) return;
-      const { ok, data } = await this.run(
-        () => this.api('DELETE', '/samples?keep_pinned=true'));
-      if (ok) {
+      this.beginSampleAccess({kind: 'clear'});
+    },
+
+    beginSampleAccess(action) {
+      this.err = '';
+      this.samplePassword = '';
+      this.sampleAccess = action;
+      this._lockModal?.(() => this.closeSampleAccess());
+      this.$nextTick?.(() => this.$refs?.samplePasswordInput?.focus());
+    },
+
+    closeSampleAccess() {
+      if (this.busy) return;
+      this.samplePassword = '';
+      this.sampleAccess = null;
+      this._unlockModal?.();
+    },
+
+    async confirmSampleAccess() {
+      const action = this.sampleAccess;
+      if (!action || this.busy || !['view', 'pin', 'clear'].includes(action.kind)) return;
+      const password = this.samplePassword;
+      this.samplePassword = '';
+      const {ok, data} = await this.run(() => {
+        if (action.kind === 'view') return this.api('POST', `/samples/${action.id}/view`, {password});
+        if (action.kind === 'pin') return this.api('POST', `/samples/${action.id}/pin`, {pinned: action.pinned, password});
+        return this.api('DELETE', '/samples?keep_pinned=true', {password});
+      });
+      if (!ok || this.sampleAccess !== action) return;
+      this.closeSampleAccess();
+      if (action.kind === 'view') this.sample = data;
+      else if (action.kind === 'pin' && data) action.row.pinned = data.pinned;
+      else {
         this.msg = `已删除 ${data?.deleted ?? 0} 条`;
         await this.loadSamples();
       }

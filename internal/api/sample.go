@@ -73,6 +73,21 @@ func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 // 只证明「已登录」；口令须再经 passwordOK 校验，与 reveal/rotate 同级。
 // 口令放在 JSON body（{"password":"..."}）；缺省或错误一律 401 且不返回正文。
 func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
+	s.sampleWithReauth(w, r, http.StatusUnauthorized)
+}
+
+// Browsers cannot send a GET body. POST view carries the per-request password;
+// the GET adapter remains available to existing non-browser clients.
+func (s *Server) viewSample(w http.ResponseWriter, r *http.Request) {
+	s.sampleWithReauth(w, r, http.StatusForbidden)
+}
+
+func writeSampleReauthFailure(w http.ResponseWriter, status int) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, status, map[string]any{"code": "reauth_failed", "error": "管理员口令不正确，请重新输入"})
+}
+
+func (s *Server) sampleWithReauth(w http.ResponseWriter, r *http.Request, failureStatus int) {
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
@@ -90,7 +105,7 @@ func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 		password = body.Password
 	}
 	if !s.passwordOK(password) {
-		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
+		writeSampleReauthFailure(w, failureStatus)
 		return
 	}
 	smp, err := s.st.GetSample(id)
@@ -119,7 +134,7 @@ func (s *Server) pinSample(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.passwordOK(body.Password) {
-		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
+		writeSampleReauthFailure(w, http.StatusForbidden)
 		return
 	}
 	if err := s.st.SetSamplePinned(id, body.Pinned); err != nil {
@@ -146,7 +161,7 @@ func (s *Server) clearSamples(w http.ResponseWriter, r *http.Request) {
 		password = body.Password
 	}
 	if !s.passwordOK(password) {
-		writeJSON(w, http.StatusUnauthorized, errBody{"管理员密码不正确"})
+		writeSampleReauthFailure(w, http.StatusForbidden)
 		return
 	}
 	keepPinned := r.URL.Query().Get("keep_pinned") != "false"

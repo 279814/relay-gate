@@ -109,8 +109,8 @@ func TestPinSample_RequiresReauth(t *testing.T) {
 	path := "/admin/api/samples/" + itoa(smp.ID) + "/pin"
 
 	noPW := do(t, h, "POST", path, `{"pinned":true}`, true)
-	if noPW.Code != http.StatusUnauthorized {
-		t.Fatalf("session alone want 401, got %d body=%s", noPW.Code, noPW.Body.String())
+	if noPW.Code != http.StatusForbidden {
+		t.Fatalf("session alone want 403, got %d body=%s", noPW.Code, noPW.Body.String())
 	}
 	got, err := s.st.GetSample(smp.ID)
 	if err != nil {
@@ -121,8 +121,8 @@ func TestPinSample_RequiresReauth(t *testing.T) {
 	}
 
 	bad := do(t, h, "POST", path, `{"pinned":true,"password":"not-the-admin"}`, true)
-	if bad.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong password want 401, got %d body=%s", bad.Code, bad.Body.String())
+	if bad.Code != http.StatusForbidden {
+		t.Fatalf("wrong password want 403, got %d body=%s", bad.Code, bad.Body.String())
 	}
 
 	ok := do(t, h, "POST", path, `{"pinned":true,"password":"`+testAdminPW+`"}`, true)
@@ -165,16 +165,16 @@ func TestClearSamples_RequiresReauth(t *testing.T) {
 	}
 
 	noPW := do(t, h, "DELETE", "/admin/api/samples", "", true)
-	if noPW.Code != http.StatusUnauthorized {
-		t.Fatalf("session alone want 401, got %d body=%s", noPW.Code, noPW.Body.String())
+	if noPW.Code != http.StatusForbidden {
+		t.Fatalf("session alone want 403, got %d body=%s", noPW.Code, noPW.Body.String())
 	}
 	if n, _ := s.st.CountSamples(); n != 1 {
 		t.Fatalf("clear must not run without password, count=%d", n)
 	}
 
 	bad := do(t, h, "DELETE", "/admin/api/samples", `{"password":"not-the-admin"}`, true)
-	if bad.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong password want 401, got %d body=%s", bad.Code, bad.Body.String())
+	if bad.Code != http.StatusForbidden {
+		t.Fatalf("wrong password want 403, got %d body=%s", bad.Code, bad.Body.String())
 	}
 	if n, _ := s.st.CountSamples(); n != 1 {
 		t.Fatalf("clear must not run with wrong password, count=%d", n)
