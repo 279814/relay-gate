@@ -188,6 +188,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return fmt.Sprintf("改写出站认证失败: %v", err)
 	}
+	redactKeys := append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)
 
 	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
 	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，
@@ -251,7 +252,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 			return ""
 		}
 		return fmt.Sprintf("转发失败: %s",
-			sample.RedactDiagnosticText(err.Error(), h.credentialsOf(r, cand)))
+			sample.RedactDiagnosticText(err.Error(), redactKeys))
 	}
 	defer resp.Body.Close()
 	if instr.Observer != nil {
@@ -279,13 +280,13 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 最容易触发的分支。不脱敏的话日志就成了明文 key 的副本 —— §3.6.3b 对
 	// 样本库的要求是无条件的，日志没有理由比它宽松。
 	if resp.StatusCode >= 400 {
-		safe := sample.RedactDiagnostic(respBody, h.credentialsOf(r, cand))
+		safe := sample.RedactDiagnostic(respBody, redactKeys)
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
 			collapseSpaces(string(safe), maxCountTokensLogBody))
 	}
 
 	// 成功。原样回传上游响应体。
-	FinalizeClientResponseHeaders(resp.Header, h.credentialsOf(r, cand))
+	FinalizeClientResponseHeaders(resp.Header, redactKeys)
 	dst := w.Header()
 	for k, vs := range resp.Header {
 		for _, v := range vs {

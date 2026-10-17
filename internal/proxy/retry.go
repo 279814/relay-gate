@@ -518,7 +518,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	// Published binding only; unbound → passthrough (§15.1).
 	var compiled *transform.Compiled
 	var verID int64
-	redactKeys := h.credentialsOf(r, cand)
+	redactKeys := append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)
 	shadowHeader, shadowBody := outHeader, outBody
 	if h.transforms != nil && target.EndpointID != 0 {
 		var terr error

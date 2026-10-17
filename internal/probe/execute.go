@@ -41,6 +41,7 @@ type preparedProbe struct {
 	requestURLHash  string
 
 	outputTokenLimit int
+	redactSecrets    []string
 }
 
 // requestPreparer only resolves and renders a fixed request. It has no network
@@ -171,6 +172,10 @@ func (p *requestPreparer) finishPrepare(ctx context.Context, up *model.Upstream,
 		request.Host = target.RequestHost
 	}
 	request.ContentLength = int64(len(rendered.Body))
+	redactSecrets := target.ResolvedSecrets()
+	for _, secret := range values.Secrets {
+		redactSecrets = append(redactSecrets, string(secret.Plain))
+	}
 
 	return &preparedProbe{
 		recipe:           resolved,
@@ -178,6 +183,7 @@ func (p *requestPreparer) finishPrepare(ctx context.Context, up *model.Upstream,
 		resolvedURLHash:  target.ResolvedURLHash,
 		requestURLHash:   target.RequestURLHash,
 		outputTokenLimit: ProbeRequestOutputTokenLimit(rendered.Body),
+		redactSecrets:    redactSecrets,
 	}, resolved, nil
 }
 
@@ -318,9 +324,13 @@ func (p *requestPreparer) applyProbeHeaders(ctx context.Context, header http.Hea
 	target outbound.ResolvedTarget) error {
 
 	applyUpstreamHeaderOverrides(header, up)
+	values := target.CredentialValues
+	if values == nil {
+		values = p.values(up)
+	}
 	return outbound.ApplyAuth(ctx, header, outbound.AuthInput{
 		Profile: target.AuthProfile,
-		Values:  p.values(up),
+		Values:  values,
 		Use:     outbound.ResolveSyntheticProbe,
 	})
 }
