@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
@@ -42,16 +45,17 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	cur, err := s.st.GetSettings()
+	cur, revision, err := s.st.GetSettingsWithRevision()
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := decodeJSON(r, &cur); err != nil {
+	cur, err = decodeSettingsUpdate(r, cur)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.SaveSettings(cur); err != nil {
+	if _, err := s.st.SaveSettingsWithRevision(cur, revision); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -65,6 +69,60 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("更新全局设置", "real_first_token_sec", cur.RealFirstTokenSec,
 		"sample_enabled", cur.SampleEnabled)
 	writeJSON(w, http.StatusOK, cur)
+}
+
+// A partial update starts from one captured revision. Legacy aliases expand
+// only when explicitly supplied, and explicit stage fields take precedence.
+func decodeSettingsUpdate(r *http.Request, current model.Settings) (model.Settings, error) {
+	var raw json.RawMessage
+	if err := decodeJSON(r, &raw); err != nil {
+		return current, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&current); err != nil {
+		return current, model.WrapValidation("请求体不是合法 JSON")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return current, model.WrapValidation("请求体不是合法 JSON")
+	}
+	present := func(name string) bool {
+		for key, value := range fields {
+			// Match encoding/json's case-insensitive field names and its
+			// existing null-as-no-change behavior for numeric Settings.
+			if strings.EqualFold(key, name) && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return true
+			}
+		}
+		return false
+	}
+	fillUnspecified := func(name string, target *int, value int) {
+		if !present(name) {
+			*target = value
+		}
+	}
+	if present("real_first_token_sec") {
+		fillUnspecified("real_response_header_sec", &current.RealResponseHeaderSec, current.RealFirstTokenSec)
+		fillUnspecified("real_first_byte_sec", &current.RealFirstByteSec, current.RealFirstTokenSec)
+		fillUnspecified("real_first_semantic_sec", &current.RealFirstSemanticSec, current.RealFirstTokenSec)
+	}
+	if present("l2_first_token_sec") {
+		fillUnspecified("l2_response_header_sec", &current.L2ResponseHeaderSec, current.L2FirstTokenSec)
+		fillUnspecified("l2_first_byte_sec", &current.L2FirstByteSec, current.L2FirstTokenSec)
+		fillUnspecified("l2_first_event_sec", &current.L2FirstEventSec, current.L2FirstTokenSec)
+		fillUnspecified("l2_first_semantic_sec", &current.L2FirstSemanticSec, current.L2FirstTokenSec)
+	}
+	if present("count_tokens_sec") {
+		fillUnspecified("count_tokens_connect_sec", &current.CountTokensConnectSec, current.CountTokensSec)
+		fillUnspecified("count_tokens_total_sec", &current.CountTokensTotalSec, current.CountTokensSec)
+	}
+	// Persisted settings omit aliases; match their canonical read-side values
+	// in the unchanged Settings response as well.
+	current.RealFirstTokenSec = current.RealFirstSemanticSec
+	current.L2FirstTokenSec = current.L2FirstSemanticSec
+	current.CountTokensSec = current.CountTokensTotalSec
+	return current, nil
 }
 
 // getState / setState 是服务总闸（§4.8 / §P0-12）。
