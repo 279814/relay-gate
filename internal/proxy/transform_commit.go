@@ -50,6 +50,14 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
+	if at.f.RespObserver != nil {
+		observer := observerTee{at.f.RespObserver}
+		if len(at.peeked) > 0 {
+			_, _ = observer.Write(at.peeked)
+		}
+		at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, readError: &at.res.upstreamReadErr}
+		at.f.RespObserver = nil // transformed/fail-open writes must not duplicate input
+	}
 
 	ct := at.resp.Header.Get("Content-Type")
 	if transform.IsSSEContentType(ct) {

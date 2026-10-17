@@ -17,11 +17,18 @@ import (
 // capabilityTraffic reuses the bounded observer queue and committed observation
 // path for count_tokens and structured model_not_found. It retains summaries.
 type capabilityTraffic struct {
-	recipe     ResolvedRecipe
-	req        ExecutionRequest
-	decoder    Decoder
-	classifier *ResponseClassifier
-	decodeErr  error
+	recipe                                                  ResolvedRecipe
+	req                                                     ExecutionRequest
+	decoder                                                 Decoder
+	classifier                                              *ResponseClassifier
+	decodeErr                                               error
+	encoding                                                string
+	responseBytes                                           int64
+	firstByteAt, firstEventAt, firstSemanticAt, lastInputAt time.Time
+	decodeWork                                              time.Duration
+	shape                                                   model.ClientRequestShape
+	shapeReason                                             model.RequestShapeUnavailableReason
+	requestBytes                                            int64
 }
 
 func prepareCapabilityTraffic(ctx context.Context, snap *livecfg.ProbeSnapshot, target health.AttemptTarget, order int64) *capabilityTraffic {
@@ -67,14 +74,26 @@ func prepareCapabilityTraffic(ctx context.Context, snap *livecfg.ProbeSnapshot, 
 	}
 	recipe.Facts.Use = model.BindingRealTrafficContext
 	up := &model.Upstream{ID: target.UpstreamID}
-	_, _, expectation, policy, err := buildL2Expectations(snap, up, route, target.Endpoint, recipe)
+	reach, reachPolicy, expectation, policy, err := buildRealExpectations(snap, up, route, target.Endpoint, recipe)
 	if err != nil {
 		return nil
 	}
 	return &capabilityTraffic{recipe: recipe, req: ExecutionRequest{
 		ExecutionID: sample.NewReqID(), Trigger: model.TriggerRealTraffic, Upstream: up, Route: route, ModelName: mn,
 		Endpoint: target.Endpoint, ObservationOrder: order, CapabilityExpectation: expectation, CapabilityPolicy: policy,
-	}}
+		ReachabilityExpectation: reach, ReachabilityPolicy: reachPolicy,
+	}, shapeReason: model.ShapeUnsupported}
+}
+
+func (o *trafficObserver) TryRequest(view health.AttemptRequestView) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.finished || o.capability == nil {
+		return
+	}
+	c := o.capability
+	c.requestBytes = int64(len(view.Body))
+	c.shape, c.shapeReason = SanitizeRequestShape(c.req.Endpoint, view)
 }
 
 func (c *capabilityTraffic) consume(event trafficEvent) {
@@ -82,27 +101,65 @@ func (c *capabilityTraffic) consume(event trafficEvent) {
 		return
 	}
 	if event.kind == "headers" {
-		// The count_tokens forwarding path preserves wire bytes. Until it also
-		// supplies decoded bytes, encoded responses are unobserved, not failures.
-		encoding := strings.TrimSpace(event.header.Get("Content-Encoding"))
-		if encoding != "" && !strings.EqualFold(encoding, "identity") {
-			c.decodeErr = errors.New("observer_content_encoding")
-			return
-		}
+		c.encoding = strings.ToLower(strings.TrimSpace(event.header.Get("Content-Encoding")))
 		c.classifier = NewResponseClassifier(ObserveReal, c.req.Endpoint, event.status, event.header, event.at)
-		c.decoder, c.decodeErr = NewDecoder(DecoderSpec{Endpoint: c.req.Endpoint, Protocol: c.req.ModelName.Protocol}, WireAuto, perAttemptCopyBudget, perAttemptCopyBudget)
+		c.decoder, c.decodeErr = NewDecoder(DecoderSpec{Endpoint: c.req.Endpoint, Protocol: c.req.ModelName.Protocol}, WireAuto, trafficDecodedLimit, trafficDecodedLimit)
 		return
 	}
 	if c.decoder != nil && len(event.chunk) > 0 {
-		var events []ProtocolEvent
-		events, c.decodeErr = c.decoder.Feed(event.chunk)
-		for _, value := range events {
-			c.classifier.Observe(value)
+		c.lastInputAt = event.at
+		if c.firstByteAt.IsZero() {
+			c.firstByteAt = event.at
 		}
+		c.feed(event.chunk, event.at)
 	}
 }
 
-func (c *capabilityTraffic) observation(v health.AttemptFinish, timing sendTiming, incomplete bool, status int, header http.Header, resolvedURLHash string) *model.ProbeObservation {
+const trafficDecodedLimit = 1 << 20
+const trafficDecodeCPULimit = 25 * time.Millisecond
+
+var errTrafficDecodeDeadline = errors.New("observer decode deadline")
+var errTrafficObserverPanic = errors.New("observer worker panic")
+
+func (c *capabilityTraffic) feed(body []byte, at time.Time) {
+	started := time.Now()
+	events, err := c.decoder.Feed(body)
+	c.decodeWork += time.Since(started)
+	c.accept(events, at)
+	if err != nil {
+		c.decodeErr = err
+	} else if c.decodeWork > trafficDecodeCPULimit {
+		c.decodeErr = errTrafficDecodeDeadline
+	}
+}
+
+func (c *capabilityTraffic) accept(events []ProtocolEvent, at time.Time) {
+	for _, event := range events {
+		if c.firstEventAt.IsZero() {
+			c.firstEventAt = at
+		}
+		if event.Semantic && c.firstSemanticAt.IsZero() {
+			c.firstSemanticAt = at
+		}
+		c.classifier.Observe(event)
+	}
+}
+
+func (c *capabilityTraffic) finishDecode() {
+	defer func() {
+		if recover() != nil {
+			c.decodeErr = errTrafficObserverPanic
+		}
+	}()
+	if c.decoder == nil || c.decodeErr != nil {
+		return
+	}
+	events, err := c.decoder.Finish()
+	c.accept(events, c.lastInputAt)
+	c.decodeErr = err
+}
+
+func (c *capabilityTraffic) observation(v health.AttemptFinish, timing sendTiming, incomplete model.ObserverIncompleteReason, status int, header http.Header, resolvedURLHash string) *model.ProbeObservation {
 	if c == nil {
 		return nil
 	}
@@ -122,13 +179,7 @@ func (c *capabilityTraffic) observation(v health.AttemptFinish, timing sendTimin
 	if c.classifier == nil {
 		c.classifier = NewResponseClassifier(ObserveReal, c.req.Endpoint, status, header, time.UnixMilli(timing.responseHeaderAtMS))
 	}
-	if c.decoder != nil && c.decodeErr == nil {
-		var tail []ProtocolEvent
-		tail, c.decodeErr = c.decoder.Finish()
-		for _, event := range tail {
-			c.classifier.Observe(event)
-		}
-	}
+	c.finishDecode()
 	var cause error
 	if v.ClientCanceled {
 		cause = ErrClientCanceled
@@ -150,26 +201,66 @@ func (c *capabilityTraffic) observation(v health.AttemptFinish, timing sendTimin
 	if c.req.Endpoint == model.EndpointCountTokens && decision.ErrorClass == model.ErrorAuthRejected {
 		decision.Capability = model.CapabilityConfigError
 	}
-	statusEvidence := c.req.Endpoint == model.EndpointCountTokens &&
-		(status == http.StatusUnauthorized || status == http.StatusForbidden ||
-			status == http.StatusNotFound || status == http.StatusMethodNotAllowed)
-	if (incomplete || c.decodeErr != nil) && !statusEvidence && !v.ConfigError {
-		decision = Decision{Final: true, ErrorClass: model.ErrorIgnored, Scope: model.ScopeNone, StatusCode: decision.StatusCode}
+	capExpectation, capPolicy := c.req.CapabilityExpectation, c.req.CapabilityPolicy
+	reachExpectation, reachPolicy := c.req.ReachabilityExpectation, c.req.ReachabilityPolicy
+	if (incomplete != "" || c.decodeErr != nil) && !v.ConfigError {
+		// Missing body evidence never turns an otherwise successful response
+		// into a Capability failure. Headers/transport still carry evidence.
+		transportPartial := v.ReadErr != nil && c.classifier.semanticSeen
+		if !transportPartial {
+			decision = NewResponseClassifier(ObserveReal, c.req.Endpoint, status, header, time.UnixMilli(timing.responseHeaderAtMS)).Finish(v.ReadErr, cause)
+		}
+		if status >= 200 && status < 300 && v.ReadErr == nil {
+			decision.ErrorClass = model.ErrorIgnored
+			capExpectation, capPolicy = nil, nil
+		}
+		if c.req.Endpoint == model.EndpointCountTokens && decision.ErrorClass == model.ErrorAuthRejected {
+			decision.Capability = model.CapabilityConfigError
+		}
 	}
-	// Existing RouteHealth reporting remains authoritative for other model
-	// outcomes. Only this structured configuration error belongs to this path.
-	if c.req.Endpoint != model.EndpointCountTokens && decision.ErrorClass != model.ErrorModelNotFound && decision.ErrorClass != model.ErrorConfig {
-		return nil
+	if cause != nil {
+		reachExpectation, reachPolicy, capExpectation, capPolicy = nil, nil, nil, nil
 	}
-	exec := (&Executor{}).buildExecution(c.req, c.recipe, decision, timing, 0, 0, 0, false, resolvedURLHash, "")
-	exec.RealRequestShapeUnavailableReason = model.ShapeUnsupported
-	exec.ObserverIncomplete = incomplete || c.decodeErr != nil
-	if incomplete {
-		exec.ObserverIncompleteReason = model.ObserverCapacity
+	if status == 0 && !v.ConfigError {
+		capExpectation, capPolicy = nil, nil
+	}
+	if v.ConfigError {
+		reachExpectation, reachPolicy = nil, nil
+	}
+	timing.firstByteAtMS = msOrZero(c.firstByteAt)
+	timing.firstEventAtMS = msOrZero(c.firstEventAt)
+	timing.firstSemanticAtMS = msOrZero(c.firstSemanticAt)
+	// Remote identifiers can themselves contain unknown credentials. Real
+	// traffic persists classified vocabulary, never remote text or fields.
+	decision.RedactedDetail = string(decision.ErrorClass)
+	exec := (&Executor{}).buildExecution(c.req, c.recipe, decision, timing, c.requestBytes, c.responseBytes, 0, false, resolvedURLHash, "")
+	exec.RealRequestShapeUnavailableReason = c.shapeReason
+	if c.shapeReason == "" {
+		exec.RealRequestShapeHash = ShapeHash(c.shape)
+		exec.RealRequestShapeLearnable = exec.RealRequestShapeHash != ""
+		if !exec.RealRequestShapeLearnable {
+			exec.RealRequestShapeUnavailableReason = model.ShapeSanitizerFailure
+		}
+	}
+	exec.ObserverIncomplete = incomplete != "" || c.decodeErr != nil
+	if incomplete != "" {
+		exec.ObserverIncompleteReason = incomplete
 	} else if c.decodeErr != nil {
 		exec.ObserverIncompleteReason = model.ObserverDecodeFailure
+		if errors.Is(c.decodeErr, errTrafficDecodeDeadline) || errors.Is(c.decodeErr, ErrDecoderWorkBudget) || errors.Is(c.decodeErr, ErrContentDecoderWorkBudget) {
+			exec.ObserverIncompleteReason = model.ObserverDeadline
+		}
+		if errors.Is(c.decodeErr, errTrafficObserverPanic) {
+			exec.ObserverIncompleteReason = model.ObserverPanic
+		}
+		if errors.Is(c.decodeErr, ErrDecodedBodyTooLarge) || errors.Is(c.decodeErr, ErrEventTooLarge) {
+			exec.ObserverIncompleteReason = model.ObserverOutputLimit
+		}
+		if errors.Is(c.decodeErr, ErrEncodedBodyTooLarge) {
+			exec.ObserverIncompleteReason = model.ObserverInputLimit
+		}
 	}
-	obs := &model.ProbeObservation{Execution: exec, CapabilityExpectation: c.req.CapabilityExpectation, CapabilityPolicy: c.req.CapabilityPolicy}
+	obs := &model.ProbeObservation{Execution: exec, CapabilityExpectation: capExpectation, CapabilityPolicy: capPolicy, ReachabilityExpectation: reachExpectation, ReachabilityPolicy: reachPolicy}
 	hash, err := revisioncodec.NewProbeEvidenceHash(*obs)
 	if err != nil {
 		return nil
@@ -179,15 +270,34 @@ func (c *capabilityTraffic) observation(v health.AttemptFinish, timing sendTimin
 }
 
 func (o *trafficObserver) queueCapabilityObservation() {
+	defer func() {
+		if recover() != nil {
+			o.m.persistDrops.Add(1)
+		}
+	}()
 	snap := o.trace.Snapshot()
+	timing := trafficTiming(snap.SentAt, snap.ResponseHeaderAt, snap.DoneAt)
+	timing.gotConnAtMS = msOrZero(snap.GotConnAt)
+	timing.tlsHandshakeStartAtMS = msOrZero(snap.TLSStartAt)
+	timing.tlsHandshakeDoneAtMS = msOrZero(snap.TLSDoneAt)
+	incomplete := o.incomplete
+	o.capability.responseBytes = o.wireBytes
+	if o.capability.firstByteAt.IsZero() {
+		o.capability.firstByteAt = o.firstByteAt
+	}
+	if !o.full && incomplete == "" {
+		incomplete = model.ObserverCapacity
+	}
 	observation := o.capability.observation(o.finishView,
-		trafficTiming(snap.SentAt, snap.ResponseHeaderAt, snap.DoneAt), o.incomplete != "" || !o.full,
+		timing, incomplete,
 		o.status, o.header, o.target.Config.ResolvedURLHash)
 	if observation == nil {
 		return
 	}
 	select {
-	case o.m.queue <- observation:
+	case <-o.m.stop:
+		o.m.persistDrops.Add(1)
+	case o.m.queue <- trafficWrite{observation: observation, target: o.target, finish: o.finishView, shape: o.capability.shape}:
 	default:
 		o.m.persistDrops.Add(1)
 	}

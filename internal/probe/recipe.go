@@ -16,6 +16,7 @@ package probe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -75,16 +76,13 @@ type ResolvedRecipe struct {
 	// 与 Compiled 出自同一条记录，所以必须一起带出：分两次读会让
 	// 「用新模板配旧超时档」成为可能。
 	//
-	// profile 层没有这两项：learner 学的是请求形状，而超时档按 endpoint 推。
+	// profile 的流式标记从安全模板读取，超时档按 endpoint 推。
 	StreamExpected bool
 	TimeoutProfile model.ProbeTimeoutProfile
 
 	// Builtin 只在命中第 4 级时非 nil，带出 token 估算与最小输出说明。
 	//
-	// 单独一个字段而不是把估算值抬到 ResolvedRecipe 上：前三级的成本要按
-	// ModelName 的 probe_max_tokens 估（那是用户配的），而内置模板的估算写在
-	// manifest 里。抬上来就得给前三级填一个「算出来的」值，于是两种来源在
-	// 同一个字段里，读的人无从知道手上这个是哪种。
+	// 其余配方在渲染后按请求实际输出上限估算；内置估算声明随 manifest。
 	Builtin *BuiltinTemplate
 }
 
@@ -364,10 +362,18 @@ func (resolver *RecipeResolver) fromProfile(query RecipeQuery,
 		Compiled: compiled,
 		// profile 层没有 Secret 快照，上面也已拒绝引用 Secret 的 shape：
 		// 认证由 Endpoint 的 auth profile 提供（§7.2）。
-		SecretRefs: nil,
+		SecretRefs:     nil,
+		StreamExpected: learnedStreamExpected(safe.BodyTemplate),
 		// 超时档按 endpoint 推：profile 不存这一项。
 		TimeoutProfile: defaultTimeoutProfile(query.Endpoint),
 	}, nil
+}
+
+func learnedStreamExpected(body []byte) bool {
+	var view struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &view) == nil && view.Stream
 }
 
 // defaultTimeoutProfile 按 endpoint 给出超时档。

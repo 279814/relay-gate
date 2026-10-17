@@ -85,7 +85,8 @@ func TestCapabilityTraffic_ReEnableBeforeCommittedResultReturns(t *testing.T) {
 			observer.Finish(health.AttemptFinish{})
 			var value *model.ProbeObservation
 			select {
-			case value = <-h.manager.queue:
+			case item := <-h.manager.queue:
+				value = item.observation
 			case <-time.After(time.Second):
 				t.Fatal("observation not queued")
 			}

@@ -35,7 +35,6 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
 // modelNotFoundMarkers 是「模型不存在」的响应体特征（§4.3 致命类）。
@@ -195,7 +194,7 @@ func ClassifyTransportErr(err error) Outcome {
 	}
 	// 客户端断开/取消与上游健康无关。这条判断必须在最前面：
 	// 客户端断开会连带触发下面那些超时错误。
-	if !proxy.IsUpstreamFault(err) {
+	if !health.IsUpstreamFault(err) {
 		return Outcome{Verdict: health.VerdictIgnore, Err: err}
 	}
 	// 其余一律算上游的账，**包括我们自己设的超时** —— 那些超时到期

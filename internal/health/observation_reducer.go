@@ -131,7 +131,9 @@ func (reducer *ObservationReducer) ReduceCapability(current *model.EndpointCapab
 	next.ExpiresAt = capabilityExpiresAt(state, nowMS, execution.RetryAfterUntilMS, policy)
 
 	if execution.Trigger == model.TriggerRealTraffic && execution.Success {
-		next.LastRealOKAt = nowMS
+		if execution.DoneAtMS > next.LastRealOKAt {
+			next.LastRealOKAt = execution.DoneAtMS
+		}
 		next.LastRealOKToken = execution.CapabilityToken
 	}
 	return next, nil

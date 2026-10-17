@@ -13,13 +13,14 @@ import (
 
 // AttemptTarget 标识一次即将发出的真实 Attempt。
 type AttemptTarget struct {
-	ReqID      string
-	Attempt    int
-	Protocol   model.Protocol
-	Endpoint   model.EndpointKind
-	UpstreamID int64
-	RouteID    int64
-	Config     AttemptConfigFacts
+	ReqID            string
+	Attempt          int
+	Protocol         model.Protocol
+	Endpoint         model.EndpointKind
+	UpstreamID       int64
+	RouteID          int64
+	HealthGeneration uint64
+	Config           AttemptConfigFacts
 }
 
 // AttemptConfigFacts 是该次 Attempt 已固定的配置身份（proxy 原样复制，不造 token）。
@@ -41,7 +42,7 @@ type AttemptConfigFacts struct {
 	ResolvedURLHash                 string
 }
 
-// AttemptRequestView 只在 PrepareAttempt 同步调用期间有效。
+// AttemptRequestView 只在 PrepareAttempt / TryRequest 同步调用期间有效。
 type AttemptRequestView struct {
 	Header        http.Header
 	RawQuery      string
@@ -55,6 +56,7 @@ type AttemptFinish struct {
 	ClientCanceled  bool
 	ServiceCanceled bool
 	ClientCommitted bool
+	HalfOpen        bool
 	ConfigError     bool
 	ConfigFacts     *AttemptConfigFacts
 }
@@ -70,6 +72,10 @@ type AttemptObserver interface {
 type AttemptObserverFactory interface {
 	PrepareAttempt(ctx context.Context, target AttemptTarget, request AttemptRequestView) AttemptInstrumentation
 }
+
+// AttemptRequestObserver accepts the final outbound view before socket write.
+// Local configuration failures can still use the earlier instrumentation.
+type AttemptRequestObserver interface{ TryRequest(AttemptRequestView) }
 
 // AttemptInstrumentation 捆绑 Observer、同步 RetryDecider 与共享 Trace。
 type AttemptInstrumentation struct {

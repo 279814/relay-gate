@@ -337,9 +337,11 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 		probe.ClientProfileSecretRefs[id] = append([]model.RequiredSecretRef(nil), refs...)
 	}
 
+	routing := router.BuildSnapshot(modelNames, routingUpstreams, routes)
+	routing.Generation = generation
 	return &PublishedConfig{
 		Generation: generation,
-		Routing:    router.BuildSnapshot(modelNames, routingUpstreams, routes),
+		Routing:    routing,
 		Probe:      probe,
 		Settings:   settings,
 		RunState:   bundle.RunState,

@@ -57,6 +57,15 @@ func (s *Source) Snapshot() (*router.Snapshot, error) {
 	return pub.Routing, nil
 }
 
+// SnapshotWithSettings fixes routing and timeouts to one published generation.
+func (s *Source) SnapshotWithSettings() (*router.Snapshot, model.Settings, error) {
+	pub, err := s.get(false)
+	if err != nil {
+		return nil, model.Settings{}, err
+	}
+	return pub.Routing, pub.Settings, nil
+}
+
 func (s *Source) Settings() (model.Settings, error) {
 	pub, err := s.get(false)
 	if err != nil {

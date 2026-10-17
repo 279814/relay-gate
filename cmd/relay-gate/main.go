@@ -267,6 +267,9 @@ func runServer() error {
 	} else if n > 0 {
 		log.Info("已恢复 config_error 能力状态", "rows", n)
 	}
+	if _, err := capRegistry.RestoreRealSuccesses(context.Background(), st, cfgSrc, recipes); err != nil {
+		return fmt.Errorf("恢复真实成功探活证据: %w", err)
+	}
 
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
@@ -327,7 +330,8 @@ func runServer() error {
 	defer seq.Close()
 	sched.WithSequencer(seq)
 
-	traffic := probe.NewTrafficObserverManager(cfgSrc, seq, resultRecorder, log).WithScheduler(sched)
+	traffic := probe.NewTrafficObserverManager(cfgSrc, seq, resultRecorder, log).WithScheduler(sched).WithHealthTracker(tracker).WithLearner(probe.NewLearner(st)).WithPiggybackStore(st)
+	sched.WithPiggybackRecorder(traffic)
 	fwd.WithObservers(traffic)
 	janitor := probe.NewRetentionJanitor(st, log)
 

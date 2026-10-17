@@ -52,10 +52,11 @@ type SampleDiskStat interface {
 
 // Handler 处理三个透传端点。
 type Handler struct {
-	cfg     ConfigSource
-	health  router.HealthView
-	samples SampleSink
-	log     *slog.Logger
+	admission admissionFence
+	cfg       ConfigSource
+	health    router.HealthView
+	samples   SampleSink
+	log       *slog.Logger
 
 	// targets 是唯一的出站 URL 来源（§7.1）。为 nil 时转发直接失败 ——
 	// 绝不回落到自己拼一个：那正是 P0-03 要消灭的第二套规则。
@@ -343,13 +344,13 @@ func (h *Handler) resolveTarget(r *http.Request, cand *router.Candidate,
 
 // Routes 注册透传端点。三个协议路径 1:1 对应上游同名路径（§3.1）。
 func (h *Handler) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/messages", h.handle(model.ProtoAnthropic))
-	mux.HandleFunc("POST /v1/responses", h.handle(model.ProtoOpenAIResponses))
-	mux.HandleFunc("POST /v1/chat/completions", h.handle(model.ProtoOpenAIChat))
+	mux.HandleFunc("POST /v1/messages", h.withAdmission(model.ProtoAnthropic, h.handle(model.ProtoAnthropic)))
+	mux.HandleFunc("POST /v1/responses", h.withAdmission(model.ProtoOpenAIResponses, h.handle(model.ProtoOpenAIResponses)))
+	mux.HandleFunc("POST /v1/chat/completions", h.withAdmission(model.ProtoOpenAIChat, h.handle(model.ProtoOpenAIChat)))
 
 	// M4: 附加端点（§3.1）
-	mux.HandleFunc("POST /v1/messages/count_tokens", h.handleCountTokens)
-	mux.HandleFunc("GET /v1/models", h.handleModels)
+	mux.HandleFunc("POST /v1/messages/count_tokens", h.withAdmission(model.ProtoAnthropic, h.handleCountTokens))
+	mux.HandleFunc("GET /v1/models", h.withAdmission(model.ProtoOpenAIChat, h.handleModels))
 }
 
 func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
@@ -462,13 +463,6 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	settings, err := h.cfg.Settings()
-	if err != nil {
-		h.log.Error("读取设置失败", "err", err)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-		return nil, false
-	}
-
 	// 3. 读 body。必须整体读入：改 model 要定位偏移量，重试要能重放。
 	body, err := ReadBodyLimited(r.Body, MaxRequestBody)
 	if err != nil {
@@ -501,7 +495,18 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	}
 
 	// 5. 读配置快照
-	snap, err := h.cfg.Snapshot()
+	var snap *router.Snapshot
+	var settings model.Settings
+	if published, ok := h.cfg.(interface {
+		SnapshotWithSettings() (*router.Snapshot, model.Settings, error)
+	}); ok {
+		snap, settings, err = published.SnapshotWithSettings()
+	} else {
+		settings, err = h.cfg.Settings()
+		if err == nil {
+			snap, err = h.cfg.Snapshot()
+		}
+	}
 	if err != nil {
 		h.log.Error("读取配置快照失败", "err", err)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")

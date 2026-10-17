@@ -84,3 +84,28 @@ func buildL2Expectations(snap *livecfg.ProbeSnapshot, up *model.Upstream, rt *mo
 	}
 	return &reachExp, &reachPolicyBuilt.State, &capExp, &capPolicyBuilt.State, nil
 }
+
+func buildRealExpectations(snap *livecfg.ProbeSnapshot, up *model.Upstream, rt *model.Route,
+	endpoint model.EndpointKind, recipe ResolvedRecipe) (*model.ReachabilityExpectation, *model.ReachabilityReductionPolicy, *model.SemanticExpectation, *model.CapabilityReductionPolicy, error) {
+	if endpoint == model.EndpointCountTokens {
+		return buildL2Expectations(snap, up, rt, endpoint, recipe)
+	}
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceRealTraffic, Endpoint: endpoint}
+	reach, err := snap.ReachabilityExpectation(up.ID, selector)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	reachPolicy, err := revisioncodec.BuildReachabilityEvidencePolicy(snap.Settings, selector)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	capability, err := snap.SemanticExpectation(model.SemanticTarget{Scope: model.RecipeScopeRoute, UpstreamID: up.ID, RouteID: rt.ID, Endpoint: endpoint}, recipe.Identity, recipe.Facts, selector)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	capPolicy, err := revisioncodec.BuildCapabilityEvidencePolicy(snap.Settings, selector)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return &reach, &reachPolicy.State, &capability, &capPolicy.State, nil
+}
