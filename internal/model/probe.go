@@ -425,6 +425,7 @@ const (
 )
 
 type ClientRequestShape struct {
+	ClientFamily   string
 	SafeHeaders    []HeaderTemplate
 	FixedRawQuery  string
 	QueryShapeJSON []byte

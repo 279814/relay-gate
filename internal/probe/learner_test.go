@@ -10,6 +10,8 @@ import (
 	"github.com/279814/relay-gate/internal/probetemplate"
 )
 
+const gatewaySessionCookieName = "relay_session"
+
 type captureLearnerStore struct {
 	profile *model.ClientProbeProfile
 }
@@ -24,7 +26,7 @@ func (c *captureLearnerStore) UpsertClientProbeProfile(_ context.Context, profil
 }
 
 // 非认证头的值仍须过 §8.5 高置信前缀门禁：头名不是 AuthHeaders 不能成为
-// 明文 key 旁路。占位符与 anthropic-beta 等协议常量必须保留。
+// 明文 key 旁路。自动学习只保留白名单协议常量；自定义认证应配置 Endpoint auth。
 func TestLearner_ObserveSuccessfulDropsLiteralCredentialOnNonAuthHeader(t *testing.T) {
 	store := &captureLearnerStore{}
 	learner := NewLearner(store)
@@ -48,11 +50,11 @@ func TestLearner_ObserveSuccessfulDropsLiteralCredentialOnNonAuthHeader(t *testi
 	if got := headerValue(store.profile.SafeHeaders, "X-Custom"); got != "" {
 		t.Fatalf("非认证头上的高置信字面 key 不得入库，得到 %q", got)
 	}
-	if got := headerValue(store.profile.SafeHeaders, "X-Upstream-Key"); got != "{{UPSTREAM_API_KEY}}" {
-		t.Fatalf("UPSTREAM_API_KEY 占位符应保留，得到 %q", got)
+	if got := headerValue(store.profile.SafeHeaders, "X-Upstream-Key"); got != "" {
+		t.Fatalf("自动学习不得保留自定义认证头，得到 %q", got)
 	}
-	if got := headerValue(store.profile.SafeHeaders, "X-Tenant-Secret"); got != "{{SECRET:tenant}}" {
-		t.Fatalf("SECRET 占位符应保留，得到 %q", got)
+	if got := headerValue(store.profile.SafeHeaders, "X-Tenant-Secret"); got != "" {
+		t.Fatalf("自动学习不得声明 Secret，得到 %q", got)
 	}
 	if got := headerValue(store.profile.SafeHeaders, "anthropic-beta"); got != "prompt-caching-2024-07-31" {
 		t.Fatalf("anthropic-beta 应仍被学习，得到 %q", got)
@@ -73,8 +75,8 @@ func TestLearner_ObserveSuccessfulDropsSecretsKeepsSafeHeaders(t *testing.T) {
 			{Name: "Cookie", Values: []string{gatewaySessionCookieName + "=admin-session-tok; theme=dark"}},
 			{Name: "anthropic-beta", Values: []string{"prompt-caching-2024-07-31"}},
 		},
-		FixedRawQuery: "beta=1&key=sk-ant-abcdefghijklmnopqrstuv&flag=ok",
-		BodyShapeJSON: []byte(`{"stream":"bool"}`),
+		FixedRawQuery: "beta=1&key=sk-ant-abcdefghijklmnopqrstuv",
+		BodyShapeJSON: []byte(`{"model":"string","stream":true}`),
 	}
 	if err := learner.ObserveSuccessful(context.Background(), 7, model.EndpointMessages, shape); err != nil {
 		t.Fatalf("ObserveSuccessful: %v", err)
@@ -90,8 +92,7 @@ func TestLearner_ObserveSuccessfulDropsSecretsKeepsSafeHeaders(t *testing.T) {
 	if strings.Contains(store.profile.FixedRawQuery, "sk-ant-") {
 		t.Fatalf("纯凭据 query 不得入库，得到 %q", store.profile.FixedRawQuery)
 	}
-	if !strings.Contains(store.profile.FixedRawQuery, "beta=1") ||
-		!strings.Contains(store.profile.FixedRawQuery, "flag=ok") {
+	if store.profile.FixedRawQuery != "beta=1" {
 		t.Fatalf("非凭据 query 应保留，得到 %q", store.profile.FixedRawQuery)
 	}
 }
@@ -169,7 +170,7 @@ func TestLearner_ProbeBodyOmitsClientMessagesSystemToolsAndCredentials(t *testin
 	learner := NewLearner(store)
 	shape := model.ClientRequestShape{
 		BodyTemplate:  append([]byte(nil), clientBody...),
-		BodyShapeJSON: []byte(`{"stream":"bool","model":"string","messages":"array"}`),
+		BodyShapeJSON: []byte(`{"stream":true,"model":"string","messages":"array"}`),
 	}
 	if err := learner.ObserveSuccessful(context.Background(), 7, model.EndpointMessages, shape); err != nil {
 		t.Fatalf("ObserveSuccessful: %v", err)
@@ -192,7 +193,7 @@ func TestLearner_ProbeBodyOmitsClientMessagesSystemToolsAndCredentials(t *testin
 			ID: 11, Revision: 2, Status: model.ProfileTested,
 			Endpoint:      model.EndpointMessages,
 			BodyTemplate:  append([]byte(nil), clientBody...),
-			BodyShapeJSON: []byte(`{"stream":"bool"}`),
+			BodyShapeJSON: []byte(`{"model":"string","stream":true}`),
 			SafeHeaders:   []model.HeaderTemplate{{Name: "anthropic-beta", Values: []string{"prompt-caching-2024-07-31"}}},
 		},
 	}
