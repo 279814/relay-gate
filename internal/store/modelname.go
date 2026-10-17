@@ -179,7 +179,7 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 	}
 	value.Revision = current.Revision + 1
 	value.CapabilityRevision = current.CapabilityRevision
-	if semanticChanged {
+	if semanticChanged || (!current.Enabled && value.Enabled) {
 		value.CapabilityRevision++
 	}
 	value.CreatedAt = current.CreatedAt
@@ -194,6 +194,14 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrRevisionConflict
+	}
+	if !current.Enabled && value.Enabled {
+		// Starting a new ModelName lifecycle must also reject persisted errors
+		// and in-flight observations from every child Route, in this transaction.
+		if err = deleteConfigErrorCapabilitiesTx(ctx, tx,
+			`scope_route_id IN (SELECT id FROM route WHERE model_name_id=?)`, value.ID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
