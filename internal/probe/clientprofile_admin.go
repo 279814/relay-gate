@@ -35,18 +35,26 @@ func (s *Service) GetClientProfile(ctx context.Context, id int64) (model.ClientP
 }
 
 func (s *Service) PreviewClientProfile(ctx context.Context, id int64, in PreviewInput) (RedactedPreview, error) {
-	profile, err := s.GetClientProfile(ctx, id)
+	stored, err := s.store.GetClientProfile(ctx, id)
 	if err != nil {
 		return RedactedPreview{}, err
 	}
+	if _, err := compileAdminProfile(*stored); err != nil {
+		return RedactedPreview{}, err
+	}
+	if err := sanitizeAdminProfile(stored); err != nil {
+		return RedactedPreview{}, err
+	}
+	profile := *stored
 	return s.previewVersion(ctx, model.ProbeRecipeVersion{Method: profile.Endpoint.Method(), FixedRawQuery: profile.FixedRawQuery, Headers: profile.SafeHeaders, Body: profile.BodyTemplate, BodyIsText: true, StreamExpected: learnedStreamExpected(profile.BodyTemplate), TimeoutProfile: defaultTimeoutProfile(profile.Endpoint)}, model.ProbeRecipe{ScopeType: model.RecipeScopeUpstream, ScopeID: profile.UpstreamID, Endpoint: profile.Endpoint}, in)
 }
 
 func (s *Service) TestClientProfile(ctx context.Context, id, routeID, expectedRevision int64) (model.ProbeExecution, error) {
-	profile, err := s.GetClientProfile(ctx, id)
+	stored, err := s.store.GetClientProfile(ctx, id)
 	if err != nil {
 		return model.ProbeExecution{}, err
 	}
+	profile := *stored
 	if expectedRevision < 1 {
 		return model.ProbeExecution{}, model.WrapValidation("expected_revision 必须是正整数")
 	}
@@ -70,9 +78,7 @@ func (s *Service) TestClientProfile(ctx context.Context, id, routeID, expectedRe
 	}
 	// Reuse the resolver's existing read-side sanitizer/compiler without treating
 	// the candidate as an already active binding in its observation identity.
-	compiledView := profile
-	compiledView.Status = model.ProfileTested
-	explicit, err := NewRecipeResolver(nil).fromProfile(RecipeQuery{UpstreamID: profile.UpstreamID, Endpoint: profile.Endpoint}, &compiledView)
+	explicit, err := compileAdminProfile(profile)
 	if err != nil {
 		return model.ProbeExecution{}, err
 	}
@@ -91,6 +97,14 @@ func (s *Service) TestClientProfile(ctx context.Context, id, routeID, expectedRe
 		return execution, err
 	}
 	return execution, nil
+}
+
+func compileAdminProfile(profile model.ClientProbeProfile) (ResolvedRecipe, error) {
+	// Compile the stored declaration before removing forbidden fields. This must
+	// match automatic resolution, including its pre-sanitization Secret guard.
+	// The value copy is only a compile view, never a persisted activation.
+	profile.Status = model.ProfileTested
+	return NewRecipeResolver(nil).fromProfile(RecipeQuery{UpstreamID: profile.UpstreamID, Endpoint: profile.Endpoint}, &profile)
 }
 
 func (s *Service) DisableClientProfile(ctx context.Context, id, expectedRevision int64) error {
