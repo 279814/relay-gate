@@ -77,7 +77,7 @@ func TestDeclaredAuthSecretRealHTTPAndCountTokensKeepUsedValuesPrivate(t *testin
 			secrets := &countedAuthSecretStore{Store: h.store}
 			targets := outbound.NewProvider(cfg, h.store, outbound.NewResolver(testHasher{}))
 			handler := proxy.NewHandler(cfg, h.tracker, recorder, []string{"test-relay-key"}, discardLogger()).
-				WithTargets(targets, secrets).WithObservers(h.manager).WithCountTokensCapability(h.caps)
+				WithRunState(fixtureController(t, h.store)).WithTargets(targets, secrets).WithObservers(h.manager).WithCountTokensCapability(h.caps)
 			mux := http.NewServeMux()
 			handler.Routes(mux)
 			gate := httptest.NewServer(mux)

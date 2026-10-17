@@ -158,8 +158,8 @@ func runServer() error {
 	}
 
 	// 启动时读一次运行状态：暂停时重启不应自动跑起来（§4.8）。
-	// 转发路径读的是 livecfg 的缓存视图，这里只为启动日志与首个 /healthz。
-	runState, err := st.GetRunState()
+	// 转发与调度只读 Controller.Current；这里用于初始化协调器与启动日志。
+	runState, _, err := st.GetRunStateWithRevision()
 	if err != nil {
 		return fmt.Errorf("读取运行状态: %w", err)
 	}
@@ -283,7 +283,7 @@ func runServer() error {
 		return fmt.Errorf("打开 runstate controller: %w", err)
 	}
 	defer runCtrl.Close()
-	coordinator := probe.NewSyntheticCoordinator(model.RunState(runState))
+	coordinator := probe.NewSyntheticCoordinator(runState)
 
 	resultRecorder := probe.NewResultRecorder(st, obsReducer, reachTracker, capRegistry)
 	executor := probe.NewExecutor(targets, st, recipes,
@@ -456,7 +456,7 @@ func runServer() error {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		state := runCtrl.Current().State
 		if !state.Valid() {
-			state = model.RunState(runState)
+			state = model.RunStatePaused
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)

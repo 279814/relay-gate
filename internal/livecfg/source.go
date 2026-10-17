@@ -3,7 +3,7 @@ package livecfg
 // Package livecfg 提供数据库业务配置的带缓存只读视图。
 //
 // 与 internal/config 的分工：那边是启动时读一次的环境变量（进程级不可变，
-// 缺失即拒绝启动）；这边是运行时可热改的业务配置（上游、路由、超时、总闸）。
+// 缺失即拒绝启动）；这边是运行时可热改的业务配置（上游、路由、超时）；总闸由 runstate.Controller 独立发布。
 //
 // P0-10 起：LoadConfigBundle 一次事务读完全部行；Source 构建同代 routing+Probe
 // 快照后以单个原子指针发布。真实流量在 Refresh 失败时仍可读旧 routing；
@@ -72,14 +72,6 @@ func (s *Source) Settings() (model.Settings, error) {
 		return model.Settings{}, err
 	}
 	return pub.Settings, nil
-}
-
-func (s *Source) RunState() (store.RunState, error) {
-	pub, err := s.get(false)
-	if err != nil {
-		return "", err
-	}
-	return pub.RunState, nil
 }
 
 // Bundle 返回当前已发布的同代配置。

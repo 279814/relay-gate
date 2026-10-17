@@ -17,6 +17,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -30,7 +31,7 @@ type fakeCfg struct {
 	mu       sync.Mutex
 	snap     *router.Snapshot
 	settings model.Settings
-	state    store.RunState
+	state    model.RunState
 	// snapErr 让 Snapshot 报错，用于测「配置读不出来时不崩」的路径。
 	snapErr error
 }
@@ -48,12 +49,12 @@ func (f *fakeCfg) Settings() (model.Settings, error) {
 	defer f.mu.Unlock()
 	return f.settings, nil
 }
-func (f *fakeCfg) RunState() (store.RunState, error) {
+func (f *fakeCfg) Current() runstate.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.state, nil
+	return runstate.Snapshot{State: f.state, Revision: 1}
 }
-func (f *fakeCfg) setState(s store.RunState) {
+func (f *fakeCfg) setState(s model.RunState) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state = s
@@ -213,7 +214,7 @@ func newSchedHarness(t *testing.T, n int, handler http.HandlerFunc) *schedHarnes
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := newRecordingTracker()
 	reach := health.NewReachabilityTracker(cfg)
@@ -252,7 +253,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 		snap: router.BuildSnapshot([]*model.ModelName{mn},
 			[]*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	cfg.settings.FailThreshold = 1
 	track := newRecordingTracker()
@@ -341,7 +342,7 @@ func TestScheduler_CoalescesL1PerUpstream(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	sched := newSchedulerFixture(t, cfg, newFakeTransport(), newRecordingTracker(),
 		health.NewReachabilityTracker(nil), discardLogger())
@@ -390,7 +391,7 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	cfg.settings.FailThreshold = 1
 	track := newRecordingTracker()
@@ -478,7 +479,7 @@ func TestScheduler_SerializesL2PerUpstream(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	sched := newSchedulerFixture(t, cfg, newFakeTransport(), newRecordingTracker(),
 		health.NewReachabilityTracker(nil), discardLogger())
@@ -610,7 +611,7 @@ func TestScheduler_PausedStopsAllProbing(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(200)
 	})
-	hs.cfg.setState(store.StatePaused)
+	hs.cfg.setState(model.RunStatePaused)
 
 	for i := 0; i < 3; i++ {
 		hs.sched.tick(context.Background())
@@ -631,10 +632,10 @@ func TestScheduler_ResumeResetsState(t *testing.T) {
 		w.WriteHeader(200)
 	})
 
-	hs.cfg.setState(store.StatePaused)
+	hs.cfg.setState(model.RunStatePaused)
 	hs.sched.tick(context.Background())
 
-	hs.cfg.setState(store.StateRunning)
+	hs.cfg.setState(model.RunStateRunning)
 	hs.sched.tick(context.Background())
 	hs.sched.wg.Wait()
 
@@ -737,7 +738,7 @@ func (g *gatingCfg) Snapshot() (*router.Snapshot, error) {
 	return g.inner.Snapshot()
 }
 func (g *gatingCfg) Settings() (model.Settings, error) { return g.inner.Settings() }
-func (g *gatingCfg) RunState() (store.RunState, error) { return g.inner.RunState() }
+func (g *gatingCfg) Current() runstate.Snapshot        { return g.inner.Current() }
 
 // Armed L2 must not RoundTrip after the Route is disabled between Claim and send.
 // An enabled sibling's armed probe still sends. Re-enable does not replay the skip.
@@ -778,7 +779,7 @@ func TestScheduler_ArmedL2SkipsRoundTripAfterDisable(t *testing.T) {
 	inner := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{upA, upB}, []*model.Route{rtA, rtB}),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	gate := &gatingCfg{
 		inner:       inner,
@@ -1044,7 +1045,7 @@ func TestL1StationEffectDoesNotSpreadConfigErrors(t *testing.T) {
 // Delete must drop inflightL2 / pendingL2 / busyUp for that id. Otherwise a
 // reused SQLite rowid is skipped as still in flight until the stale endL2.
 func TestForgetRoute_ClearsL2FlagsForIDReuse(t *testing.T) {
-	sched := newSchedulerFixture(t, &fakeCfg{state: store.StateRunning, settings: fastSettings()},
+	sched := newSchedulerFixture(t, &fakeCfg{state: model.RunStateRunning, settings: fastSettings()},
 		newFakeTransport(), newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger())
 
 	hold, ok := sched.beginL2(10, 100)

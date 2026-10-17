@@ -14,10 +14,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
-const (
-	keySettings = "settings"
-	keyRunState = "run_state"
-)
+const keySettings = "settings"
 
 func decodeSettingsDocument(raw []byte, target any) error {
 	var object map[string]json.RawMessage
@@ -222,31 +219,6 @@ func (s *Store) SaveSettingsWithRevision(settings model.Settings, expectedRevisi
 	return newRevision, nil
 }
 
-// RunState remains a source-compatible alias until P0-17 removes the legacy
-// Store-facing API.
-type RunState = model.RunState
-
-const (
-	StateRunning RunState = model.RunStateRunning
-	StatePaused  RunState = model.RunStatePaused
-)
-
-// GetRunState 读运行状态，默认 running。
-// 状态持久化的意义在于「暂停时重启不会自动跑起来」（§4.8）。
-func (s *Store) GetRunState() (RunState, error) {
-	state, _, err := s.GetRunStateWithRevision()
-	return state, err
-}
-
-func (s *Store) SetRunState(st RunState) error {
-	_, revision, err := s.GetRunStateWithRevision()
-	if err != nil {
-		return err
-	}
-	_, err = s.SetRunStateWithRevision(st, revision)
-	return err
-}
-
 func (s *Store) GetRunStateWithRevision() (model.RunState, int64, error) {
 	var state model.RunState
 	var revision int64
@@ -299,11 +271,6 @@ func (s *Store) SetRunStateWithRevision(state model.RunState, expectedRevision i
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return 0, ErrRevisionConflict
-	}
-	if _, err = tx.Exec(`INSERT INTO setting(key,value,updated_at,revision) VALUES (?,?,?,1)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,revision=setting.revision+1`,
-		keyRunState, state, updatedAt); err != nil {
-		return 0, err
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err

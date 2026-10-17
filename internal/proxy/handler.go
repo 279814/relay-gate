@@ -19,7 +19,6 @@ import (
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
-	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -34,7 +33,6 @@ const MaxRequestBody = 32 << 20
 type ConfigSource interface {
 	Snapshot() (*router.Snapshot, error)
 	Settings() (model.Settings, error)
-	RunState() (store.RunState, error)
 }
 
 // SampleSink 接收样本。由 sample.Recorder 实现，可为 nil（关闭样本记录）。
@@ -90,7 +88,7 @@ type Handler struct {
 	// 与探活共用同一个 Manager —— 各建一套就丢掉了连接复用的收益。
 	transports *outbound.Manager
 
-	// runState 是 P0-12 热路径总闸；非 nil 时优先于 cfg.RunState（避 livecfg TTL）。
+	// runState 是唯一热路径总闸；未装配时拒绝真实请求。
 	runState runstate.Reader
 
 	// observers 是 P0-13 真实流量旁路工厂；可为 nil（不观察）。
@@ -417,20 +415,10 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 			return nil, false
 		}
 	} else {
-		state, err := h.cfg.RunState()
-		if err != nil {
-			h.log.Error("读取运行状态失败", "err", err)
-			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-			return nil, false
-		}
-		if state == store.StatePaused {
-			httpbody.DiscardRejected(w, r)
-			w.Header().Set("X-Relay-State", "paused")
-			w.Header().Set("Retry-After", "60")
-			writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
-				"服务已暂停。在管理界面点「启动」后恢复")
-			return nil, false
-		}
+		httpbody.DiscardRejected(w, r)
+		w.Header().Set("Retry-After", "60")
+		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error", "运行状态控制器未就绪")
+		return nil, false
 	}
 
 	// 3. 读 body。必须整体读入：改 model 要定位偏移量，重试要能重放。

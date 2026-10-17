@@ -14,7 +14,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // 请求内重试（§3.5）。
@@ -117,9 +116,9 @@ func newMultiHarness(t *testing.T, responders ...http.HandlerFunc) *multiHarness
 	hs.cfg = &fakeConfig{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: s,
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(hs.cfg).
 		WithTargets(testTargets(hs.cfg), nil).
 		WithObservers(&attemptRecorder{})
 	t.Cleanup(hs.h.CloseIdleConnections)

@@ -11,7 +11,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // §8.10：下一次到期时间从本次 Probe 完成时计算。同站 Route 被 beginL1 收敛进
@@ -42,7 +41,7 @@ func TestScheduler_L1CompletionRearmsFoldedSiblings(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := health.NewTracker(cfg)
 	for _, rt := range routes {
@@ -85,7 +84,7 @@ func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	if cfg.settings.FailThreshold < 2 {
 		t.Fatalf("setup: FailThreshold=%d, need >=2 so one L1 failure leaves the Route unknown", cfg.settings.FailThreshold)
@@ -125,7 +124,7 @@ func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.
 // §8.10：周期到期因同站串行 / 全局上限 / 自身在途被拒时不得留下 pending，
 // 否则该 Route 下一次完成后会立刻再补一发，绕过从完成时刻起算的间隔。
 func TestScheduler_RefusedL2DoesNotBurstAfterCompletion(t *testing.T) {
-	cfg := &fakeCfg{settings: fastSettings(), state: store.StateRunning}
+	cfg := &fakeCfg{settings: fastSettings(), state: model.RunStateRunning}
 	track := health.NewTracker(cfg)
 	for _, id := range []int64{100, 101} {
 		track.Report(health.Report{RouteID: id, Verdict: health.VerdictFatal})

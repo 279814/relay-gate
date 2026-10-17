@@ -10,7 +10,6 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 type rejectionEOFBody struct {
@@ -37,7 +36,7 @@ func TestModelEarlyRejectionSmallClosePostDelivers503AndDiscardsBody(t *testing.
 			case "maintenance":
 				hs.h.WithRunState(maintSnap{snap: runstate.Snapshot{State: model.RunStateRunning, Maintenance: true}})
 			case "paused":
-				hs.cfg.state = store.StatePaused
+				hs.cfg.state = model.RunStatePaused
 			}
 			mux := http.NewServeMux()
 			hs.h.Routes(mux)

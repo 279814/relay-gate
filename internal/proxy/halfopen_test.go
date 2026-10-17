@@ -10,7 +10,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/runstate"
 )
 
 // ── 半开放行（§4.4c）─────────────────────────────────────
@@ -206,7 +206,7 @@ func (g *gatingConfig) Snapshot() (*router.Snapshot, error) {
 	return g.inner.Snapshot()
 }
 func (g *gatingConfig) Settings() (model.Settings, error) { return g.inner.Settings() }
-func (g *gatingConfig) RunState() (store.RunState, error) { return g.inner.RunState() }
+func (g *gatingConfig) Current() runstate.Snapshot        { return g.inner.Current() }
 
 // HalfOpen on observer completion / request_log must stay on the Route that claimed
 // RecoveryGate. A sibling tried in the same client request (failover after
@@ -290,7 +290,7 @@ func TestHandler_ArmedHalfOpenSkipsRoundTripAfterDisable(t *testing.T) {
 		blockSecond: make(chan struct{}),
 		secondSeen:  make(chan struct{}),
 	}
-	hs.h = NewHandler(gate, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+	hs.h = NewHandler(gate, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(gate).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 

@@ -12,6 +12,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/revisioncodec"
+	"github.com/279814/relay-gate/internal/runstate"
 )
 
 func disconnectBeforeHeaders(w http.ResponseWriter) {
@@ -39,7 +40,14 @@ func newSchedulerFixture(t *testing.T, cfg ConfigSource, transports TransportMan
 	recipes := builtinOnlyResolver()
 	recorder := &schedulerFixtureRecorder{reach: reach, reducer: health.NewObservationReducer(nil), rows: map[int64]*model.UpstreamReachability{}}
 	executor := NewExecutor(testTargets(), nil, recipes, transports, recorder, AlwaysOpenAdmission(), WallClock(), log)
-	return NewScheduler(cfg, track, reach, log).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
+	// Configuration and Controller are separate production dependencies. These
+	// scheduler-only fixtures model a running Controller unless their input also
+	// exposes an explicit mutable Current snapshot (pause/resume tests).
+	var state runstate.Reader = fixedSchedulerRunState{runstate.Snapshot{State: model.RunStateRunning, Revision: 1}}
+	if input, ok := cfg.(runstate.Reader); ok {
+		state = input
+	}
+	return NewScheduler(cfg, track, reach, log).WithRunState(state).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
 }
 
 func schedFixtureRoutes(cfg *fakeCfg, modelID int64) []*model.Route {

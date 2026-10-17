@@ -398,23 +398,23 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 func TestRunStatePersistence(t *testing.T) {
 	st := testStore(t)
 
-	got, err := st.GetRunState()
+	got, revision, err := st.GetRunStateWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != StateRunning {
+	if got != model.RunStateRunning {
 		t.Errorf("默认应为 running，得到 %q", got)
 	}
 
-	if err := st.SetRunState(StatePaused); err != nil {
+	if revision, err = st.SetRunStateWithRevision(model.RunStatePaused, revision); err != nil {
 		t.Fatal(err)
 	}
 	// 暂停状态必须持久化：暂停时重启不应自动跑起来（§4.8）
-	if got, _ := st.GetRunState(); got != StatePaused {
+	if got, _, _ := st.GetRunStateWithRevision(); got != model.RunStatePaused {
 		t.Errorf("暂停状态应持久化，得到 %q", got)
 	}
 
-	if err := st.SetRunState("bogus"); !errors.Is(err, model.ErrValidation) {
+	if _, err := st.SetRunStateWithRevision("bogus", revision); !errors.Is(err, model.ErrValidation) {
 		t.Errorf("非法状态应被拒绝，得到 %v", err)
 	}
 }
