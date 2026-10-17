@@ -14,6 +14,7 @@ import { createSecurityFeature, mergeSecurityTab } from './security.mjs';
 import { createTransformsFeature, mergeTransformsTab } from './transforms.mjs';
 import { createRuntimeStateFeature } from './runtime.mjs';
 import { createCountTokensFeature } from './count_tokens.mjs';
+import { createRecipeAdminFeature } from './recipe_admin.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -48,6 +49,7 @@ if (typeof base !== 'function') {
       createTransformsFeature(shell, api);
       mergeTransformsTab(shell);
       createCountTokensFeature(shell);
+      createRecipeAdminFeature(shell, api);
       shell.probeModuleReady = true;
     } catch (e) {
       shell.probeModuleReady = false;
@@ -113,6 +115,8 @@ if (typeof base !== 'function') {
         this.loadCalibrations(true);
       } else if (tab === 'probe-runtime') {
         this.loadProbeRuntime();
+      } else if (tab === 'client-profiles') {
+        this.loadProfiles(true);
       } else if (tab === 'credentials') {
         this.loadCredentials();
       } else if (tab === 'security') {

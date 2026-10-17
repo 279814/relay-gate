@@ -38,6 +38,7 @@ func TestHandler_ServesStaticAssets(t *testing.T) {
 		{"/admin/js/modal.mjs", "javascript", "openModalLock"},
 		{"/admin/js/boot.mjs", "javascript", "createProbeFeature"},
 		{"/admin/js/count_tokens.mjs", "javascript", "createCountTokensFeature"},
+		{"/admin/js/recipe_admin.mjs", "javascript", "createRecipeAdminFeature"},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
@@ -118,6 +119,7 @@ func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 		"static/js/transforms.mjs":   true,
 		"static/js/runtime.mjs":      true,
 		"static/js/count_tokens.mjs": true,
+		"static/js/recipe_admin.mjs": true,
 	}
 	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

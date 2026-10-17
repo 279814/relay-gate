@@ -18,11 +18,15 @@ package outbound_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/livecfg"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/probetemplate"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -127,20 +131,31 @@ func (fixture *recipeStoreFixture) testExecution(t *testing.T,
 	recipeID, versionID, routeID int64) model.ProbeExecution {
 
 	t.Helper()
+	upstream := fixture.upstream
+	if routeID > 0 {
+		route, err := fixture.store.GetRoute(routeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upstream, err = fixture.store.GetUpstream(route.UpstreamID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	page, err := fixture.store.ListEndpointsPage(context.Background(), model.EndpointFilter{
-		UpstreamID: fixture.upstream.ID, Endpoint: model.EndpointModels,
+		UpstreamID: upstream.ID, Endpoint: model.EndpointModels,
 	})
 	if err != nil || len(page.Items) != 1 {
 		t.Fatalf("models endpoint = %+v err=%v", page, err)
 	}
 	endpoint := page.Items[0]
 	order := fixture.nextOrder(t)
-	return model.ProbeExecution{
+	execution := model.ProbeExecution{
 		ID:                         "exec-models-" + itoa(versionID),
 		Trigger:                    model.TriggerManual,
-		UpstreamID:                 fixture.upstream.ID,
-		UpstreamNetworkRevision:    fixture.upstream.NetworkRevision,
-		UpstreamCredentialRevision: fixture.upstream.CredentialRevision,
+		UpstreamID:                 upstream.ID,
+		UpstreamNetworkRevision:    upstream.NetworkRevision,
+		UpstreamCredentialRevision: upstream.CredentialRevision,
 		EndpointID:                 endpoint.ID, EndpointRevision: endpoint.Revision,
 		AuthProfileRevision: endpoint.AuthProfile.Revision,
 		Endpoint:            model.EndpointModels,
@@ -156,6 +171,48 @@ func (fixture *recipeStoreFixture) testExecution(t *testing.T,
 		Reachable:    true, Final: true, Success: true,
 		ObservationOrder: order, SentAtMS: order, DoneAtMS: order + 1,
 	}
+	// Resolver fixtures still need authentic current publication evidence. Build
+	// it from one real immutable snapshot rather than bypassing the Store gate.
+	source := livecfg.New(fixture.store, slog.Default())
+	if err := source.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := source.ProbeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe := snap.Recipes[recipeID]
+	facts := model.RecipeBindingFacts{Use: model.BindingExplicitTest, ExplicitRecipeID: recipeID, ExplicitVersionID: versionID, ExplicitRecipeRowRevision: recipe.Revision}
+	if recipe.ScopeType == model.RecipeScopeRoute {
+		facts.ResolvedLayer = model.ResolvedRoute
+		facts.RouteRecipeID = recipeID
+		facts.RoutePublishedVersionID = versionID
+		facts.RouteBindingRevision = recipe.ActiveBindingRevision
+	} else {
+		facts.ResolvedLayer = model.ResolvedUpstream
+		facts.UpstreamRecipeID = recipeID
+		facts.UpstreamPublishedVersionID = versionID
+		facts.UpstreamBindingRevision = recipe.ActiveBindingRevision
+	}
+	target := model.SemanticTarget{Scope: model.RecipeScopeUpstream, UpstreamID: upstream.ID, Endpoint: model.EndpointModels}
+	if routeID > 0 {
+		target.Scope = model.RecipeScopeRoute
+		target.RouteID = routeID
+	}
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
+	expectation, err := snap.SemanticExpectation(target, model.RecipeIdentity{Storage: model.RecipeStorageDB, Origin: model.RecipeManual, DBVersionID: versionID}, facts, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution.CapabilityToken = expectation.ObservationToken
+	execution.CapabilityPolicySelector = selector
+	execution.RecipeBindingFacts = facts
+	execution.RecipeBindingRevision = expectation.Revision.RecipeBindingRevision
+	execution.ProbeSettingsFingerprint = expectation.Revision.ProbeSettingsFingerprint
+	execution.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(expectation.Revision.ProbeSecrets)
+	execution.RouteCapabilityRevision = expectation.Revision.RouteCapability
+	execution.ModelCapabilityRevision = expectation.Revision.ModelCapability
+	return execution
 }
 
 func (fixture *recipeStoreFixture) nextOrder(t *testing.T) int64 {
@@ -765,30 +822,8 @@ func publishUpstreamRecipe(t *testing.T, st *store.Store, upstream *model.Upstre
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := st.ListEndpointsPage(ctx, model.EndpointFilter{
-		UpstreamID: upstream.ID, Endpoint: model.EndpointModels,
-	})
-	if err != nil || len(page.Items) != 1 {
-		t.Fatalf("models endpoint = %+v err=%v", page, err)
-	}
-	endpoint := page.Items[0]
-	start, _, err := st.ReserveObservationOrders(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	execution := model.ProbeExecution{
-		ID:      "exec-up-" + itoa(version.ID) + "-" + itoa(upstream.ID),
-		Trigger: model.TriggerManual, UpstreamID: upstream.ID,
-		UpstreamNetworkRevision: upstream.NetworkRevision, UpstreamCredentialRevision: upstream.CredentialRevision,
-		EndpointID: endpoint.ID, EndpointRevision: endpoint.Revision,
-		AuthProfileRevision: endpoint.AuthProfile.Revision, Endpoint: model.EndpointModels,
-		RecipeBindingUse: model.BindingExplicitTest, RecipeStorage: model.RecipeStorageDB,
-		RecipeOrigin: model.RecipeManual, RecipeID: recipeID, RecipeVersionID: version.ID,
-		EvidenceHash: "evidence-up-" + itoa(version.ID), ErrorClass: model.ErrorNone,
-		Capability: model.CapabilityUnknown, Scope: model.ScopeUpstreamEndpoint,
-		Reachable: true, Final: true, Success: true,
-		ObservationOrder: start, SentAtMS: start, DoneAtMS: start + 1,
-	}
+	fixture := &recipeStoreFixture{store: st, upstream: upstream}
+	execution := fixture.testExecution(t, recipeID, version.ID, 0)
 	if err := st.InsertProbeExecution(ctx, &execution); err != nil {
 		t.Fatal(err)
 	}

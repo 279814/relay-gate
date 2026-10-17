@@ -1283,10 +1283,16 @@
 
             <div class="bar" style="margin-top:20px">
               <strong>Probe Recipes</strong>
-              <span class="dim">preview/test/publish 属后续 API；此处创建 draft 并查看</span>
+              <span class="dim">不可变版本 → 脱敏预览 → 单次测试 → 显式发布</span>
               <span class="grow"></span>
-              <button class="primary" @click="recipeForm = { scope: 'upstream', scope_id: '', endpoint: 'messages' }">新建配方</button>
+              <button class="primary" @click="recipeCandidateSeed = null; recipeForm = { scope: 'upstream', scope_id: '', endpoint: 'messages' }">新建配方</button>
               <button @click="loadRecipes(true)">刷新</button>
+            </div>
+            <div class="bar">
+              <label>配方 Upstream ID<input type="number" min="1" x-model="recipes.filter.upstream_id" @change="onProbeFilterChange('recipes'); loadRecipes(true)"></label>
+              <label>配方 Route ID<input type="number" min="1" x-model="recipes.filter.route_id" @change="onProbeFilterChange('recipes'); loadRecipes(true)"></label>
+              <label>配方端点<select x-model="recipes.filter.endpoint" @change="onProbeFilterChange('recipes'); loadRecipes(true)"><option value="">全部</option><option value="messages">messages</option><option value="count_tokens">count_tokens</option><option value="responses">responses</option><option value="chat_completions">chat_completions</option><option value="models">models</option></select></label>
+              <label>配方状态<select x-model="recipes.filter.status" @change="onProbeFilterChange('recipes'); loadRecipes(true)"><option value="">全部</option><option value="draft">draft</option><option value="published">published</option><option value="disabled">disabled</option><option value="archived">archived</option><option value="legacy_compat">legacy_compat</option><option value="legacy_quarantined">legacy_quarantined</option></select></label>
             </div>
             <table>
               <thead><tr><th>ID</th><th>范围</th><th>端点</th><th>状态</th><th>修订</th><th></th></tr></thead>
@@ -1308,6 +1314,145 @@
               <button @click="loadRecipes(false)" :disabled="recipes.loading">加载更多</button>
             </div>
           </div>
+        </template>
+
+        <template x-if="tab === 'client-profiles'">
+          <section>
+            <div class="bar">
+              <strong>
+                客户端请求形状
+              </strong>
+              <span class="dim">
+                只保留协议结构；候选不会自动启用
+              </span>
+              <span class="grow">
+              </span>
+              <button @click="loadProfiles(true)" :disabled="profiles.loading">
+                刷新候选
+              </button>
+            </div>
+            <div class="bar">
+              <label>
+                Upstream ID
+                <input type="number" min="1" x-model="profileFilters.upstream_id" @change="loadProfiles(true)">
+              </label>
+              <label>
+                端点
+                <select x-model="profileFilters.endpoint" @change="loadProfiles(true)">
+                  <option value="">
+                    全部
+                  </option>
+                  <option value="messages">
+                    messages
+                  </option>
+                  <option value="count_tokens">
+                    count_tokens
+                  </option>
+                  <option value="responses">
+                    responses
+                  </option>
+                  <option value="chat_completions">
+                    chat_completions
+                  </option>
+                  <option value="models">
+                    models
+                  </option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select x-model="profileFilters.status" @change="loadProfiles(true)">
+                  <option value="">
+                    全部
+                  </option>
+                  <option value="candidate">
+                    candidate
+                  </option>
+                  <option value="tested">
+                    tested
+                  </option>
+                  <option value="disabled">
+                    disabled
+                  </option>
+                </select>
+              </label>
+              <label>
+                客户端族
+                <input x-model="profileFilters.client_family" @change="loadProfiles(true)" placeholder="如 generic">
+              </label>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>
+                    ID / 形状
+                  </th>
+                  <th>
+                    上游 / 端点
+                  </th>
+                  <th>
+                    客户端
+                  </th>
+                  <th>
+                    状态
+                  </th>
+                  <th>
+                    观察次数
+                  </th>
+                  <th>
+                    修订
+                  </th>
+                  <th>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="row in profiles.items" :key="row.id">
+                  <tr>
+                    <td class="mono">
+                      <span x-text="'#' + row.id">
+                      </span>
+                      <br>
+                      <span class="dim" x-text="row.shape_hash.slice(0,12)">
+                      </span>
+                    </td>
+                    <td>
+                      <span x-text="'#' + row.upstream_id">
+                      </span>
+                      <br>
+                      <span class="mono" x-text="row.endpoint">
+                      </span>
+                    </td>
+                    <td x-text="row.client_family">
+                    </td>
+                    <td>
+                      <span class="tag" :class="row.status === 'tested' ? 'ok' : ''" x-text="row.status">
+                      </span>
+                    </td>
+                    <td class="num" x-text="row.seen_count">
+                    </td>
+                    <td class="num" x-text="row.revision">
+                    </td>
+                    <td>
+                      <button @click="openClientProfile(row.id)">
+                        查看与测试
+                      </button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="!profiles.items.length">
+                  <td colspan="7" class="empty">
+                    暂无匹配候选。安全学习器会从真实流量提取允许的协议形状；页面不会创建或回放用户正文。
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="bar" x-show="profiles.next_cursor">
+              <button @click="loadProfiles(false)" :disabled="profiles.loading">
+                加载更多候选
+              </button>
+            </div>
+          </section>
         </template>
 
         <!-- ── 执行 / 成本 ─────────────────────────────────── -->
@@ -1501,7 +1646,7 @@
       </template>
 
       <template x-if="recipeForm">
-        <div class="mask" @click.self="recipeForm = null">
+        <div class="mask" @click.self="recipeForm = null; recipeCandidateSeed = null">
           <div class="modal">
             <h3>新建配方</h3>
             <div class="row">
@@ -1528,7 +1673,7 @@
               </div>
             </div>
             <footer>
-              <button @click="recipeForm = null">取消</button>
+              <button @click="recipeForm = null; recipeCandidateSeed = null">取消</button>
               <button class="primary" @click="createRecipe()" :disabled="busy">创建</button>
             </footer>
           </div>
@@ -1579,12 +1724,269 @@
         </div>
       </template>
 
-      <template x-if="recipeDetail">
-        <div class="mask" @click.self="recipeDetail = null; _unlockModal()">
-          <div class="modal">
-            <h3>Recipe #<span x-text="f(recipeDetail,'ID','id')"></span></h3>
-            <pre class="body mono" x-text="JSON.stringify(recipeDetail, null, 2)"></pre>
-            <footer><button @click="recipeDetail = null; _unlockModal()">关闭</button></footer>
+      <template x-if="recipeEditor">
+        <div class="mask" @click.self="closeRecipeEditor()">
+          <div class="modal recipe-workspace" role="dialog" aria-modal="true" aria-labelledby="recipe-editor-title" x-ref="recipeEditorDialog">
+            <div class="bar">
+              <h3 id="recipe-editor-title">
+                Recipe #
+                <span x-text="recipeValue(recipeEditor.recipe,'id')">
+                </span>
+              </h3>
+              <span class="tag" x-text="recipeValue(recipeEditor.recipe,'status')">
+              </span>
+              <span class="grow">
+              </span>
+              <button @click="reloadRecipeEditor()" :disabled="recipeEditor.busy">
+                重新载入
+              </button>
+              <button @click="closeRecipeEditor()" :disabled="recipeEditor.busy">
+                关闭
+              </button>
+            </div>
+            <p class="dim" x-text="recipeValue(recipeEditor.recipe,'scope_type') + ' #' + recipeValue(recipeEditor.recipe,'scope_id') + ' · ' + recipeValue(recipeEditor.recipe,'endpoint') + ' · revision ' + recipeValue(recipeEditor.recipe,'revision')">
+            </p>
+            <div class="alert err" x-show="recipeEditor.conflict">
+              版本冲突或激活待完成。编辑内容保留；请重新载入核对，禁止自动重放旧写入。
+            </div>
+            <div class="recipe-columns">
+              <aside class="recipe-versions">
+                <strong>
+                  不可变版本
+                </strong>
+                <p class="dim">
+                  选择后可编辑为新版本
+                </p>
+                <template x-for="v in recipeEditor.versions.items" :key="v.id">
+                  <button class="recipe-version" :class="{on: recipeEditor.selected?.id === v.id}" @click="selectRecipeVersion(v)" :disabled="recipeEditor.busy">
+                    <span x-text="'v' + v.version + ' · ' + v.origin">
+                    </span>
+                    <span class="tag ok" x-show="recipeValue(recipeEditor.recipe,'published_version_id') === v.id">
+                      published
+                    </span>
+                    <span class="tag" x-show="recipeValue(recipeEditor.recipe,'draft_version_id') === v.id && recipeValue(recipeEditor.recipe,'published_version_id') !== v.id">
+                      draft
+                    </span>
+                  </button>
+                </template>
+                <p class="dim" x-show="!recipeEditor.versions.items.length">
+                  还没有版本
+                </p>
+                <button x-show="recipeEditor.versions.next_cursor" @click="loadRecipeVersions(false)">
+                  更多版本
+                </button>
+              </aside>
+              <div>
+                <div class="bar">
+                  <strong>
+                    编辑为新版本
+                  </strong>
+                  <span class="tag warn" x-show="recipeEditor.dirty">
+                    未保存
+                  </span>
+                  <span class="grow">
+                  </span>
+                  <button class="primary" @click="saveRecipeVersion()" :disabled="recipeEditor.busy || recipeEditor.conflict || recipeValue(recipeEditor.recipe,'status') === 'archived'">
+                    保存新版本
+                  </button>
+                </div>
+                <div class="row">
+                  <div class="field">
+                    <label>
+                      Method
+                      <select x-model="recipeEditor.draft.method" @change="markRecipeDraftChanged()">
+                        <option>
+                          POST
+                        </option>
+                        <option>
+                          GET
+                        </option>
+                        <option>
+                          HEAD
+                        </option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="field">
+                    <label>
+                      超时档
+                      <select x-model="recipeEditor.draft.timeout_profile" @change="markRecipeDraftChanged()">
+                        <option value="l1">
+                          l1
+                        </option>
+                        <option value="l2_standard">
+                          l2_standard
+                        </option>
+                        <option value="l2_long_thinking">
+                          l2_long_thinking
+                        </option>
+                        <option value="count_tokens">
+                          count_tokens
+                        </option>
+                      </select>
+                    </label>
+                  </div>
+                  <label class="check">
+                    <input type="checkbox" x-model="recipeEditor.draft.stream_expected" @change="markRecipeDraftChanged()">
+                    预期流式
+                  </label>
+                </div>
+                <div class="field">
+                  <label>
+                    固定原始 Query
+                    <input class="mono" x-model="recipeEditor.draft.fixed_raw_query" @input="markRecipeDraftChanged()" placeholder="仅写模板；凭据使用占位符">
+                  </label>
+                </div>
+                <div class="field">
+                  <label>
+                    Headers（有序数组，values 保留多值）
+                    <textarea class="mono" rows="4" x-model="recipeEditor.draft.headers" @input="markRecipeDraftChanged()" placeholder='[{"name":"User-Agent","values":["probe"]}]'>
+                    </textarea>
+                  </label>
+                </div>
+                <div class="bar">
+                  <label>
+                    正文编码
+                    <select x-model="recipeEditor.draft.encoding" @change="markRecipeDraftChanged()">
+                      <option value="text">
+                        UTF-8 文本
+                      </option>
+                      <option value="base64">
+                        Base64 字节
+                      </option>
+                    </select>
+                  </label>
+                  <span class="dim">
+                    只接受手工模板；认证使用 UPSTREAM_API_KEY / SECRET 占位符
+                  </span>
+                </div>
+                <div class="field">
+                  <textarea class="mono" aria-label="Recipe 正文" rows="7" x-model="recipeEditor.draft.body" @input="markRecipeDraftChanged()">
+                  </textarea>
+                </div>
+                <div class="recipe-stage">
+                  <div class="bar">
+                    <strong x-text="recipeEditor.selected ? '验证已保存版本 v' + recipeEditor.selected.version : '先保存一个版本'">
+                    </strong>
+                    <span class="grow">
+                    </span>
+                    <label>
+                      测试 Route ID
+                      <input type="number" min="1" x-model="recipeEditor.routeId" @change="clearRecipeEvidence()" :disabled="recipeValue(recipeEditor.recipe,'scope_type') === 'route'">
+                    </label>
+                  </div>
+                  <p class="dim">
+                    预览、测试、发布始终针对已保存版本。修改编辑内容后须重新保存；模型端点须提供同站且协议一致的 Route。
+                  </p>
+                  <div class="bar">
+                    <button @click="previewRecipe()" :disabled="!recipeEditor.selected || recipeEditor.dirty || recipeEditor.busy || recipeEditor.conflict">
+                      脱敏差异预览
+                    </button>
+                    <button @click="testRecipe()" :disabled="!recipeEditor.preview || recipeEditor.dirty || recipeEditor.busy || recipeEditor.conflict || !canRunCandidate()">
+                      单次测试（产生费用）
+                    </button>
+                    <button class="primary" @click="publishRecipe(false)" :disabled="!recipeValue(recipeEditor.execution,'success') || recipeEditor.busy || recipeEditor.conflict || recipeEditor.dirty">
+                      发布成功测试版本
+                    </button>
+                  </div>
+                  <template x-if="recipeEditor.preview">
+                    <div>
+                      <p class="note" x-text="previewCost(recipeEditor.preview)">
+                      </p>
+                      <p class="dim" x-text="'相对当前 ' + recipeEditor.preview.current_layer + ' 的差异：' + (recipeEditor.preview.changed_fields.join(', ') || '无')">
+                      </p>
+                      <pre class="body mono" x-text="JSON.stringify(recipeEditor.preview,null,2)">
+                      </pre>
+                    </div>
+                  </template>
+                  <template x-if="recipeEditor.execution">
+                    <div class="candidate-result">
+                      <strong :class="recipeValue(recipeEditor.execution,'success') ? 'ok-text' : 'err-text'" x-text="recipeValue(recipeEditor.execution,'success') ? '测试成功，尚未发布' : '测试失败，尚未发布'">
+                      </strong>
+                      <p class="mono" x-text="recipeValue(recipeEditor.execution,'id')">
+                      </p>
+                      <p x-text="recipeValue(recipeEditor.execution,'redacted_detail') || '无额外诊断'">
+                      </p>
+                      <label class="check" x-show="!recipeValue(recipeEditor.execution,'success')">
+                        <input type="checkbox" x-model="recipeEditor.forceAcknowledged">
+                        我确认该失败测试形状仍可用于探活
+                      </label>
+                      <button class="danger" x-show="!recipeValue(recipeEditor.execution,'success')" @click="publishRecipe(true)" :disabled="!canForceRecipe()">
+                        Force 发布失败测试
+                      </button>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+            <footer>
+              <button @click="retireRecipe('disable')" :disabled="recipeEditor.busy || recipeEditor.conflict || recipeValue(recipeEditor.recipe,'status') === 'archived'">
+                停用配方
+              </button>
+              <button class="danger" @click="retireRecipe('archive')" :disabled="recipeEditor.busy || recipeEditor.conflict || recipeValue(recipeEditor.recipe,'status') === 'archived'">
+                归档配方
+              </button>
+            </footer>
+          </div>
+        </div>
+      </template>
+      <template x-if="profileView">
+        <div class="mask" @click.self="closeClientProfile()">
+          <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="profile-title" x-ref="clientProfileDialog">
+            <div class="bar">
+              <h3 id="profile-title" x-text="'客户端形状 #' + profileView.profile.id">
+              </h3>
+              <span class="tag" x-text="profileView.profile.status">
+              </span>
+              <span class="grow">
+              </span>
+              <button @click="closeClientProfile()" :disabled="profileView.busy">
+                关闭
+              </button>
+            </div>
+            <p class="dim" x-text="'Upstream #' + profileView.profile.upstream_id + ' · ' + profileView.profile.endpoint + ' · revision ' + profileView.profile.revision">
+            </p>
+            <div class="alert err" x-show="profileView.conflict">
+              配置已改变或尚未激活。请关闭后重新打开，再核对当前候选。
+            </div>
+            <p class="note">
+              下方仅为 sanitizer 允许的协议结构与生成的紧凑模板，不包含用户原文。候选通过一次显式测试后才成为 tested fallback。
+            </p>
+            <pre class="body mono" x-text="JSON.stringify(profileView.profile,null,2)">
+            </pre>
+            <label>
+              测试 Route ID
+              <input type="number" min="1" x-model="profileView.routeId" @change="profileView.preview = null; profileView.execution = null">
+            </label>
+            <div class="bar">
+              <button @click="previewClientProfile()" :disabled="profileView.busy || profileView.conflict">
+                候选差异预览
+              </button>
+              <button class="primary" @click="testClientProfile()" :disabled="!profileView.preview || profileView.profile.status !== 'candidate' || profileView.busy || profileView.conflict || !canRunCandidate()">
+                测试成功后启用（产生费用）
+              </button>
+              <button @click="disableClientProfile()" :disabled="profileView.profile.status === 'disabled' || profileView.busy || profileView.conflict">
+                停用形状
+              </button>
+            </div>
+            <template x-if="profileView.preview">
+              <div>
+                <p class="note" x-text="previewCost(profileView.preview)">
+                </p>
+                <pre class="body mono" x-text="JSON.stringify(profileView.preview,null,2)">
+                </pre>
+              </div>
+            </template>
+            <template x-if="profileView.execution">
+              <div class="candidate-result">
+                <strong x-text="recipeValue(profileView.execution,'success') ? '测试成功，已启用 tested fallback' : '测试失败，仍为候选'">
+                </strong>
+                <p class="mono" x-text="recipeValue(profileView.execution,'id')">
+                </p>
+                <p x-text="recipeValue(profileView.execution,'redacted_detail') || ''">
+                </p>
+              </div>
+            </template>
           </div>
         </div>
       </template>

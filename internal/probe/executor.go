@@ -880,6 +880,7 @@ func applyExpectationColumns(exec *model.ProbeExecution,
 		exec.CapabilityPolicySelector = capExp.PolicySelector
 		exec.CapabilityToken = capExp.ObservationToken
 		exec.ProbeSettingsFingerprint = capExp.Revision.ProbeSettingsFingerprint
+		exec.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(capExp.Revision.ProbeSecrets)
 		exec.UpstreamNetworkRevision = capExp.Revision.UpstreamNetwork
 		exec.UpstreamCredentialRevision = capExp.Revision.UpstreamCredential
 		exec.EndpointID = capExp.Revision.EndpointID
