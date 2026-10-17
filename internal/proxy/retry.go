@@ -86,15 +86,16 @@ func closeSampleTrail(trail []*liveAttempt) {
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
 type liveAttempt struct {
-	cand   *router.Candidate
-	at     *Attempt
-	tee    *sample.HeadTail
-	secTee *sample.HeadTail
-	keys   []string
-	body   []byte
-	header http.Header
-	url    string
-	instr  health.AttemptInstrumentation
+	cand        *router.Candidate
+	at          *Attempt
+	tee         *sample.HeadTail
+	secTee      *sample.HeadTail
+	keys        []string
+	body        []byte
+	header      http.Header
+	url         string
+	instr       health.AttemptInstrumentation
+	configFacts *health.AttemptConfigFacts
 	// Published transform selected at dispatch (immutable for this Attempt).
 	compiled   *transform.Compiled
 	verID      int64
@@ -337,6 +338,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		if h.reporter != nil {
 			ep, _ := proto.Endpoint()
 			view := viewOf(la.at.Result(), la.keys, ep)
+			view.CapabilityObserved = h.observers != nil
 			view.HalfOpen = armedHalfOpen(la.cand.Route.ID, attempt)
 			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, view)
 		}
@@ -473,19 +475,45 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
+	instr := health.NoopInstrumentation()
+	if h.observers != nil {
+		instr = h.observers.PrepareAttempt(r.Context(), health.AttemptTarget{
+			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID,
+			Config: health.AttemptConfigFacts{
+				UpstreamNetworkRevision:    cand.Upstream.NetworkRevision,
+				UpstreamCredentialRevision: cand.Upstream.CredentialRevision,
+				UpstreamCreatedAt:          cand.Upstream.CreatedAt, RouteCreatedAt: cand.Route.CreatedAt,
+				RouteCapabilityRevision: cand.Route.CapabilityRevision, ModelCapabilityRevision: cand.ModelName.CapabilityRevision,
+			},
+		}, health.AttemptRequestView{})
+	}
+	handedOff, configError := false, false
+	var configFacts *health.AttemptConfigFacts
+	defer func() {
+		if !handedOff {
+			finishObserver(&liveAttempt{instr: instr}, health.AttemptFinish{
+				ConfigError: configError, ClientCanceled: r.Context().Err() != nil, ConfigFacts: configFacts,
+			})
+		}
+	}()
 	target, err := h.resolveTarget(r, cand, kind)
 	if err != nil {
 		if (errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) || errors.Is(err, outbound.ErrURLConfig)) &&
 			r.Context().Err() == nil {
 			h.log.Warn("出站 URL 配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
-			h.markRouteConfigError(cand, kind)
+			configError = true
+			if h.observers == nil {
+				h.markRouteConfigError(cand, kind)
+			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
+	configFacts = &health.AttemptConfigFacts{EndpointID: target.EndpointID, EndpointRevision: target.EndpointRevision,
+		AuthProfileRevision: target.AuthProfile.Revision, ResolvedURLHash: target.ResolvedURLHash}
 
 	// 认证也只有一个来源（§7.2）。profile 跟着 target 一起来，两者出自
 	// 同一条 Endpoint 记录的同一个 revision —— 分两次读会让请求「用新 URL
@@ -495,7 +523,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		if errors.Is(err, outbound.ErrAuthConfig) && r.Context().Err() == nil {
 			h.log.Warn("出站认证配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
-			h.markRouteConfigError(cand, kind)
+			configError = true
+			if h.observers == nil {
+				h.markRouteConfigError(cand, kind)
+			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
@@ -569,7 +600,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		if errors.Is(err, outbound.ErrURLConfig) && r.Context().Err() == nil {
 			h.log.Warn("出站网络配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
-			h.markRouteConfigError(cand, kind)
+			configError = true
+			if h.observers == nil {
+				h.markRouteConfigError(cand, kind)
+			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
@@ -618,25 +652,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		fwd.RespTee = secTee
 	}
 
-	instr := health.NoopInstrumentation()
-	if h.observers != nil {
-		instr = h.observers.PrepareAttempt(r.Context(), health.AttemptTarget{
-			Attempt:    0,
-			Protocol:   proto,
-			Endpoint:   kind,
-			UpstreamID: cand.Upstream.ID,
-			RouteID:    cand.Route.ID,
-			Config: health.AttemptConfigFacts{
-				EndpointRevision: target.EndpointRevision,
-				ResolvedURLHash:  target.ResolvedURLHash,
-			},
-		}, health.AttemptRequestView{
-			Header:   outHeader,
-			RawQuery: "",
-			Body:     outBody,
-		})
-	}
-
 	sendCtx := r.Context()
 	if instr.Trace != nil {
 		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
@@ -646,12 +661,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	if instr.Observer != nil && at.Result() != nil && at.Result().Status > 0 {
 		instr.Observer.TryHeaders(at.Result().Status, at.Result().RespHeaders, time.Now())
 	}
+	handedOff = true
 
 	return &liveAttempt{
 		cand: cand, at: at, tee: tee, secTee: secTee,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
-		instr:    instr,
+		instr: instr, configFacts: configFacts,
 		compiled: compiled, verID: verID, endpointID: target.EndpointID,
 	}, dispatchSent
 }
@@ -887,6 +903,19 @@ func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
 		return
 	}
 	defer func() { _ = recover() }()
+	if la.configFacts != nil {
+		fin.ConfigFacts = la.configFacts
+	}
+	if la.at != nil && la.at.Result() != nil {
+		res := la.at.Result()
+		fin.ReadErr = res.Err
+		fin.ClientCanceled = errors.Is(res.Err, ErrCanceled) || errors.Is(res.Err, ErrClientGone)
+		if len(res.ErrBody) > 0 {
+			// ErrBody is already bounded by forwarding; normal model streams
+			// retain no body copy. The observer receives only redacted errors.
+			la.instr.Observer.TryChunk(sample.RedactDiagnostic(res.ErrBody, la.keys), time.Now())
+		}
+	}
 	la.instr.Observer.Finish(fin)
 }
 

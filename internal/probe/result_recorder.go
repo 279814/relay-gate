@@ -56,6 +56,11 @@ func (recorder *ResultRecorder) Record(ctx context.Context,
 	if value == nil {
 		return model.ProbeApplyResult{}, model.WrapValidation("probe observation 不能为空")
 	}
+	var expectedGeneration *uint64
+	if recorder.caps != nil && recorder.caps.routeGen != nil && value.Execution.RouteID > 0 {
+		generation := recorder.caps.routeGen.GenerationOf(value.Execution.RouteID)
+		expectedGeneration = &generation
+	}
 
 	result, err := recorder.store.CommitProbeObservation(ctx, value, recorder.reducer)
 	if err != nil {
@@ -68,7 +73,7 @@ func (recorder *ResultRecorder) Record(ctx context.Context,
 		}
 	}
 	if result.Capability == model.ApplyCurrent && result.CommittedCapability != nil && recorder.caps != nil {
-		recorder.caps.ApplyCommitted(result.CommittedCapability)
+		recorder.caps.applyCommitted(result.CommittedCapability, expectedGeneration)
 	}
 	return result, nil
 }

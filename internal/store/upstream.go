@@ -226,7 +226,9 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	}
 	upstream.Revision = current.Revision + 1
 	upstream.NetworkRevision = current.NetworkRevision
-	if networkChanged {
+	// §9.2: re-enable invalidates the previous connectivity/capability lifecycle
+	// atomically with the update, including results still waiting to commit.
+	if networkChanged || (!current.Enabled && upstream.Enabled) {
 		upstream.NetworkRevision++
 	}
 	upstream.CredentialRevision = current.CredentialRevision

@@ -28,6 +28,8 @@ type AttemptConfigFacts struct {
 	EndpointID                      int64
 	UpstreamNetworkRevision         int64
 	UpstreamCredentialRevision      int64
+	UpstreamCreatedAt               int64
+	RouteCreatedAt                  int64
 	EndpointRevision                int64
 	AuthProfileRevision             int64
 	ModelCapabilityRevision         int64
@@ -53,6 +55,8 @@ type AttemptFinish struct {
 	ClientCanceled  bool
 	ServiceCanceled bool
 	ClientCommitted bool
+	ConfigError     bool
+	ConfigFacts     *AttemptConfigFacts
 }
 
 // AttemptObserver 旁路观察响应；不得改变转发字节。

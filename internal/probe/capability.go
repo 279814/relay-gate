@@ -73,12 +73,24 @@ func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
 // sequencer 提交的新 token），即使 order 更低也必须替换。空 ObservationToken
 // 的旁路占位不得覆盖已有非空 token；非空 token 仍可替换空占位。
 func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability) {
+	registry.applyCommitted(row, nil)
+}
+
+// expectedGeneration guards the in-memory apply after the SQL transaction has
+// returned. It is checked while holding the same lock used by InvalidateScope:
+// Forget either changes the generation first, or its following invalidation
+// waits for this apply and removes it. No tracker lock is held across SQL I/O.
+func (registry *CapabilityRegistry) applyCommitted(row *model.EndpointCapability, expectedGeneration *uint64) {
 	if registry == nil || row == nil || row.ScopeID <= 0 || !row.Endpoint.Valid() {
 		return
 	}
 	key := capabilityKey{scopeType: row.ScopeType, scopeID: row.ScopeID, endpoint: row.Endpoint}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	if expectedGeneration != nil && row.ScopeType == model.RecipeScopeRoute &&
+		!registry.routeGenerationCurrent(row.ScopeID, *expectedGeneration) {
+		return
+	}
 	current := registry.rows[key]
 	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
 		return

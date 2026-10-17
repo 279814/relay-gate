@@ -162,7 +162,15 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 	if m == nil {
 		return health.NoopInstrumentation()
 	}
-	snap, err := m.cfg.ProbeSnapshot()
+	var snap *livecfg.ProbeSnapshot
+	var err error
+	if cached, ok := m.cfg.(interface {
+		CachedProbeSnapshot() (*livecfg.ProbeSnapshot, error)
+	}); ok {
+		snap, err = cached.CachedProbeSnapshot()
+	} else {
+		snap, err = m.cfg.ProbeSnapshot()
+	}
 	if err != nil || snap == nil {
 		return health.NoopInstrumentation()
 	}
@@ -189,13 +197,14 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 	}
 
 	obs := &trafficObserver{
-		m:      m,
-		target: target,
-		order:  order,
-		trace:  trace,
-		full:   full,
-		queue:  make(chan trafficEvent, perAttemptQueue),
-		stop:   make(chan struct{}),
+		m:          m,
+		target:     target,
+		order:      order,
+		trace:      trace,
+		full:       full,
+		queue:      make(chan trafficEvent, perAttemptQueue),
+		stop:       make(chan struct{}),
+		capability: prepareCapabilityTraffic(ctx, snap, target, order),
 	}
 	if full {
 		obs.wg.Add(1)
@@ -217,11 +226,12 @@ type trafficEvent struct {
 }
 
 type trafficObserver struct {
-	m      *TrafficObserverManager
-	target health.AttemptTarget
-	order  int64
-	trace  *outbound.AttemptTrace
-	full   bool
+	m          *TrafficObserverManager
+	target     health.AttemptTarget
+	order      int64
+	trace      *outbound.AttemptTrace
+	full       bool
+	capability *capabilityTraffic
 
 	mu         sync.Mutex
 	incomplete string
@@ -229,6 +239,7 @@ type trafficObserver struct {
 	header     http.Header
 	finished   bool
 	copyUsed   int64
+	finishView health.AttemptFinish
 
 	queue chan trafficEvent
 	stop  chan struct{}
@@ -302,6 +313,7 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 		return
 	}
 	o.finished = true
+	o.finishView = v
 	status := o.status
 	incomplete := o.incomplete
 	full := o.full
@@ -311,6 +323,12 @@ func (o *trafficObserver) Finish(v health.AttemptFinish) {
 		o.trace.MarkDone(time.Now())
 	}
 	close(o.stop)
+	if o.capability != nil {
+		if !full {
+			o.queueCapabilityObservation()
+		}
+		return // the existing worker drains and queues without delaying forwarding
+	}
 	if full {
 		o.wg.Wait()
 		select {
@@ -369,12 +387,19 @@ func msOrZero(t time.Time) int64 {
 
 func (o *trafficObserver) worker() {
 	defer o.wg.Done()
+	if o.capability != nil {
+		defer func() {
+			o.m.leases <- struct{}{}
+			o.queueCapabilityObservation()
+		}()
+	}
 	for {
 		select {
 		case <-o.stop:
 			for {
 				select {
 				case ev := <-o.queue:
+					o.capability.consume(ev)
 					if len(ev.chunk) > 0 {
 						o.m.copyBytes.Add(-int64(len(ev.chunk)))
 					}
@@ -383,6 +408,7 @@ func (o *trafficObserver) worker() {
 				}
 			}
 		case ev := <-o.queue:
+			o.capability.consume(ev)
 			if len(ev.chunk) > 0 {
 				o.m.copyBytes.Add(-int64(len(ev.chunk)))
 			}

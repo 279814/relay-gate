@@ -98,6 +98,19 @@ func (s *Source) ProbeSnapshot() (*ProbeSnapshot, error) {
 	return pub.Probe, nil
 }
 
+// CachedProbeSnapshot is the best-effort real-traffic observation view. It
+// neither refreshes an expired TTL nor waits for a refresh holding the lock.
+func (s *Source) CachedProbeSnapshot() (*ProbeSnapshot, error) {
+	if !s.mu.TryRLock() {
+		return nil, ErrProbeSnapshotUnavailable
+	}
+	defer s.mu.RUnlock()
+	if !s.probeReady || s.cur == nil || s.cur.Probe == nil {
+		return nil, ErrProbeSnapshotUnavailable
+	}
+	return s.cur.Probe, nil
+}
+
 // Invalidate 标记 Probe 快照不可用，要求随后 Refresh。
 func (s *Source) Invalidate() {
 	s.mu.Lock()

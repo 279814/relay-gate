@@ -39,6 +39,12 @@ func (r *Reporter) recordRealModelNotFound(routeID int64, generation uint64, res
 	if !isModelNotFound(event) {
 		return false
 	}
+	if res.CapabilityObserved {
+		// The send-time observer commits this evidence through the shared order
+		// and token checks. Do not block forwarding or race a manual retest with
+		// the legacy synchronous persistence path.
+		return true
+	}
 	if !r.routeGenerationCurrent(routeID, generation) {
 		// Stale incarnation: drop ApplyCommitted, still suppress RouteHealth.
 		return true
