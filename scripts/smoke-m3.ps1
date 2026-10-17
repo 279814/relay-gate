@@ -125,15 +125,21 @@ try {
         name = 'claude-opus-5'; protocol = 'anthropic'; match_mode = 'exact'; enabled = $true
     }
 
+    $initialEndpoints = foreach ($kind in @('models','messages','responses','chat_completions','count_tokens')) {
+        @{ endpoint = $kind; auth_profile = @{ mode = 'x_api_key'; secret_ref = 'upstream_api_key' } }
+    }
     $upOK = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-ok'; base_url = "http://127.0.0.1:$MOCK_OK"
         api_key = 'sk-mock-ok-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upDead = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-dead'; base_url = "http://127.0.0.1:$MOCK_DEAD"
         api_key = 'sk-mock-dead-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upFake = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-fake'; base_url = "http://127.0.0.1:$MOCK_FAKE"
         api_key = 'sk-mock-fake-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }

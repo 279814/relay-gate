@@ -30,7 +30,11 @@ func TestServiceDeletionHonorsClientRevisionBeforePublishing(t *testing.T) {
 			pub := &publisher{}
 			svc := configadmin.New(st, pub)
 			ctx := context.Background()
-			up, err := svc.CreateUpstream(ctx, model.Upstream{Name: "fixture", BaseURL: "https://example.test", APIKey: "fixture-upstream-credential", Enabled: true})
+			initial := []configadmin.EndpointMutation{}
+			for _, kind := range []model.EndpointKind{model.EndpointModels, model.EndpointMessages, model.EndpointResponses, model.EndpointChatCompletions, model.EndpointCountTokens} {
+				initial = append(initial, configadmin.EndpointMutation{Endpoint: kind, AuthProfile: model.EndpointAuthProfile{Mode: model.AuthModeBearer, SecretRef: "upstream_api_key"}})
+			}
+			up, err := svc.CreateUpstream(ctx, model.Upstream{Name: "fixture", BaseURL: "https://example.test", APIKey: "fixture-upstream-credential", Enabled: true}, initial)
 			if err != nil {
 				t.Fatal(err)
 			}

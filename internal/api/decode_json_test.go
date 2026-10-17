@@ -34,8 +34,7 @@ func (a *recordingCancelAdmin) CancelCalibration(ctx context.Context, runID stri
 func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 	server, handler := newTestServer(t)
 
-	created := do(t, handler, http.MethodPost, "/admin/api/upstreams",
-		`{"name":"keep","base_url":"https://keep.example.com","api_key":"sk-keep-key-12","auth_style":"bearer"}`, true)
+	created := do(t, handler, http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"keep","base_url":"https://keep.example.com","api_key":"sk-keep-key-12","auth_style":"bearer"}`), true)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("seed create = %d: %s", created.Code, created.Body.String())
 	}
@@ -50,14 +49,12 @@ func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 	beforeName := list[0].Name
 
 	// 两个对象：必须 400，且既不新建也不改已有行。
-	dupCreate := do(t, handler, http.MethodPost, "/admin/api/upstreams",
-		`{"name":"ok","base_url":"https://ok.example.com","api_key":"sk-ok-key-1234","auth_style":"bearer"}{"name":"evil"}`, true)
+	dupCreate := do(t, handler, http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"ok","base_url":"https://ok.example.com","api_key":"sk-ok-key-1234","auth_style":"bearer"}{"name":"evil"}`), true)
 	if dupCreate.Code != http.StatusBadRequest {
 		t.Fatalf("trailing create = %d: %s, want 400", dupCreate.Code, dupCreate.Body.String())
 	}
 
-	dupUpdate := do(t, handler, http.MethodPut, "/admin/api/upstreams/"+itoa(id),
-		`{"name":"evil"}{"name":"worse"}`, true)
+	dupUpdate := do(t, handler, http.MethodPut, "/admin/api/upstreams/"+itoa(id), `{"expected_revision":1,"name":"evil"}{"name":"worse"}`, true)
 	if dupUpdate.Code != http.StatusBadRequest {
 		t.Fatalf("trailing update = %d: %s, want 400", dupUpdate.Code, dupUpdate.Body.String())
 	}
@@ -83,7 +80,7 @@ func TestDecodeJSON_SingleObjectStillSaves(t *testing.T) {
 		`{"name":"one","base_url":"https://one.example.com","api_key":"sk-one-key-123","auth_style":"bearer"}`,
 		`{"name":"two","base_url":"https://two.example.com","api_key":"sk-two-key-123","auth_style":"bearer"}` + " \n\t",
 	} {
-		rec := do(t, handler, http.MethodPost, "/admin/api/upstreams", body, true)
+		rec := do(t, handler, http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, body), true)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("valid create = %d: %s (body=%q)", rec.Code, rec.Body.String(), body)
 		}

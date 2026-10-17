@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/configadmin"
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
@@ -34,8 +35,9 @@ type SampleStats interface {
 }
 
 type Server struct {
-	st  *store.Store
-	log *slog.Logger
+	st          *store.Store
+	log         *slog.Logger
+	configAdmin ConfigAdmin
 	// inFlight、samples 与 reqLogs 可以为 nil（测试里常只关心 CRUD），
 	// runtime 端点会据此把对应字段留空而不是崩。
 	inFlight InFlightView
@@ -98,7 +100,7 @@ func (s *Server) WithAdminHash(hash, dataDir string) *Server {
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{st: st, log: log, sessions: newSessionStore()}
+	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), sessions: newSessionStore()}
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，
@@ -153,6 +155,8 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, model.ErrValidation):
 		msg := strings.TrimPrefix(err.Error(), "validation: ")
 		writeJSON(w, http.StatusBadRequest, errBody{msg})
+	case errors.Is(err, store.ErrInvalidCursor):
+		writeJSON(w, http.StatusBadRequest, errBody{"分页 cursor 或 limit 无效"})
 	case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrDependencyConflict),
 		errors.Is(err, store.ErrIdempotencyConflict):
 		// 409：这三类都是「请求本身合法，但与当前状态冲突」——

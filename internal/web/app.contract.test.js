@@ -219,6 +219,10 @@ t('非法 UTF-8 不抛错', () => {
   assert.ok(out.length > 0);
 });
 
+t('配置客户端版本、冲突草稿、游标与五端点契约', () => {
+  require('child_process').execFileSync(process.execPath, [path.join(__dirname, 'configadmin.contract.test.js')], {stdio: 'inherit'});
+});
+
 runAll().then(() => {
   console.log(failed ? `\n${failed} 条失败` : '\n全部通过');
   process.exit(failed ? 1 : 0);

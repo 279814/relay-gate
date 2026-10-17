@@ -1,9 +1,12 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
+	"github.com/279814/relay-gate/internal/configadmin"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -28,14 +31,24 @@ func maskUpstream(u *model.Upstream) upstreamOut {
 }
 
 func (s *Server) listUpstreams(w http.ResponseWriter, r *http.Request) {
-	list, err := s.st.ListUpstreams()
+	page, err := configPage(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	out := make([]upstreamOut, 0, len(list))
-	for _, u := range list {
-		out = append(out, maskUpstream(u))
+	enabled, err := configEnabled(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	list, err := s.configAdmin.ListUpstreams(r.Context(), model.UpstreamFilter{PageRequest: page, Enabled: enabled, ProbeMode: model.ProbeMode(r.URL.Query().Get("probe_mode"))})
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	out := model.Page[upstreamOut]{Items: make([]upstreamOut, 0, len(list.Items)), NextCursor: list.NextCursor}
+	for _, u := range list.Items {
+		out.Items = append(out.Items, maskUpstream(&u))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -46,34 +59,59 @@ func (s *Server) getUpstream(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	u, err := s.st.GetUpstream(id)
+	u, err := s.configAdmin.GetUpstream(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, maskUpstream(u))
+	writeJSON(w, http.StatusOK, maskUpstream(&u))
 }
 
 func (s *Server) createUpstream(w http.ResponseWriter, r *http.Request) {
 	var u model.Upstream
 	u.Enabled = true // 新建默认启用；显式传 false 可覆盖
-	if err := decodeJSON(r, &u); err != nil {
+	in := struct {
+		*model.Upstream
+		InitialEndpoints []initialEndpointInput `json:"initial_endpoints"`
+	}{Upstream: &u}
+	if err := decodeJSON(r, &in); err != nil {
 		s.writeErr(w, err)
 		return
 	}
 	u.ID = 0
-	if err := s.st.CreateUpstream(&u); err != nil {
+	initial := make([]configadmin.EndpointMutation, 0, len(in.InitialEndpoints))
+	for _, ep := range in.InitialEndpoints {
+		initial = append(initial, configadmin.EndpointMutation{Endpoint: ep.Endpoint, URLOverride: ep.URLOverride, FixedQueryTemplate: ep.FixedQueryTemplate, AuthProfile: model.EndpointAuthProfile{Mode: ep.AuthProfile.Mode, HeaderName: ep.AuthProfile.HeaderName, QueryName: ep.AuthProfile.QueryName, SecretRef: ep.AuthProfile.SecretRef, ManualHeaders: ep.AuthProfile.ManualHeaders}})
+	}
+	created, err := s.configAdmin.CreateUpstream(r.Context(), u, initial)
+	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			err = model.WrapValidation("%s", sample.RedactDiagnosticText(err.Error(), []string{u.APIKey}))
+		}
 		s.writeErr(w, err)
 		return
 	}
+	u = created
 	s.log.Info("新增 upstream", "id", u.ID, "name", u.Name)
 	// 新建的站还没有 Route，没什么可探的。等 Route 建好时由那边触发。
 	// 仍须发布 routing 快照：enabled / base_url 等进入同代视图，不等 TTL。
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, u.ID, u.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, maskUpstream(&u))
+}
+
+type initialEndpointInput struct {
+	Endpoint           model.EndpointKind `json:"endpoint"`
+	URLOverride        string             `json:"url_override"`
+	FixedQueryTemplate string             `json:"fixed_query_template"`
+	AuthProfile        struct {
+		Mode          model.AuthMode         `json:"mode"`
+		HeaderName    string                 `json:"header_name,omitempty"`
+		QueryName     string                 `json:"query_name,omitempty"`
+		SecretRef     string                 `json:"secret_ref"`
+		ManualHeaders []model.HeaderTemplate `json:"manual_headers,omitempty"`
+	} `json:"auth_profile"`
 }
 
 func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
@@ -84,36 +122,45 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	// 以库中现值为基底：PUT 未提供的字段保持原样，
 	// 尤其 api_key 留空或回写脱敏值表示「不改 key」（前端拿到的是脱敏值，不能当真 key 回写）。
-	cur, err := s.st.GetUpstream(id)
+	current, err := s.configAdmin.GetUpstream(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	cur := &current
 	// 留一份改动前的副本用于比对。必须在置空 APIKey **之前**拷贝：
 	// 置空后再比就会把「没改 key」误判成「key 从有变没」，于是每次
 	// 保存都触发一轮全站重探。
 	before := *cur
 
 	cur.APIKey = "" // 置空 = 不改；若请求体带了新 key 会覆盖它
-	if err := decodeJSON(r, cur); err != nil {
+	in := struct {
+		*model.Upstream
+		ExpectedRevision int64 `json:"expected_revision"`
+	}{Upstream: cur}
+	if err := decodeJSON(r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := requireRevision(in.ExpectedRevision); err != nil {
 		s.writeErr(w, err)
 		return
 	}
 	cur.ID = id
-	if err := s.st.UpdateUpstream(cur); err != nil {
+	updated, err := s.configAdmin.UpdateUpstream(r.Context(), id, in.ExpectedRevision, *cur)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
 	s.log.Info("更新 upstream", "id", id, "name", cur.Name)
 
-	fresh, err := s.st.GetUpstream(id)
-	if err != nil {
-		s.writeErr(w, err)
-		return
+	if updated.APIKey == "" {
+		updated.APIKey = before.APIKey
 	}
+	fresh := &updated
 	// §4.5：改了 key / 地址 / 探活头就立刻重探整站，不等下一个周期。
-	// 用 fresh 而不是 cur 比对：cur 的 APIKey 可能是「留空表示不改」的空串，
-	// 而 fresh 是库里的真实现值。
+	// 使用本次提交结果和保留的凭据比对。提交后再次 GET 可能读到另一位
+	// 管理员随后写入的版本，不能把那次修改归给当前请求。
 	// 仅把 Enabled 从 false 翻回 true：发布 livecfg，并 Forget 停用前留下的
 	// dead/cooldown，但不调度合成探活或校准；真实流量可在健康未知时选中该站。
 	if !before.Enabled && fresh.Enabled {
@@ -122,14 +169,18 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	if probeAffectingUpstream(&before, fresh) {
 		s.invalidateUpstream(id)
 	}
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, fresh.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusOK, maskUpstream(fresh))
 }
 
 func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
+	revision, err := deleteRevision(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
@@ -145,10 +196,10 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 	var delErr error
 	if s.transforms != nil {
 		delErr = s.transforms.DetachRouteBindingsAround(childRoutes, func() error {
-			return s.st.DeleteUpstream(id)
+			return s.configAdmin.DeleteUpstream(r.Context(), id, revision)
 		})
 	} else {
-		delErr = s.st.DeleteUpstream(id)
+		delErr = s.configAdmin.DeleteUpstream(r.Context(), id, revision)
 	}
 	if delErr != nil {
 		s.writeErr(w, delErr)
@@ -156,8 +207,7 @@ func (s *Server) deleteUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	s.forgetUpstreamSchedulerHolds(id, childRoutes)
 	s.invalidateUpstreamDeleted(id, childRoutes)
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, revision) {
 		return
 	}
 	s.log.Info("删除 upstream", "id", id)

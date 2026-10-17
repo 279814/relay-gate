@@ -13,7 +13,7 @@ import (
 type Store interface {
 	ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error)
 	GetUpstream(id int64) (*model.Upstream, error)
-	CreateUpstream(u *model.Upstream) error
+	CreateUpstreamWithEndpoints(context.Context, *model.Upstream, []*model.UpstreamEndpoint) error
 	UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) error
 	DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error
 
@@ -65,9 +65,26 @@ func (s *Service) GetUpstream(_ context.Context, id int64) (model.Upstream, erro
 	return *u, nil
 }
 
-func (s *Service) CreateUpstream(_ context.Context, in model.Upstream) (model.Upstream, error) {
+type EndpointMutation struct {
+	Endpoint           model.EndpointKind
+	URLOverride        string
+	FixedQueryTemplate string
+	AuthProfile        model.EndpointAuthProfile
+}
+
+func (s *Service) CreateUpstream(ctx context.Context, in model.Upstream, initial []EndpointMutation) (model.Upstream, error) {
 	cp := in
-	if err := s.store.CreateUpstream(&cp); err != nil {
+	endpoints := make([]*model.UpstreamEndpoint, 0, len(initial))
+	for _, item := range initial {
+		if !item.AuthProfile.Mode.Valid() || item.AuthProfile.SecretRef == "" {
+			return model.Upstream{}, model.WrapValidation("每个 Endpoint 必须显式配置认证 mode 和 secret_ref")
+		}
+		if item.AuthProfile.Mode == model.AuthModeLegacyAutoRealOnly || item.AuthProfile.CalibratedMode != "" || item.AuthProfile.Revision != 0 {
+			return model.Upstream{}, model.WrapValidation("不能创建迁移或已校准认证状态")
+		}
+		endpoints = append(endpoints, &model.UpstreamEndpoint{Kind: item.Endpoint, URLMode: model.EndpointURLCanonical, URLOverride: item.URLOverride, FixedQueryTemplate: item.FixedQueryTemplate, AuthProfile: item.AuthProfile})
+	}
+	if err := s.store.CreateUpstreamWithEndpoints(ctx, &cp, endpoints); err != nil {
 		return model.Upstream{}, err
 	}
 	s.publish()
