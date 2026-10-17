@@ -322,6 +322,9 @@ func (classifier *ResponseClassifier) hasFailedAfterSemantic(readErr error) bool
 }
 
 func (classifier *ResponseClassifier) partialDetail(readErr error) string {
+	if reason := probeTimeoutReason(readErr); reason != "" {
+		return "partial_after_semantic:" + reason
+	}
 	if readErr != nil {
 		return "partial_after_semantic:transport"
 	}
@@ -395,10 +398,10 @@ func (classifier *ResponseClassifier) failure(readErr error) Decision {
 		decision.Capability = model.CapabilityConfigError
 		decision.ErrorClass = model.ErrorShapeRejected
 
-	case errors.Is(readErr, ErrProbeSemanticTimeout):
+	case probeTimeoutReason(readErr) != "":
 		decision.Capability = model.CapabilityTransientError
 		decision.ErrorClass = model.ErrorTransient
-		decision.RedactedDetail = "semantic_timeout"
+		decision.RedactedDetail = probeTimeoutReason(readErr)
 
 	case readErr != nil:
 		decision.Capability = model.CapabilityTransientError

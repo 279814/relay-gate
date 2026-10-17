@@ -37,6 +37,9 @@ func TestL2_FirstTokenTimeoutIsNotReportedAsFakeAlive(t *testing.T) {
 	defer srv.Close()
 
 	s := fastSettings()
+	// Isolate semantic expiry: no body byte/event also has its own deadline.
+	s.L2FirstByteSec = 5
+	s.L2FirstEventSec = 5
 	s.L2FirstSemanticSec = 1
 	s.L2TotalSec = 10
 
