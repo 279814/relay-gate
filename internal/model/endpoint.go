@@ -186,6 +186,26 @@ type EndpointAuthProfile struct {
 	Revision       int64            `json:"revision"`
 }
 
+// SecretPlaceholder maps the closed configuration vocabulary to the shared
+// value resolver. A literal credential is never a valid reference.
+func (profile EndpointAuthProfile) SecretPlaceholder() (string, error) {
+	if profile.SecretRef == "upstream_api_key" {
+		return "UPSTREAM_API_KEY", nil
+	}
+	name, ok := strings.CutPrefix(profile.SecretRef, "probe:")
+	if !ok || name == "" {
+		return "", WrapValidation("auth secret_ref 必须为 upstream_api_key 或 probe:<name>")
+	}
+	for _, character := range []byte(name) {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || strings.ContainsRune("-_.", rune(character)) {
+			continue
+		}
+		return "", WrapValidation("auth secret_ref 的 Probe Secret 名称无效")
+	}
+	return "SECRET:" + name, nil
+}
+
 type UpstreamEndpoint struct {
 	ID                    int64               `json:"id"`
 	UpstreamID            int64               `json:"upstream_id"`

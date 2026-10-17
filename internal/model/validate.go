@@ -114,8 +114,8 @@ func (endpoint *UpstreamEndpoint) Validate() error {
 	if endpoint.AuthProfile.Mode != AuthModeLegacyAutoRealOnly && endpoint.LegacyCompatRealOnly {
 		return invalid("legacy_compat_real_only 只允许 legacy auto endpoint")
 	}
-	if endpoint.AuthProfile.SecretRef == "" {
-		return invalid("auth secret_ref 不能为空")
+	if _, err := endpoint.AuthProfile.SecretPlaceholder(); err != nil {
+		return err
 	}
 	if HeaderFieldHasCRLFOrNUL(endpoint.AuthProfile.HeaderName) {
 		return invalid("auth header_name 不能含 CR/LF/NUL")

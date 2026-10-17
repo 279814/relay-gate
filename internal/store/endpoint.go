@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -400,6 +401,15 @@ func replaceEndpointSecretRefs(ctx context.Context, tx *sql.Tx, endpoint *model.
 	if err != nil {
 		return err
 	}
+	placeholder, err := endpoint.AuthProfile.SecretPlaceholder()
+	if err != nil {
+		return err
+	}
+	if name, ok := strings.CutPrefix(placeholder, "SECRET:"); ok {
+		required = append(required, name)
+	}
+	slices.Sort(required)
+	required = slices.Compact(required)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM endpoint_active_secret_ref WHERE endpoint_id=?`, endpoint.ID); err != nil {
 		return err
 	}
