@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/sample"
@@ -367,30 +368,18 @@ func (s *Server) invalidateModelNameDeleted(modelNameID int64, routeIDs []int64)
 
 // routeIDsOfUpstream lists live Route ids under an Upstream (pre-CASCADE snapshot).
 func (s *Server) routeIDsOfUpstream(upstreamID int64) []int64 {
-	routes, err := s.st.ListRoutes(0)
+	ids, err := s.configAdmin.RouteIDsOfUpstream(context.Background(), upstreamID)
 	if err != nil {
 		return nil
-	}
-	var ids []int64
-	for _, rt := range routes {
-		if rt != nil && rt.UpstreamID == upstreamID {
-			ids = append(ids, rt.ID)
-		}
 	}
 	return ids
 }
 
 // routeIDsOfModelName lists live Route ids under a ModelName (pre-CASCADE snapshot).
 func (s *Server) routeIDsOfModelName(modelNameID int64) []int64 {
-	routes, err := s.st.ListRoutes(modelNameID)
+	ids, err := s.configAdmin.RouteIDsOfModelName(context.Background(), modelNameID)
 	if err != nil {
 		return nil
-	}
-	ids := make([]int64, 0, len(routes))
-	for _, rt := range routes {
-		if rt != nil {
-			ids = append(ids, rt.ID)
-		}
 	}
 	return ids
 }

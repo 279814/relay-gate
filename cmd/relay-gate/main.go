@@ -348,26 +348,16 @@ func runServer() error {
 		Semantic: semanticInv,
 		Inner:    sched,
 		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := st.ListRoutes(0)
+			ids, err := st.RouteIDsOfUpstream(context.Background(), upstreamID)
 			if err != nil {
 				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
 			}
 			return ids
 		},
 		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := st.ListRoutes(modelNameID)
+			ids, err := st.RouteIDsOfModelName(context.Background(), modelNameID)
 			if err != nil {
 				return nil
-			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
 			}
 			return ids
 		},

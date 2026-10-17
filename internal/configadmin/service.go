@@ -26,6 +26,8 @@ type Store interface {
 
 	ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error)
 	ListRouteMetadataPage(context.Context, model.RouteFilter) (model.Page[model.RouteMetadata], error)
+	RouteIDsOfUpstream(context.Context, int64) ([]int64, error)
+	RouteIDsOfModelName(context.Context, int64) ([]int64, error)
 	GetRoute(id int64) (*model.Route, error)
 	CreateRoute(r *model.Route) error
 	UpdateRouteWithRevision(ctx context.Context, value *model.Route, expectedRevision int64) error
@@ -77,6 +79,14 @@ func (s *Service) GetUpstreamByName(ctx context.Context, name string) (model.Ups
 
 func (s *Service) ListRouteMetadata(ctx context.Context, f model.RouteFilter) (model.Page[model.RouteMetadata], error) {
 	return s.store.ListRouteMetadataPage(ctx, f)
+}
+
+func (s *Service) RouteIDsOfUpstream(ctx context.Context, id int64) ([]int64, error) {
+	return s.store.RouteIDsOfUpstream(ctx, id)
+}
+
+func (s *Service) RouteIDsOfModelName(ctx context.Context, id int64) ([]int64, error) {
+	return s.store.RouteIDsOfModelName(ctx, id)
 }
 
 type EndpointMutation struct {
