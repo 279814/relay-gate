@@ -188,43 +188,27 @@
             <p class="dim" x-show="probeResult?.execution_id"
                x-text="'本次手动探活 execution_id=' + (probeResult?.execution_id || '')"></p>
 
-            <!-- 手动探活结果。同步返回，点了就该看到答案 -->
-            <template x-if="probeResult">
+            <!-- One manual action displays its actual immutable execution. -->
+            <template x-if="manualProbeResult()">
               <div class="panel">
                 <div class="bar">
-                  <strong x-text="`Route #${probeResult.route_id} 探活结果`"></strong>
+                  <strong x-text="`Route #${manualProbeResult().routeId} 探活结果`"></strong>
                   <span class="grow"></span>
                   <button @click="probeResult = null">关闭</button>
                 </div>
                 <table>
-                  <thead><tr><th>层级</th><th>判定</th><th>状态码</th><th>TTFT</th><th>错误</th></tr></thead>
-                  <tbody>
-                    <tr>
-                      <td>L1<span class="dim">（零 token）</span></td>
-                      <td><span class="tag" :class="verdictClass(probeResult.l1?.verdict)"
-                                x-text="probeResult.l1?.verdict || '—'"></span></td>
-                      <td class="num" x-text="probeResult.l1?.status || '—'"></td>
-                      <td class="num" x-text="(probeResult.l1?.ttft_ms || 0) + 'ms'"></td>
-                      <td class="wrap dim" x-text="probeResult.l1?.error || '—'"></td>
-                    </tr>
-                    <tr>
-                      <td>L2<span class="dim">（真实模型调用）</span></td>
-                      <!-- l2 为 null = L1 没过、根本没执行。不能显示成 ok：
-                           Verdict 的零值恰好是 OK，那会变成「L1 失败但 L2 成功」 -->
-                      <template x-if="probeResult.l2">
-                        <td><span class="tag" :class="verdictClass(probeResult.l2.verdict)"
-                                  x-text="probeResult.l2.verdict"></span></td>
-                      </template>
-                      <template x-if="!probeResult.l2">
-                        <td><span class="tag unknown">未执行</span></td>
-                      </template>
-                      <td class="num" x-text="probeResult.l2?.status || '—'"></td>
-                      <td class="num" x-text="probeResult.l2 ? probeResult.l2.ttft_ms + 'ms' : '—'"></td>
-                      <td class="wrap dim" x-text="probeResult.l2?.error || '—'"></td>
-                    </tr>
-                  </tbody>
+                  <thead><tr><th>端点</th><th>判定</th><th>状态码</th><th>首语义</th><th>总耗时</th><th>详情</th></tr></thead>
+                  <tbody><tr>
+                    <td x-text="manualProbeResult().endpoint"></td>
+                    <td><span class="tag" :class="manualProbeResult().success ? 'ok' : manualProbeResult().errorClass === 'ignored' ? 'unknown' : 'err'"
+                      x-text="manualProbeResult().success ? '成功' : manualProbeResult().errorClass || '未完成'"></span></td>
+                    <td class="num" x-text="manualProbeResult().status || '—'"></td>
+                    <td class="num" x-text="manualProbeResult().semanticMS"></td>
+                    <td class="num" x-text="manualProbeResult().totalMS"></td>
+                    <td class="wrap dim" x-text="manualProbeResult().detail || '—'"></td>
+                  </tr></tbody>
                 </table>
-                <p class="dim" x-show="probeResult.l2_skipped" x-text="probeResult.l2_skipped"></p>
+                <p class="dim" x-text="'能力：' + (manualProbeResult().capability || 'unknown') + ' · 站点可达：' + (manualProbeResult().reachable ? '是' : '未取得可达证据') + ' · 语义输出：' + (manualProbeResult().semanticSeen ? '有' : '无')"></p>
               </div>
             </template>
           </div>
@@ -1884,23 +1868,22 @@
             </div>
 
             <div class="bar" style="margin-top:14px">
-              <button @click="exportHeaders(sample.id)">以此为模板导出探活头</button>
-              <span class="dim">从真实请求导，而不是手写 —— 手写等于猜</span>
+              <button @click="exportHeaders(sample.id)">生成安全配方草稿</button>
+              <span class="dim">仅保留协议形状，正文使用探活占位符</span>
             </div>
 
             <template x-if="hdrExport">
               <div class="panel">
-                <strong>建议的 probe_headers</strong>
-                <pre class="body mono" x-text="JSON.stringify(hdrExport.headers, null, 2)"></pre>
+                <strong>安全配方候选</strong>
+                <pre class="body mono" x-text="JSON.stringify(hdrExport.candidate, null, 2)"></pre>
                 <!-- skipped 要显式展示：让用户知道鉴权头是刻意排除的 -->
                 <p class="dim" x-show="hdrExport.skipped?.length">
                   已排除（<span x-text="hdrExport.skipped.length"></span> 项）：
                   <span class="mono" x-text="hdrExport.skipped.join(', ')"></span>。
-                  凭据类的头一律不导 —— 样本里存的是脱敏值，拿它当 key 会让整站探活 401。
-                  另外几个由探活自己按协议设，抄过来反而会出错。
+                  认证和未知头值均不导入；只有明确批准的协议字段会进入草稿。
                 </p>
                 <div class="bar" style="margin-top:8px">
-                  <button class="primary" @click="applyHeaders()">填入该上游的表单</button>
+                  <button class="primary" @click="applyHeaders()">在配方编辑器中打开</button>
                   <button @click="hdrExport = null">关闭</button>
                 </div>
               </div>

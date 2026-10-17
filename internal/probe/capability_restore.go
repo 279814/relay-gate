@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"time"
 
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
@@ -153,20 +152,10 @@ func currentCapabilityExpectation(ctx context.Context, snap *livecfg.ProbeSnapsh
 	return expectation
 }
 
-// ConfigErrorStore 落库真实流量得到的 Route config_error。由 store.Store 实现。
-type ConfigErrorStore interface {
-	SaveConfigErrorCapability(ctx context.Context, expectation *model.SemanticExpectation,
-		statusCode int, errorClass model.ErrorClass, detail string, observedAt int64) error
-}
-
-// WithConfigErrorPersistence 让真实流量与校准的 config_error 以当前
-// Observation Token 落库，重启后由 RestoreConfigErrors 装回（§5.2）。
-// 必须在接流量前调用。
-func (registry *CapabilityRegistry) WithConfigErrorPersistence(st ConfigErrorStore,
-	configs PublishedConfigSource, recipes *RecipeResolver) *CapabilityRegistry {
-
+// WithPublishedConfig supplies the current binding used by calibration and
+// restart verification. ResultRecorder owns all live observation persistence.
+func (registry *CapabilityRegistry) WithPublishedConfig(configs PublishedConfigSource, recipes *RecipeResolver) *CapabilityRegistry {
 	if registry != nil {
-		registry.configErrors = st
 		registry.configs = configs
 		registry.recipes = recipes
 	}
@@ -188,23 +177,4 @@ func (registry *CapabilityRegistry) currentRouteExpectation(ctx context.Context,
 	return currentCapabilityExpectation(ctx, pub.Probe, registry.recipes, &model.EndpointCapability{
 		ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: endpoint,
 	})
-}
-
-const configErrorPersistTimeout = 5 * time.Second
-
-// persistRouteConfigError 尽力落库；失败时内存标记照常生效，只是不跨重启。
-func (registry *CapabilityRegistry) persistRouteConfigError(routeID int64, endpoint model.EndpointKind,
-	statusCode int, errorClass model.ErrorClass, observedAt int64) {
-
-	if registry == nil || registry.configErrors == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), configErrorPersistTimeout)
-	defer cancel()
-	expectation := registry.currentRouteExpectation(ctx, routeID, endpoint)
-	if expectation == nil {
-		return
-	}
-	_ = registry.configErrors.SaveConfigErrorCapability(ctx, expectation, statusCode, errorClass,
-		string(errorClass), observedAt)
 }

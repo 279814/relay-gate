@@ -39,3 +39,20 @@ func TestExecutorMissingRecipeSourceDoesNotSendBuiltinRequest(t *testing.T) {
 		t.Fatalf("missing source silently selected a builtin: sent=%v calls=%d class=%s", result.Sent, rt.count(), result.Decision.ErrorClass)
 	}
 }
+
+func TestExecutorDoesNotMergeRetiredUpstreamProbeHeaders(t *testing.T) {
+	var sent http.Header
+	rt := &countingRoundTripper{fn: func(r *http.Request) (*http.Response, error) {
+		sent = r.Header.Clone()
+		return respFrom(200, "text/event-stream", anthropicSemanticBody()), nil
+	}}
+	up := upstreamFor("https://example.test")
+	up.ProbeHeaders = map[string]string{"user-agent": "legacy-fingerprint-private", "x-legacy": "legacy-private", "accept": "legacy-media"}
+	executor := newTestExecutorFor(up, rt, &captureRecorder{}, AlwaysOpenAdmission(), WallClock())
+	if _, err := executor.Execute(context.Background(), l2RequestFor(up)); err != nil {
+		t.Fatal(err)
+	}
+	if sent == nil || sent.Get("X-Legacy") != "" || sent.Get("User-Agent") == "legacy-fingerprint-private" || sent.Get("Accept") == "legacy-media" {
+		t.Fatalf("retired overrides affected outbound request: %v", sent)
+	}
+}

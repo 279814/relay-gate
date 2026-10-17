@@ -11,7 +11,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -146,7 +145,7 @@ func TestRestoreConfigErrors_MatchingTokenSurvivesRestart(t *testing.T) {
 func restartedRegistry(t *testing.T, st *store.Store) *CapabilityRegistry {
 	t.Helper()
 	cfg, recipes := restoreTestDeps(st)
-	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithConfigErrorPersistence(st, cfg, recipes)
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithPublishedConfig(cfg, recipes)
 	if _, err := caps.RestoreConfigErrors(context.Background(), st, cfg, recipes); err != nil {
 		t.Fatal(err)
 	}
@@ -155,25 +154,22 @@ func restartedRegistry(t *testing.T, st *store.Store) *CapabilityRegistry {
 
 func persistingRegistry(st *store.Store) *CapabilityRegistry {
 	cfg, recipes := restoreTestDeps(st)
-	return NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithConfigErrorPersistence(st, cfg, recipes)
+	return NewCapabilityRegistry(capSettings{model.DefaultSettings()}).WithPublishedConfig(cfg, recipes)
 }
 
-// §5.2 / §8.12：真实流量 model_not_found 的 config_error 必须跨重启；落库不
-// 占用 observation order，之后的探活提交仍可覆盖（§8.13 人工重测）。
+// A real observation uses the same captured expectation/order as manual tests,
+// and its config_error survives restarting the registry.
 func TestRestoreConfigErrors_LiveModelNotFoundSurvivesRestart(t *testing.T) {
-	st := calibrationTestStore(t)
-	up, _, rt := seedCalibrationRoute(t, st)
-	rep := NewReporter(health.NewTracker(nil)).WithCapabilityRegistry(persistingRegistry(st))
-	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
-	rep.ReportResult(rt.ID, 0, &proxy.ResultView{
-		Status: 404, ErrBody: body, Endpoint: model.EndpointMessages, BytesWritten: int64(len(body)),
-	})
-
-	caps := restartedRegistry(t, st)
-	if got := caps.Effective(model.RecipeScopeRoute, rt.ID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("after restart messages=%s, want config_error", got)
+	h := newCountTrafficHarness(t)
+	h.finish(t, h.beginEndpoint(model.EndpointMessages), 400, liveMissingModel)
+	caps := restartedRegistry(t, h.store)
+	if got := caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("restart state=%s", got)
 	}
-	commitRouteConfigError(t, st, up, rt, model.EndpointMessages)
+	h.seedEndpoint(t, model.EndpointMessages, model.CapabilitySupported)
+	if got := restartedRegistry(t, h.store).Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+		t.Fatalf("manual successful retest retained config_error: %s", got)
+	}
 }
 
 // §5.2 / §8.7：校准鉴权穷尽写的 config_error 必须用 RestoreConfigErrors 能

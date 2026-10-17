@@ -659,6 +659,25 @@ function app() {
       }
     },
 
+    manualProbeResult() {
+      const execution = this.probeResult?.execution;
+      if (!execution) return null;
+      const field = (name, snake) => execution[name] ?? execution[snake];
+      const sent = field('SentAtMS', 'sent_at_ms');
+      const elapsed = end => sent > 0 && end >= sent ? `${end - sent}ms` : '—';
+      return {
+        routeId: field('RouteID', 'route_id'), endpoint: field('Endpoint', 'endpoint'),
+        success: field('Success', 'success') === true, status: field('StatusCode', 'status_code'),
+        errorClass: field('ErrorClass', 'error_class'), capability: field('Capability', 'capability'),
+        reachable: field('Reachable', 'reachable') === true,
+        semanticSeen: field('SemanticSeen', 'semantic_seen') === true,
+        normalEndSeen: field('NormalEndSeen', 'normal_end_seen') === true,
+        semanticMS: elapsed(field('FirstSemanticAtMS', 'first_semantic_at_ms')),
+        totalMS: elapsed(field('DoneAtMS', 'done_at_ms')),
+        detail: field('RedactedDetail', 'redacted_detail'),
+      };
+    },
+
     // ── 样本 ─────────────────────────────────────────
 
     async openSample(id) {

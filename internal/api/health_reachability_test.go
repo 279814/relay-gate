@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/revisioncodec"
 	"github.com/279814/relay-gate/internal/store"
@@ -154,7 +156,7 @@ func TestManualProbeRunnerDomainErrorsKeepHTTPMeaning(t *testing.T) {
 		name   string
 		err    error
 		status int
-	}{{"missing target", store.ErrNotFound, 404}, {"paused admission", probe.ErrSyntheticClosed, 503}} {
+	}{{"missing target", store.ErrNotFound, 404}, {"paused admission", probe.ErrSyntheticClosed, 503}, {"unpublished snapshot", livecfg.ErrProbeSnapshotUnavailable, 503}, {"order unavailable", observationseq.ErrUnavailable, 503}} {
 		t.Run(test.name, func(t *testing.T) {
 			s, _ := newTestServer(t)
 			calls := 0

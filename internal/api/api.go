@@ -13,7 +13,9 @@ import (
 	"github.com/279814/relay-gate/internal/configadmin"
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
@@ -67,7 +69,8 @@ type Server struct {
 	runState RunStateAdmin
 
 	// probeAdmin 是 P0-14 探活管理服务。未注入时新探活端点 503。
-	probeAdmin ProbeAdmin
+	probeAdmin       ProbeAdmin
+	sampleCandidates SampleRecipeCandidateBuilder
 
 	// security 是 P3 Security Center。未注入时 list 返回空。
 	security SecurityCenter
@@ -101,7 +104,7 @@ func (s *Server) WithAdminHash(hash, dataDir string) *Server {
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), sessions: newSessionStore()}
+	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), sampleCandidates: probe.NewSampleCandidateBuilder(st), sessions: newSessionStore()}
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，
@@ -149,9 +152,9 @@ func conflictClientMessage(err error) string {
 // 吞掉它们会让配置出错时只剩一个无信息的 400。
 func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, probe.ErrSyntheticClosed):
+	case errors.Is(err, probe.ErrSyntheticClosed), errors.Is(err, livecfg.ErrProbeSnapshotUnavailable), errors.Is(err, observationseq.ErrUnavailable):
 		w.Header().Set("Retry-After", "60")
-		writeJSON(w, http.StatusServiceUnavailable, errBody{"合成探活已暂停或维护中"})
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"探活配置或执行准入暂不可用，请稍后重试"})
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, credential.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errBody{"not found"})
 	case errors.Is(err, credential.ErrRevealUnavailable):

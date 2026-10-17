@@ -7,7 +7,6 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
 const liveMissingModel = `{"error":{"type":"invalid_request_error","code":"model_not_found","message":"missing model"}}`
@@ -53,10 +52,9 @@ func TestModelErrorTraffic_ConfigChangeRejectsLateFailure(t *testing.T) {
 	}
 }
 
-func TestReportResult_ObservedModelNotFoundDoesNotWaitForDatabase(t *testing.T) {
+func TestModelErrorTraffic_FinishDoesNotWaitForDatabase(t *testing.T) {
 	h := newCountTrafficHarness(t)
 	h.seedEndpoint(t, model.EndpointMessages, model.CapabilitySupported)
-	reporter := NewReporter(health.NewTracker(nil)).WithCapabilityRegistry(h.caps)
 	conn, err := h.store.DB().Conn(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -64,9 +62,10 @@ func TestReportResult_ObservedModelNotFoundDoesNotWaitForDatabase(t *testing.T) 
 	defer conn.Close()
 	done := make(chan struct{})
 	go func() {
-		reporter.ReportResult(h.route.ID, 0, &proxy.ResultView{
-			Endpoint: model.EndpointMessages, Status: 404, ErrBody: []byte(liveMissingModel), CapabilityObserved: true,
-		})
+		observer := h.beginEndpoint(model.EndpointMessages)
+		observer.TryHeaders(400, nil, time.Now())
+		observer.TryChunk([]byte(liveMissingModel), time.Now())
+		observer.Finish(health.AttemptFinish{})
 		close(done)
 	}()
 	select {
@@ -74,10 +73,15 @@ func TestReportResult_ObservedModelNotFoundDoesNotWaitForDatabase(t *testing.T) 
 	case <-time.After(time.Second):
 		conn.Close()
 		<-done
-		t.Fatal("Reporter blocked on a duplicate capability write")
+		t.Fatal("model-error observation waited for SQLite")
 	}
 	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilitySupported {
-		t.Fatalf("Reporter wrote a second capability: %s", got)
+		t.Fatalf("result was applied outside shared persistence: %s", got)
+	}
+	conn.Close()
+	h.commitQueued(t)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("queued result was not committed: %s", got)
 	}
 }
 

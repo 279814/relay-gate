@@ -126,24 +126,21 @@ func (s *Service) RunManual(ctx context.Context, routeID int64) (model.ProbeExec
 	if err != nil {
 		return model.ProbeExecution{}, err
 	}
-	order := int64(0)
 	req := ExecutionRequest{
 		ExecutionID: sample.NewReqID(), Trigger: model.TriggerManual,
 		Upstream: up, ModelName: mn, Route: rt, Endpoint: kind,
-		Mode: ObserveProbe, Budget: outbound.L2Budget(settings), ObservationOrder: order,
+		Mode: ObserveProbe, Budget: outbound.L2Budget(settings),
 	}
-	if src, ok := s.snapshots.(ProbeSnapshotSource); ok {
-		if snap, err := src.ProbeSnapshot(); err == nil && snap != nil {
-			_ = snap // expectation 由 ManualPreparer 附上；未装配时走 not_applicable
-		} else if err == livecfg.ErrProbeSnapshotUnavailable {
-			return model.ProbeExecution{}, err
-		}
+	if s.manual == nil {
+		return model.ProbeExecution{}, livecfg.ErrProbeSnapshotUnavailable
 	}
-	if s.manual != nil {
-		if err := s.manual.PrepareManual(ctx, &req); err != nil {
-			return model.ProbeExecution{}, err
-		}
+	if err := s.manual.PrepareManual(ctx, &req); err != nil {
+		return model.ProbeExecution{}, err
 	}
+	if req.ObservationOrder <= 0 || req.ReachabilityExpectation == nil || req.CapabilityExpectation == nil || req.ReachabilityPolicy == nil || req.CapabilityPolicy == nil {
+		return model.ProbeExecution{}, livecfg.ErrProbeSnapshotUnavailable
+	}
+
 	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		return model.ProbeExecution{}, err

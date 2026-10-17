@@ -74,9 +74,7 @@ func (p *requestPreparer) prepare(ctx context.Context, up *model.Upstream, mn *m
 	// 请求完全一致，各拼一套的话「探活通过」不代表真实请求能通，而那个差异
 	// 只在生产流量上显形。
 	//
-	// 这道检查不能省成「反正装配时会传」：Prober 与它的字段都是导出的，
-	// 而这里跑在 Scheduler 起的 goroutine 里 —— 那里没有 recover，
-	// 一次 nil 解引用会带崩整个网关进程。
+	// 缺少准备依赖时必须先于 Scheduler 的网络执行返回配置错误。
 	if p.Targets == nil {
 		return nil, ResolvedRecipe{}, errors.New("探活未装配出站目标解析器")
 	}
@@ -315,15 +313,11 @@ func (p *requestPreparer) resolveSecrets(ctx context.Context,
 	return BindSecrets(resolved.SecretRefs, resolvedSecrets)
 }
 
-// applyProbeHeaders 在渲染出的头上叠加 Upstream 级覆盖，再装配认证。
-//
-// 顺序是不变量：覆盖先、认证后。反过来的话，probe_headers 里的一个
-// Authorization 会盖掉 ApplyAuth 刚写的那个 —— 而 probe_headers 是明文 JSON，
-// 等于给这个站开了第二个不受加密保护的 key 来源。
+// applyProbeHeaders applies only the Endpoint credential profile. Recipe
+// rendering has already supplied all non-credential protocol headers.
 func (p *requestPreparer) applyProbeHeaders(ctx context.Context, header http.Header, up *model.Upstream,
 	target outbound.ResolvedTarget) error {
 
-	applyUpstreamHeaderOverrides(header, up)
 	values := target.CredentialValues
 	if values == nil {
 		values = p.values(up)

@@ -64,3 +64,29 @@ func TestSchedulerCannotSendWithoutOrderOrCurrentExpectations(t *testing.T) {
 		})
 	}
 }
+
+type emptyManualPreparer struct{}
+
+func (emptyManualPreparer) PrepareManual(context.Context, *ExecutionRequest) error { return nil }
+
+func TestRunManualRequiresBoundPreparationBeforeSending(t *testing.T) {
+	for _, name := range []string{"missing", "empty"} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int64
+			h := newSchedHarness(t, 1, func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(anthropicSemanticBody()))
+			})
+			svc := manualFixtureService(h.cfg, h.sched)
+			if name == "missing" {
+				svc.manual = nil
+			} else {
+				svc.manual = emptyManualPreparer{}
+			}
+			_, err := svc.RunManual(context.Background(), 100)
+			if err == nil || calls.Load() != 0 {
+				t.Fatalf("unbound manual request: err=%v sends=%d", err, calls.Load())
+			}
+		})
+	}
+}
