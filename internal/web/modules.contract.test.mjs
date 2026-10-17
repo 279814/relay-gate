@@ -18,6 +18,7 @@ const { createApiClient, parseProbeHeadersJSON, field } = await import(pathToFil
 const { createProbeFeature, mergeProbeTabs, probeTabIds } = await import(pathToFileURL(path.join(jsDir, 'probes.mjs')).href);
 const modal = await import(pathToFileURL(path.join(jsDir, 'modal.mjs')).href);
 const { createCountTokensFeature, summarizeCountTokens, countTokensClass } = await import(pathToFileURL(path.join(jsDir, 'count_tokens.mjs')).href);
+const { createCredentialsFeature } = await import(pathToFileURL(path.join(jsDir, 'credentials.mjs')).href);
 
 let failed = 0;
 async function check(name, fn) {
@@ -263,6 +264,40 @@ await check('count_tokens station posture: uniform, mixed, not wired', () => {
   assert.equal(shell.countTokensPosture(99).state, 'none');
   shell.health.routes = routes;
   assert.equal(shell.countTokensPosture(50).state, 'mixed');
+});
+
+await check('Master rotation never sends requests while environment override or status is unknown', async () => {
+  for (const status of [null, { rotation_allowed: false, blocked_reason: 'Run credentials migrate and restart without ENCRYPTION_KEY' }]) {
+    const sent = [];
+    const shell = { displayState: 'running', err: '', msg: '' };
+    createCredentialsFeature(shell, {
+      get: async () => status,
+      post: async (url, body) => { sent.push({ url, body }); return {}; },
+    });
+    shell.credentials.status = status;
+    shell.credentials.new_master = 'fixture-master-input';
+    await shell.rotateMasterKey();
+    assert.equal(sent.length, 0, 'blocked rotation must not send the new master to the API');
+    assert.equal(shell.credentials.new_master, 'fixture-master-input', 'blocked input should remain editable');
+    assert.ok(shell.err.length > 0);
+    if (status) assert.equal(shell.err, status.blocked_reason);
+  }
+});
+
+await check('Master rotation is enabled only by explicit backend allowance', async () => {
+  const sent = [];
+  const shell = { displayState: 'running', err: '', msg: '' };
+  createCredentialsFeature(shell, {
+    get: async () => ({ rotation_allowed: true }),
+    post: async (url, body) => { sent.push({ url, body }); return { phase: 'cleaned', new_key_id: 'fixture-key-id' }; },
+  });
+  await shell.loadCredentials();
+  shell.credentials.new_master = 'fixture-new-master';
+  shell.credentials.password = 'fixture-admin';
+  await shell.rotateMasterKey();
+  assert.deepEqual(sent, [{ url: '/credentials/rotate-master', body: { password: 'fixture-admin', new_master: 'fixture-new-master' } }]);
+  assert.equal(shell.credentials.new_master, '');
+  assert.match(shell.msg, /fixture-key-id/);
 });
 
 if (failed) {

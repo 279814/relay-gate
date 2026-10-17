@@ -70,7 +70,7 @@ func TestRecoverUnfinished_PreparedAbortsWithoutMaintenance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hold, st, err := f.RecoverUnfinished()
+	hold, st, err := f.RecoverUnfinishedValidated("", func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestRecoverUnfinishedAgainst_PreparedCommittedRollsForward(t *testing.T) {
 	if _, err := stale.BeginRotation(newMaster); err != nil {
 		t.Fatal(err)
 	}
-	if _, st, err := stale.RecoverUnfinishedAgainst("some-older-rotation"); err != nil || st.HasPending || st.Phase != PhaseIdle {
+	if _, st, err := stale.RecoverUnfinishedValidated("some-older-rotation", func(string) error { return nil }); err != nil || st.HasPending || st.Phase != PhaseIdle {
 		t.Fatalf("mismatched rotation_id must abort: %+v err=%v", st, err)
 	}
 
@@ -127,11 +127,11 @@ func TestRecoverUnfinishedAgainst_PreparedCommittedRollsForward(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hold, st, err := f.RecoverUnfinishedAgainst(rid)
+	hold, st, err := f.RecoverUnfinishedValidated(rid, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hold || st.HasPending || st.Phase != PhaseKeyActivated {
+	if hold || st.HasPending || st.Phase != PhaseCleaned {
 		t.Fatalf("committed prepared must activate forward: hold=%v %+v", hold, st)
 	}
 	if _, active, err := f.LoadActive(); err != nil || active != newMaster {
@@ -156,7 +156,7 @@ func TestRecoverUnfinished_DBCommittedActivatesForward(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hold, st, err := f.RecoverUnfinished()
+	hold, st, err := f.RecoverUnfinishedValidated(rid, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,8 +166,8 @@ func TestRecoverUnfinished_DBCommittedActivatesForward(t *testing.T) {
 	if st.HasPending {
 		t.Fatalf("pending must not remain unused after activate: %+v", st)
 	}
-	if st.Phase != PhaseKeyActivated {
-		t.Fatalf("phase=%s want key_activated", st.Phase)
+	if st.Phase != PhaseCleaned {
+		t.Fatalf("phase=%s want cleaned", st.Phase)
 	}
 	id, active, err := f.LoadActive()
 	if err != nil || active != newMaster {
@@ -201,7 +201,7 @@ func TestRecoverUnfinished_KeyActivatedMarksCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hold, st, err := f.RecoverUnfinished()
+	hold, st, err := f.RecoverUnfinishedValidated(rid, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

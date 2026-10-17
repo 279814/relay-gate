@@ -160,3 +160,97 @@ func TestRecoverMasterRotation_PreparedWithoutDBCommitAborts(t *testing.T) {
 		t.Fatalf("upstream must still decrypt under old active: err=%v", err)
 	}
 }
+
+func TestRecoverMasterRotation_CorruptCommittedDataCannotActivateOrClean(t *testing.T) {
+	for _, phase := range []keyring.RotationPhase{keyring.PhasePrepared, keyring.PhaseDBCommitted, keyring.PhaseKeyActivated} {
+		t.Run(string(phase), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "relay-gate.db")
+			const oldMaster = "old-master-corruption-fixture"
+			const newMaster = "new-master-corruption-fixture"
+			keys := keyring.Open(dir)
+			if err := keys.EnsureInitialized("initial", oldMaster); err != nil {
+				t.Fatal(err)
+			}
+			cipher, err := store.NewCipher(oldMaster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, err := store.Open(path, cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			u := &model.Upstream{Name: "corruption", BaseURL: "https://fixture.example", APIKey: "sk-corruption-fixture-key", Enabled: true}
+			if err := st.CreateUpstream(u); err != nil {
+				t.Fatal(err)
+			}
+			rid, err := keys.BeginRotation(newMaster)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.RewrapDirectSecrets(newMaster, rid); err != nil {
+				t.Fatal(err)
+			}
+			if phase != keyring.PhasePrepared {
+				if err := keys.MarkDBCommitted(rid); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if phase == keyring.PhaseKeyActivated {
+				if _, err := keys.ActivatePending(rid); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := st.DB().Exec(`UPDATE upstream SET api_key_enc='corrupt-ciphertext' WHERE id=?`, u.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			hold, _, err := recoverMasterRotation(dir, path)
+			if err == nil || !hold {
+				t.Fatalf("corrupt database admitted: hold=%v err=%v", hold, err)
+			}
+			status, err := keys.Status()
+			if err != nil || status.Phase != phase || status.RotationID != rid {
+				t.Fatalf("corrupt recovery advanced its journal: %+v err=%v", status, err)
+			}
+		})
+	}
+}
+
+func TestResealPersistedRelayUnderPending_EncryptsLegacyPlaintext(t *testing.T) {
+	dir := t.TempDir()
+	const oldMaster = "old-master-legacy-relay-fixture"
+	const newMaster = "new-master-legacy-relay-fixture"
+	const relay = "rk-legacy-plaintext-relay-fixture"
+	keys := keyring.Open(dir)
+	if err := keys.EnsureInitialized("initial", oldMaster); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keys.BeginRotation(newMaster); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.WritePersisted(dir, credential.Persisted{FormatVersion: 1, RelayKey: relay, AdminPasswordHash: "fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := resealPersistedRelayUnderPending(keys, dir); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := credential.LoadPersistedFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !credential.IsRelayKeyEnvelope(persisted.RelayKey) {
+		t.Fatal("recovery retained a plaintext relay key instead of resealing it")
+	}
+	cipher, err := store.NewCipher(newMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := credential.OpenPersistedRelayKey(persisted.RelayKey, cipher)
+	if err != nil || plain != relay {
+		t.Fatalf("recovered relay does not open under pending: %v", err)
+	}
+}

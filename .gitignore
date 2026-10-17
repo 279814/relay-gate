@@ -13,6 +13,17 @@ data/
 *.db
 *.db-shm
 *.db-wal
+# RELAY_DB may live outside data/. Backups and restore staging contain the
+# Master Key or old credentials and must stay private at every directory depth.
+backups/
+secrets/
+.secrets-restore-*/
+isolated-*/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.restore-staging
+restore-intent.json*
 
 # 构建产物。必须用 / 锚定到根目录：
 # 无斜杠的 "relay-gate" 会匹配任意层级的同名目录，

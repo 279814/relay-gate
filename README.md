@@ -165,6 +165,8 @@ relay-gate db restore --database /abs/path/data/relay.db \
 
 使用输出要求的配对 image/binary 启动并检查 `/healthz`；恢复会保留原数据库的隔离目录，不要在验证前删除。schema 3→2 需要 manifest 指定的 P0 compatible reader；恢复 schema 1 到 pre-P0 程序会放弃该备份之后的新配置。完整限制见需求基线中的恢复章节。
 
+schema 8 备份将数据库和 `secrets/` 配对保存。轮换之后恢复旧 Master Key 的备份时，可在上述两个命令中显式加 `--use-backup-keyring`，仅使用经 manifest 哈希校验并与数据库配对的归档 active Master；默认仍使用当前配置并在不匹配时拒绝。恢复命令仍需全部数据替换授权。备份中的 `secrets.json` 含真实密钥，应按敏感文件保管。迁移与恢复契约见 [数据密钥与恢复说明](docs/12-数据密钥与恢复.md)。
+
 ## 安全
 
 - 上游 key 和样本正文使用 AES-GCM 加密；路径、脱敏请求头等元数据并非整库加密，管理 API 经授权仍能读出对话原文

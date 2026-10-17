@@ -695,6 +695,11 @@ func TestPrivateProbeArtifactsStayOutOfGitAndDockerContexts(t *testing.T) {
 		filepath.FromSlash("scripts/upstreams.tsv"),
 		filepath.FromSlash("scripts/p0-fixture.local.json"),
 		filepath.FromSlash("docs/02-上游能力矩阵.md"),
+		filepath.FromSlash("custom-runtime/backups/rotation/secrets.json"),
+		filepath.FromSlash("custom-runtime/backups/rotation/database.sqlite"),
+		filepath.FromSlash("custom-runtime/.secrets-restore-fixture/keyring.json"),
+		filepath.FromSlash("custom-runtime/isolated-fixture/secrets/keyring.json"),
+		filepath.FromSlash("custom-runtime/secrets/keyring.json"),
 	}
 	for _, relative := range privatePaths {
 		absolute := filepath.Join(repositoryRoot, relative)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P5 release validation gate（离线）：schema 7 终态、Keyring、备份拒绝门、
+# P5 release validation gate（离线）：schema 8 终态、Keyring、备份拒绝门、
 # 安全扫描不改字节、Transform 未绑定透传、RecoveryGate single-flight、
 # IP 证书续期可观测（fake RenewWatch；不冒充真实公网签发）。
 set -euo pipefail
@@ -32,6 +32,10 @@ for name in forbidden:
     for line in tracked:
         if line == name or line.endswith('/' + name) or line.endswith('\\' + name):
             raise SystemExit(f'tracked forbidden path: {line}')
+for line in tracked:
+    parts = line.replace('\\', '/').split('/')
+    if any(part in ('backups', 'secrets') or part.startswith(('.secrets-restore-', 'isolated-')) for part in parts):
+        raise SystemExit(f'tracked forbidden path: {line}')
 print('ok')
 PY
 

@@ -28,7 +28,7 @@ func TestSchemaSevenLegacyVariants(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if state.Version != 7 {
+			if state.Version != developmentSchemaVersion {
 				t.Fatalf("version=%d fp=%s", state.Version, state.Fingerprint)
 			}
 			t.Logf("fp=%s", state.Fingerprint)

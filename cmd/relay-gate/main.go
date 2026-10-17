@@ -99,6 +99,12 @@ func runServer() error {
 		return err
 	}
 	defer instanceLock.Close()
+	// A restore may have isolated secrets/ immediately before a crash. Finish
+	// installing the verified DB+secrets group before first-run bootstrap can
+	// mistake that intermediate state for a new deployment.
+	if err := store.ResumePendingRestore(dbPath); err != nil {
+		return fmt.Errorf("恢复未完成数据库还原: %w", err)
+	}
 	if err := credential.MaybeBootstrap(dataDir, os.Stdout); err != nil {
 		return fmt.Errorf("首次凭据: %w", err)
 	}
@@ -396,7 +402,8 @@ func runServer() error {
 		WithSecurityCenter(secCenter).
 		WithAlertMailer(mailer).
 		WithTransformRegistry(xform).
-		WithCredentials(credSvc, kr)
+		WithCredentials(credSvc, kr).
+		WithMasterKeyEnvironmentOverride(strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")) != "")
 	if hash, err := credential.LoadAdminHash(dataDir); err == nil {
 		adminAPI = adminAPI.WithAdminHash(hash, dataDir)
 	}

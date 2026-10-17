@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -54,7 +55,7 @@ func createMigrationBackup(ctx context.Context, conn *sql.Conn, databasePath str
 	if databasePath == "" || databasePath == ":memory:" {
 		return result, fmt.Errorf("migration backup requires a file database")
 	}
-	if spec.TargetSchema != spec.SourceSchema+1 || spec.SourceFingerprint == "" || spec.LegacyCipherID == "" {
+	if (spec.TargetSchema != spec.SourceSchema+1 && !(spec.TargetSchema == 8 && spec.SourceSchema == 8 && spec.SourceValidator == "schema-8-data-key-v2")) || spec.SourceFingerprint == "" || spec.LegacyCipherID == "" {
 		return result, fmt.Errorf("migration backup metadata is incomplete")
 	}
 	if err := ctx.Err(); err != nil {
@@ -114,6 +115,9 @@ func createMigrationBackup(ctx context.Context, conn *sql.Conn, databasePath str
 		PairedBuildID:     spec.PairedBuildID,
 		ReaderContract:    spec.ReaderContract,
 		CreatedAt:         createdAt.Format(time.RFC3339Nano),
+	}
+	if err := backupSecrets(filepath.Dir(databasePath), temporaryDirectory, &manifest); err != nil {
+		return result, err
 	}
 	temporaryManifest := filepath.Join(temporaryDirectory, "manifest.json.tmp")
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
@@ -226,12 +230,35 @@ func writeSyncedFile(path string, content []byte, mode os.FileMode) error {
 }
 
 func fileEvidence(path string) (int64, string, error) {
-	content, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return 0, "", fmt.Errorf("读取备份数据库: %w", err)
 	}
-	sum := sha256.Sum256(content)
-	return int64(len(content)), hex.EncodeToString(sum[:]), nil
+	defer file.Close()
+	digest := sha256.New()
+	size, err := io.Copy(digest, file)
+	if err != nil {
+		return 0, "", err
+	}
+	return size, hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// CreateRotationBackup returns one consistent SQLite snapshot paired with the
+// current on-disk credential root. The API closes mutation admission first.
+func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult, error) {
+	state, err := inspectSchemaState(ctx, s.db)
+	if err != nil {
+		return MigrationBackupResult{}, err
+	}
+	if state.Version != 8 {
+		return MigrationBackupResult{}, fmt.Errorf("rotation backup requires schema 8")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return MigrationBackupResult{}, err
+	}
+	defer conn.Close()
+	return createMigrationBackup(ctx, conn, s.path, MigrationBackupSpec{SourceSchema: 8, TargetSchema: 8, SourceFingerprint: state.Fingerprint, LegacyCipherID: s.cipher.KeyID(), SourceValidator: "schema-8-data-key-v2", PairedBuildID: "relay-gate-schema-8-data-key-v2", ReaderContract: "schema-8-data-key-v2-reader"})
 }
 
 func syncDirectory(path string) error {

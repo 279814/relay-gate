@@ -48,10 +48,8 @@ func TestCipherEnvelopeRejectsWrongKeyID(t *testing.T) {
 	}
 }
 
-// TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts pins §12.7 + §5.4:
-// after live Cipher follows key_activated, new sample ciphertext is under the
-// new key-id while envelopes written with the previous master still decrypt
-// (Master Key rotation does not re-encrypt all large samples).
+// Master activation changes wrapping material, while samples keep their
+// independent Data Key and remain readable without any retired Master Key.
 func TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts(t *testing.T) {
 	oldMaster := "old-master-key-aaaaaa"
 	newMaster := "new-master-key-bbbbbb"
@@ -79,8 +77,8 @@ func TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, old.ID).Scan(&rawOld); err != nil {
 		t.Fatal(err)
 	}
-	if !IsSampleEnvelope(rawOld) || !strings.Contains(string(rawOld), "v1:"+oldID+":") {
-		t.Fatalf("pre-rotate envelope want key-id %s, got %q", oldID, rawOld)
+	if !strings.HasPrefix(string(rawOld), "v2:") || strings.Contains(string(rawOld), oldID) {
+		t.Fatalf("pre-rotate sample must use an independent Data Key")
 	}
 
 	if err := st.ActivateMaster(newMaster); err != nil {
@@ -104,11 +102,8 @@ func TestActivateMaster_NewSampleUsesNewKeyOldEnvelopeDecrypts(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT in_body FROM sample_request WHERE id=?`, neu.ID).Scan(&rawNew); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(rawNew), "v1:"+newID+":") {
-		t.Fatalf("post-rotate ciphertext want new key-id %s, got %q", newID, rawNew)
-	}
-	if strings.Contains(string(rawNew), "v1:"+oldID+":") {
-		t.Fatal("post-rotate sample still encrypted under old key (stale live Cipher)")
+	if strings.SplitN(string(rawNew), ":", 3)[1] != strings.SplitN(string(rawOld), ":", 3)[1] {
+		t.Fatal("Master activation changed the independent Sample Data Key")
 	}
 
 	gotOld, err := st.GetSample(old.ID)

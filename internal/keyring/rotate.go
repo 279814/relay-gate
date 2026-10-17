@@ -129,72 +129,89 @@ func (f *File) AbortPrepared(rotationID string) error {
 	return f.writeLocked(doc)
 }
 
-// RecoverUnfinished applies §12.7 startup recovery before admitting traffic.
-//
-// prepared (DB not committed per RecoverUnfinishedAgainst): AbortPrepared —
-// pending deleted, old active kept;
-// HoldMaintenance is false so the gateway may leave maintenance.
-// db_committed: must roll forward via ActivatePending (DB already under new key);
-// HoldMaintenance is false once activation finishes. Never claims rollback.
-// key_activated: MarkCleaned — same finish step the online path uses after
-// activate; new active stays; HoldMaintenance false so traffic is not stuck
-// rejecting while the working new key can decrypt.
-// Idle/cleaned keyrings return HoldMaintenance false with no mutation.
-// Does not log or return key material.
+// RecoverUnfinished inspects a clean keyring without a database verifier.
+// Incomplete rotations fail closed; production recovery supplies the committed
+// database rotation ID and real validator to RecoverUnfinishedValidated.
 func (f *File) RecoverUnfinished() (holdMaintenance bool, st Status, err error) {
 	return f.RecoverUnfinishedAgainst("")
 }
 
-// RecoverUnfinishedAgainst is RecoverUnfinished with the rotation_id SQLite
-// committed alongside the rewrap (§12.7 step 7). prepared whose rotation_id
-// matches dbRotationID means the DB is already under pending, so it rolls
-// forward like db_committed instead of discarding pending.
+// RecoverUnfinishedAgainst retains the original entry point, but incomplete
+// rotations now require RecoverUnfinishedValidated and a real database verifier.
 func (f *File) RecoverUnfinishedAgainst(dbRotationID string) (holdMaintenance bool, st Status, err error) {
+	return f.RecoverUnfinishedValidated(dbRotationID, nil)
+}
+
+// RecoverUnfinishedValidated advances only after the matching master has opened
+// every protected database value. The callback runs without the keyring mutex:
+// database validation must not hold a filesystem/state lock across SQLite I/O.
+// The data-directory instance lock and maintenance admission fence remain the
+// caller's responsibility. Failures retain the last recoverable journal phase.
+func (f *File) RecoverUnfinishedValidated(dbRotationID string, verify func(master string) error) (holdMaintenance bool, st Status, err error) {
 	st, err = f.Status()
 	if err != nil {
 		return false, Status{}, err
 	}
-	if st.Phase == PhasePrepared && st.RotationID != "" && st.RotationID == dbRotationID {
-		if err := f.MarkDBCommitted(st.RotationID); err != nil {
+	if st.Phase == PhaseIdle || st.Phase == PhaseCleaned {
+		return false, st, nil
+	}
+	if verify == nil {
+		return true, st, fmt.Errorf("unfinished rotation requires encrypted-state verification")
+	}
+	if st.Phase == PhasePrepared && st.RotationID != dbRotationID {
+		_, active, err := f.LoadActive()
+		if err != nil {
 			return true, st, err
 		}
-		st.Phase = PhaseDBCommitted
-	}
-	switch st.Phase {
-	case PhasePrepared:
+		if err := verify(active); err != nil {
+			return true, st, fmt.Errorf("verify uncommitted rotation: %w", err)
+		}
 		if err := f.AbortPrepared(st.RotationID); err != nil {
-			return false, st, err
+			return true, st, err
 		}
 		st, err = f.Status()
+		return err != nil, st, err
+	}
+	if st.RotationID == "" || st.RotationID != dbRotationID {
+		return true, st, fmt.Errorf("keyring and database rotation IDs do not match")
+	}
+	if st.Phase == PhasePrepared || st.Phase == PhaseDBCommitted {
+		pending, err := f.LoadPending()
 		if err != nil {
-			return false, Status{}, err
+			return true, st, err
 		}
-		return false, st, nil
-	case PhaseDBCommitted:
-		// Forward only: ciphertext is already under pending; ActivatePending is
-		// the same step the online rotation happy path uses after MarkDBCommitted.
+		if err := verify(pending); err != nil {
+			return true, st, fmt.Errorf("verify committed rotation before activation: %w", err)
+		}
+		if st.Phase == PhasePrepared {
+			if err := f.MarkDBCommitted(st.RotationID); err != nil {
+				return true, st, err
+			}
+			st.Phase = PhaseDBCommitted
+		}
 		if _, err := f.ActivatePending(st.RotationID); err != nil {
 			return true, st, err
 		}
 		st, err = f.Status()
 		if err != nil {
-			return false, Status{}, err
+			return true, Status{}, err
 		}
-		return false, st, nil
-	case PhaseKeyActivated:
-		// Forward finish only: online rotate calls MarkCleaned after activate;
-		// do not invent a verifier or roll back the already-active new key.
+	}
+	if st.Phase == PhaseKeyActivated {
+		_, active, err := f.LoadActive()
+		if err != nil {
+			return true, st, err
+		}
+		if err := verify(active); err != nil {
+			return true, st, fmt.Errorf("verify active rotation before cleanup: %w", err)
+		}
 		if err := f.MarkCleaned(st.RotationID); err != nil {
 			return true, st, err
 		}
 		st, err = f.Status()
-		if err != nil {
-			return false, Status{}, err
-		}
-		return false, st, nil
-	default:
-		return false, st, nil
+		return err != nil, st, err
 	}
+	return true, st, fmt.Errorf("unsupported rotation phase %q", st.Phase)
 }
 
 // LoadPending returns the pending master key during rotation.

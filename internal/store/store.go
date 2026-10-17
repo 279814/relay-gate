@@ -18,6 +18,7 @@ type Store struct {
 	db     *sql.DB
 	cipher *Cipher
 	lock   *instanceLock
+	path   string
 }
 
 // connPragmas 是必须写在 DSN 里的**连接级** pragma。
@@ -152,18 +153,45 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 	// 提前 chmod 会漏掉它们。
 	restrictPerms(dsn)
 
-	return &Store{db: db, cipher: c, lock: lock}, nil
+	st := &Store{db: db, cipher: c, lock: lock, path: databasePath}
+	keys, err := readDataKeys(context.Background(), db, c)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	c.installDataKeys(keys)
+	if err := st.ValidateEncryptedState(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("启动密文全量校验: %w", err)
+	}
+	return st, nil
 }
 
+func (s *Store) DatabasePath() string { return s.path }
+
 // ActivateMaster switches the live Cipher after Keyring key_activated (§12.7).
-// New sample envelopes encrypt under the new key. Enveloped sample bodies are
-// rewrapped in RewrapDirectSecrets so a restart with only the new master still
-// decrypts them; ActivateMaster also retains the prior key for in-process reads.
+// Direct secrets and Data Key wrappers follow the new master; sample/security
+// body keys and ciphertext remain unchanged. Retired masters are retained only
+// until full verification and ForgetRetiredMasterKeys finish the rotation.
 func (s *Store) ActivateMaster(passphrase string) error {
 	if s == nil || s.cipher == nil {
 		return ErrNoKey
 	}
 	return s.cipher.ActivateMaster(passphrase)
+}
+
+// ForgetRetiredMasterKeys is called only after full verification and keyring
+// cleanup. Independent Data Keys continue to open all sample/evidence bodies.
+func (s *Store) ForgetRetiredMasterKeys() {
+	if s == nil || s.cipher == nil {
+		return
+	}
+	s.cipher.mu.Lock()
+	defer s.cipher.mu.Unlock()
+	for i := range s.cipher.previous {
+		s.cipher.previous[i] = retiredMaster{}
+	}
+	s.cipher.previous = nil
 }
 
 func defaultMigrationBackupIdentity() MigrationBackupIdentity {
@@ -181,7 +209,7 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaSeven(ctx, db)
+			return initializeEmptySchemaEight(ctx, db, cipher)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
@@ -210,6 +238,10 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 			if _, err := migrateSchemaSixToSeven(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
 			}
+		case state.Version == 7:
+			if _, err := migrateSchemaSevenToEight(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
 		case state.Version == developmentSchemaVersion:
 			return nil
 		default:
@@ -221,8 +253,8 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 // dbFilePerm 是库文件应有的权限：**只有属主可读写**。
 //
 // 这不是「加固」，是把 §3.6.3d 的承诺落实。库里躺着两类东西：
-// AES-GCM 加密的上游 key，以及**明文的**样本 —— 完整对话原文、
-// 你贴进去的代码、以及请求日志。加密只保护了 key。
+// 上游 Key、Data Key 包装、加密的样本正文，以及仍敏感的路径/头/请求日志元数据。
+// 正文加密不能替代对整个数据库及其 WAL/SHM 的权限保护。
 const dbFilePerm = 0o600
 
 // restrictPerms 把库文件及其 WAL/shm 副产品收到 0600。

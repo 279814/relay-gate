@@ -686,7 +686,8 @@
                   <label>新 Master Key（≥16）</label>
                   <input type="password" x-model="credentials.new_master" autocomplete="new-password">
                 </div>
-                <button class="primary" @click="rotateMasterKey()" :disabled="displayState === 'maintenance'">轮换 Master Key</button>
+                <div class="sub" x-show="credentials.status?.blocked_reason" x-text="credentials.status?.blocked_reason"></div>
+                <button class="primary" @click="rotateMasterKey()" :disabled="!canRotateMasterKey()">轮换 Master Key</button>
               </div>
               <div class="card">
                 <h3>管理员密码</h3>

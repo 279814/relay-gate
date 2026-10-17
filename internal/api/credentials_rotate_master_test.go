@@ -58,7 +58,7 @@ func TestRotateMaster_RewrapsSecretsForRevealAndDecrypt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kr := keyring.Open(filepath.Join(dir, "secrets"))
+	kr := keyring.Open(dir)
 	if err := kr.EnsureInitialized("mk_boot", oldMaster); err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +70,7 @@ func TestRotateMaster_RewrapsSecretsForRevealAndDecrypt(t *testing.T) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := New(st, log).WithCredentials(creds, kr).WithRunState(runCtrl)
+	installRotationWriteBarriers(t, s)
 	h := s.Routes(testAdminPW)
 	sess := loginSession(t, h)
 

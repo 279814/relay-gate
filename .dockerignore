@@ -10,6 +10,15 @@ data/
 *.db
 *.db-shm
 *.db-wal
+**/backups
+**/secrets
+**/.secrets-restore-*
+**/isolated-*
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.restore-staging
+**/restore-intent.json*
 
 # 环境变量：ENCRYPTION_KEY / RELAY_KEYS / ADMIN_PASSWORD 都在这里
 .env

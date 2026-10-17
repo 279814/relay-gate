@@ -117,7 +117,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/transform-bindings", s.listTransformBindings)
 	mux.HandleFunc("GET /admin/api/transform-executions", s.listTransformExecutions)
 
-	guarded := s.requireAdmin(mux)
+	guarded := s.requireAdmin(s.guardMutations(mux))
 
 	// 会话端点挂在鉴权**之外**。
 	//

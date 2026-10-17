@@ -16,4 +16,7 @@ type BackupManifest struct {
 	PairedBuildID     string `json:"paired_build_id"`
 	ReaderContract    string `json:"reader_contract"`
 	CreatedAt         string `json:"created_at"`
+	SecretsFile       string `json:"secrets_file,omitempty"`
+	SecretsSize       int64  `json:"secrets_size,omitempty"`
+	SecretsSHA256     string `json:"secrets_sha256,omitempty"`
 }

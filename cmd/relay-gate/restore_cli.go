@@ -22,6 +22,7 @@ type dbFlags struct {
 	execute               bool
 	acceptDataReplacement bool
 	acceptReaderContract  string
+	useBackupKeyring      bool
 }
 
 func parseDBFlags(args []string) (dbFlags, error) {
@@ -44,6 +45,8 @@ func parseDBFlags(args []string) (dbFlags, error) {
 			f.manifest = strings.TrimPrefix(a, "--manifest=")
 		case a == "--execute":
 			f.execute = true
+		case a == "--use-backup-keyring":
+			f.useBackupKeyring = true
 		case a == "--accept-data-replacement":
 			f.acceptDataReplacement = true
 		case a == "--accept-reader-contract" && i+1 < len(args):
@@ -71,12 +74,17 @@ func runDBCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "restore 需要 --execute --accept-data-replacement --accept-reader-contract <exact>\n")
 		return exitUsage
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(stderr, "加载配置: %v\n", err)
-		return exitFail
+	var cipher *store.Cipher
+	if f.useBackupKeyring {
+		cipher, err = store.CipherFromBackupKeyring(f.database, f.manifest)
+	} else {
+		cfg, loadErr := config.Load()
+		if loadErr != nil {
+			fmt.Fprintf(stderr, "加载配置: %v\n", loadErr)
+			return exitFail
+		}
+		cipher, err = store.NewCipher(cfg.EncKey)
 	}
-	cipher, err := store.NewCipher(cfg.EncKey)
 	if err != nil {
 		fmt.Fprintf(stderr, "打开加密: %v\n", err)
 		return exitFail
