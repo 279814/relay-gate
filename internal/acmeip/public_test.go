@@ -208,8 +208,12 @@ func TestPublicRunClosesAtExpiryBeforeHourlyCheck(t *testing.T) {
 	process := m.process
 	done := make(chan error, 1)
 	go func() { done <- m.Run(ctx) }()
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
 	state := m.Snapshot()
+	for state.Phase != "expired" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		state = m.Snapshot()
+	}
 	// End the fake child before cancelling so the graceful-shutdown wait exits.
 	_ = process.Kill()
 	cancel()

@@ -1,6 +1,6 @@
 module github.com/279814/relay-gate
 
-go 1.26.9
+go 1.27.2
 
 require (
 	github.com/andybalholm/brotli v1.2.6

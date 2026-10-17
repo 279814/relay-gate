@@ -1,6 +1,6 @@
 # Official Certbot 5.8.0 includes IP + webroot support. Runtime capability checks
 # still reject missing IP/profile/plugin support before contacting the ACME CA.
-FROM golang:1.26.9-alpine AS builder
+FROM golang:1.27.2-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 ARG GOPROXY=https://proxy.golang.org,direct

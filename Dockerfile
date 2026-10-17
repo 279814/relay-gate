@@ -7,7 +7,7 @@
 # ── 构建阶段 ─────────────────────────────────────────────
 # 版本与 go.mod 的 toolchain 对齐。写死大版本而不是 latest：
 # 一个能构建的镜像不该因为上游发了新版而在某天早上突然构建不出来。
-FROM golang:1.26.9-alpine AS builder
+FROM golang:1.27.2-alpine AS builder
 
 WORKDIR /src
 
@@ -42,7 +42,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/relay-gate ./cmd/relay-gate
 
 # ── 运行阶段 ─────────────────────────────────────────────
-FROM alpine:3.21
+FROM alpine:3.24
 
 # ca-certificates 是必需的：出站要连公益站的 HTTPS，没有根证书链
 # 一律 x509 校验失败。alpine 基础镜像默认不带它。
