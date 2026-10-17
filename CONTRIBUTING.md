@@ -19,7 +19,7 @@
 
 ## 开发环境
 
-需要 `go.mod` 指定的 Go 版本（当前 1.26.9）。不需要 CGO（SQLite 驱动是纯 Go 的）；Linux CI 的竞态检测需要 CGO。
+需要 `go.mod` 指定的 Go 版本（当前 1.27.2）。不需要 CGO（SQLite 驱动是纯 Go 的）；Linux CI 的竞态检测需要 CGO。
 
 ```bash
 go build ./...
@@ -38,7 +38,7 @@ CI 会跑这些，本地先过一遍能省一个来回：
 ```bash
 gofmt -l .                              # 格式
 go vet ./...                            # 静态检查
-go test -race -count=1 ./...            # 竞态
+go test -race -timeout=20m -count=1 ./... # 竞态，含真实大数据保留 fixture
 node internal/web/bindings.check.js     # 前端绑定（查 x-model 写向不存在的属性）
 node internal/web/app.contract.test.js  # 前端契约
 node --test internal/web/modules.contract.test.mjs  # 前端业务模块契约
