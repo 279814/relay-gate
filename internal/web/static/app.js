@@ -296,6 +296,13 @@ function app() {
       if (form.id) body.expected_revision = form.revision;
       try { return await this.api(form.id ? 'PUT' : 'POST', '/' + resource + (form.id ? '/' + form.id : ''), body); }
       catch (error) {
+		const pending = error.data;
+		if (!form.id && pending?.persisted === true && Number.isSafeInteger(pending.resource_id) && pending.resource_id > 0 && Number.isSafeInteger(pending.revision) && pending.revision > 0) {
+		  // The POST committed. Retain its identity so recovery can compare
+		  // the saved row and never accidentally issue a second create.
+		  form.id = pending.resource_id;
+		  form.revision = pending.revision;
+		}
         if (error.status === 409 || error.data?.persisted) error.message += '。编辑内容已保留，请读取最新配置，比较后选择版本再重试';
         throw error;
       }
