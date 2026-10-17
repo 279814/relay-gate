@@ -173,7 +173,9 @@ class Runtime:
             return database.execute(query, args).fetchall()
 
     def seed(self, upstream_port):
-        upstream = self.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{upstream_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy"}, 201)
+        endpoints = [{"endpoint": kind, "auth_profile": {"mode": "header_bearer", "secret_ref": "upstream_api_key"}}
+                     for kind in ("models", "messages", "responses", "chat_completions", "count_tokens")]
+        upstream = self.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{upstream_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy", "initial_endpoints": endpoints}, 201)
         model = self.api("POST", "/model-names", {"name": "runtime-model", "protocol": "anthropic"}, 201)
         self.api("POST", "/routes", {"upstream_id": upstream["id"], "model_name_id": model["id"], "priority": 1, "weight": 100}, 201)
         body = {"model": "runtime-model", "messages": [{"role": "user", "content": PRIVATE}], "stream": True}
