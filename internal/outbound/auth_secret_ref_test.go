@@ -45,3 +45,21 @@ func TestAuthSecretRefNeverFallsBackOrEchoesResolverErrors(t *testing.T) {
 		t.Fatal("credential resolver error was echoed")
 	}
 }
+
+func TestAuthSecretRefRejectsCredentialsBelowRedactionMinimum(t *testing.T) {
+	for _, size := range []int{model.MinRedactableKeyLen - 1, model.MinRedactableKeyLen} {
+		private := strings.Repeat("x", size)
+		header := inboundHeaders()
+		err := ApplyAuth(context.Background(), header, AuthInput{
+			Profile: model.EndpointAuthProfile{Mode: model.AuthModeBearer, SecretRef: "probe:short-auth"},
+			Values:  staticValues{"SECRET:short-auth": {Plain: []byte(private)}},
+		})
+		if size < model.MinRedactableKeyLen {
+			if !errors.Is(err, ErrAuthConfig) || header.Get("Authorization") != "" || (err != nil && strings.Contains(err.Error(), private)) {
+				t.Fatal("credential below the safe redaction minimum was accepted or exposed")
+			}
+		} else if err != nil || header.Get("Authorization") != "Bearer "+private {
+			t.Fatal("credential at the safe redaction minimum was rejected")
+		}
+	}
+}

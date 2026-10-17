@@ -169,22 +169,8 @@ func TestManualProbeUsesDeclaredCredentialOnceAndRedactsReflectedFailure(t *test
 	if err := h.store.UpdateEndpoint(ep, ep.Revision); err != nil {
 		t.Fatal(err)
 	}
-	cfg, recipes := restoreTestDeps(h.store)
-	if _, err := cfg.Bundle(); err != nil {
-		t.Fatal(err)
-	}
 	secrets := &countedAuthSecretStore{Store: h.store}
-	transports := outbound.NewManager()
-	t.Cleanup(transports.CloseIdleConnections)
-	executor := NewExecutor(outbound.NewProvider(cfg, h.store, outbound.NewResolver(testHasher{})), secrets, recipes,
-		ManagerTransports{Manager: transports}, NewExecutionOnlyRecorder(h.store), AlwaysOpenAdmission(), WallClock(), discardLogger())
-	seq, err := observationseq.Open(context.Background(), h.store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(seq.Close)
-	scheduler := NewScheduler(cfg, nil, health.NewTracker(cfg), nil, discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
-	service := NewService(h.store, executor, nil, cfg, nil, nil).WithManualPreparer(scheduler)
+	service := manualAuthProbeService(t, h, secrets)
 	execution, err := service.RunManual(context.Background(), h.route.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -201,5 +187,85 @@ func TestManualProbeUsesDeclaredCredentialOnceAndRedactsReflectedFailure(t *test
 	}
 	if strings.Contains(execution.RedactedDetail, credential) || strings.Contains(stored.RedactedDetail, credential) {
 		t.Fatal("reflected Probe Secret escaped into manual execution evidence")
+	}
+}
+
+func manualAuthProbeService(t *testing.T, h *trafficHTTPHarness, secrets outbound.SecretSource) *Service {
+	t.Helper()
+	cfg, recipes := restoreTestDeps(h.store)
+	if _, err := cfg.Bundle(); err != nil {
+		t.Fatal(err)
+	}
+	transports := outbound.NewManager()
+	t.Cleanup(transports.CloseIdleConnections)
+	executor := NewExecutor(outbound.NewProvider(cfg, h.store, outbound.NewResolver(testHasher{})), secrets, recipes,
+		ManagerTransports{Manager: transports}, NewExecutionOnlyRecorder(h.store), AlwaysOpenAdmission(), WallClock(), discardLogger())
+	seq, err := observationseq.Open(context.Background(), h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(seq.Close)
+	scheduler := NewScheduler(cfg, nil, health.NewTracker(cfg), nil, discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
+	return NewService(h.store, executor, nil, cfg, nil, nil).WithManualPreparer(scheduler)
+}
+
+func TestShortDeclaredCredentialsNeverReachHTTPUpstream(t *testing.T) {
+	for _, path := range []string{"messages", "count_tokens", "manual"} {
+		t.Run(path, func(t *testing.T) {
+			var received atomic.Int64
+			h := newTrafficHTTPHarness(t, func(http.ResponseWriter, *http.Request) { received.Add(1) })
+			if _, err := h.store.CreateProbeSecret("short-auth", []byte("short-value")); err != nil {
+				t.Fatal(err)
+			}
+			kind := model.EndpointMessages
+			if path == "count_tokens" {
+				kind = model.EndpointCountTokens
+			}
+			ep, err := h.store.Endpoint(context.Background(), h.up.ID, kind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ep.LegacyCompatRealOnly = false
+			ep.AuthProfile = model.EndpointAuthProfile{Mode: model.AuthModeBearer, SecretRef: "probe:short-auth"}
+			if err := h.store.UpdateEndpoint(ep, ep.Revision); err != nil {
+				t.Fatal(err)
+			}
+			cfg := h.manager.cfg.(*livecfg.Source)
+			cfg.Invalidate()
+			if err := cfg.Refresh(); err != nil {
+				t.Fatal(err)
+			}
+			if path == "manual" {
+				execution, err := manualAuthProbeService(t, h, h.store).RunManual(context.Background(), h.route.ID)
+				if err != nil || execution.ErrorClass != model.ErrorConfig || execution.SentAtMS != 0 {
+					t.Fatalf("short credential must produce an unsent config error: class=%s sent=%d err=%v", execution.ErrorClass, execution.SentAtMS, err)
+				}
+			} else {
+				request, err := http.NewRequest(http.MethodPost, h.url+kind.CanonicalPath(), strings.NewReader(`{"model":"claude-cal","messages":[]}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("X-Api-Key", "test-relay-key")
+				response, err := http.DefaultClient.Do(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.Copy(io.Discard, response.Body)
+				response.Body.Close()
+				want := http.StatusServiceUnavailable
+				if kind == model.EndpointCountTokens {
+					want = http.StatusOK
+					if response.Header.Get("X-Relay-Count-Tokens") != "estimated" {
+						t.Fatal("short credential did not use the local token estimate")
+					}
+				}
+				if response.StatusCode != want {
+					t.Fatalf("status=%d want=%d", response.StatusCode, want)
+				}
+			}
+			if received.Load() != 0 {
+				t.Fatal("short credential was sent to the HTTP upstream")
+			}
+		})
 	}
 }

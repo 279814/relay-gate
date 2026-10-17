@@ -202,6 +202,9 @@ func authCredential(ctx context.Context, values ValueResolver, placeholder strin
 		// 用户看到「认证失败」，而真正的问题是「key 没配」。
 		return "", fmt.Errorf("%w: 选定的认证凭据为空", ErrAuthConfig)
 	}
+	if len(resolved.Plain) < model.MinRedactableKeyLen {
+		return "", fmt.Errorf("%w: 认证凭据短于安全脱敏下限 %d", ErrAuthConfig, model.MinRedactableKeyLen)
+	}
 	return string(resolved.Plain), nil
 }
 
