@@ -156,6 +156,46 @@ await check('probe feature lists + filter reset + load more + bad cursor', async
   }
 });
 
+await check('Probe list filters expose the typed HTTP fields and reset cursors', async () => {
+  const expected = {
+    endpoints: ['upstream_id', 'endpoint', 'needs_review'], secrets: ['name_prefix'],
+    executions: ['upstream_id', 'route_id', 'endpoint', 'error_class', 'trigger', 'capability_state'],
+    capabilities: ['upstream_id', 'route_id', 'endpoint', 'state', 'expired'],
+    reachability: ['upstream_id', 'state', 'current'], calibrations: ['route_id', 'endpoint', 'state'],
+    probeCostDaily: ['day_from', 'day_to', 'trigger', 'origin', 'endpoint', 'route_id', 'upstream_id'],
+  };
+  const paths = { endpoints: '/upstream-endpoints', secrets: '/probe-secrets', executions: '/probe-executions', capabilities: '/capabilities', reachability: '/reachability', calibrations: '/calibrations', probeCostDaily: '/probe-costs' };
+  const seen = [];
+  const shell = { err: '' };
+  createProbeFeature(shell, { get: async url => { seen.push(new URL(url, 'http://fixture')); return { items: [], next_cursor: '' }; } });
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  for (const [list, keys] of Object.entries(expected)) {
+    assert.deepEqual(Object.keys(shell[list].filter), keys, list + ' typed fields');
+    assert.deepEqual(shell.probeFilterFields[list].map(field => field.key), keys, list + ' controls');
+    assert.ok(html.includes('probeFilterFields.' + list), list + ' visible filters');
+    shell[list].next_cursor = 'old-filter-cursor';
+    shell[list].items = [{ id: 'old-filter-row' }];
+    shell[list].filter[keys[0]] = 'fixture-selected';
+    shell.onProbeFilterChange(list);
+    assert.equal(shell[list].next_cursor, '');
+    assert.deepEqual(shell[list].items, []);
+    await shell.loadPaged(list, paths[list], true);
+    const request = seen.at(-1);
+    assert.equal(request.searchParams.get(keys[0]), 'fixture-selected');
+    assert.equal(request.searchParams.has('cursor'), false);
+  }
+});
+
+await check('Probe cost rows preserve the complete SQL identity across origins and endpoints', () => {
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  const expression = html.match(/x-for="c in probeCostDaily.items" :key="([^"]+)"/)[1];
+  const key = new Function('c', 'f', 'return ' + expression);
+  const first = { DayUTC: '2099-01-01', Trigger: 'manual', Origin: 'manual', Endpoint: 'messages', RouteID: 1, UpstreamID: 1 };
+  for (const changed of [{ Origin: 'learned' }, { Endpoint: 'count_tokens' }, { UpstreamID: 2 }]) {
+    assert.notEqual(key(first, field), key({ ...first, ...changed }, field));
+  }
+});
+
 await check('capabilityBadge expired is derived stale', () => {
   const shell = {};
   createProbeFeature(shell, createApiClient());
@@ -202,9 +242,17 @@ await check('boot wraps window.app without requiring committed app.js edits', ()
 
 await check('boot wrappers call originals with the reactive this, not bind(shell)', () => {
   const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
-  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp', 'saveUp']) {
+  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp']) {
     assert.ok(!new RegExp(`shell\\.${name}\\.bind\\(shell\\)`).test(boot), name + ' bound to raw shell');
   }
+});
+
+await check('Upstream save uses the explicit classic DTO without intercepting API calls', () => {
+  const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
+  const classic = fs.readFileSync(path.join(staticDir, 'app.js'), 'utf8');
+  assert.ok(!boot.includes('origSaveUp'));
+  assert.ok(!boot.includes('shell.saveUp ='));
+  for (const field of ['probe_mode: f.probe_mode', 'host_override: f.host_override', 'tls_server_name: f.tls_server_name', 'body.initial_endpoints']) assert.ok(classic.includes(field), field);
 });
 
 await check('Secret clear sends empty value', async () => {
@@ -264,6 +312,17 @@ await check('count_tokens station posture: uniform, mixed, not wired', () => {
   assert.equal(shell.countTokensPosture(99).state, 'none');
   shell.health.routes = routes;
   assert.equal(shell.countTokensPosture(50).state, 'mixed');
+});
+
+await check('count_tokens posture identifies a partial health page without inventing no-routes', () => {
+  const shell = {health: {routes: [{route_id: 1, upstream_id: 10, count_tokens: 'supported'}], next_cursor: 'next'}, configPages: {health: {cursor: ''}}, routes: []};
+  createCountTokensFeature(shell);
+  assert.equal(shell.countTokensPosture(10).text, '本页 supported');
+  assert.equal(shell.countTokensPosture(20).state, 'na');
+  assert.equal(shell.countTokensPosture(20).text, '未在本页');
+  shell.health.next_cursor = '';
+  shell.configPages.health.cursor = 'last-page';
+  assert.equal(shell.countTokensPosture(20).state, 'na');
 });
 
 await check('Master rotation never sends requests while environment override or status is unknown', async () => {

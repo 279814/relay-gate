@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/protocol"
 	"github.com/andybalholm/brotli"
 )
 
@@ -28,7 +29,7 @@ type ContentCodingLimits struct {
 var (
 	ErrUnknownContentEncoding   = errors.New("unknown content encoding")
 	ErrEncodedBodyTooLarge      = errors.New("encoded body exceeds limit")
-	ErrDecodedBodyTooLarge      = errors.New("decoded body exceeds limit")
+	ErrDecodedBodyTooLarge      = protocol.ErrDecodedBodyTooLarge
 	ErrContentEncodingTruncated = errors.New("content encoding is truncated")
 	ErrMalformedContentEncoding = errors.New("malformed content encoding")
 	ErrContentDecoderWorkBudget = errors.New("content decoder work budget exceeded")

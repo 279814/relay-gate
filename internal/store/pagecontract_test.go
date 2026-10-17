@@ -132,12 +132,12 @@ func TestListUpstreamsPageContract(t *testing.T) {
 	// 一个 disabled + 一个 Lazy，用来分别验证两个服务端 filter 真的生效。
 	disabled := mkUpstream(t, store, "foxtrot")
 	disabled.Enabled = false
-	if err := store.UpdateUpstream(disabled); err != nil {
+	if err := store.UpdateUpstreamWithRevision(context.Background(), disabled, disabled.Revision); err != nil {
 		t.Fatal(err)
 	}
 	lazy := mkUpstream(t, store, "golf")
 	lazy.ProbeMode = model.ProbeModeLazy
-	if err := store.UpdateUpstream(lazy); err != nil {
+	if err := store.UpdateUpstreamWithRevision(context.Background(), lazy, lazy.Revision); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,7 +243,7 @@ func TestListModelNamesPageContract(t *testing.T) {
 	}
 	openAI := mkModelName(t, store, "gpt-5.6-sol", model.ProtoOpenAIResponses)
 	openAI.Enabled = false
-	if err := store.UpdateModelName(openAI); err != nil {
+	if err := store.UpdateModelNameWithRevision(context.Background(), openAI, openAI.Revision); err != nil {
 		t.Fatal(err)
 	}
 

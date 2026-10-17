@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,12 +26,12 @@ func testForwarder(t *testing.T, to Timeouts) *Forwarder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Forwarder{Transport: tr, Timeouts: to}
+	return &Forwarder{Transport: tr, Timeouts: to, Protocol: model.ProtoAnthropic}
 }
 
 func fastTimeouts() Timeouts {
 	// 测试用的短超时。生产值有 300s 硬下限，测试里不受此限（那是配置层的约束）
-	return Timeouts{Connect: 2 * time.Second, FirstToken: 600 * time.Millisecond,
+	return Timeouts{Connect: 2 * time.Second, ResponseHead: 600 * time.Millisecond, FirstByte: 600 * time.Millisecond, FirstSemantic: 600 * time.Millisecond,
 		Idle: 400 * time.Millisecond, Total: 5 * time.Second}
 }
 
@@ -145,7 +147,7 @@ func TestForward_StreamsIncrementally(t *testing.T) {
 
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
 	f := testForwarder(t, Timeouts{Connect: 2 * time.Second,
-		FirstToken: 2 * time.Second, Idle: 2 * time.Second, Total: 5 * time.Second})
+		FirstSemantic: 2 * time.Second, Idle: 2 * time.Second, Total: 5 * time.Second})
 	res := f.Forward(context.Background(), rec, "POST", up.URL, http.Header{}, []byte("{}"))
 
 	if res.Err != nil {
@@ -168,8 +170,8 @@ type flushRecorder struct {
 func (f *flushRecorder) Flush() { f.flushes++; f.ResponseRecorder.Flush() }
 
 // §6.8 / §8.12：HTTP 200 SSE 在写出内容后出现协议错误事件，不得按 200 判活。
-// Commit 路径必须把错误帧写入 ErrBody，供 classifyReal 拒绝 piggyback。
-func TestCommit_MidStreamSSEErrorCapturesErrBody(t *testing.T) {
+// Commit 保留原始流；健康与重试各自消费同一原始 Decoder 证据。
+func TestCommit_MidStreamSSEErrorPassesThrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -196,19 +198,16 @@ func TestCommit_MidStreamSSEErrorCapturesErrBody(t *testing.T) {
 	if res.Status != 200 {
 		t.Fatalf("status=%d", res.Status)
 	}
-	if len(res.ErrBody) == 0 {
-		t.Fatal("mid-stream SSE error must fill ErrBody for health")
-	}
-	if !IsStructuredErrorPayload(res.ErrBody, "text/event-stream") {
-		t.Fatalf("ErrBody must be structured error, got %q", res.ErrBody)
+	if !rawProtocolError(rec.Body.Bytes(), "text/event-stream") {
+		t.Fatal("mid-stream SSE error must preserve the original structured error")
 	}
 	if !strings.Contains(rec.Body.String(), `"text":"hi"`) {
 		t.Fatalf("client must still receive prior content, body=%q", rec.Body.String())
 	}
 }
 
-// 正文里出现字母 error 的正常 delta 不得填 ErrBody。
-func TestCommit_TextDeltaSpellingErrorLeavesErrBodyEmpty(t *testing.T) {
+// 正文里出现字母 error 的正常 delta 不得变成协议错误。
+func TestCommit_TextDeltaSpellingErrorIsNotProtocolError(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -227,12 +226,13 @@ func TestCommit_TextDeltaSpellingErrorLeavesErrBodyEmpty(t *testing.T) {
 	if at.Failed() {
 		t.Fatalf("Send: %v", at.Result().Err)
 	}
-	res := at.Commit(httptest.NewRecorder())
+	rec := httptest.NewRecorder()
+	res := at.Commit(rec)
 	if res.Err != nil {
 		t.Fatalf("Commit: %v", res.Err)
 	}
-	if len(res.ErrBody) != 0 {
-		t.Fatalf("text spelling \"error\" must not fill ErrBody, got %q", res.ErrBody)
+	if rawProtocolError(rec.Body.Bytes(), "text/event-stream") {
+		t.Fatalf("text spelling \"error\" must not become a protocol error, got %v", rawProtocolError(rec.Body.Bytes(), "text/event-stream"))
 	}
 }
 
@@ -257,7 +257,7 @@ func TestForward_FirstTokenTimeout(t *testing.T) {
 	if !errors.Is(res.Err, ErrFirstTokenTimeout) {
 		t.Fatalf("应返回 ErrFirstTokenTimeout，得到 %v", res.Err)
 	}
-	// 必须真的在 FirstToken 时限内中断，而不是等到 Total
+	// 必须真的在 FirstSemantic 时限内中断，而不是等到 Total
 	if elapsed > 2*time.Second {
 		t.Errorf("应在首 Token 超时（600ms）后立即中断，实际耗时 %v —— "+
 			"超时未生效会让死站一直占住请求", elapsed)
@@ -273,7 +273,7 @@ func TestForward_IdleTimeoutAfterFirstByte(t *testing.T) {
 	release := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		// 必须是 §8.8 语义证据：裸 "data: first" 不能结束 FirstToken。
+		// 必须是 §8.8 语义证据：裸 "data: first" 不能结束 FirstSemantic。
 		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"))
 		w.(http.Flusher).Flush()
 		<-release // 之后再不吐东西
@@ -322,16 +322,21 @@ func TestStreamBody_IdleFiredButClientGoneIsCanceled(t *testing.T) {
 	defer clientCancel()
 	ctx := context.Background() // 不随 clientCancel 结束
 
-	f := &Forwarder{Timeouts: fastTimeouts()}
+	f := &Forwarder{Timeouts: fastTimeouts(), Protocol: model.ProtoAnthropic}
 	res := &Result{
 		Status:      200,
+		SentAt:      time.Now(),
 		RespHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 	}
 	rec := httptest.NewRecorder()
+	at := &Attempt{f: f, res: res, resp: &http.Response{StatusCode: 200, Body: pr}, ctx: ctx, clientCtx: clientCtx,
+		wire: newWireEvidence(f.Protocol, res.RespHeaders, nil)}
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := f.streamBody(ctx, clientCtx, rec, pr, pr, res)
+		stop := at.watchResponse()
+		defer stop()
+		_, err := at.streamBody(rec, pr, false)
 		errCh <- err
 	}()
 
@@ -390,7 +395,7 @@ func TestResult_TTFT(t *testing.T) {
 	}
 }
 
-// 长思考场景：首语义来得很慢，但只要在 FirstToken 时限内就必须放过，
+// 长思考场景：首语义来得很慢，但只要在 FirstSemantic 时限内就必须放过，
 // 之后持续吐 delta 也不能被 Idle 超时打断。这是 5 分钟下限要保护的场景。
 func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 	delta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n")
@@ -399,7 +404,7 @@ func TestForward_ToleratesSlowFirstTokenThenSteadyStream(t *testing.T) {
 		w.WriteHeader(200)
 		fl := w.(http.Flusher)
 		fl.Flush()
-		time.Sleep(350 * time.Millisecond) // 慢，但在 FirstToken(600ms) 内
+		time.Sleep(350 * time.Millisecond) // 慢，但在 FirstSemantic(600ms) 内
 		for i := 0; i < 4; i++ {
 			_, _ = w.Write(delta)
 			fl.Flush()
@@ -454,7 +459,7 @@ func TestForward_LongStreamIsNotTruncated(t *testing.T) {
 
 // 回归测试：响应头阶段的时限绝不能误伤「头回得快、body 吐得慢」的长流。
 //
-// 曾经的写法是给请求套一个 FirstToken 的 context，拿到响应头后再 cancel ——
+// 曾经的写法是给请求套一个 FirstSemantic 的 context，拿到响应头后再 cancel ——
 // 但请求是用那个 context 建的，cancel 会连带取消整个响应体读取，
 // 流当场断在第一块。真实的长思考正是这个形状：头秒回，body 慢慢吐。
 func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
@@ -463,7 +468,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200) // 头立刻回
 		w.(http.Flusher).Flush()
-		// 之后每块都比 FirstToken(300ms) 晚，但都在 Idle(400ms) 之内
+		// 之后每块都比 FirstSemantic(300ms) 晚，但都在 Idle(400ms) 之内
 		for i := 0; i < 6; i++ {
 			time.Sleep(200 * time.Millisecond)
 			_, _ = w.Write(delta)
@@ -484,7 +489,7 @@ func TestForward_HeaderDeadlineDoesNotKillSlowBody(t *testing.T) {
 	}
 }
 
-// 卡在响应头阶段的站要在 FirstToken 时限内识别，而不是等 Total。
+// 卡在响应头阶段的站按 ResponseHead 到期，不等 Total。
 // 这类站在公益站里不罕见：连接建立、请求收下，然后就没有然后了。
 func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 	release := make(chan struct{})
@@ -495,8 +500,8 @@ func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 	defer close(release)
 
 	to := fastTimeouts()
-	to.FirstToken = 300 * time.Millisecond
-	to.Total = 10 * time.Second // 远大于 FirstToken，用来证明不是它兜的底
+	to.ResponseHead = 300 * time.Millisecond
+	to.Total = 10 * time.Second // 远大于 FirstSemantic，用来证明不是它兜的底
 
 	rec := httptest.NewRecorder()
 	f := testForwarder(t, to)
@@ -508,7 +513,7 @@ func TestForward_HeaderPhaseStallHitsFirstTokenBudget(t *testing.T) {
 		t.Errorf("应归类为首 Token 超时，得到 %v", res.Err)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("应在 FirstToken(300ms) 后就放弃，实际等了 %v", elapsed)
+		t.Errorf("应在 FirstSemantic(300ms) 后就放弃，实际等了 %v", elapsed)
 	}
 	// 关键：必须算上游的账，否则死站永远攒不够失败次数
 	if !IsUpstreamFault(res.Err) {
@@ -641,7 +646,7 @@ func TestForward_ClientCancelIsNotUpstreamFault(t *testing.T) {
 	go func() { <-started; cancel() }()
 
 	f := testForwarder(t, Timeouts{Connect: 2 * time.Second,
-		FirstToken: 5 * time.Second, Idle: 5 * time.Second, Total: 10 * time.Second})
+		FirstSemantic: 5 * time.Second, Idle: 5 * time.Second, Total: 10 * time.Second})
 	res := f.Forward(ctx, httptest.NewRecorder(), "POST", up.URL, http.Header{}, []byte("{}"))
 
 	if res.Err == nil {
@@ -679,68 +684,38 @@ func TestIsUpstreamFault(t *testing.T) {
 // 配置确实存进去了、API 也回显了新值，但出站流量还在绕过代理 —— 直到重启。
 // livecfg 每 2 秒刷新配置，这种「看起来生效了其实没有」最难排查。
 //
-// 池的分组规则本身由 outbound.TestManager_PoolIdentityCoversNetworkConfigOnly
-// 覆盖。这条钉的是**接线**：Handler.TransportFor 有没有把 Upstream 的网络
-// 字段真的传进 NetworkConfig —— 漏传一个字段，那个配置在 proxy 层就是死的，
-// 而 outbound 侧的测试看不到这段。
-func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
-	hs := newHarness(t, nil)
-	up := &model.Upstream{ID: 10, Name: "s", BaseURL: "https://x.com",
-		Enabled: true, NetworkRevision: 1}
-	budget := outbound.RealBudget(testSettings())
-
-	tr1, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 同一个 ID，但换了代理地址
-	up.ProxyURL = "http://127.0.0.1:9999"
-	tr2, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr2 == tr1 {
-		t.Error("改了 proxy_url 后应换池，否则流量永远绕过代理")
-	}
-
-	// 配置没变时必须复用 —— 每请求新建会丢掉连接复用，
-	// 对高延迟的公益站等于每次重新 TLS 握手
-	tr3, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr3 != tr2 {
-		t.Error("配置未变时应复用同一个池")
-	}
-
-	// connect 预算是池身份的一部分：真实请求与探活各传自己的值，
-	// 而 TransportFor 必须把它带进 NetworkConfig，否则 l*_connect_sec 是死的。
-	shorter := budget
-	shorter.Connect = 7 * time.Second
-	if tr4, _ := hs.h.TransportFor(up, shorter); tr4 == tr2 {
-		t.Error("改了 connect 预算后应换池")
-	}
-
-	// 其余网络字段同样必须传进去。漏传任何一个，那个配置在 proxy 层就是死的。
-	for _, testCase := range []struct {
-		name  string
-		apply func(*model.Upstream)
-	}{
-		{"tls_server_name", func(u *model.Upstream) { u.TLSServerName = "sni.x.com" }},
-		{"host_override", func(u *model.Upstream) { u.HostOverride = "real.x.com" }},
-		{"network_revision", func(u *model.Upstream) { u.NetworkRevision = 2 }},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			changed := *up
-			testCase.apply(&changed)
-			got, err := hs.h.TransportFor(&changed, budget)
-			if err != nil {
-				t.Fatal(err)
+// Both forwarders must honor a changed proxy through the shared Manager.
+func TestHandler_ProxyChangesAffectActualRequests(t *testing.T) {
+	for _, countTokens := range []bool{false, true} {
+		t.Run(fmt.Sprint(countTokens), func(t *testing.T) {
+			var first, second atomic.Int32
+			body := `{"id":"msg_1","type":"message"}`
+			if countTokens {
+				body = `{"input_tokens":13}`
 			}
-			if got == tr2 {
-				t.Errorf("改了 %s 应换池 —— 说明 TransportFor 没把它传进 NetworkConfig",
-					testCase.name)
+			makeProxy := func(hits *atomic.Int32) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(body))
+				}))
+			}
+			proxyA, proxyB := makeProxy(&first), makeProxy(&second)
+			defer proxyA.Close()
+			defer proxyB.Close()
+			hs := newHarness(t, nil)
+			for _, address := range []string{proxyA.URL, proxyB.URL} {
+				hs.cfg.snap.Upstreams[10].ProxyURL = address
+				request := hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`)
+				if countTokens {
+					request = hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`)
+				}
+				if response := hs.serve(request); response.Code != 200 || response.Body.String() != body {
+					t.Fatalf("changed proxy was not used: %d %s", response.Code, response.Body.String())
+				}
+			}
+			if first.Load() != 1 || second.Load() != 1 {
+				t.Fatalf("proxy hits=%d/%d", first.Load(), second.Load())
 			}
 		})
 	}
@@ -749,8 +724,8 @@ func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
 func TestRealTimeouts(t *testing.T) {
 	s := model.DefaultSettings()
 	to := RealTimeouts(s)
-	if to.FirstToken != 1200*time.Second {
-		t.Errorf("首 Token 应为 1200s，得到 %v", to.FirstToken)
+	if to.FirstSemantic != 1200*time.Second {
+		t.Errorf("首 Token 应为 1200s，得到 %v", to.FirstSemantic)
 	}
 	if to.Idle != 600*time.Second {
 		t.Errorf("Idle 应为 600s，得到 %v", to.Idle)
@@ -761,9 +736,8 @@ func TestRealTimeouts(t *testing.T) {
 	}
 }
 
-// 配置层只卡 real_first_semantic_sec ≥ 300，但 TimeoutsFrom 取各阶段最小值。
-// 短 response_header / first_byte 若原样落入 FirstToken，会把长思考砍到五分钟以下。
-func TestRealTimeouts_ShortHeaderCannotUndercutSemanticFloor(t *testing.T) {
+// Short header/byte limits do not replace the independent semantic deadline.
+func TestRealTimeouts_ShortHeaderAndByteRemainIndependentOfSemantic(t *testing.T) {
 	s := model.DefaultSettings()
 	s.RealResponseHeaderSec = 60
 	s.RealFirstByteSec = 60
@@ -772,19 +746,18 @@ func TestRealTimeouts_ShortHeaderCannotUndercutSemanticFloor(t *testing.T) {
 		t.Fatalf("合法 settings 必须通过校验：%v", err)
 	}
 	to := RealTimeouts(s)
-	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
-	if to.FirstToken != floor {
-		t.Fatalf("FirstToken = %v, want floor %v", to.FirstToken, floor)
+	if to.FirstSemantic != 1200*time.Second || to.ResponseHead != 60*time.Second || to.FirstByte != 60*time.Second {
+		t.Fatalf("independent phases changed: %+v", to)
 	}
 }
 
-// CapTotal 把剩余总预算夹到低于 5 分钟时，不得把 FirstToken 抬过 Total，
-// 否则共享总预算会失真（TestRetry_SharesTotalTimeBudget 依赖这条）。
+// CapTotal clips the effective deadline even when phase settings are longer.
 func TestTimeoutsFrom_CapTotalBelowFloorNotRaised(t *testing.T) {
 	budget := outbound.RealBudget(model.DefaultSettings()).CapTotal(90 * time.Second)
 	to := TimeoutsFrom(budget)
-	if to.FirstToken != 90*time.Second {
-		t.Fatalf("FirstToken = %v, want remaining total 90s (must not raise above CapTotal)", to.FirstToken)
+	deadline, kind := to.pendingDeadline(time.Unix(1, 0), false, time.Time{}, time.Time{}, time.Time{}, false, 0)
+	if !deadline.Equal(time.Unix(1, 0).Add(90*time.Second)) || kind != responseTotalTimeout {
+		t.Fatalf("effective deadline=%v kind=%d, want shared total", deadline, kind)
 	}
 	if to.Total != 90*time.Second {
 		t.Fatalf("Total = %v, want 90s", to.Total)

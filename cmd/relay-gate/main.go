@@ -77,6 +77,10 @@ func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func runServer() error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	readerBuildID, err := store.CurrentReaderBuildID(version)
+	if err != nil {
+		return err
+	}
 
 	// Resolve data dir before Load so first-start can materialize the three
 	// secrets (admin / relay / ENCRYPTION_KEY) via crash-safe bootstrap.
@@ -142,7 +146,7 @@ func runServer() error {
 	if err := credSvc.RestorePersistedGrace(dataDir); err != nil {
 		return fmt.Errorf("恢复 Relay grace: %w", err)
 	}
-	st, err := store.OpenLocked(cfg.DBPath, cipher, instanceLock.db)
+	st, err := store.OpenLockedWithReaderBuildID(cfg.DBPath, cipher, instanceLock.db, readerBuildID)
 	if err != nil {
 		return err
 	}
@@ -154,8 +158,8 @@ func runServer() error {
 	}
 
 	// 启动时读一次运行状态：暂停时重启不应自动跑起来（§4.8）。
-	// 转发路径读的是 livecfg 的缓存视图，这里只为启动日志与首个 /healthz。
-	runState, err := st.GetRunState()
+	// 转发与调度只读 Controller.Current；这里用于初始化协调器与启动日志。
+	runState, _, err := st.GetRunStateWithRevision()
 	if err != nil {
 		return fmt.Errorf("读取运行状态: %w", err)
 	}
@@ -163,7 +167,7 @@ func runServer() error {
 	cfgSrc := livecfg.New(st, log)
 	tracker := health.NewTracker(cfgSrc)
 	reachTracker := health.NewReachabilityTracker(cfgSrc)
-	gate := health.NewUpstreamGate().WithTracker(reachTracker)
+
 	capRegistry := probe.NewCapabilityRegistry(cfgSrc).WithRouteGeneration(tracker)
 	obsReducer := health.NewObservationReducer(nil)
 
@@ -230,7 +234,6 @@ func runServer() error {
 		WithRelayKeyValidator(credSvc).
 		WithTargets(targets, st).
 		WithTransports(transports).
-		WithHealthReporter(probe.NewReporter(tracker).WithCapabilityRegistry(capRegistry)).
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
@@ -246,9 +249,7 @@ func runServer() error {
 	//
 	// 探活成本计数（§5.2d）落库跨重启：纯内存计数在重启后归零，
 	// 「今日 L1 次数」会一天里越报越少 —— 会骗人的计数器比没有更糟。
-	cost := probe.NewCost()
-	costPersister := probe.NewCostPersister(cost, st, log)
-	costPersister.Restore()
+	cost := probe.NewDurableCostView(st)
 
 	// Recipe 四级解析器（§8.2）。探活与 Executor 共用这一份。
 	recipes := probe.NewRecipeResolver(st).WithNotFound(func(err error) bool {
@@ -261,7 +262,7 @@ func runServer() error {
 	// §5.2：重启后匹配当前 Observation Token 的 config_error 继续生效。
 	// 必须在接流量、起探活之前装回，否则首批请求会选中已知配置错误的 Route。
 	// 真实流量 / 校准的 config_error 也以同一 token 落库，下次启动才能装回。
-	capRegistry.WithConfigErrorPersistence(st, cfgSrc, recipes)
+	capRegistry.WithPublishedConfig(cfgSrc, recipes)
 	if n, err := capRegistry.RestoreConfigErrors(context.Background(), st, cfgSrc, recipes); err != nil {
 		return fmt.Errorf("恢复 config_error 能力状态: %w", err)
 	} else if n > 0 {
@@ -270,6 +271,11 @@ func runServer() error {
 	if _, err := capRegistry.RestoreRealSuccesses(context.Background(), st, cfgSrc, recipes); err != nil {
 		return fmt.Errorf("恢复真实成功探活证据: %w", err)
 	}
+	if n, err := reachTracker.RestoreNegatives(context.Background(), st); err != nil {
+		return fmt.Errorf("恢复站级不可达状态: %w", err)
+	} else if n > 0 {
+		log.Info("已恢复站级不可达状态", "rows", n)
+	}
 
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
@@ -277,7 +283,7 @@ func runServer() error {
 		return fmt.Errorf("打开 runstate controller: %w", err)
 	}
 	defer runCtrl.Close()
-	coordinator := probe.NewSyntheticCoordinator(model.RunState(runState))
+	coordinator := probe.NewSyntheticCoordinator(runState)
 
 	resultRecorder := probe.NewResultRecorder(st, obsReducer, reachTracker, capRegistry)
 	executor := probe.NewExecutor(targets, st, recipes,
@@ -285,9 +291,7 @@ func runServer() error {
 		resultRecorder, coordinator,
 		probe.WallClock(), log)
 
-	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
-		WithCost(cost).
-		WithTargets(targets, st).
+	sched := probe.NewScheduler(cfgSrc, tracker, reachTracker, log).
 		WithRecipes(recipes).
 		WithExecutor(executor).
 		WithRunState(runCtrl).
@@ -344,28 +348,33 @@ func runServer() error {
 		Semantic: semanticInv,
 		Inner:    sched,
 		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := st.ListRoutes(0)
+			ids, err := st.RouteIDsOfUpstream(context.Background(), upstreamID)
 			if err != nil {
 				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
 			}
 			return ids
 		},
 		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := st.ListRoutes(modelNameID)
+			ids, err := st.RouteIDsOfModelName(context.Background(), modelNameID)
 			if err != nil {
 				return nil
 			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
-			}
 			return ids
+		},
+		RouteScheduleKey: func(routeID int64) (probe.ScheduleKey, bool) {
+			route, err := st.GetRoute(routeID)
+			if err != nil {
+				return probe.ScheduleKey{}, false
+			}
+			name, err := st.GetModelName(route.ModelNameID)
+			if err != nil {
+				return probe.ScheduleKey{}, false
+			}
+			endpoint, ok := name.Protocol.Endpoint()
+			if !ok {
+				return probe.ScheduleKey{}, false
+			}
+			return probe.ScheduleKey{ScopeType: model.RecipeScopeRoute, ScopeID: routeID, UpstreamID: route.UpstreamID, Endpoint: endpoint}, true
 		},
 		// 删站后没有下一次 Transport() 去换池键，必须主动丢掉该站全部池。
 		DropUpstreamTransports: transports.Invalidate,
@@ -373,10 +382,9 @@ func runServer() error {
 	calibrator.WithInvalidator(inv).WithConfigPublisher(cfgSrc)
 	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv).WithManualPreparer(sched)
 	var bg sync.WaitGroup
-	bg.Add(6)
+	bg.Add(5)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
 	go func() { defer bg.Done(); persister.Run(bgCtx) }()
-	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
 	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
 	go func() { defer bg.Done(); traffic.Run(bgCtx) }()
 	go func() { defer bg.Done(); janitor.Run(bgCtx) }()
@@ -396,8 +404,8 @@ func runServer() error {
 	// routing 快照，使新请求看到新 enabled/路由，不等 livecfg 的 2s TTL。
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
-		WithHealth(tracker, gate, sched).
-		WithCountTokensView(capRegistry).
+		WithHealth(tracker, reachTracker).
+		WithCapabilities(capRegistry).
 		WithCost(cost).
 		WithInvalidator(inv).
 		WithConfigPublisher(cfgSrc).
@@ -448,7 +456,7 @@ func runServer() error {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		state := runCtrl.Current().State
 		if !state.Valid() {
-			state = model.RunState(runState)
+			state = model.RunStatePaused
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)

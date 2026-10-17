@@ -9,7 +9,7 @@ import (
 //
 // 覆盖非流式 message 正文：content:[{type,text|thinking|input}]。
 // 空数组、空字符串、以及无法解析的形状都返回 false。
-// 真实流量 HasSemanticEvidence 与探活 Decoder 必须调用本函数，避免各写一份比较。
+// 统一协议 Decoder 必须调用本函数，避免各写一份比较。
 func AnthropicContentSemantic(raw json.RawMessage) (kind string, ok bool) {
 	var blocks []map[string]json.RawMessage
 	if json.Unmarshal(raw, &blocks) != nil {
@@ -37,7 +37,7 @@ func AnthropicContentSemantic(raw json.RawMessage) (kind string, ok bool) {
 // ResponsesOutputSemantic 报告 Responses output[] 是否携带非空文本 / 拒答 / 参数。
 //
 // 覆盖非流式响应：output[].content[].text|refusal，以及 item.arguments。
-// 真实流量 HasSemanticEvidence 与探活 Decoder 必须调用本函数，避免各写一份比较。
+// 统一协议 Decoder 必须调用本函数，避免各写一份比较。
 func ResponsesOutputSemantic(raw json.RawMessage) (kind string, ok bool) {
 	var items []map[string]json.RawMessage
 	if json.Unmarshal(raw, &items) != nil {

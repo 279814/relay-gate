@@ -101,7 +101,8 @@ func inspectSchemaState(ctx context.Context, db schemaQuerier) (inspectedSchemaS
 		if version > developmentSchemaVersion {
 			return inspectedSchemaState{}, fmt.Errorf("%w: database=%d program=%d", ErrSchemaTooNew, version, developmentSchemaVersion)
 		}
-		if !schemaVersionFingerprintKnown(version, fingerprint) {
+		if !schemaVersionFingerprintKnown(version, fingerprint) &&
+			!(version == 8 && knownSchemaEightWithRetentionIndexes(catalog)) {
 			return inspectedSchemaState{}, fmt.Errorf("%w: version=%d fingerprint=%s", ErrUnknownSchema, version, fingerprint)
 		}
 		return inspectedSchemaState{Version: version, Fingerprint: fingerprint}, nil
@@ -171,7 +172,6 @@ func readSchemaCatalog(ctx context.Context, db schemaQuerier) ([]schemaCatalogRo
 	}
 	defer rows.Close()
 
-	digest := sha256.New()
 	catalog := make([]schemaCatalogRow, 0)
 	for rows.Next() {
 		var row schemaCatalogRow
@@ -180,15 +180,22 @@ func readSchemaCatalog(ctx context.Context, db schemaQuerier) ([]schemaCatalogRo
 		}
 		row.statement = normalizeSchemaStatement(row.statement)
 		catalog = append(catalog, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("遍历数据库结构: %w", err)
+	}
+	return catalog, schemaCatalogFingerprint(catalog), nil
+}
+
+func schemaCatalogFingerprint(catalog []schemaCatalogRow) string {
+	digest := sha256.New()
+	for _, row := range catalog {
 		writeSchemaFingerprintField(digest, row.objectType)
 		writeSchemaFingerprintField(digest, row.name)
 		writeSchemaFingerprintField(digest, row.table)
 		writeSchemaFingerprintField(digest, row.statement)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("遍历数据库结构: %w", err)
-	}
-	return catalog, hex.EncodeToString(digest.Sum(nil)), nil
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 func normalizeSchemaStatement(statement string) string {

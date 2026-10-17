@@ -77,6 +77,20 @@ type AttemptObserverFactory interface {
 // Local configuration failures can still use the earlier instrumentation.
 type AttemptRequestObserver interface{ TryRequest(AttemptRequestView) }
 
+// ResponseProgress is a bounded, read-only summary of original upstream wire.
+// Incomplete means semantic timing is unavailable; it never proves an upstream
+// failure. A compressed response uses the existing observer worker to decode.
+type ResponseProgress struct {
+	FirstSemanticAt time.Time
+	LastSemanticAt  time.Time
+	Incomplete      model.ObserverIncompleteReason
+}
+
+type AttemptResponseProgress interface {
+	ResponseProgress() ResponseProgress
+	ProgressChanges() <-chan struct{}
+}
+
 // AttemptInstrumentation 捆绑 Observer、同步 RetryDecider 与共享 Trace。
 type AttemptInstrumentation struct {
 	Observer AttemptObserver

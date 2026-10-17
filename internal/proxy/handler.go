@@ -12,13 +12,13 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/httpbody"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
-	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -33,7 +33,6 @@ const MaxRequestBody = 32 << 20
 type ConfigSource interface {
 	Snapshot() (*router.Snapshot, error)
 	Settings() (model.Settings, error)
-	RunState() (store.RunState, error)
 }
 
 // SampleSink 接收样本。由 sample.Recorder 实现，可为 nil（关闭样本记录）。
@@ -65,9 +64,6 @@ type Handler struct {
 	// keys 提供出站渲染需要的 Secret 值（固定 query 里的占位符）。可为 nil。
 	keys outbound.SecretSource
 
-	// reporter 接收真实请求的健康结论。可为 nil（不做健康回写）。
-	reporter HealthReporter
-
 	// logs 接收逐次尝试的请求日志。可为 nil（不记日志）。
 	logs LogSink
 
@@ -92,7 +88,7 @@ type Handler struct {
 	// 与探活共用同一个 Manager —— 各建一套就丢掉了连接复用的收益。
 	transports *outbound.Manager
 
-	// runState 是 P0-12 热路径总闸；非 nil 时优先于 cfg.RunState（避 livecfg TTL）。
+	// runState 是唯一热路径总闸；未装配时拒绝真实请求。
 	runState runstate.Reader
 
 	// observers 是 P0-13 真实流量旁路工厂；可为 nil（不观察）。
@@ -105,18 +101,10 @@ type Handler struct {
 	countCaps CountTokensCapability
 }
 
-// CountTokensCapability is the narrow Capability lookup/update used by
-// count_tokens multi-route (§10.3). MarkCountTokensUnsupported records a
-// 404/405; MarkCountTokensConfigError records a 401/403; MarkCountTokensSupported
-// records a 200 with positive input_tokens. All touch that Route's count_tokens
-// only — never model RouteHealth / messages config_error.
-// generation is the RouteHealth generation from select/TryAcquire; callers must
-// pass Candidate.HealthGeneration so stale marks after id reuse are dropped.
+// CountTokensCapability reads committed per-Endpoint capability. State writes
+// belong to the shared traffic observer and ResultRecorder.
 type CountTokensCapability interface {
 	Effective(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind, expectedToken string) model.CapabilityState
-	MarkCountTokensUnsupported(routeID int64, generation uint64, statusCode int)
-	MarkCountTokensConfigError(routeID int64, generation uint64, statusCode int)
-	MarkCountTokensSupported(routeID int64, generation uint64)
 }
 
 // RelayKeyValidator is the hot-path relay auth snapshot (§12.6).
@@ -139,23 +127,6 @@ func (h *Handler) capabilityExcludes(routeID int64, endpoint model.EndpointKind)
 	}
 	state := h.countCaps.Effective(model.RecipeScopeRoute, routeID, endpoint, "")
 	return state == model.CapabilityUnsupported || state == model.CapabilityConfigError
-}
-
-// RouteConfigErrorMarker is the optional Capability write for a route-local
-// Auth Secret failure on real traffic (§6.5 / §7.2). Checked by type assertion
-// on the injected CountTokensCapability so existing implementations keep
-// compiling; without it the Route is still skipped for this request.
-type RouteConfigErrorMarker interface {
-	MarkRouteConfigError(routeID int64, generation uint64, endpoint model.EndpointKind)
-}
-
-func (h *Handler) markRouteConfigError(cand *router.Candidate, endpoint model.EndpointKind) {
-	if cand == nil || cand.Route == nil || !endpoint.Valid() {
-		return
-	}
-	if marker, ok := h.countCaps.(RouteConfigErrorMarker); ok {
-		marker.MarkRouteConfigError(cand.Route.ID, cand.HealthGeneration, endpoint)
-	}
 }
 
 // WithRelayKeyValidator wires live relay-key auth (rotate / grace / revoke).
@@ -241,15 +212,6 @@ func (h *Handler) WithTransports(manager *outbound.Manager) *Handler {
 	if manager != nil {
 		h.transports = manager
 	}
-	return h
-}
-
-// WithHealthReporter 接上真实请求的健康回写（§3.5）。
-//
-// 分成单独的 setter 而不是加构造参数：健康回写是可选的（M2 的测试与
-// 冒烟脚本都不需要它），而 NewHandler 的参数已经有五个了。
-func (h *Handler) WithHealthReporter(r HealthReporter) *Handler {
-	h.reporter = r
 	return h
 }
 
@@ -441,6 +403,7 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	if h.runState != nil {
 		snap := h.runState.Current()
 		if !snap.Admitting() {
+			httpbody.DiscardRejected(w, r)
 			eff := snap.Effective()
 			w.Header().Set("X-Relay-State", eff)
 			w.Header().Set("Retry-After", "60")
@@ -452,19 +415,10 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 			return nil, false
 		}
 	} else {
-		state, err := h.cfg.RunState()
-		if err != nil {
-			h.log.Error("读取运行状态失败", "err", err)
-			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
-			return nil, false
-		}
-		if state == store.StatePaused {
-			w.Header().Set("X-Relay-State", "paused")
-			w.Header().Set("Retry-After", "60")
-			writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",
-				"服务已暂停。在管理界面点「启动」后恢复")
-			return nil, false
-		}
+		httpbody.DiscardRejected(w, r)
+		w.Header().Set("Retry-After", "60")
+		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error", "运行状态控制器未就绪")
+		return nil, false
 	}
 
 	// 3. 读 body。必须整体读入：改 model 要定位偏移量，重试要能重放。
@@ -553,24 +507,6 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 		for _, l := range oc.logs {
 			h.logs.Record(l)
 		}
-	}
-
-	// 9. 健康回写。**这是最快的故障发现路径** —— 探活有周期（dead 状态
-	//    20 秒），真实请求没有延迟，站挂掉那一刻就有请求撞上去（§3.5）。
-	//    放在写错误响应之前：客户端已经在等了，先把状态记下来，
-	//    下一个请求就能绕开这个站。
-	//
-	//    这里回写的是**最终**那次尝试。被丢弃的尝试已经在重试循环里各自
-	//    回写过了（那是 §3.5 要求的「任何失败都立刻回写」）。
-	//
-	//    传 key 是为了脱敏 ErrBody：它会一路流进 route_health.last_error
-	//    并显示在管理界面上，而上游的鉴权错误常把 key 回显在里面（见 viewOf）。
-	if h.reporter != nil {
-		ep, _ := proto.Endpoint()
-		view := viewOf(res, keys, ep)
-		view.CapabilityObserved = h.observers != nil
-		view.HalfOpen = oc.halfOpen
-		h.reporter.ReportResult(oc.cand.Route.ID, oc.cand.HealthGeneration, view)
 	}
 
 	// 转发在写出响应头之前失败时，**必须**由我们回一个错误响应。
@@ -945,15 +881,15 @@ func classifyOutcome(res *Result) model.Outcome {
 	return model.OutcomeOK
 }
 
-// credentialsOf 收齐这次请求涉及的全部凭据，供脱敏使用。
+// credentialsOf 收集入站 Relay Key 与上游基础凭据，供脱敏使用。
 //
 // 两处来源：出站的上游 key 与入站的 relay key。位置清单走
 // inboundCredentials（其内部读 model.AuthHeaders，是唯一来源）——
 // 各列一份的话，新增一个鉴权位置时必然漏掉其中之一，而漏掉的表现是
 // 明文 key 静默落库或进日志，不报错、不失败。
 //
-// 四个消费方共用它：样本落库（recordSample）、健康回写的 ErrBody
-// （viewOf）、count_tokens 的降级日志、被动安全扫描证据脱敏（ObserveJob.Keys）。
+// 各次尝试再补 target.ResolvedSecrets，供样本、响应头、降级日志和安全证据
+// 使用同一份实际凭据列表。
 func (h *Handler) credentialsOf(r *http.Request, cand *router.Candidate) []string {
 	keys := make([]string, 0, len(model.AuthHeaders)+1)
 	keys = append(keys, cand.Upstream.APIKey)
@@ -1001,21 +937,6 @@ func (h *Handler) authOK(r *http.Request) bool {
 		}
 	}
 	return false
-}
-
-// TransportFor 按用途取连接池，供探活共用同一份连接（probe.TransportSource）。
-//
-// 导出是为了让探活与真实请求共享连接池：探活顺带把连接热着，真实请求就省掉
-// 一次 TLS 握手 —— 对高延迟的公益站，握手占首字节的可观比例。各建一套的话
-// 这份收益就没了，还会多出一倍空闲连接。
-//
-// budget 决定用哪个池：connect 预算不同必须不同池（§7.3），因为它是
-// NetworkConfig 的一部分。真实请求、L1、L2、count_tokens 各传自己的预算。
-func (h *Handler) TransportFor(up *model.Upstream, budget outbound.Budget) (*outbound.Transport, error) {
-	if h.transports == nil {
-		return nil, errors.New("未装配连接池管理器")
-	}
-	return h.transports.Transport(outbound.NetworkFor(up.ProbeConfig(), budget.Connect))
 }
 
 // CloseIdleConnections 关闭所有连接池的空闲连接，供优雅关闭调用。

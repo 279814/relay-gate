@@ -368,8 +368,16 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 	if current.Revision != expectedRevision {
 		return ErrRevisionConflict
 	}
+	if sameEndpointConfiguration(*current, *endpoint) {
+		*endpoint = *current
+		endpoint.BoundSecrets, err = loadEndpointBindingMetadata(context.Background(), tx, current.ID)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	endpoint.Revision = current.Revision + 1
-	if reflect.DeepEqual(endpoint.AuthProfile, current.AuthProfile) {
+	if sameEndpointAuthProfile(endpoint.AuthProfile, current.AuthProfile) {
 		endpoint.AuthProfile.Revision = current.AuthProfile.Revision
 	} else {
 		endpoint.AuthProfile.Revision = current.AuthProfile.Revision + 1
@@ -405,6 +413,29 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 		return err
 	}
 	return tx.Commit()
+}
+
+func sameEndpointAuthProfile(left, right model.EndpointAuthProfile) bool {
+	left.Revision, right.Revision = 0, 0
+	if len(left.ManualHeaders) == 0 {
+		left.ManualHeaders = nil
+	}
+	if len(right.ManualHeaders) == 0 {
+		right.ManualHeaders = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func sameEndpointConfiguration(left, right model.UpstreamEndpoint) bool {
+	if !sameEndpointAuthProfile(left.AuthProfile, right.AuthProfile) {
+		return false
+	}
+	left.AuthProfile, right.AuthProfile = model.EndpointAuthProfile{}, model.EndpointAuthProfile{}
+	left.Revision, right.Revision = 0, 0
+	left.CreatedAt, right.CreatedAt = 0, 0
+	left.UpdatedAt, right.UpdatedAt = 0, 0
+	left.BoundSecrets, right.BoundSecrets = nil, nil
+	return reflect.DeepEqual(left, right)
 }
 
 func replaceEndpointSecretRefs(ctx context.Context, tx *sql.Tx, endpoint *model.UpstreamEndpoint) error {

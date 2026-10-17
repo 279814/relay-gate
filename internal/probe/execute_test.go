@@ -2,10 +2,7 @@ package probe
 
 // Recipe 解析结果真的被用来发请求（P0-05 第 11 条的后半）。
 //
-// 为什么这一组必须存在：四级解析在 P0-05 就交付了，但直到本轮之前
-// **没有任何生产调用方** —— Prober 仍在硬拼 body 与头。那种状态下 recipe
-// 的全部测试都是绿的，而用户配的配方对探活毫无影响。这里的断言全部落在
-// 「上游实际收到了什么」上，所以它证明的是那条链路接通了。
+// 断言落在上游实际收到的请求上，确保四级配方解析结果参与唯一的准备路径。
 
 import (
 	"bytes"
@@ -37,9 +34,9 @@ func recordUpstream(t *testing.T) (*httptest.Server, func() (*http.Request, []by
 	return server, func() (*http.Request, []byte) { return got, body }
 }
 
-// proberWithRecipes 造一个装配了指定解析来源的 Prober。
-func proberWithRecipes(source *fakeRecipeSource, secrets *fakeSecretSource) *Prober {
-	prober := &Prober{
+// executorWithRecipes 造一个装配了指定解析来源的 Executor。
+func executorWithRecipes(source *fakeRecipeSource, secrets *fakeSecretSource) *executorProbeHarness {
+	prober := &executorProbeHarness{
 		Transport: http.DefaultTransport,
 		Targets:   testTargets(),
 		Recipes:   testResolver(source),
@@ -82,7 +79,7 @@ func TestL2_UsesPublishedRouteRecipeContent(t *testing.T) {
 		`"probe_marker":"route-recipe"}`)
 	source := &fakeRecipeSource{routeBinding: binding}
 
-	out := proberWithRecipes(source, nil).L2(context.Background(), upstreamFor(server.URL),
+	out := executorWithRecipes(source, nil).L2(context.Background(), upstreamFor(server.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 2}, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
@@ -126,7 +123,7 @@ func TestL2_RendersBoundProbeSecret(t *testing.T) {
 		"tenant": {ID: 11, Plain: []byte("tenant-value"), Revision: 4},
 	}}
 
-	out := proberWithRecipes(source, secrets).L2(context.Background(), upstreamFor(server.URL),
+	out := executorWithRecipes(source, secrets).L2(context.Background(), upstreamFor(server.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 2}, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
@@ -167,7 +164,7 @@ func TestL2_RejectsRecreatedSecretWithoutSendingRequest(t *testing.T) {
 		"tenant": {ID: 12, Plain: []byte("new-value"), Revision: 1},
 	}}
 
-	out := proberWithRecipes(source, secrets).L2(context.Background(), upstreamFor(server.URL),
+	out := executorWithRecipes(source, secrets).L2(context.Background(), upstreamFor(server.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 2}, fastSettings())
 	if out.Verdict == health.VerdictOK {
 		t.Error("身份不匹配的 Secret 不该判成功")
@@ -199,7 +196,7 @@ func TestL2_MissingSecretSourceFailsClosed(t *testing.T) {
 	}
 	source := &fakeRecipeSource{routeBinding: binding}
 
-	out := proberWithRecipes(source, nil).L2(context.Background(), upstreamFor(server.URL),
+	out := executorWithRecipes(source, nil).L2(context.Background(), upstreamFor(server.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 2}, fastSettings())
 	if out.Verdict == health.VerdictOK {
 		t.Error("拿不到 Secret 不该判成功")
@@ -229,7 +226,7 @@ func TestL1_UsesPublishedUpstreamModelsRecipe(t *testing.T) {
 	binding.Version.TimeoutProfile = model.TimeoutL1
 	source := &fakeRecipeSource{upstreamBinding: binding}
 
-	out := proberWithRecipes(source, nil).L1(context.Background(),
+	out := executorWithRecipes(source, nil).L1(context.Background(),
 		upstreamFor(server.URL), fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("L1 未成功: %s（err=%v）", out.Verdict, out.Err)
@@ -260,7 +257,7 @@ func TestL1_RejectsModelPlaceholderWithoutSendingRequest(t *testing.T) {
 	binding.Version.TimeoutProfile = model.TimeoutL1
 	source := &fakeRecipeSource{upstreamBinding: binding}
 
-	out := proberWithRecipes(source, nil).L1(context.Background(),
+	out := executorWithRecipes(source, nil).L1(context.Background(),
 		upstreamFor(server.URL), fastSettings())
 	if out.Verdict == health.VerdictOK {
 		t.Error("L1 没有模型上下文，引用 MODEL_NAME 的配方不该判成功")
@@ -270,37 +267,22 @@ func TestL1_RejectsModelPlaceholderWithoutSendingRequest(t *testing.T) {
 	}
 }
 
-// 探活不装配解析器时仍能用内置模板发请求。
-//
-// 这条保护的是「退化路径仍然正确」：Prober.Recipes 为 nil 时不该 panic、
-// 也不该发一个空请求，而是走 embedded 那一级。
-func TestL2_WithoutResolverFallsBackToBuiltin(t *testing.T) {
+// A missing recipe resolver is an assembly error and must fail before I/O.
+func TestL2_WithoutResolverFailsClosed(t *testing.T) {
 	server, taken := recordUpstream(t)
-
-	prober := &Prober{Transport: http.DefaultTransport, Targets: testTargets()}
-	out := prober.L2(context.Background(), upstreamFor(server.URL),
-		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
-	if out.Verdict != health.VerdictOK {
-		t.Fatalf("未装配解析器时应用内置模板: %s（err=%v）", out.Verdict, out.Err)
-	}
-	_, body := taken()
-	if !bytes.Contains(body, []byte(`"type":"text"`)) {
-		t.Errorf("应发内置 compact 模板的 body，得到 %s", body)
+	executor := &executorProbeHarness{Transport: http.DefaultTransport, Targets: testTargets()}
+	out := executor.L2(context.Background(), upstreamFor(server.URL), modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
+	request, _ := taken()
+	if out.Err == nil || out.Sent || request != nil {
+		t.Fatalf("missing resolver sent or succeeded: outcome=%+v request=%v", out, request)
 	}
 }
 
 // 未装配出站目标解析器时，两级探活都以配置错误结束而**不是 panic**。
 //
-// Prober.Targets 的文档承诺「为 nil 时探活直接失败而不是自己拼一个」，理由是
-// 探活打的地址必须与真实请求完全一致。P0-06 之前这道检查在 Prober.resolve 里，
-// 随那个函数一起被删掉了 —— 于是承诺变成了一次空指针解引用。
-//
-// 为什么这条值得单独钉：探活跑在 Scheduler 起的 goroutine 里，那里没有
-// recover，一个 nil Targets 会**带崩整个网关进程**。而它是可达的 ——
-// probe.Prober 是导出类型，字段也是导出的（crosspath_test 就直接构造它），
-// 装配时漏一个 WithTargets 就是这个形态。
+// Scheduler goroutine中的依赖缺失必须返回配置错误，不能造成空指针崩溃。
 func TestProbeWithoutTargetsFailsAsConfigErrorNotPanic(t *testing.T) {
-	prober := &Prober{Transport: http.DefaultTransport}
+	prober := &executorProbeHarness{Transport: http.DefaultTransport, Recipes: builtinOnlyResolver()}
 	upstream := upstreamFor("http://127.0.0.1:1")
 
 	t.Run("L1", func(t *testing.T) {
@@ -325,56 +307,32 @@ func TestProbeWithoutTargetsFailsAsConfigErrorNotPanic(t *testing.T) {
 	})
 }
 
-// 已发布的 HEAD models 配方**不能**把 L1 变成「任何响应都算通」。
-//
-// 「只探连接层」这个语义由 l1_path 为空定义（§4.1 给那些连 /v1/models 都会
-// 报错的站留的退路），而不是由请求方法定义。两者在迁移出来的站上会分开：
-// `backfillLegacyModelsRecipe` 在 l1_path 为空时物化一份 method=HEAD 的
-// models 配方，而用户之后在界面上把 l1_path 改成 /v1/models 时，
-// `UpdateUpstream` 只重译 url_override —— 那份不可变的配方仍然是 HEAD。
-//
-// 于是若判据看的是方法，这个站的 L1 会对 500 / 401 一律判通：站级门禁
-// （gate.OK）放行，L2 接着往一个明显已死的站上烧 token，而界面显示健康。
-// ModelName 与 Route 全都正常，没有任何地方能看出问题。
-func TestL1_HeadRecipeStillClassifiesStatusWhenL1PathIsSet(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
+// The immutable recipe alone selects the method. HTTP failure remains reachable.
+func TestL1_HeadRecipeClassifiesStatusIndependentlyOfLegacyPath(t *testing.T) {
+	var method string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { method = r.Method; w.WriteHeader(500) }))
 	defer server.Close()
-
 	binding := testBinding(8, 80, 4, "HEAD")
 	binding.Recipe.Endpoint = model.EndpointModels
-	source := &fakeRecipeSource{upstreamBinding: binding}
-
-	upstream := upstreamFor(server.URL) // L1Path = "/v1/models"
-	out := proberWithRecipes(source, nil).L1(context.Background(), upstream, fastSettings())
-
-	if out.Verdict == health.VerdictOK {
-		t.Error("l1_path 非空时 500 必须判不可用 —— " +
-			"「只探连接层」由 l1_path 为空定义，不由配方的方法定义")
+	executor := executorWithRecipes(&fakeRecipeSource{upstreamBinding: binding}, nil)
+	out := executor.L1(context.Background(), upstreamFor(server.URL), fastSettings())
+	if method != "HEAD" || out.Verdict == health.VerdictOK || !executor.Last.Execution.Reachable || executor.Last.Execution.StatusCode != 500 {
+		t.Fatalf("HEAD recipe/status evidence: method=%s outcome=%+v execution=%+v", method, out, executor.Last.Execution)
 	}
 }
 
-// l1_path 为空时仍然是连接层探测：任何响应都算通。
-//
-// 与上一条互为反向：判据换成 l1_path 之后，这条必须仍然成立，
-// 否则那些「连 /v1/models 都报错」的站会被判死（§4.1 的退路）。
-func TestL1_EmptyL1PathIgnoresStatusEvenWithGetRecipe(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
+func TestL1_EmptyLegacyPathCannotOverrideGetRecipe(t *testing.T) {
+	var method, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { method, path = r.Method, r.URL.Path; w.WriteHeader(500) }))
 	defer server.Close()
-
 	binding := testBinding(8, 80, 4, "GET")
 	binding.Recipe.Endpoint = model.EndpointModels
-	source := &fakeRecipeSource{upstreamBinding: binding}
-
-	upstream := upstreamFor(server.URL)
-	upstream.L1Path = ""
-	out := proberWithRecipes(source, nil).L1(context.Background(), upstream, fastSettings())
-
-	if out.Verdict != health.VerdictOK {
-		t.Errorf("空 l1_path 只探连接层，500 也算通，得到 %s（err=%v）", out.Verdict, out.Err)
+	up := upstreamFor(server.URL)
+	up.L1Path = ""
+	executor := executorWithRecipes(&fakeRecipeSource{upstreamBinding: binding}, nil)
+	out := executor.L1(context.Background(), up, fastSettings())
+	if method != "GET" || path != "/v1/models" || out.Verdict == health.VerdictOK || !executor.Last.Execution.Reachable || executor.Last.Execution.ErrorClass != model.ErrorTransient {
+		t.Fatalf("legacy field changed recipe or status: method=%s path=%s outcome=%+v execution=%+v", method, path, out, executor.Last.Execution)
 	}
 }
 
@@ -387,7 +345,7 @@ func TestProbeSessionIDDiffersPerProbe(t *testing.T) {
 		{Name: "X-Session", Values: []string{"{{SESSION_ID}}"}},
 	}
 	source := &fakeRecipeSource{routeBinding: binding}
-	prober := proberWithRecipes(source, nil)
+	prober := executorWithRecipes(source, nil)
 
 	seen := map[string]bool{}
 	for range 3 {

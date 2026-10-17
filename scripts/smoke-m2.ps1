@@ -89,19 +89,22 @@ func main() {
 
     # ── 配置：1 个上游 + 1 个 ModelName + 1 条 Route ──
     Write-Host "`n配置..." -ForegroundColor Cyan
+    $initialEndpoints = foreach ($kind in @('models','messages','responses','chat_completions','count_tokens')) {
+        @{ endpoint = $kind; auth_profile = @{ mode = 'x_api_key'; secret_ref = 'upstream_api_key' } }
+    }
     $up = Invoke-RestMethod -Method Post 'http://127.0.0.1:18888/admin/api/upstreams' `
         -Headers $admin -ContentType 'application/json' -Body (@{
-            name = 'fake'; base_url = 'http://127.0.0.1:19999'
+            name = 'fake'; base_url = 'http://127.0.0.1:19999'; initial_endpoints = $initialEndpoints
             api_key = 'sk-fake-upstream-key'; enabled = $true
-        } | ConvertTo-Json)
+        } | ConvertTo-Json -Depth 8)
     $mn = Invoke-RestMethod -Method Post 'http://127.0.0.1:18888/admin/api/model-names' `
         -Headers $admin -ContentType 'application/json' -Body (@{
             name = 'claude-opus-5'; protocol = 'anthropic'; enabled = $true
-        } | ConvertTo-Json)
+        } | ConvertTo-Json -Depth 8)
     Invoke-RestMethod -Method Post 'http://127.0.0.1:18888/admin/api/routes' `
         -Headers $admin -ContentType 'application/json' -Body (@{
             model_name_id = $mn.id; upstream_id = $up.id; enabled = $true
-        } | ConvertTo-Json) | Out-Null
+        } | ConvertTo-Json -Depth 8) | Out-Null
 
     # GET 回显必须脱敏，否则管理接口就是个 key 泄露口子
     $got = Invoke-RestMethod "http://127.0.0.1:18888/admin/api/upstreams/$($up.id)" -Headers $admin

@@ -65,7 +65,7 @@ func TestUpstreamCRUD(t *testing.T) {
 
 	got.Name = "sta-renamed"
 	got.APIKey = "" // 空 = 不改 key
-	if err := st.UpdateUpstream(got); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), got, got.Revision); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := st.GetUpstream(u.ID)
@@ -77,7 +77,7 @@ func TestUpstreamCRUD(t *testing.T) {
 	}
 
 	after.APIKey = "sk-rotated-key-value"
-	if err := st.UpdateUpstream(after); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), after, after.Revision); err != nil {
 		t.Fatal(err)
 	}
 	rotated, _ := st.GetUpstream(u.ID)
@@ -89,7 +89,7 @@ func TestUpstreamCRUD(t *testing.T) {
 	maskedEcho := MaskKey(rotated.APIKey)
 	rotated.Name = "sta-mask-echo"
 	rotated.APIKey = maskedEcho
-	if err := st.UpdateUpstream(rotated); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), rotated, rotated.Revision); err != nil {
 		t.Fatal(err)
 	}
 	afterMask, err := st.GetUpstream(u.ID)
@@ -107,7 +107,10 @@ func TestUpstreamCRUD(t *testing.T) {
 			afterMask.CredentialRevision, rotated.CredentialRevision)
 	}
 
-	if err := st.DeleteUpstream(u.ID); err != nil {
+	if err := st.DeleteUpstreamWithRevision(context.Background(), u.ID, u.Revision); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale creation revision must not delete updated row: %v", err)
+	}
+	if err := st.DeleteUpstreamWithRevision(context.Background(), u.ID, afterMask.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.GetUpstream(u.ID); !errors.Is(err, ErrNotFound) {
@@ -139,7 +142,7 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 
 	short := strings.Repeat("x", model.MinRedactableKeyLen-1)
 	u.APIKey = short
-	err := st.UpdateUpstream(u)
+	err := st.UpdateUpstreamWithRevision(context.Background(), u, u.Revision)
 	if err == nil {
 		t.Fatal("短于下限的 api_key 应被拒绝")
 	}
@@ -156,7 +159,7 @@ func TestUpstreamAPIKeyRejectsShorterThanMinRedactable(t *testing.T) {
 
 	exact := strings.Repeat("y", model.MinRedactableKeyLen)
 	u.APIKey = exact
-	if err := st.UpdateUpstream(u); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), u, u.Revision); err != nil {
 		t.Fatalf("恰好下限长度应接受：%v", err)
 	}
 	got, err = st.GetUpstream(u.ID)
@@ -253,8 +256,8 @@ func TestRouteForeignKeyEnforced(t *testing.T) {
 	}
 }
 
-// 删除 ModelName 应级联删掉它的 Route，否则会留下悬挂绑定。
-func TestCascadeDelete(t *testing.T) {
+// 删除主体必须先显式处理独立 Route，不能把引用当作隐式删除授权。
+func TestModelNameDeleteRequiresExplicitRouteCleanup(t *testing.T) {
 	st := testStore(t)
 	u := mkUpstream(t, st, "sta")
 	m := mkModelName(t, st, "m1", model.ProtoAnthropic)
@@ -263,22 +266,31 @@ func TestCascadeDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteModelName(m.ID); err != nil {
+	if err := st.DeleteModelNameWithRevision(context.Background(), m.ID, m.Revision); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("external Route deletion must conflict: %v", err)
+	}
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("refused parent deletion removed Route")
+	}
+	if err := st.DeleteRouteWithRevision(context.Background(), r.ID, r.Revision); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetRoute(r.ID); !errors.Is(err, ErrNotFound) {
-		t.Errorf("ModelName 删除后其 Route 应级联消失，得到 %v", err)
+	if err := st.DeleteModelNameWithRevision(context.Background(), m.ID, m.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetModelName(m.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatal("empty parent deletion failed")
 	}
 }
 
-func TestListRoutesFilter(t *testing.T) {
+func TestRoutePagesFilterAndUseStableIdentityOrder(t *testing.T) {
 	st := testStore(t)
 	u1 := mkUpstream(t, st, "s1")
 	u2 := mkUpstream(t, st, "s2")
 	m1 := mkModelName(t, st, "m1", model.ProtoAnthropic)
 	m2 := mkModelName(t, st, "m2", model.ProtoOpenAIChat)
 
-	// m1 下两条，优先级刻意倒序插入，验证返回时按 priority 升序
+	// 优先级刻意倒序插入；管理页按稳定 ID，运行时快照另行按 priority 选路。
 	for _, spec := range []struct {
 		mn, up   int64
 		priority int
@@ -294,24 +306,23 @@ func TestListRoutesFilter(t *testing.T) {
 		}
 	}
 
-	all, err := st.ListRoutes(0)
+	allPage, err := st.ListRoutesPage(context.Background(), model.RouteFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 3 {
-		t.Fatalf("应返回全部 3 条，得到 %d", len(all))
+	if len(allPage.Items) != 3 {
+		t.Fatalf("应返回全部 3 条，得到 %d", len(allPage.Items))
 	}
 
-	only, err := st.ListRoutes(m1.ID)
+	onlyPage, err := st.ListRoutesPage(context.Background(), model.RouteFilter{ModelNameID: m1.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(only) != 2 {
-		t.Fatalf("m1 下应有 2 条，得到 %d", len(only))
+	if len(onlyPage.Items) != 2 {
+		t.Fatalf("m1 下应有 2 条，得到 %d", len(onlyPage.Items))
 	}
-	if only[0].Priority != 1 || only[1].Priority != 2 {
-		t.Errorf("应按 priority 升序返回（与选路顺序一致），得到 %d,%d",
-			only[0].Priority, only[1].Priority)
+	if onlyPage.Items[0].Priority != 2 || onlyPage.Items[1].Priority != 1 || onlyPage.Items[0].ID >= onlyPage.Items[1].ID {
+		t.Fatal("管理页未保持稳定 ID 次序或丢失 priority")
 	}
 }
 
@@ -319,33 +330,33 @@ func TestSettingsPersistence(t *testing.T) {
 	st := testStore(t)
 
 	// 未初始化时返回默认值，让首次启动不依赖初始化步骤
-	got, err := st.GetSettings()
+	got, settingsRevision, err := st.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RealFirstTokenSec != 1200 {
-		t.Errorf("首次读取应得默认 1200，得到 %d", got.RealFirstTokenSec)
+	if got.RealFirstSemanticSec != 1200 {
+		t.Errorf("首次读取应得默认 1200，得到 %d", got.RealFirstSemanticSec)
 	}
 
-	got.RealFirstTokenSec = 900
+	got.RealFirstSemanticSec = 900
 	got.SampleEnabled = false
-	if err := st.SaveSettings(got); err != nil {
+	if settingsRevision, err = st.SaveSettingsWithRevision(got, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	back, _ := st.GetSettings()
-	if back.RealFirstTokenSec != 900 || back.SampleEnabled {
+	if back.RealFirstSemanticSec != 900 || back.SampleEnabled {
 		t.Errorf("设置未正确持久化：%+v", back)
 	}
 
 	// 低于硬下限必须被拒，且库里的值保持不变
 	bad := back
-	bad.RealFirstTokenSec = 60
-	if err := st.SaveSettings(bad); !errors.Is(err, model.ErrValidation) {
+	bad.RealFirstSemanticSec = 60
+	if _, err := st.SaveSettingsWithRevision(bad, settingsRevision); !errors.Is(err, model.ErrValidation) {
 		t.Fatalf("低于 300s 应被拒绝，得到 %v", err)
 	}
 	unchanged, _ := st.GetSettings()
-	if unchanged.RealFirstTokenSec != 900 {
-		t.Errorf("校验失败不应写入，库中值变成了 %d", unchanged.RealFirstTokenSec)
+	if unchanged.RealFirstSemanticSec != 900 {
+		t.Errorf("校验失败不应写入，库中值变成了 %d", unchanged.RealFirstSemanticSec)
 	}
 }
 
@@ -355,7 +366,7 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 	st := testStore(t)
 	// 模拟旧版本只存了一个字段
 	if _, err := st.DB().Exec(
-		`INSERT INTO setting (key, value, updated_at) VALUES ('settings', '{"real_idle_sec":123}', 0)`,
+		`UPDATE setting SET value='{"real_idle_sec":123}',updated_at=0 WHERE key='settings'`,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -366,9 +377,9 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 	if got.RealIdleSec != 123 {
 		t.Errorf("已存字段应读出，得到 %d", got.RealIdleSec)
 	}
-	if got.RealFirstTokenSec != 1200 {
+	if got.RealFirstSemanticSec != 1200 {
 		t.Errorf("缺失字段应回落默认 1200，得到 %d（若为 0 说明升级会破坏配置）",
-			got.RealFirstTokenSec)
+			got.RealFirstSemanticSec)
 	}
 	if !got.SampleEnabled {
 		t.Error("缺失的 bool 也应回落默认（true）")
@@ -389,23 +400,23 @@ func TestSettingsMergesDefaultsForMissingFields(t *testing.T) {
 func TestRunStatePersistence(t *testing.T) {
 	st := testStore(t)
 
-	got, err := st.GetRunState()
+	got, revision, err := st.GetRunStateWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != StateRunning {
+	if got != model.RunStateRunning {
 		t.Errorf("默认应为 running，得到 %q", got)
 	}
 
-	if err := st.SetRunState(StatePaused); err != nil {
+	if revision, err = st.SetRunStateWithRevision(model.RunStatePaused, revision); err != nil {
 		t.Fatal(err)
 	}
 	// 暂停状态必须持久化：暂停时重启不应自动跑起来（§4.8）
-	if got, _ := st.GetRunState(); got != StatePaused {
+	if got, _, _ := st.GetRunStateWithRevision(); got != model.RunStatePaused {
 		t.Errorf("暂停状态应持久化，得到 %q", got)
 	}
 
-	if err := st.SetRunState("bogus"); !errors.Is(err, model.ErrValidation) {
+	if _, err := st.SetRunStateWithRevision("bogus", revision); !errors.Is(err, model.ErrValidation) {
 		t.Errorf("非法状态应被拒绝，得到 %v", err)
 	}
 }
@@ -418,11 +429,11 @@ func TestNotFoundOnMissingRows(t *testing.T) {
 	if _, err := st.GetModelName(999); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetModelName: 得到 %v", err)
 	}
-	if err := st.DeleteRoute(999); !errors.Is(err, ErrNotFound) {
+	if err := st.DeleteRouteWithRevision(context.Background(), 999, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("DeleteRoute: 得到 %v", err)
 	}
-	if err := st.UpdateUpstream(&model.Upstream{
-		ID: 999, Name: "x", BaseURL: "https://a.com", APIKey: "k"}); !errors.Is(err, ErrNotFound) {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), &model.Upstream{
+		ID: 999, Name: "x", BaseURL: "https://a.com", APIKey: "k"}, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateUpstream: 得到 %v", err)
 	}
 }
@@ -430,16 +441,16 @@ func TestNotFoundOnMissingRows(t *testing.T) {
 // 空列表必须序列化成 [] 而不是 null，否则前端要多写一处判空。
 func TestEmptyListsAreNotNil(t *testing.T) {
 	st := testStore(t)
-	ups, err := st.ListUpstreams()
-	if err != nil || ups == nil {
+	ups, err := st.ListUpstreamsPage(context.Background(), model.UpstreamFilter{})
+	if err != nil || ups.Items == nil {
 		t.Errorf("ListUpstreams 空结果应为非 nil 切片，得到 %v %v", ups, err)
 	}
-	mns, err := st.ListModelNames()
-	if err != nil || mns == nil {
+	mns, err := st.ListModelNamesPage(context.Background(), model.ModelNameFilter{})
+	if err != nil || mns.Items == nil {
 		t.Errorf("ListModelNames 空结果应为非 nil 切片")
 	}
-	rts, err := st.ListRoutes(0)
-	if err != nil || rts == nil {
+	rts, err := st.ListRoutesPage(context.Background(), model.RouteFilter{})
+	if err != nil || rts.Items == nil {
 		t.Errorf("ListRoutes 空结果应为非 nil 切片")
 	}
 }
@@ -503,10 +514,8 @@ func TestForeignKeysOnEveryConn(t *testing.T) {
 	}
 }
 
-// ON DELETE CASCADE 必须真的生效：删 ModelName 要连带清掉它的 Route。
-// 这是上一条的另一面 —— 外键失效时级联也失效，而级联失效的症状是
-// 「删了模型，选路里还留着一堆悬挂 Route」。
-func TestDeleteModelNameCascadesRoutes(t *testing.T) {
+// 业务删除不借 CASCADE 清除外部 Route，显式清理后才允许删除空主体。
+func TestModelNameDeleteDoesNotCascadeExternalRoutes(t *testing.T) {
 	st := testStore(t)
 	up := mkUpstream(t, st, "s1")
 	mn := mkModelName(t, st, "m1", model.ProtoAnthropic)
@@ -517,23 +526,23 @@ func TestDeleteModelNameCascadesRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteModelName(mn.ID); err != nil {
+	if err := st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("external Route deletion must conflict: %v", err)
+	}
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("refused parent deletion removed Route")
+	}
+	if err := st.DeleteRouteWithRevision(context.Background(), r.ID, r.Revision); err != nil {
 		t.Fatal(err)
 	}
-	rs, err := st.ListRoutes(0) // 0 = 不筛 ModelName，列全部
-	if err != nil {
+	if err := st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision); err != nil {
 		t.Fatal(err)
 	}
-	for _, got := range rs {
-		if got.ID == r.ID {
-			t.Fatal("删除 ModelName 后它的 Route 仍在（ON DELETE CASCADE 未生效）")
-		}
+	if _, err := st.GetModelName(mn.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatal("empty parent deletion failed")
 	}
 }
 
-// DeleteModelName archives child-route recipes in the same transaction as the
-// DELETE. A RESTRICT pin that blocks CASCADE must roll the archive back so a
-// still-living ModelName does not lose its published route recipe.
 func TestDeleteModelName_RollbackKeepsChildRouteRecipes(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -567,7 +576,7 @@ func TestDeleteModelName_RollbackKeepsChildRouteRecipes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = st.DeleteModelName(mn.ID)
+	err = st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision)
 	if err == nil {
 		t.Fatal("DeleteModelName must fail while calibration_run pins the route")
 	}

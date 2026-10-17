@@ -49,6 +49,11 @@ export function summarizeCountTokens(routes, upstreamID) {
 export function createCountTokensFeature(shell) {
   shell.countTokensPosture = function countTokensPosture(upstreamID) {
     const sum = summarizeCountTokens((this.health && this.health.routes) || [], upstreamID);
+    const partial = !!(this.health?.next_cursor || this.configPages?.health?.cursor);
+    if (partial) {
+      if (sum.state === 'none') return {state: 'na', text: '未在本页', counts: {}, detail: '当前健康页不含该站路由，可按上游 ID 筛选健康页面', routes: []};
+      return {...sum, text: '本页 ' + sum.text, detail: '仅统计当前健康页\n' + sum.detail};
+    }
     if (sum.state === 'none' && (this.routes || []).some((r) => r.upstream_id === upstreamID)) {
       return { state: 'na', text: '—', counts: {}, detail: '健康看板未加载', routes: [] };
     }

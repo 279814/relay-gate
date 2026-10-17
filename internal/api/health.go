@@ -1,14 +1,11 @@
 package api
 
 import (
-	"context"
 	"net/http"
-	"time"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
-	"github.com/279814/relay-gate/internal/router"
 )
 
 // HealthView 暴露每个 Route 的健康状态。由 health.Tracker 实现。
@@ -17,39 +14,37 @@ type HealthView interface {
 	Status(routeID int64) health.Status
 }
 
-// GateView 暴露站级 L1 结论。由 health.UpstreamGate 实现。
-type GateView interface {
-	Status(upstreamID int64) health.UpstreamStatus
-	StatusAt(upstreamID, networkRevision int64) health.UpstreamStatus
+// ReachabilityView exposes committed evidence; it owns no legacy L1 status map.
+type ReachabilityView interface {
+	Snapshot(int64) *model.UpstreamReachability
+	Effective(int64, int64) model.ReachabilityState
 }
 
-// Prober 执行手动探活。由 probe.Scheduler 实现。
-type Prober interface {
-	ProbeNow(ctx context.Context, snap *router.Snapshot,
-		rt *model.Route) (l1, l2 probe.Outcome, err error)
-}
-
-// CountTokensView 暴露 Route 级 count_tokens 的 effective Capability。
-// 由 probe.CapabilityRegistry 实现；与 proxy 选 count_tokens Route 时读的是同一个值
-// （过期、配置 revision 不匹配都回落 unknown），界面不另行推断。
-type CountTokensView interface {
+// CapabilityView exposes the same current endpoint evidence read by routing.
+// A health page never substitutes a separately loaded UI capability page.
+type CapabilityView interface {
 	Effective(scope model.RecipeScope, scopeID int64,
 		endpoint model.EndpointKind, expectedToken string) model.CapabilityState
 }
 
-var _ CountTokensView = (*probe.CapabilityRegistry)(nil)
+var _ CapabilityView = (*probe.CapabilityRegistry)(nil)
 
 // WithHealth 接上健康看板与手动探活。分成单独的 setter，理由同 WithRuntime：
 // 这些属于探活链路，而 api.Server 的主职责是配置 CRUD。
-func (s *Server) WithHealth(hv HealthView, gate GateView, prober Prober) *Server {
-	s.healthView, s.gate, s.prober = hv, gate, prober
+func (s *Server) WithHealth(hv HealthView, reach ReachabilityView) *Server {
+	s.healthView, s.reachability = hv, reach
 	return s
 }
 
-// WithCountTokensView 让健康看板每行带上该 Route 的 count_tokens Capability。
-// 未接入时字段省略，界面显示「—」而不是伪装成 unknown。
-func (s *Server) WithCountTokensView(v CountTokensView) *Server {
-	s.countTokensView = v
+func (s *Server) WithManualProbeRunner(runner ManualProbeRunner) *Server {
+	s.manualRunner = runner
+	return s
+}
+
+// WithCapabilities wires model and count_tokens observations from one registry.
+// Missing wiring is represented by absent fields, rather than invented unknown.
+func (s *Server) WithCapabilities(v CapabilityView) *Server {
+	s.capabilities = v
 	return s
 }
 
@@ -78,6 +73,9 @@ type healthRow struct {
 	Reason     string `json:"reason,omitempty"`
 
 	CountTokens model.CapabilityState `json:"count_tokens,omitempty"`
+	Endpoint    model.EndpointKind    `json:"endpoint,omitempty"`
+	Capability  model.CapabilityState `json:"capability,omitempty"`
+	ProbeMode   model.ProbeMode       `json:"probe_mode"`
 
 	Health health.Status         `json:"health"`
 	L1     health.UpstreamStatus `json:"l1"`
@@ -91,66 +89,87 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mns, err := s.st.ListModelNames()
+	page, err := configPage(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	ups, err := s.st.ListUpstreams()
+	enabled, err := configEnabled(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	routes, err := s.st.ListRoutes(0)
+	modelID, err := configIDFilter(r, "model_name_id")
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
 
-	mnByID := make(map[int64]*model.ModelName, len(mns))
-	for _, mn := range mns {
-		mnByID[mn.ID] = mn
+	upstreamID, err := configIDFilter(r, "upstream_id")
+	if err != nil {
+		s.writeErr(w, err)
+		return
 	}
-	upByID := make(map[int64]*model.Upstream, len(ups))
-	for _, up := range ups {
-		upByID[up.ID] = up
+	metadata, err := s.configAdmin.ListRouteMetadata(r.Context(), model.RouteFilter{PageRequest: page, Enabled: enabled, ModelNameID: modelID, UpstreamID: upstreamID})
+	if err != nil {
+		s.writeErr(w, err)
+		return
 	}
-
-	rows := make([]healthRow, 0, len(routes))
-	for _, rt := range routes {
+	rows := make([]healthRow, 0, len(metadata.Items))
+	for _, entry := range metadata.Items {
+		rt := &entry.Route
 		st := s.healthView.Status(rt.ID)
 		row := healthRow{
 			RouteID: rt.ID, ModelNameID: rt.ModelNameID, UpstreamID: rt.UpstreamID,
 			Priority: rt.Priority, Weight: rt.Weight, Enabled: rt.Enabled,
 			State: st.State, Health: st,
+			ModelName: entry.ModelName, Upstream: entry.UpstreamName,
+			ProbeMode: entry.UpstreamProbeMode,
 		}
-		if mn := mnByID[rt.ModelNameID]; mn != nil {
-			row.ModelName = mn.Name
+		row.Endpoint, _ = entry.ModelProtocol.Endpoint()
+		var up *model.Upstream
+		if entry.UpstreamExists {
+			up = &model.Upstream{ID: rt.UpstreamID, Name: entry.UpstreamName, Enabled: entry.UpstreamEnabled, NetworkRevision: entry.UpstreamNetworkRevision}
 		}
-		up := upByID[rt.UpstreamID]
-		if up != nil {
-			row.Upstream = up.Name
-		}
-		if s.gate != nil {
-			if up != nil {
-				row.L1 = s.gate.StatusAt(rt.UpstreamID, up.NetworkRevision)
-			} else {
-				row.L1 = s.gate.Status(rt.UpstreamID)
+		row.L1 = health.UpstreamStatus{UpstreamID: rt.UpstreamID, OK: true}
+		if s.reachability != nil && up != nil {
+			state := s.reachability.Effective(up.ID, up.NetworkRevision)
+			row.L1.OK = state != model.ReachabilityUnreachable
+			row.L1.Probed = state != model.ReachabilityUnknown
+			if evidence := s.reachability.Snapshot(up.ID); evidence != nil && row.L1.Probed {
+				row.L1.LastError = evidence.LastError
+				row.L1.LastAt = max(evidence.LastOKAt, evidence.LastErrorAt)
 			}
 		}
 		row.Selectable, row.Reason = selectability(rt, up, st)
-		if s.countTokensView != nil {
-			row.CountTokens = s.countTokensView.Effective(model.RecipeScopeRoute, rt.ID,
+		if !entry.ModelExists {
+			row.Selectable = false
+			row.Reason = "ModelName 已不存在"
+		} else if !entry.ModelEnabled {
+			row.Selectable = false
+			row.Reason = "ModelName 已手动停用"
+		}
+		if row.Selectable && !row.L1.OK {
+			row.Selectable = false
+			row.Reason = "Upstream 网络不可达"
+		}
+		if s.capabilities != nil {
+			row.CountTokens = s.capabilities.Effective(model.RecipeScopeRoute, rt.ID,
 				model.EndpointCountTokens, "")
+			if row.Endpoint != "" {
+				row.Capability = s.capabilities.Effective(model.RecipeScopeRoute, rt.ID, row.Endpoint, "")
+			}
 		}
 		rows = append(rows, row)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"routes": rows,
-		"summary": map[string]int{
+		"routes":      rows,
+		"next_cursor": metadata.NextCursor,
+		"summary": map[string]any{
 			"total":      len(rows),
 			"selectable": countSelectable(rows),
+			"scope":      "page",
 		},
 	})
 }
@@ -191,116 +210,30 @@ func countSelectable(rows []healthRow) int {
 	return n
 }
 
-// probeRoute 手动探活一个 Route（§4.5：UI 手动点「测试」，结果直接展示）。
-//
-// P0-14：优先走 ManualProbeRunner（恰好一次 manual execution）；
-// 未装配时回落旧 ProbeNow compatibility adapter。
+// probeRoute delegates exactly one manual execution to the configured service.
+// The service owns the validated timeout profile, admission and persistence.
 func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), manualProbeTimeout)
-	defer cancel()
-
-	if s.probeAdmin != nil {
-		exec, err := s.probeAdmin.RunManual(ctx, id)
-		if err != nil {
-			s.writeErr(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"execution_id": exec.ID,
-			"execution":    redactExecutionDetail(exec, s.knownUpstreamRedactKeys()),
-			"ok":           exec.Success,
-		})
+	runner := s.manualRunner
+	if runner == nil && s.probeAdmin != nil {
+		runner = s.probeAdmin
+	}
+	if runner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"手动探活服务未装配"})
 		return
 	}
-
-	if s.prober == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errBody{"探活未启用"})
-		return
-	}
-	rt, err := s.st.GetRoute(id)
+	execution, err := runner.RunManual(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-
-	mns, err := s.st.ListModelNames()
-	if err != nil {
-		s.writeErr(w, err)
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
 		return
 	}
-	ups, err := s.st.ListUpstreams()
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	routes, err := s.st.ListRoutes(0)
-	if err != nil {
-		s.writeErr(w, err)
-		return
-	}
-	snap := router.BuildSnapshot(mns, ups, routes)
-
-	l1, l2, err := s.prober.ProbeNow(ctx, snap, rt)
-	if err != nil {
-		s.writeErr(w, model.WrapValidation("%v", err))
-		return
-	}
-
-	// L1 失败时 ProbeNow 直接返回，l2 是**零值**（§4.1：站都连不上，
-	// 探模型只是白等一次超时）。
-	//
-	// 而 health.Verdict 的零值恰好是 VerdictOK（iota 的第一个），
-	// 直接序列化会报成 `"l2": {"verdict": "ok"}` —— 界面上就成了
-	// 「L1 失败但 L2 成功」，一个自相矛盾、且让人无法判断能不能用的结论。
-	//
-	// 所以显式区分「未执行」与「执行了且成功」。判据用 l1 而不是给
-	// Outcome 加一个 executed 字段：ProbeNow 的契约就是「L1 不通就不探 L2」，
-	// 在这里复述它比在探活热路径上多带一个字段干净。
-	body := map[string]any{
-		"route_id": id,
-		"l1":       outcomeJSON(l1),
-		"state":    s.healthStateOf(id),
-	}
-	if l1.Verdict == health.VerdictOK {
-		body["l2"] = outcomeJSON(l2)
-	} else {
-		body["l2"] = nil
-		body["l2_skipped"] = "L1 未通过，已跳过 L2（站连不上时探模型只是白等一次超时）"
-	}
-	writeJSON(w, http.StatusOK, body)
-}
-
-// manualProbeTimeout 是手动探活的上限。
-//
-// 比 L2 的 150s 留一点余量：ProbeNow 是 L1 + L2 串行，两者各有自己的
-// 超时，这个值只是防止整体挂住。
-const manualProbeTimeout = 200 * time.Second
-
-// outcomeJSON 把探活结果转成前端友好的形状。
-func outcomeJSON(o probe.Outcome) map[string]any {
-	m := map[string]any{
-		"verdict": o.Verdict.String(),
-		"status":  o.Status,
-		"ttft_ms": o.TTFT.Milliseconds(),
-	}
-	if o.Err != nil {
-		m["error"] = o.Err.Error()
-	}
-	if o.RetryAfter > 0 {
-		m["retry_after_s"] = int(o.RetryAfter.Seconds())
-	}
-	return m
-}
-
-func (s *Server) healthStateOf(routeID int64) model.HealthState {
-	if s.healthView == nil {
-		return model.StateUnknown
-	}
-	return s.healthView.Status(routeID).State
+	writeJSON(w, http.StatusOK, map[string]any{"execution_id": execution.ID, "execution": redactExecutionDetail(execution, keys), "ok": execution.Success})
 }

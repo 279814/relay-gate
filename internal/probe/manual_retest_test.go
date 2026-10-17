@@ -74,7 +74,7 @@ func TestRunManual_RetestReplacesConfigErrorOnlyOnNewResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(seq.Close)
-	sched := NewScheduler(cfg, nil, health.NewTracker(nil), nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
+	sched := NewScheduler(cfg, health.NewTracker(nil), nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
 		WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
 	svc := NewService(st, executor, nil, settingsSnap{}, nil, nil).WithManualPreparer(sched)
 

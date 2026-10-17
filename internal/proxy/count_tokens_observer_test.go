@@ -19,11 +19,6 @@ type countAttemptObserver struct {
 	finish   health.AttemptFinish
 }
 
-type observedResultReporter struct{ view *ResultView }
-
-func (r *observedResultReporter) ReportResult(_ int64, _ uint64, view *ResultView) { r.view = view }
-func (r *observedResultReporter) TriggerProbe(int64)                               {}
-
 func (o *countAttemptObserver) PrepareAttempt(_ context.Context, target health.AttemptTarget, _ health.AttemptRequestView) health.AttemptInstrumentation {
 	o.target = target
 	return health.AttemptInstrumentation{Observer: o}
@@ -76,17 +71,13 @@ func TestModelError_ObserverReceivesBoundedErrorAndOwnsCapability(t *testing.T) 
 		_, _ = w.Write([]byte(body))
 	})
 	observer := &countAttemptObserver{}
-	reporter := &observedResultReporter{}
-	hs.h.WithObservers(observer).WithHealthReporter(reporter)
+	hs.h.WithObservers(observer)
 	response := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`))
 	if response.Code != 404 || response.Body.String() != body {
 		t.Fatalf("upstream response changed: %d %s", response.Code, response.Body.String())
 	}
 	if string(observer.body) != body || observer.finished != 1 {
 		t.Fatalf("model error not observed: %+v", observer)
-	}
-	if reporter.view == nil || !reporter.view.CapabilityObserved {
-		t.Fatal("Reporter did not yield Capability ownership to observer")
 	}
 }
 

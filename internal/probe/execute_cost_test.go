@@ -14,7 +14,7 @@ func TestPreparedProbe_CostUsesRenderedOutputUpperBound(t *testing.T) {
 			binding.Version.Body = []byte(`{"model":"{{UPSTREAM_MODEL}}","` + field + `":1025,"messages":[{"role":"user","content":"{{PROBE_PROMPT}}"}]}`)
 			mn := modelNameFor(model.ProtoAnthropic)
 			mn.ProbeMaxTokens = 1
-			prepared, _, err := proberWithRecipes(&fakeRecipeSource{routeBinding: binding}, nil).prepare(context.Background(), upstreamFor("http://localhost"), mn, &model.Route{ID: 2}, model.EndpointMessages)
+			prepared, _, err := (&requestPreparer{Targets: testTargets(), Recipes: testResolver(&fakeRecipeSource{routeBinding: binding})}).prepare(context.Background(), upstreamFor("http://localhost"), mn, &model.Route{ID: 2}, model.EndpointMessages)
 			if err != nil {
 				t.Fatal(err)
 			}

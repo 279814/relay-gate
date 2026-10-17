@@ -37,6 +37,13 @@ function app() {
     upstreams: [],
     modelNames: [],
     routes: [],
+  configPages: {
+    health: {cursor: '', next: '', history: [], limit: 25, enabled: '', upstream_id: '', model_name_id: ''},
+    upstreams: {cursor: '', next: '', history: [], limit: 25, enabled: '', probe_mode: ''},
+    'model-names': {cursor: '', next: '', history: [], limit: 25, enabled: '', protocol: ''},
+    routes: {cursor: '', next: '', history: [], limit: 25, enabled: '', upstream_id: '', model_name_id: ''},
+  },
+  configNames: {upstreams: {}, 'model-names': {}},
     samples: [],
     samplesTotal: 0,
     sampleFilter: { outcome: '' },
@@ -51,12 +58,15 @@ function app() {
     expandedLogs: {},
 
     settings: null,
+    settingsModuleReady: false,
     limits: {},
 
     upForm: null,
     mnForm: null,
     rtForm: null,
     sample: null,
+    sampleAccess: null,
+    samplePassword: '',
     hdrExport: null,
     probeResult: null,
     probing: 0,
@@ -127,6 +137,7 @@ function app() {
         // 探活未启用时几个端点回 503，那是「功能没接」不是「出错了」——
         // 按中文子串匹配来区分的话，后端改一次文案前端就误报。
         e.status = r.status;
+    e.data = data;
         throw e;
       }
       return data;
@@ -197,6 +208,8 @@ function app() {
       this.upstreams = [];
       this.modelNames = [];
       this.routes = [];
+    for (const page of Object.values(this.configPages)) { page.cursor = ''; page.next = ''; page.history = []; page.request = (page.request || 0) + 1; }
+    this.configNames = {upstreams: {}, 'model-names': {}};
       this.samples = [];
       this.samplesTotal = 0;
       // 请求日志同样要清。它含 model 名、站名、失败原因 —— 那是运营信息，
@@ -213,6 +226,9 @@ function app() {
       this.mnForm = null;
       this.rtForm = null;
       this.sample = null;
+      this.sampleAccess = null;
+      this.samplePassword = '';
+      this._unlockModal?.();
       this.hdrExport = null;
       this.probeResult = null;
       this.tab = 'health';
@@ -223,30 +239,99 @@ function app() {
     async loadAll() {
       await this.run(async () => {
         // 并发拉取。串行的话首屏要等 6 个往返。
-        const [st, ups, mns, rts] = await Promise.all([
-          this.api('GET', '/state'),
-          this.api('GET', '/upstreams'),
-          this.api('GET', '/model-names'),
-          this.api('GET', '/routes'),
+        await Promise.all([
+          this.refreshState?.(),
+          this.loadConfigPage('upstreams', 'reset'),
+          this.loadConfigPage('model-names', 'reset'),
+          this.loadConfigPage('routes', 'reset'),
         ]);
-        this.running = st.state === 'running';
-        this.upstreams = ups || [];
-        this.modelNames = mns || [];
-        this.routes = rts || [];
       });
       await this.loadHealth();
       await this.loadSettings();
     },
 
+    async loadConfigPage(resource, direction) {
+      const page = this.configPages[resource];
+    const request = (page.request || 0) + 1;
+    page.request = request;
+      let cursor = page.cursor, history = [...page.history];
+      if (direction === 'reset') { cursor = ''; history = []; }
+      else if (direction === 'next') { if (!page.next) return; history.push(cursor); cursor = page.next; }
+      else if (direction === 'prev') { if (!history.length) return; cursor = history.pop(); }
+      const query = new URLSearchParams({limit: String(page.limit)});
+      if (cursor) query.set('cursor', cursor);
+      for (const key of ['enabled', 'probe_mode', 'protocol', 'upstream_id', 'model_name_id']) {
+        if (page[key] !== undefined && page[key] !== '') query.set(key, String(page[key]));
+      }
+      const result = await this.api('GET', '/' + resource + '?' + query);
+    if (request !== page.request) return;
+      if (resource === 'health') {
+        const routes = [...(result.routes || [])].sort((a, b) =>
+          ((a.model_name_id || 0) - (b.model_name_id || 0)) || (a.priority - b.priority) || (a.route_id - b.route_id));
+        this.health = {...result, routes};
+        page.cursor = cursor; page.history = history; page.next = result.next_cursor || '';
+        return;
+      }
+      const field = {'upstreams': 'upstreams', 'model-names': 'modelNames', 'routes': 'routes'}[resource];
+      this[field] = result.items;
+      page.cursor = cursor; page.history = history; page.next = result.next_cursor || '';
+      if (resource !== 'routes') for (const row of result.items) this.configNames[resource][row.id] = row;
+      else {
+        const missing = [];
+        for (const [kind, key] of [['upstreams', 'upstream_id'], ['model-names', 'model_name_id']]) {
+          for (const id of new Set(result.items.map(row => row[key]))) if (!this.configNames[kind][id]) {
+            missing.push(this.api('GET', '/' + kind + '/' + id).then(row => { this.configNames[kind][id] = row; }));
+          }
+        }
+        await Promise.all(missing);
+      }
+    },
+
+    async pageConfig(resource, direction) { await this.run(() => this.loadConfigPage(resource, direction)); },
+
+    configOptions(resource, selected) {
+      const rows = resource === 'upstreams' ? this.upstreams : this.modelNames;
+      const retained = this.configNames[resource][selected];
+      return retained && !rows.some(row => row.id === selected) ? [retained, ...rows] : rows;
+    },
+
+    async refreshConfigForm(resource, field) {
+      const form = this[field];
+      await this.run(async () => { form._latest = await this.api('GET', '/' + resource + '/' + form.id); });
+    },
+
+    acceptConfigRevision(field) {
+      const form = this[field];
+      if (form._latest) { form.revision = form._latest.revision; delete form._latest; }
+    },
+
+    async saveConfigRequest(resource, form, body) {
+      if (form.id) body.expected_revision = form.revision;
+      try { return await this.api(form.id ? 'PUT' : 'POST', '/' + resource + (form.id ? '/' + form.id : ''), body); }
+      catch (error) {
+		const pending = error.data;
+		if (!form.id && pending?.persisted === true && Number.isSafeInteger(pending.resource_id) && pending.resource_id > 0 && Number.isSafeInteger(pending.revision) && pending.revision > 0) {
+		  // The POST committed. Retain its identity so recovery can compare
+		  // the saved row and never accidentally issue a second create.
+		  form.id = pending.resource_id;
+		  form.revision = pending.revision;
+		}
+        if (error.status === 409 || error.data?.persisted) error.message += '。编辑内容已保留，请读取最新配置，比较后选择版本再重试';
+        throw error;
+      }
+    },
+
     async loadHealth() {
+      const page = this.configPages.health;
+      const healthLoad = this.loadConfigPage('health');
+      const request = page.request;
       try {
-        const [h, rt] = await Promise.all([
-          this.api('GET', '/health'),
-          this.api('GET', '/runtime'),
+        await Promise.all([
+          healthLoad,
+          this.api('GET', '/runtime').then(rt => { if (request === page.request) this.runtime = rt || {}; }),
         ]);
-        this.health = h || {};
-        this.runtime = rt || {};
       } catch (e) {
+        if (request !== page.request) return;
         // 503 = 探活未启用，那不是错误，其余页面照常可用（api.Server 在
         // healthView 为 nil 时刻意回 503 而不是让整个管理接口不可用）。
         // 按状态码判断而不是匹配错误文案 —— 后端改一次措辞就会让匹配失效。
@@ -256,11 +341,8 @@ function app() {
     },
 
     async loadSettings() {
-      try {
-        const s = await this.api('GET', '/settings');
-        this.settings = s.settings;
-        this.limits = s.limits || {};
-      } catch (e) { this.err = e.message; }
+      // The revision-aware module supplies this method before Alpine boots.
+      this.settings = null;
     },
 
     async loadCost() {
@@ -410,32 +492,22 @@ function app() {
       if (tab === 'reqlogs' && !this.reqLogs.length) this.loadReqLogs();
       if (tab === 'cost') this.loadCost();
       if (tab === 'health') this.loadHealth();
+    const resource = {upstreams: 'upstreams', models: 'model-names', routes: 'routes'}[tab];
+    if (resource) this.pageConfig(resource);
     },
 
     // ── 总闸（§4.8）───────────────────────────────────
 
-    async toggleState() {
-      const next = this.running ? 'paused' : 'running';
-      const { ok } = await this.run(
-        () => this.api('POST', '/state', { state: next }),
-        next === 'paused'
-          ? '已暂停：新请求返回 503，探活全停。进行中的流式对话会正常收完'
-          : '已恢复：全部 Route 置 unknown 并立即重新探活',
-      );
-      if (ok) {
-        this.running = next === 'running';
-        this.loadHealth();
-      }
-    },
+    async toggleState() { this.err = '状态模块未就绪，请刷新页面'; },
 
     // ── 上游 CRUD ────────────────────────────────────
 
     editUp(u) {
       if (!u) {
         this.upForm = {
-          name: '', base_url: '', api_key: '', auth_style: 'auto',
-          l1_path: '/v1/models', proxy_url: '', enabled: true,
-          full_url_mode: false, probe_headers_raw: '',
+          name: '', base_url: '', api_key: '', proxy_url: '', enabled: true,
+      probe_mode: 'active', host_override: '', tls_server_name: '',
+      initial_endpoints: ['models', 'messages', 'responses', 'chat_completions', 'count_tokens'].map(endpoint => ({endpoint, url_override: '', fixed_query_template: '', auth_profile: {mode: endpoint === 'messages' || endpoint === 'count_tokens' ? 'x_api_key' : 'header_bearer', secret_ref: 'upstream_api_key'}})),
         };
         return;
       }
@@ -445,33 +517,26 @@ function app() {
         ...u,
         api_key: '',
         api_key_masked: u.api_key,
-        probe_headers_raw: u.probe_headers ? JSON.stringify(u.probe_headers, null, 2) : '',
       };
     },
 
     async saveUp() {
       const f = this.upForm;
 
-      // probe_headers 在界面上是一段文本，存进去必须是对象。
-      // 解析失败要当场说清楚是哪儿错了 —— 让它带着一段坏 JSON 提交，
-      // 后端只会回一个笼统的「请求体不是合法 JSON」，指不到这个字段。
-      let headers;
-      try {
-        headers = f.probe_headers_raw.trim() ? JSON.parse(f.probe_headers_raw) : {};
-      } catch (e) {
-        this.err = '探活头不是合法 JSON：' + e.message;
-        return;
-      }
-      if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
-        this.err = '探活头必须是一个 JSON 对象，例如 {"user-agent": "claude-cli/2.1.220"}';
-        return;
-      }
-
       const body = {
-        name: f.name, base_url: f.base_url, auth_style: f.auth_style,
-        l1_path: f.l1_path, proxy_url: f.proxy_url, enabled: f.enabled,
-        full_url_mode: f.full_url_mode, probe_headers: headers,
+        name: f.name, base_url: f.base_url,
+        proxy_url: f.proxy_url, enabled: f.enabled,
+    probe_mode: f.probe_mode, host_override: f.host_override || '', tls_server_name: f.tls_server_name || '',
       };
+    if (!f.id) {
+      try {
+        body.initial_endpoints = f.initial_endpoints.map(ep => {
+          const auth = {...ep.auth_profile};
+          if (auth.mode === 'manual_headers') auth.manual_headers = ep.manual_headers_raw?.trim() ? JSON.parse(ep.manual_headers_raw) : [];
+          return {endpoint: ep.endpoint, url_override: ep.url_override, fixed_query_template: ep.fixed_query_template, auth_profile: auth};
+        });
+      } catch { this.err = '初始端点认证头必须是合法 JSON 数组'; return; }
+    }
       // 只在真的填了新 key 时才带上这个字段（后端：留空 = 不改）。
       if (f.api_key) body.api_key = f.api_key;
 
@@ -481,9 +546,8 @@ function app() {
       // 网络抖动）就会变成一个未捕获的 promise rejection —— 界面静默不动，
       // 用户以为保存没生效，而其实存进去了。
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/upstreams/' + f.id, body)
-             : await this.api('POST', '/upstreams', body);
-        this.upstreams = await this.api('GET', '/upstreams') || [];
+    await this.saveConfigRequest('upstreams', f, body);
+    await this.loadConfigPage('upstreams');
       }, f.id ? '已保存。改了 key 或地址会立即重新探活' : '已新增');
 
       if (ok) {
@@ -493,10 +557,9 @@ function app() {
     },
 
     async delUp(u) {
-      const n = this.routes.filter(r => r.upstream_id === u.id).length;
-      const warn = n ? `\n\n它下面的 ${n} 条路由会一并删除。` : '';
+      const warn = '\n\n有路由引用或历史时禁止硬删除，请改为停用；历史不会随删除清理。';
       if (!confirm(`删除上游「${u.name}」？${warn}`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id + '?expected_revision=' + u.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
@@ -518,9 +581,8 @@ function app() {
         probe_max_tokens: f.probe_max_tokens, enabled: f.enabled,
       };
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/model-names/' + f.id, body)
-             : await this.api('POST', '/model-names', body);
-        this.modelNames = await this.api('GET', '/model-names') || [];
+    await this.saveConfigRequest('model-names', f, body);
+    await this.loadConfigPage('model-names');
       }, f.id ? '已保存' : '已新增');
 
       if (ok) {
@@ -530,10 +592,9 @@ function app() {
     },
 
     async delMn(m) {
-      const n = this.routes.filter(r => r.model_name_id === m.id).length;
-      const warn = n ? `\n\n它的 ${n} 条路由会一并删除。` : '';
+      const warn = '\n\n有路由引用或历史时禁止硬删除，请改为停用；历史不会随删除清理。';
       if (!confirm(`删除模型「${m.name}」？${warn}`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id + '?expected_revision=' + m.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
@@ -557,9 +618,8 @@ function app() {
         enabled: f.enabled,
       };
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/routes/' + f.id, body)
-             : await this.api('POST', '/routes', body);
-        this.routes = await this.api('GET', '/routes') || [];
+    await this.saveConfigRequest('routes', f, body);
+    await this.loadConfigPage('routes');
       }, f.id ? '已保存' : '已新增，正在探活');
 
       if (ok) {
@@ -570,17 +630,15 @@ function app() {
 
     async delRt(r) {
       if (!confirm(`删除路由「${this.mnName(r.model_name_id)} × ${this.upName(r.upstream_id)}」？`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/routes/' + r.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/routes/' + r.id + '?expected_revision=' + r.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
     // ── 设置 ─────────────────────────────────────────
 
     async saveSettings() {
-      await this.run(
-        () => this.api('PUT', '/settings', this.settings),
-        '已保存，立即生效',
-      );
+      this.err = '设置模块未就绪，请刷新页面';
+      return false;
     },
 
     // ── 探活 ─────────────────────────────────────────
@@ -599,28 +657,72 @@ function app() {
       }
     },
 
+    manualProbeResult() {
+      const execution = this.probeResult?.execution;
+      if (!execution) return null;
+      const field = (name, snake) => execution[name] ?? execution[snake];
+      const sent = field('SentAtMS', 'sent_at_ms');
+      const elapsed = end => sent > 0 && end >= sent ? `${end - sent}ms` : '—';
+      return {
+        routeId: field('RouteID', 'route_id'), endpoint: field('Endpoint', 'endpoint'),
+        success: field('Success', 'success') === true, status: field('StatusCode', 'status_code'),
+        errorClass: field('ErrorClass', 'error_class'), capability: field('Capability', 'capability'),
+        reachable: field('Reachable', 'reachable') === true,
+        semanticSeen: field('SemanticSeen', 'semantic_seen') === true,
+        normalEndSeen: field('NormalEndSeen', 'normal_end_seen') === true,
+        semanticMS: elapsed(field('FirstSemanticAtMS', 'first_semantic_at_ms')),
+        totalMS: elapsed(field('DoneAtMS', 'done_at_ms')),
+        detail: field('RedactedDetail', 'redacted_detail'),
+      };
+    },
+
     // ── 样本 ─────────────────────────────────────────
 
     async openSample(id) {
       this.hdrExport = null;
-      await this.run(async () => { this.sample = await this.api('GET', '/samples/' + id); });
+      this.sample = null;
+      this.beginSampleAccess({kind: 'view', id});
     },
 
-    async togglePin(s) {
-      const { ok, data } = await this.run(
-        () => this.api('POST', `/samples/${s.id}/pin`, { pinned: !s.pinned }),
-      );
-      // 用后端返回的值而不是自己再取反一次：两边各算一遍的话，
-      // 一旦后端将来对这个操作加了条件（比如置顶数量上限），
-      // 界面就会显示一个并没有生效的状态。
-      if (ok && data) s.pinned = data.pinned;
+    async togglePin(row) {
+      this.beginSampleAccess({kind: 'pin', id: row.id, pinned: !row.pinned, row});
     },
 
     async clearSamples() {
       if (!confirm('清空样本？置顶的会保留。')) return;
-      const { ok, data } = await this.run(
-        () => this.api('DELETE', '/samples?keep_pinned=true'));
-      if (ok) {
+      this.beginSampleAccess({kind: 'clear'});
+    },
+
+    beginSampleAccess(action) {
+      this.err = '';
+      this.samplePassword = '';
+      this.sampleAccess = action;
+      this._lockModal?.(() => this.closeSampleAccess());
+      this.$nextTick?.(() => this.$refs?.samplePasswordInput?.focus());
+    },
+
+    closeSampleAccess() {
+      if (this.busy) return;
+      this.samplePassword = '';
+      this.sampleAccess = null;
+      this._unlockModal?.();
+    },
+
+    async confirmSampleAccess() {
+      const action = this.sampleAccess;
+      if (!action || this.busy || !['view', 'pin', 'clear'].includes(action.kind)) return;
+      const password = this.samplePassword;
+      this.samplePassword = '';
+      const {ok, data} = await this.run(() => {
+        if (action.kind === 'view') return this.api('POST', `/samples/${action.id}/view`, {password});
+        if (action.kind === 'pin') return this.api('POST', `/samples/${action.id}/pin`, {pinned: action.pinned, password});
+        return this.api('DELETE', '/samples?keep_pinned=true', {password});
+      });
+      if (!ok || this.sampleAccess !== action) return;
+      this.closeSampleAccess();
+      if (action.kind === 'view') this.sample = data;
+      else if (action.kind === 'pin' && data) action.row.pinned = data.pinned;
+      else {
         this.msg = `已删除 ${data?.deleted ?? 0} 条`;
         await this.loadSamples();
       }
@@ -648,29 +750,21 @@ function app() {
       });
     },
 
-    /* applyHeaders 把导出的头填进对应上游的编辑表单。
-     *
-     * 不直接写库：这份头影响该站所有探活的成败，静默生效的话，
-     * 一次误导出就能让整站判死。让用户看一眼再按保存。
-     */
+    // 安全候选只进入手动配方草稿，测试和发布仍由用户明确操作。
     applyHeaders() {
-      const up = this.upstreams.find(u => u.id === this.hdrExport.upstream_id);
-      if (!up) {
-        this.err = '这条样本对应的上游已被删除，无法填入';
+      if (!this.hdrExport.candidate || typeof this.openSampleRecipeCandidate !== 'function') {
+        this.err = '安全配方候选编辑器尚未就绪，请刷新页面后重试';
         return;
       }
-      this.editUp(up);
-      this.upForm.probe_headers_raw = JSON.stringify(this.hdrExport.headers, null, 2);
+      this.openSampleRecipeCandidate(this.hdrExport.candidate);
       this.sample = null;
       this.hdrExport = null;
-      this.tab = 'upstreams';
-      this.msg = `已填入「${up.name}」的表单，确认后点保存`;
     },
 
     // ── 显示辅助 ─────────────────────────────────────
 
-    upName(id) { return this.upstreams.find(u => u.id === id)?.name || (id ? `#${id}` : '—'); },
-    mnName(id) { return this.modelNames.find(m => m.id === id)?.name || (id ? `#${id}` : '—'); },
+    upName(id) { return this.upstreams.find(u => u.id === id)?.name || this.configNames.upstreams[id]?.name || (id ? `#${id}` : '—'); },
+    mnName(id) { return this.modelNames.find(m => m.id === id)?.name || this.configNames['model-names'][id]?.name || (id ? `#${id}` : '—'); },
 
     routeLabel(id) {
       const r = this.routes.find(x => x.id === id);

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,63 +74,40 @@ func TestCapabilityRegistry_CountTokensDoesNotChangeMessages(t *testing.T) {
 	}
 }
 
-func TestCapabilityRegistry_MarkCountTokensUnsupported(t *testing.T) {
-	settings := model.DefaultSettings()
-	reg := NewCapabilityRegistry(capSettings{settings})
-	now := time.UnixMilli(1_700_000_000_000)
-	reg.now = func() time.Time { return now }
-
-	reg.MarkCountTokensUnsupported(7, 0, 500)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("500 marked unsupported: %s", got)
+func TestCountTokensCommittedStatusAndUnsupportedTTL(t *testing.T) {
+	h := newCountTrafficHarness(t)
+	h.finish(t, h.begin(), 500, `{"error":{"type":"server_error"}}`)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityTransientError {
+		t.Fatalf("500 state=%s", got)
 	}
-
-	reg.MarkCountTokensUnsupported(7, 0, 404)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("404 effective=%s, want unsupported", got)
-	}
-	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
-	if row == nil || row.StatusCode != 404 {
-		t.Fatalf("snapshot=%+v", row)
-	}
-	if row.Endpoint != model.EndpointCountTokens {
-		t.Fatalf("endpoint=%s", row.Endpoint)
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, model.EvidencePolicySelector{
-		Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens,
-	})
+	h.finish(t, h.begin(), 404, `{"error":{"type":"not_found_error"}}`)
+	row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens)
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(model.DefaultSettings(), model.EvidencePolicySelector{Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantExp := now.UnixMilli() + policy.State.UnsupportedTTL.Milliseconds()
-	if row.ExpiresAt != wantExp {
-		t.Fatalf("ExpiresAt=%d want=%d (existing UnsupportedTTL)", row.ExpiresAt, wantExp)
+	if row == nil || row.State != model.CapabilityUnsupported || row.StatusCode != 404 || row.ObservationToken == "" || row.ExpiresAt != h.now.Add(policy.State.UnsupportedTTL).UnixMilli() {
+		t.Fatalf("404 committed row=%+v", row)
 	}
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages capability leaked: %s", got)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages leaked: %s", got)
 	}
 }
 
-// §8.13: unsupported returns to unknown after 24 hours, not sooner.
 func TestCapabilityRegistry_CountTokensUnsupportedLasts24Hours(t *testing.T) {
-	settings := model.DefaultSettings()
-	reg := NewCapabilityRegistry(capSettings{settings})
-	start := time.UnixMilli(1_700_000_000_000)
-	now := start
-	reg.now = func() time.Time { return now }
-
-	reg.MarkCountTokensUnsupported(7, 0, 405)
-	now = start.Add(24*time.Hour - time.Millisecond)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("just before 24h effective=%s, want unsupported", got)
+	h := newCountTrafficHarness(t)
+	start := h.now
+	h.finish(t, h.begin(), 405, "")
+	h.now = start.Add(24*time.Hour - time.Millisecond)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+		t.Fatalf("before TTL=%s", got)
 	}
-	now = start.Add(24 * time.Hour)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("at 24h effective=%s, want unknown", got)
+	h.now = start.Add(24 * time.Hour)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("at TTL=%s", got)
 	}
 }
 
-// §8.13: supported goes stale only after 7 days without a new observation.
 func TestCapabilityRegistry_SupportedLasts7Days(t *testing.T) {
 	settings := model.DefaultSettings()
 	reg := NewCapabilityRegistry(capSettings{settings})
@@ -170,89 +148,54 @@ func TestCapabilityRegistry_SupportedLasts7Days(t *testing.T) {
 
 // §8.13 / §10.3: a successful real count_tokens observation is supported,
 // expires on the existing SupportedTTL, and stays count_tokens-only.
-func TestCapabilityRegistry_MarkCountTokensSupported(t *testing.T) {
-	settings := model.DefaultSettings()
-	reg := NewCapabilityRegistry(capSettings{settings})
-	start := time.UnixMilli(1_700_000_000_000)
-	now := start
-	reg.now = func() time.Time { return now }
-
-	reg.MarkCountTokensSupported(7, 0)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilitySupported {
-		t.Fatalf("effective=%s, want supported", got)
-	}
-	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
-	if row == nil || row.StatusCode != 200 || row.ErrorClass != model.ErrorNone {
-		t.Fatalf("snapshot=%+v", row)
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, model.EvidencePolicySelector{
-		Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens,
-	})
+func TestCountTokensCommittedSuccessTTLAndScope(t *testing.T) {
+	h := newCountTrafficHarness(t)
+	h.finish(t, h.begin(), 200, `{"input_tokens":12}`)
+	row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens)
+	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(model.DefaultSettings(), model.EvidencePolicySelector{Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := start.UnixMilli() + policy.State.SupportedTTL.Milliseconds(); row.ExpiresAt != want {
-		t.Fatalf("ExpiresAt=%d want=%d (existing SupportedTTL)", row.ExpiresAt, want)
+	if row == nil || row.State != model.CapabilitySupported || row.StatusCode != 200 || row.ErrorClass != model.ErrorNone || row.ExpiresAt != h.now.Add(policy.State.SupportedTTL).UnixMilli() {
+		t.Fatalf("committed success=%+v", row)
 	}
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages capability leaked: %s", got)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("messages leaked: %s", got)
 	}
-	now = start.Add(policy.State.SupportedTTL)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("after SupportedTTL effective=%s, want unknown", got)
-	}
-}
-
-func TestCapabilityRegistry_MarkCountTokensConfigError(t *testing.T) {
-	settings := model.DefaultSettings()
-	reg := NewCapabilityRegistry(capSettings{settings})
-	now := time.UnixMilli(1_700_000_000_000)
-	reg.now = func() time.Time { return now }
-
-	reg.MarkCountTokensConfigError(7, 0, 500)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("500 marked config_error: %s", got)
-	}
-	reg.MarkCountTokensConfigError(7, 0, 404)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("404 marked config_error: %s", got)
-	}
-
-	reg.MarkCountTokensConfigError(7, 0, 401)
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
-		t.Fatalf("401 effective=%s, want config_error", got)
-	}
-	row := reg.Snapshot(model.RecipeScopeRoute, 7, model.EndpointCountTokens)
-	if row == nil || row.StatusCode != 401 {
-		t.Fatalf("snapshot=%+v", row)
-	}
-	if row.State != model.CapabilityConfigError || row.ErrorClass != model.ErrorAuthRejected {
-		t.Fatalf("state=%s class=%s", row.State, row.ErrorClass)
-	}
-	if row.ExpiresAt != 0 {
-		t.Fatalf("ExpiresAt=%d want 0 (config_error does not TTL)", row.ExpiresAt)
-	}
-	if got := reg.Effective(model.RecipeScopeRoute, 7, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages capability leaked: %s", got)
-	}
-
-	// 404 remains unsupported, not overwritten by a later mis-mark as config_error path.
-	reg2 := NewCapabilityRegistry(capSettings{settings})
-	reg2.now = func() time.Time { return now }
-	reg2.MarkCountTokensUnsupported(8, 0, 404)
-	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("404 effective=%s, want unsupported", got)
-	}
-	reg2.MarkCountTokensConfigError(8, 0, 500)
-	if got := reg2.Effective(model.RecipeScopeRoute, 8, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("500 must not change unsupported to %s", got)
+	h.now = h.now.Add(policy.State.SupportedTTL)
+	if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+		t.Fatalf("expired success=%s", got)
 	}
 }
 
-// Delete Upstream runs SemanticInvalidator.InvalidateUpstream before CASCADE.
-// Upstream-scoped L1 verdicts (unsupported / config_error) must be dropped so a
-// reused SQLite upstream id is unknown until a new observation — without
-// clearing another upstream's rows or regressing child route clears.
+func TestCountTokensCommittedAuthErrorIsStickyAndEndpointLocal(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			h := newCountTrafficHarness(t)
+			h.finish(t, h.begin(), 500, `{"error":{"type":"server_error"}}`)
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got == model.CapabilityConfigError {
+				t.Fatal("500 became config_error")
+			}
+			h.finish(t, h.begin(), 404, "")
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
+				t.Fatalf("404=%s", got)
+			}
+			h.finish(t, h.begin(), status, `{"error":{"type":"authentication_error"}}`)
+			row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens)
+			if row == nil || row.State != model.CapabilityConfigError || row.ErrorClass != model.ErrorAuthRejected || row.ExpiresAt != 0 {
+				t.Fatalf("auth committed row=%+v", row)
+			}
+			h.now = h.now.AddDate(1, 0, 0)
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
+				t.Fatalf("config_error expired=%s", got)
+			}
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+				t.Fatalf("messages leaked: %s", got)
+			}
+		})
+	}
+}
+
 func TestInvalidateUpstream_ClearsUpstreamScopedCapability(t *testing.T) {
 	const (
 		deletedUp  int64 = 10
@@ -320,106 +263,67 @@ func TestInvalidateUpstream_ClearsUpstreamScopedCapability(t *testing.T) {
 // Capability, but a late count_tokens Mark* that skips the RouteHealth
 // generation check would re-poison the new incarnation — same hole as
 // TestReportResult_ModelNotFound_LateAfterReuseDoesNotPoison.
-func TestCapabilityRegistry_MarkCountTokens_LateAfterReuseDoesNotPoison(t *testing.T) {
+func TestCapabilityRegistry_GuardedCommittedApplyRejectsForgottenGeneration(t *testing.T) {
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+	track := health.NewTracker(nil)
+	caps.WithRouteGeneration(track)
+	semantic := health.NewSemanticInvalidator(track, nil, caps, nil, nil)
 	const routeID int64 = 42
-	settings := model.DefaultSettings()
-	caps := NewCapabilityRegistry(capSettings{settings})
-	tr := health.NewTracker(nil)
-	caps.WithRouteGeneration(tr)
-	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
-
-	oldGen := tr.EnsureGeneration(routeID)
-
-	caps.MarkCountTokensUnsupported(routeID, oldGen, 404)
+	old := track.EnsureGeneration(routeID)
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens}
+	row := &model.EndpointCapability{ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: model.EndpointCountTokens, PolicySelector: selector, State: model.CapabilityUnsupported, ObservationToken: "captured-token", ProbeSettingsFingerprint: mustCapFP(t, model.DefaultSettings(), selector), LastObservationOrder: 1}
+	caps.applyCommitted(row, &old)
 	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("live 404 capability=%s want unsupported", got)
+		t.Fatalf("current generation=%s", got)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages leaked: %s", got)
+	semantic.InvalidateRoute(routeID)
+	current := track.EnsureGeneration(routeID)
+	if current == old {
+		t.Fatal("forgotten identity reused generation")
 	}
-
-	sem.InvalidateRoute(routeID)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got == model.CapabilityUnsupported {
-		t.Fatal("InvalidateRoute must clear count_tokens unsupported")
+	for _, state := range []model.CapabilityState{model.CapabilityUnsupported, model.CapabilityConfigError} {
+		row.State = state
+		row.LastObservationOrder++
+		caps.applyCommitted(row, &old)
+		if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
+			t.Fatalf("late generation revived %s", got)
+		}
 	}
-
-	newGen := tr.EnsureGeneration(routeID)
-	if newGen == 0 || newGen == oldGen {
-		t.Fatalf("reused id must get a new generation: old=%d new=%d", oldGen, newGen)
-	}
-
-	// Late 404 from the deleted incarnation must not mark the new route.
-	caps.MarkCountTokensUnsupported(routeID, oldGen, 404)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("stale 404 must not leave reused id unsupported, got %s", got)
-	}
-
-	// Late 401 must not mark config_error either.
-	caps.MarkCountTokensConfigError(routeID, oldGen, 401)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("stale 401 must not leave reused id config_error, got %s", got)
-	}
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages must stay untouched, got %s", got)
-	}
-
-	// Matching generation on the live reuse still marks.
-	caps.MarkCountTokensUnsupported(routeID, newGen, 404)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("live reused 404 capability=%s want unsupported", got)
-	}
-
-	sem.InvalidateRoute(routeID)
-	newGen2 := tr.EnsureGeneration(routeID)
-	caps.MarkCountTokensConfigError(routeID, newGen2, 401)
+	caps.applyCommitted(row, &current)
 	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityConfigError {
-		t.Fatalf("live reused 401 capability=%s want config_error", got)
+		t.Fatalf("new committed generation=%s", got)
 	}
 	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("messages must stay untouched after config_error mark, got %s", got)
+		t.Fatalf("messages leaked=%s", got)
 	}
 }
 
-// A caller that passes generation 0 must not poison a route whose live
-// RouteHealth generation is already non-zero (forgot-gen / unbound misuse).
-// Both-zero first-use still applies when no generation has been assigned yet.
-func TestCapabilityRegistry_MarkCountTokens_ZeroGenAgainstLiveNonZeroDropped(t *testing.T) {
+func TestCapabilityRegistry_GuardedApplyRejectsUnboundGenerationAgainstLiveRoute(t *testing.T) {
+	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
+	track := health.NewTracker(nil)
+	caps.WithRouteGeneration(track)
 	const routeID int64 = 55
-	settings := model.DefaultSettings()
-	caps := NewCapabilityRegistry(capSettings{settings})
-	tr := health.NewTracker(nil)
-	caps.WithRouteGeneration(tr)
-
-	tr.EnsureGeneration(routeID) // gen 1
-	tr.Forget(routeID)
-	live := tr.EnsureGeneration(routeID) // gen 2 after reuse
-	if live != 2 {
-		t.Fatalf("live generation=%d want 2", live)
+	track.EnsureGeneration(routeID)
+	track.Forget(routeID)
+	current := track.EnsureGeneration(routeID)
+	zero := uint64(0)
+	selector := model.EvidencePolicySelector{Kind: model.EvidenceCountTokens, Endpoint: model.EndpointCountTokens}
+	row := &model.EndpointCapability{ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: model.EndpointCountTokens, PolicySelector: selector, State: model.CapabilityUnsupported, ObservationToken: "token", ProbeSettingsFingerprint: mustCapFP(t, model.DefaultSettings(), selector), LastObservationOrder: 1}
+	for _, state := range []model.CapabilityState{model.CapabilityUnsupported, model.CapabilityConfigError} {
+		row.State = state
+		caps.applyCommitted(row, &zero)
+		if got := caps.Snapshot(model.RecipeScopeRoute, routeID, model.EndpointCountTokens); got != nil {
+			t.Fatalf("unbound generation polluted route: %+v", got)
+		}
 	}
-
-	caps.MarkCountTokensUnsupported(routeID, 0, 404)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("mark with gen 0 against live %d must leave unknown, got %s", live, got)
+	caps.applyCommitted(row, &current)
+	if got := caps.Snapshot(model.RecipeScopeRoute, routeID, model.EndpointCountTokens); got == nil {
+		t.Fatal("current generation was dropped")
 	}
-	caps.MarkCountTokensConfigError(routeID, 0, 401)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnknown {
-		t.Fatalf("config_error mark with gen 0 against live %d must leave unknown, got %s", live, got)
-	}
-
-	caps.MarkCountTokensUnsupported(routeID, live, 404)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("mark with matching gen %d capability=%s want unsupported", live, got)
-	}
-
-	// Both-zero: no RouteHealth entry yet → unbound mark still applies.
-	const freshID int64 = 56
-	caps2 := NewCapabilityRegistry(capSettings{settings}).WithRouteGeneration(health.NewTracker(nil))
-	if caps2.routeGen.GenerationOf(freshID) != 0 {
-		t.Fatal("fresh route must start at generation 0")
-	}
-	caps2.MarkCountTokensUnsupported(freshID, 0, 404)
-	if got := caps2.Effective(model.RecipeScopeRoute, freshID, model.EndpointCountTokens, ""); got != model.CapabilityUnsupported {
-		t.Fatalf("both-zero first mark capability=%s want unsupported", got)
+	row.ScopeID = 56
+	caps.applyCommitted(row, &zero)
+	if got := caps.Snapshot(model.RecipeScopeRoute, 56, model.EndpointCountTokens); got == nil {
+		t.Fatal("initial zero generation must be usable")
 	}
 }
 

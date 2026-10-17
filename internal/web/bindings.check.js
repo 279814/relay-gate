@@ -24,6 +24,8 @@ async function main() {
   const { createTransformsFeature, mergeTransformsTab } = await import(pathToFileURL(path.join(dir, 'js', 'transforms.mjs')).href);
   const { createRuntimeStateFeature } = await import(pathToFileURL(path.join(dir, 'js', 'runtime.mjs')).href);
   const { createCountTokensFeature } = await import(pathToFileURL(path.join(dir, 'js', 'count_tokens.mjs')).href);
+  const { createRecipeAdminFeature } = await import(pathToFileURL(path.join(dir, 'js', 'recipe_admin.mjs')).href);
+  const { createSettingsFeature } = await import(pathToFileURL(path.join(dir, 'js', 'settings.mjs')).href);
 
   const inst = app();
   const api = createApiClient({ onUnauthorized() {} });
@@ -39,6 +41,8 @@ async function main() {
   createTransformsFeature(inst, api);
   mergeTransformsTab(inst);
   createCountTokensFeature(inst);
+  createRecipeAdminFeature(inst, api);
+  createSettingsFeature(inst, api);
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([
@@ -47,6 +51,7 @@ async function main() {
     'Number', 'Array', 'confirm', 'window', 'console',
     'r', 'u', 'm', 's', 't', 'rc', 'uc', 'c', 'e', 'i', 'v', 'n', 'x', 'p', 'k', 'd',
     'g', 'l', 'row', 'ep', 'ex', 'run', 'cand', 'idx', 'a', 'ev', 'f', 'b',
+    'filterField', 'choice',
   ]);
 
   const exprs = [];

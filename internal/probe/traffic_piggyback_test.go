@@ -44,7 +44,7 @@ func TestTrafficHTTP_DueSchedulerSkipsAndPersistsExactlyOneSaving(t *testing.T) 
 		t.Fatal(err)
 	}
 	h.manager.WithPiggybackStore(h.store)
-	scheduler := NewScheduler(cfg, newFakeTransport(), h.tracker, health.NewUpstreamGate(), discardLogger()).WithCapabilityRegistry(h.caps).WithPiggybackRecorder(h.manager)
+	scheduler := newSchedulerFixture(t, cfg, newFakeTransport(), h.tracker, health.NewReachabilityTracker(nil), discardLogger()).WithCapabilityRegistry(h.caps).WithPiggybackRecorder(h.manager)
 	// L1 is an independent schedule; reserve it so this checks the actual
 	// due-L2 path, rather than the private token predicate alone.
 	h.tracker.ClaimL1(h.route.ID)
@@ -116,7 +116,7 @@ func TestTrafficHTTP_RealSuccessMetadataRestoresWithoutPromotingHealth(t *testin
 	}
 	tracker := health.NewTracker(cfg)
 	generation := tracker.EnsureGeneration(h.route.ID)
-	scheduler := NewScheduler(cfg, nil, tracker, nil, discardLogger()).WithCapabilityRegistry(caps).WithPiggybackRecorder(storePiggybackRecorder{h.store, t})
+	scheduler := newSchedulerFixture(t, cfg, nil, tracker, nil, discardLogger()).WithCapabilityRegistry(caps).WithPiggybackRecorder(storePiggybackRecorder{h.store, t})
 	if !scheduler.tryPiggyback(h.route.ID, generation, time.Now()) {
 		t.Fatal("current persisted real success did not suppress due synthetic L2")
 	}
@@ -138,12 +138,12 @@ func TestTrafficHTTP_RealSuccessMetadataRestoresWithoutPromotingHealth(t *testin
 	if saved != 1 {
 		t.Fatalf("piggyback skip not idempotent: saved=%d", saved)
 	}
-	settings, err := h.store.GetSettings()
+	settings, settingsRevision, err := h.store.GetSettingsWithRevision()
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings.RealTotalSec++
-	if err := h.store.SaveSettings(settings); err != nil {
+	if _, err := h.store.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	if err := cfg.Refresh(); err != nil {

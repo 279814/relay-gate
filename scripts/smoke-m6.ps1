@@ -122,11 +122,13 @@ try {
     Say '配置：坏站优先级 1、好站优先级 2'
     # 关掉探活：否则坏站会被判 dead 而在选路时被跳过，重试就撞不上它了。
     # 而这个脚本要验证的恰恰是「撞上去、失败、换站」。
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 60; l1_interval_dead_sec = 60
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
@@ -144,11 +146,16 @@ try {
     $mn = Admin POST '/admin/api/model-names' @{
         name = 'claude-opus-5'; protocol = 'anthropic'; match_mode = 'exact'; enabled = $true
     }
+    $initialEndpoints = foreach ($kind in @('models','messages','responses','chat_completions','count_tokens')) {
+        @{ endpoint = $kind; auth_profile = @{ mode = 'x_api_key'; secret_ref = 'upstream_api_key' } }
+    }
     $upBad = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-bad'; base_url = "http://127.0.0.1:$MOCK_BAD"
         api_key = $KEY_BAD; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upOK = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-ok'; base_url = "http://127.0.0.1:$MOCK_OK"
         api_key = $KEY_OK; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
@@ -190,10 +197,11 @@ try {
 
     Say '不需要重试时不留痕迹'
     # 停掉坏站的 Route，让请求一次就成功
-    Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+    $rtBad = Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+        expected_revision = $rtBad.revision
         model_name_id = $mn.id; upstream_id = $upBad.id
         priority = 1; weight = 100; enabled = $false
-    } | Out-Null
+    }
     Start-Sleep -Seconds 3  # 等 livecfg 的 2s TTL 过期
 
     $r2 = Relay '{"model":"claude-opus-5","max_tokens":16}'
@@ -203,10 +211,11 @@ try {
         "得到 '$($r2.Headers['X-Relay-Attempts'])' —— 正常响应必须与 M5 逐字节相同"
 
     # 恢复坏站 Route，后面的检查要用到那条重试记录
-    Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+    $rtBad = Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+        expected_revision = $rtBad.revision
         model_name_id = $mn.id; upstream_id = $upBad.id
         priority = 1; weight = 100; enabled = $true
-    } | Out-Null
+    }
 
     # ── 最危险的一条：出站头必须每次重建 ──────────────────────
     Say 'A 站的 key 绝不能出现在发往 B 站的请求里'
@@ -343,11 +352,13 @@ try {
     # ── 关掉日志开关 ─────────────────────────────────────────
     Say '关掉日志开关后零写入'
     $before = (Admin GET '/admin/api/request-logs?limit=1').total
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 60; l1_interval_dead_sec = 60
         l2_interval_alive_sec = 300; l2_interval_dead_sec = 300
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5

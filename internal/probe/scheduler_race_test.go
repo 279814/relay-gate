@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 
@@ -10,7 +11,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // 确定性复现 TestScheduler_CoalescesL1PerUpstream 的竞态（Issue #21）。
@@ -47,14 +47,15 @@ func TestScheduler_CoalescesL1PerUpstream_RaceDeterministic(t *testing.T) {
 	track := newRecordingTracker()
 	// 挡住 L2：本测试只关心 L1 收敛，L2 会让计数 transport 多计几次。
 	track.l2Allowed = map[int64]bool{}
-	gate := health.NewUpstreamGate()
+	reach := health.NewReachabilityTracker(nil)
 
 	ct := &countingErrTransport{}
 	cfg := &fakeCfg{
-		snap:  router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
-		state: store.StateRunning,
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
+		state:    model.RunStateRunning,
+		settings: fastSettings(),
 	}
-	sched := NewScheduler(cfg, ct, track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	sched := newSchedulerFixture(t, cfg, ct, track, reach, discardLogger())
 
 	// 模拟一个 tick 内串行处理 5 条 Route，且每次 after-probe 都等到
 	// goroutine 跑完 —— 正是「第一个 L1 在 tick 遍历完成前结束」的竞态。
@@ -68,7 +69,7 @@ func TestScheduler_CoalescesL1PerUpstream_RaceDeterministic(t *testing.T) {
 	}
 }
 
-// countingErrTransport 计数 TransportFor 调用，并立即返回错误。
+// countingErrTransport 计数共享 TransportManager 取池调用，并立即返回错误。
 //
 // 返回错误让 runL1 立刻结束 —— goroutine 无需真实 HTTP 就能完成，
 // 于是 endL1 会立即清除 inflightL1，竞态被确定性地触发。
@@ -77,7 +78,7 @@ type countingErrTransport struct {
 	n  int
 }
 
-func (c *countingErrTransport) TransportFor(*model.Upstream, outbound.Budget) (*outbound.Transport, error) {
+func (c *countingErrTransport) RoundTripper(outbound.NetworkConfig) (http.RoundTripper, error) {
 	c.mu.Lock()
 	c.n++
 	c.mu.Unlock()

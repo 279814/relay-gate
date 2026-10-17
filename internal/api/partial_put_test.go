@@ -29,7 +29,7 @@ func TestPartialPUT_RouteOmitsKeepStoredFields(t *testing.T) {
 	}
 	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"priority":3}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"priority":3}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("partial PUT: %d %s", rec.Code, rec.Body.String())
 	}
@@ -39,7 +39,7 @@ func TestPartialPUT_RouteOmitsKeepStoredFields(t *testing.T) {
 		t.Fatalf("omitted fields changed: %+v", got)
 	}
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"enabled":false}`, got.Revision), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("explicit enabled:false: %d %s", rec.Code, rec.Body.String())
 	}
@@ -49,7 +49,7 @@ func TestPartialPUT_RouteOmitsKeepStoredFields(t *testing.T) {
 	}
 
 	before := got
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"upstream_id":0}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"upstream_id":0}`, got.Revision), true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("upstream_id 0 must be rejected")
 	}
@@ -71,7 +71,7 @@ func TestPartialPUT_ModelNameOmitsKeepStoredFields(t *testing.T) {
 	}
 	id := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 
-	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), `{"name":"partial-mn-renamed"}`, true)
+	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), withExpectedRevision(t, `{"name":"partial-mn-renamed"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("partial PUT: %d %s", rec.Code, rec.Body.String())
 	}
@@ -82,7 +82,7 @@ func TestPartialPUT_ModelNameOmitsKeepStoredFields(t *testing.T) {
 		t.Fatalf("omitted fields changed: %+v", got)
 	}
 
-	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), withExpectedRevision(t, `{"enabled":false}`, got.Revision), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("explicit enabled:false: %d %s", rec.Code, rec.Body.String())
 	}
@@ -92,7 +92,7 @@ func TestPartialPUT_ModelNameOmitsKeepStoredFields(t *testing.T) {
 	}
 
 	before := got
-	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), `{"protocol":"not-a-protocol"}`, true)
+	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), withExpectedRevision(t, `{"protocol":"not-a-protocol"}`, got.Revision), true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("invalid protocol must be rejected")
 	}
@@ -171,7 +171,7 @@ func TestPartialPUT_EndpointOmitsKeepStoredFields(t *testing.T) {
 
 // Body id / upstream_id must not retarget the write: URL path id is the row,
 // and the stored upstream ownership stays put (validation + response + invalidate).
-func TestPartialPUT_EndpointIgnoresBodyIDAndUpstreamID(t *testing.T) {
+func TestPartialPUT_EndpointRejectsForgedIdentityAndPreservesPartialEdits(t *testing.T) {
 	s, _ := newTestServer(t)
 	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
 
@@ -203,8 +203,17 @@ func TestPartialPUT_EndpointIgnoresBodyIDAndUpstreamID(t *testing.T) {
 		`{"id":`+itoa(otherOnA.ID)+`,"upstream_id":`+itoa(upB)+
 			`,"url_override":`+mustJSON(t, override)+
 			`,"expected_revision":`+itoa(target.Revision)+`}`, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("forged identity must be rejected: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints/"+itoa(target.ID), "", true)
+	rejected := decodeBody[model.UpstreamEndpoint](t, rec)
+	if rejected.Revision != target.Revision || rejected.URLOverride != target.URLOverride || rejected.UpstreamID != upA {
+		t.Fatalf("rejected identity mutation changed target: %+v", rejected)
+	}
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(target.ID), `{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(target.Revision)+`}`, true)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT with forged id/upstream_id: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("valid partial URL edit: %d %s", rec.Code, rec.Body.String())
 	}
 	got := decodeBody[model.UpstreamEndpoint](t, rec)
 	if got.ID != target.ID {

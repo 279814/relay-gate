@@ -10,10 +10,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/configadmin"
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/observationseq"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
@@ -34,8 +37,10 @@ type SampleStats interface {
 }
 
 type Server struct {
-	st  *store.Store
-	log *slog.Logger
+	st            *store.Store
+	log           *slog.Logger
+	configAdmin   ConfigAdmin
+	settingsAdmin SettingsAdmin
 	// inFlight、samples 与 reqLogs 可以为 nil（测试里常只关心 CRUD），
 	// runtime 端点会据此把对应字段留空而不是崩。
 	inFlight InFlightView
@@ -44,10 +49,10 @@ type Server struct {
 
 	// 探活链路。同样可以为 nil —— 探活未启用时相关端点回 503，
 	// 而不是让整个管理接口不可用（管理端点必须始终可用，§4.8）。
-	healthView      HealthView
-	gate            GateView
-	prober          Prober
-	countTokensView CountTokensView
+	healthView   HealthView
+	manualRunner ManualProbeRunner
+	reachability ReachabilityView
+	capabilities CapabilityView
 
 	// cost 是探活成本计数器（§5.2d）。为 nil 时对应端点回 503。
 	cost CostView
@@ -64,7 +69,8 @@ type Server struct {
 	runState RunStateAdmin
 
 	// probeAdmin 是 P0-14 探活管理服务。未注入时新探活端点 503。
-	probeAdmin ProbeAdmin
+	probeAdmin       ProbeAdmin
+	sampleCandidates SampleRecipeCandidateBuilder
 
 	// security 是 P3 Security Center。未注入时 list 返回空。
 	security SecurityCenter
@@ -98,7 +104,7 @@ func (s *Server) WithAdminHash(hash, dataDir string) *Server {
 }
 
 func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{st: st, log: log, sessions: newSessionStore()}
+	return &Server{st: st, log: log, configAdmin: configadmin.New(st, nil), settingsAdmin: configadmin.NewSettings(st), sampleCandidates: probe.NewSampleCandidateBuilder(st), sessions: newSessionStore()}
 }
 
 // WithRuntime 接上运行时观测源。分成单独的 setter 而不是加构造参数，
@@ -146,6 +152,9 @@ func conflictClientMessage(err error) string {
 // 吞掉它们会让配置出错时只剩一个无信息的 400。
 func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, probe.ErrSyntheticClosed), errors.Is(err, livecfg.ErrProbeSnapshotUnavailable), errors.Is(err, observationseq.ErrUnavailable):
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"探活配置或执行准入暂不可用，请稍后重试"})
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, credential.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errBody{"not found"})
 	case errors.Is(err, credential.ErrRevealUnavailable):
@@ -153,6 +162,8 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, model.ErrValidation):
 		msg := strings.TrimPrefix(err.Error(), "validation: ")
 		writeJSON(w, http.StatusBadRequest, errBody{msg})
+	case errors.Is(err, store.ErrInvalidCursor):
+		writeJSON(w, http.StatusBadRequest, errBody{"分页 cursor 或 limit 无效"})
 	case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrDependencyConflict),
 		errors.Is(err, store.ErrIdempotencyConflict):
 		// 409：这三类都是「请求本身合法，但与当前状态冲突」——
@@ -165,7 +176,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	default:
 		// §2.4：包装错误可能带出站 API key / proxy userinfo；客户端仍回固定文案，
 		// 日志属性必须先过 RedactDiagnosticText（已知凭据来自 upstream 行）。
-		safeErr := sample.RedactDiagnosticText(err.Error(), s.knownUpstreamRedactKeys())
+		safeErr := s.diagnosticError(err)
 		s.log.Error("内部错误", "err", safeErr)
 		writeJSON(w, http.StatusInternalServerError, errBody{"internal error"})
 	}

@@ -3,425 +3,279 @@ package probe
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
-	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
-// §6.8 / §8.12：HTTP 200 结构化 error 不得按 200 判活，也不得 piggyback。
-func TestClassifyReal_HTTP200StructuredErrorNotOK(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		ct   string
-		want health.Verdict
-	}{
-		{
-			name: "type error object",
-			body: `{"type":"error","error":{"type":"server_error","message":"boom"}}`,
-			want: health.VerdictUnavailable,
-		},
-		{
-			name: "top-level error key",
-			body: `{"error":{"type":"api_error","message":"fail"}}`,
-			want: health.VerdictUnavailable,
-		},
-		{
-			name: "SSE error event",
-			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
-			ct:   "text/event-stream",
-			want: health.VerdictRateLimited,
-		},
-		{
-			name: "rate_limit in JSON body",
-			body: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`,
-			want: health.VerdictRateLimited,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			h := http.Header{}
-			if tc.ct != "" {
-				h.Set("Content-Type", tc.ct)
-			}
-			out := classifyReal(&proxy.ResultView{
-				Status:       200,
-				ErrBody:      []byte(tc.body),
-				Header:       h,
-				BytesWritten: int64(len(tc.body)),
-			})
-			if out.Verdict != tc.want {
-				t.Fatalf("verdict=%s want %s (err=%v)", out.Verdict, tc.want, out.Err)
-			}
-		})
-	}
-}
-
-func TestClassifyReal_HTTP200WithContentStillOK(t *testing.T) {
-	out := classifyReal(&proxy.ResultView{
-		Status:       200,
-		ErrBody:      nil,
-		BytesWritten: 120,
-		SemanticSeen: true,
-	})
-	if out.Verdict != health.VerdictOK {
-		t.Fatalf("normal 200 with semantic evidence should be OK, got %s", out.Verdict)
-	}
-}
-
-func TestClassifyReal_HTTP200BytesWithoutSemanticIsFakeAlive(t *testing.T) {
-	out := classifyReal(&proxy.ResultView{
-		Status:       200,
-		BytesWritten: 512,
-		SemanticSeen: false,
-	})
-	if out.Verdict != health.VerdictUnavailable {
-		t.Fatalf("200 with bytes but no semantic evidence should be unavailable, got %s", out.Verdict)
-	}
-}
-
-func TestClassifyReal_HTTP200EmptyIsFakeAlive(t *testing.T) {
-	out := classifyReal(&proxy.ResultView{Status: 200, BytesWritten: 0})
-	if out.Verdict != health.VerdictUnavailable {
-		t.Fatalf("empty 200 should be unavailable, got %s", out.Verdict)
-	}
-}
-
-// §6.7 / §6.8：上游 302 原样可见，但不得记为真实流量成功 / piggyback。
-func TestClassifyReal_HTTP302NotOK(t *testing.T) {
-	out := classifyReal(&proxy.ResultView{
-		Status:       http.StatusFound,
-		BytesWritten: 64,
-		SemanticSeen: true,
-		ErrBody:      []byte(`{"redirect":true}`),
-	})
-	if out.Verdict == health.VerdictOK {
-		t.Fatalf("302 must not be VerdictOK, got %s", out.Verdict)
-	}
-	if out.Verdict != health.VerdictUnavailable {
-		t.Fatalf("302 verdict=%s want unavailable", out.Verdict)
-	}
-}
-
-// Real-traffic 401/403 is an auth outcome for that request — not RouteHealth
-// dead, not cooldown, and not a single-shot config_error.
-func TestReportResult_Live401403DoesNotMarkDeadOrCooldown(t *testing.T) {
-	for _, code := range []int{401, 403} {
-		t.Run(fmt.Sprint(code), func(t *testing.T) {
-			tr := health.NewTracker(nil)
-			caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
-			rep := NewReporter(tr).WithCapabilityRegistry(caps)
-			gen := tr.EnsureGeneration(5)
-
-			// Seed alive so a mistaken Fatal/Unavailable would be visible.
-			tr.Report(health.Report{
-				RouteID: 5, Generation: gen, Verdict: health.VerdictOK, Source: health.SourceReal,
-			})
-			if tr.State(5) != model.StateAlive {
-				t.Fatalf("setup: state=%s want alive", tr.State(5))
-			}
-
-			body := []byte(`{"error":{"type":"authentication_error","message":"bad key"}}`)
-			rep.ReportResult(5, gen, &proxy.ResultView{
-				Status:       code,
-				ErrBody:      body,
-				Endpoint:     model.EndpointMessages,
-				BytesWritten: int64(len(body)),
-			})
-
-			if tr.State(5) == model.StateDead {
-				t.Fatalf("HTTP %d must not move Route to StateDead", code)
-			}
-			if tr.State(5) != model.StateAlive {
-				t.Fatalf("HTTP %d must leave Route alive, got %s", code, tr.State(5))
-			}
-			st := tr.Status(5)
-			if st.CooldownUntil != 0 {
-				t.Fatalf("HTTP %d must not start cooldown, cooldown_until=%d", code, st.CooldownUntil)
-			}
-			if st.ConsecutiveFail != 0 {
-				t.Fatalf("HTTP %d must not count as reachability failure, fail=%d", code, st.ConsecutiveFail)
-			}
-			if got := caps.Effective(model.RecipeScopeRoute, 5, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-				t.Fatalf("single live %d must not write config_error, got %s", code, got)
-			}
-		})
-	}
-}
-
-func TestReportResult_HTML200DoesNotRefreshLastRealOK(t *testing.T) {
-	tr := health.NewTracker(nil)
-	tr.Report(health.Report{RouteID: 9, Verdict: health.VerdictOK, Source: health.SourceReal})
-	seeded := tr.Status(9).LastRealOKAt
-	if seeded == 0 {
-		t.Fatal("seed real OK should set lastRealOKAt")
-	}
-
-	rep := NewReporter(tr)
-	rep.ReportResult(9, 0, &proxy.ResultView{
-		Status:       200,
-		BytesWritten: 240,
-		SemanticSeen: false, // HTML / 空壳 200：有字节但无语义证据
-	})
-
-	after := tr.Status(9)
-	if after.LastRealOKAt != seeded {
-		t.Fatalf("HTML 200 must not refresh lastRealOKAt: before=%d after=%d",
-			seeded, after.LastRealOKAt)
-	}
-	if after.ConsecutiveFail < 1 {
-		t.Fatalf("HTML 200 should count as failure, consecutive_fail=%d", after.ConsecutiveFail)
-	}
-}
-
-func TestReportResult_TextDeltaStillPiggybacks(t *testing.T) {
-	tr := health.NewTracker(nil)
-	tr.Report(health.Report{RouteID: 10, Verdict: health.VerdictOK, Source: health.SourceReal})
-	seeded := tr.Status(10).LastRealOKAt
-
-	// LastRealOKAt 精度是毫秒；同毫秒内两次 OK 看不出刷新。
-	time.Sleep(2 * time.Millisecond)
-
-	rep := NewReporter(tr)
-	rep.ReportResult(10, 0, &proxy.ResultView{
-		Status:       200,
-		BytesWritten: 180,
-		SemanticSeen: true,
-	})
-
-	after := tr.Status(10)
-	if after.LastRealOKAt == seeded {
-		t.Fatal("normal text delta must refresh lastRealOKAt for piggyback")
-	}
-	if after.ConsecutiveFail != 0 {
-		t.Fatalf("semantic 200 should reset failure streak, fail=%d", after.ConsecutiveFail)
-	}
-}
-
-func TestReportResult_Structured200DoesNotRefreshLastRealOK(t *testing.T) {
-	tr := health.NewTracker(nil)
-	tr.Report(health.Report{RouteID: 7, Verdict: health.VerdictOK, Source: health.SourceReal})
-	seeded := tr.Status(7).LastRealOKAt
-	if seeded == 0 {
-		t.Fatal("seed real OK should set lastRealOKAt")
-	}
-
-	rep := NewReporter(tr)
-	rep.ReportResult(7, 0, &proxy.ResultView{
-		Status:       200,
-		ErrBody:      []byte(`{"type":"error","error":{"type":"server_error"}}`),
-		BytesWritten: 48,
-	})
-
-	after := tr.Status(7)
-	if after.LastRealOKAt != seeded {
-		t.Fatalf("structured 200 must not refresh lastRealOKAt: before=%d after=%d",
-			seeded, after.LastRealOKAt)
-	}
-	if after.ConsecutiveFail < 1 {
-		t.Fatalf("structured 200 should count as failure, consecutive_fail=%d reason=%s",
-			after.ConsecutiveFail, after.Reason)
-	}
-	if after.Reason == health.VerdictOK.String() {
-		t.Fatal("last reason must not remain OK after structured 200 error")
-	}
-}
-
-// §6.8：已有语义输出后的 SSE error 事件是 partial_failure —— 不得 piggyback。
-func TestReportResult_MidStreamSSEErrorDoesNotPiggyback(t *testing.T) {
-	tr := health.NewTracker(nil)
-	tr.Report(health.Report{RouteID: 11, Verdict: health.VerdictOK, Source: health.SourceReal})
-	seeded := tr.Status(11).LastRealOKAt
-
-	h := http.Header{}
-	h.Set("Content-Type", "text/event-stream")
-	// streamBody 嗅探后只留下最小错误帧（不是整段流）。
-	errFrame := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\"}}\n\n"
-	rep := NewReporter(tr)
-	rep.ReportResult(11, 0, &proxy.ResultView{
-		Status:       200,
-		Header:       h,
-		ErrBody:      []byte(errFrame),
-		BytesWritten: 400,
-	})
-
-	after := tr.Status(11)
-	if after.LastRealOKAt != seeded {
-		t.Fatalf("mid-stream SSE error must not refresh lastRealOKAt")
-	}
-	if after.ConsecutiveFail < 1 {
-		t.Fatalf("mid-stream SSE error should count as failure, fail=%d", after.ConsecutiveFail)
-	}
-}
-
-type recordingSched struct {
-	n int
-}
-
-func (r *recordingSched) ObserveRealSuccess(ScheduleKey, time.Time) { r.n++ }
-
-func TestReportResult_ModelNotFoundRecordsRouteConfigError(t *testing.T) {
-	settings := model.DefaultSettings()
-	caps := NewCapabilityRegistry(capSettings{settings})
-	reach := health.NewReachabilityTracker(capSettings{settings})
-	reachSel := model.EvidencePolicySelector{Kind: model.EvidenceL1, Endpoint: model.EndpointModels}
-	reachPol, err := revisioncodec.BuildReachabilityEvidencePolicy(settings, reachSel)
+// All former Reporter assertions now enter through real HTTP, the bounded
+// observer, the production classifier/reducer and SQLite transaction CAS.
+func settleRealTraffic(t *testing.T, h *trafficHTTPHarness) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	release, err := h.handler.Quiesce(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reachFP := revisioncodec.ReachabilitySettingsFingerprint(reachPol)
-	reachTok := revisioncodec.NewReachabilityToken(model.ReachabilityRevision{
-		NetworkRevision: 1, SettingsFingerprint: reachFP,
-	})
-	reach.ApplyCommitted(&model.UpstreamReachability{
-		UpstreamID: 1, PolicySelector: reachSel, State: model.ReachabilityReachable,
-		ObservedNetworkRevision: 1, SettingsFingerprint: reachFP,
-		ObservationToken: reachTok, LastObservationOrder: 1, ConsecutiveOK: 2,
-	})
-
-	tr := health.NewTracker(nil)
-	rep := NewReporter(tr).WithCapabilityRegistry(caps)
-
-	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
-	rep.ReportResult(9, 0, &proxy.ResultView{
-		Status:       404,
-		ErrBody:      body,
-		Endpoint:     model.EndpointMessages,
-		BytesWritten: int64(len(body)),
-	})
-
-	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("route capability=%s want config_error", got)
-	}
-	row := caps.Snapshot(model.RecipeScopeRoute, 9, model.EndpointMessages)
-	if row == nil || row.ErrorClass != model.ErrorModelNotFound || row.ExpiresAt != 0 {
-		t.Fatalf("config_error row = %+v", row)
-	}
-	// §9.1：config_error 由 Capability 排除，不伪装成 dead。
-	if tr.State(9) == model.StateDead {
-		t.Fatal("model_not_found must not mark RouteHealth dead")
-	}
-	if reach.Effective(1, 1) != model.ReachabilityReachable {
-		t.Fatalf("upstream reachability=%s want reachable", reach.Effective(1, 1))
-	}
-	// Sibling route on the same upstream stays selectable (no config_error).
-	if got := caps.Effective(model.RecipeScopeRoute, 10, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-		t.Fatalf("sibling route must not inherit config_error, got %s", got)
+	defer release()
+	if err := h.manager.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// Delete + recreate can reuse a SQLite route rowid. Semantic InvalidateRoute
-// clears Capability, but a late real-traffic ApplyCommitted that skips the
-// RouteHealth generation check would re-poison the new incarnation — the same
-// hole CommitProbeObservation closes with RouteCreatedAt.
-func TestReportResult_ModelNotFound_LateAfterReuseDoesNotPoison(t *testing.T) {
-	const routeID int64 = 42
-	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
-	tr := health.NewTracker(nil)
-	rep := NewReporter(tr).WithCapabilityRegistry(caps)
-	sem := health.NewSemanticInvalidator(tr, nil, caps, nil, nil)
-
-	oldGen := tr.EnsureGeneration(routeID)
-	body := []byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"no such model"}}`)
-	view := &proxy.ResultView{
-		Status: 404, ErrBody: body, Endpoint: model.EndpointMessages,
-		BytesWritten: int64(len(body)),
-	}
-	rep.ReportResult(routeID, oldGen, view)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("live route capability=%s want config_error", got)
-	}
-
-	// §9.2 delete: clear Capability + Forget RouteHealth (generation bump on reuse).
-	sem.InvalidateRoute(routeID)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-		t.Fatal("InvalidateRoute must clear config_error")
-	}
-
-	newGen := tr.EnsureGeneration(routeID)
-	if newGen == 0 || newGen == oldGen {
-		t.Fatalf("reused id must get a new generation: old=%d new=%d", oldGen, newGen)
-	}
-
-	// Late observation from the deleted incarnation must not restore config_error.
-	rep.ReportResult(routeID, oldGen, view)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-		t.Fatalf("stale generation must not leave reused id config_error, got %s", got)
-	}
-	// New route remains selectable (Capability does not exclude).
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("reused route Effective=%s want unknown (selectable)", got)
-	}
-
-	// Matching generation on the live reuse still sticks until invalidate.
-	rep.ReportResult(routeID, newGen, view)
-	if got := caps.Effective(model.RecipeScopeRoute, routeID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("live reused route capability=%s want config_error", got)
-	}
-}
-
-func TestReportResult_ModelNotFoundCodeVariants(t *testing.T) {
-	for _, code := range []string{"model_not_found", "model_not_available", "invalid_model", "unknown_model"} {
-		t.Run(code, func(t *testing.T) {
-			caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
-			rep := NewReporter(health.NewTracker(nil)).WithCapabilityRegistry(caps)
-			body := []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"` + code + `"}}`)
-			rep.ReportResult(3, 0, &proxy.ResultView{
-				Status: 400, ErrBody: body, Endpoint: model.EndpointChatCompletions,
-				BytesWritten: int64(len(body)),
+func TestRealTraffic_ProtocolEvidenceOwnsHealthAndPiggyback(t *testing.T) {
+	semantic := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+	for _, tc := range []struct {
+		name, body, contentType string
+		status                  int
+		success, partial        bool
+		class                   model.ErrorClass
+	}{
+		{"type error object", `{"type":"error","error":{"type":"server_error","message":"boom"}}`, "application/json", 200, false, false, model.ErrorTransient},
+		{"top-level error key", `{"error":{"type":"api_error","message":"fail"}}`, "application/json", 200, false, false, model.ErrorTransient},
+		{"SSE error event", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n", "text/event-stream", 200, false, false, model.ErrorRateLimited},
+		{"JSON rate limit", `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`, "application/json", 200, false, false, model.ErrorRateLimited},
+		{"complete semantic JSON", `{"type":"message","content":[{"type":"text","text":"hello"}]}`, "application/json", 200, true, false, ""},
+		{"complete semantic SSE", semantic + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", "text/event-stream", 200, true, false, ""},
+		{"HTML has bytes but no protocol evidence", "<html>not a model response</html>", "text/html", 200, false, false, ""},
+		{"valid empty protocol content", `{"type":"message","content":[]}`, "application/json", 200, false, false, model.ErrorFakeAlive},
+		{"empty 200", "", "application/json", 200, false, false, ""},
+		{"302 cannot become success", `{"redirect":true}`, "application/json", 302, false, false, model.ErrorTransient},
+		{"semantic followed by error", semantic + "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\"}}\n\n", "text/event-stream", 200, false, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				drainBody(r)
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
 			})
-			if got := caps.Effective(model.RecipeScopeRoute, 3, model.EndpointChatCompletions, ""); got != model.CapabilityConfigError {
-				t.Fatalf("capability=%s want config_error for code %s", got, code)
+			gen := h.tracker.EnsureGeneration(h.route.ID)
+			h.tracker.Report(health.Report{RouteID: h.route.ID, Generation: gen, Verdict: health.VerdictOK, Source: health.SourceReal})
+			seeded := h.tracker.Status(h.route.ID).LastRealOKAt
+			time.Sleep(2 * time.Millisecond)
+			status, body := h.requestProtocol(t, model.ProtoAnthropic)
+			if status != tc.status || string(body) != tc.body {
+				t.Fatalf("observation changed response: status=%d body=%q", status, body)
+			}
+			settleRealTraffic(t, h)
+			execution := h.execution(t)
+			if execution.Success != tc.success || execution.Partial != tc.partial || (tc.class != "" && execution.ErrorClass != tc.class) {
+				t.Fatalf("protocol evidence changed: %+v", execution)
+			}
+			after := h.tracker.Status(h.route.ID)
+			row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages)
+			if tc.success {
+				if !execution.SemanticSeen || !execution.NormalEndSeen || after.LastRealOKAt <= seeded || after.ConsecutiveFail != 0 || row == nil || row.LastRealOKAt == 0 || row.LastRealOKToken == "" {
+					t.Fatalf("complete semantic success lost piggyback evidence: status=%+v capability=%+v", after, row)
+				}
+			} else {
+				if after.LastRealOKAt != seeded || (row != nil && (row.LastRealOKAt != 0 || row.LastRealOKToken != "")) {
+					t.Fatal("incomplete/error response forged real success")
+				}
+				// A decoder failure supplies no reliable negative body evidence;
+				// valid structured errors and partial streams do count as failures.
+				if execution.ErrorClass != model.ErrorIgnored && execution.ErrorClass != model.ErrorRateLimited && after.ConsecutiveFail < 1 {
+					t.Fatalf("valid failure was not reported: execution=%+v health=%+v", execution, after)
+				}
 			}
 		})
 	}
 }
 
-func TestReportResult_AssistantTextModelNotFoundDoesNotConfigError(t *testing.T) {
-	caps := NewCapabilityRegistry(capSettings{model.DefaultSettings()})
-	tr := health.NewTracker(nil)
-	rep := NewReporter(tr).WithCapabilityRegistry(caps)
-
-	// Normal 200 with the words inside assistant text — no structured error payload.
-	rep.ReportResult(9, 0, &proxy.ResultView{
-		Status:       200,
-		ErrBody:      nil,
-		Endpoint:     model.EndpointMessages,
-		BytesWritten: 120,
-		SemanticSeen: true,
-	})
-	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-		t.Fatal("assistant text must not write config_error")
-	}
-	if tr.Status(9).ConsecutiveFail != 0 {
-		t.Fatalf("semantic 200 should be OK, fail=%d", tr.Status(9).ConsecutiveFail)
-	}
-
-	// Structured-looking message field alone is not enough without a whitelist code.
-	body := []byte(`{"error":{"type":"server_error","message":"model_not_found in prose"}}`)
-	rep.ReportResult(9, 0, &proxy.ResultView{
-		Status: 200, ErrBody: body, Endpoint: model.EndpointMessages,
-		BytesWritten: int64(len(body)),
-	})
-	if got := caps.Effective(model.RecipeScopeRoute, 9, model.EndpointMessages, ""); got == model.CapabilityConfigError {
-		t.Fatal("message prose must not write config_error without structured code")
+func TestRealTraffic_Live401403DoesNotMarkModelDeadOrCooldown(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				drainBody(r)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"bad key"}}`)
+			})
+			generation := h.tracker.EnsureGeneration(h.route.ID)
+			h.tracker.Report(health.Report{RouteID: h.route.ID, Generation: generation, Verdict: health.VerdictOK, Source: health.SourceReal})
+			code, _ := h.requestProtocol(t, model.ProtoAnthropic)
+			if code != status {
+				t.Fatalf("status=%d want %d", code, status)
+			}
+			settleRealTraffic(t, h)
+			execution := h.execution(t)
+			state := h.tracker.Status(h.route.ID)
+			if execution.ErrorClass != model.ErrorAuthRejected || state.State != model.StateAlive || state.CooldownUntil != 0 || state.ConsecutiveFail != 0 {
+				t.Fatalf("single request auth outcome became model failure: execution=%+v health=%+v", execution, state)
+			}
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, ""); got == model.CapabilityConfigError {
+				t.Fatal("single model 401/403 became config_error")
+			}
+		})
 	}
 }
 
-func TestTrafficFinish_DoesNotPiggybackOnStatusAlone(t *testing.T) {
-	sched := &recordingSched{}
-	m := NewTrafficObserverManager(stubProbeSnap{}, nil, nil, discardLogger()).WithScheduler(sched)
-	instr := m.PrepareAttempt(context.Background(), health.AttemptTarget{
-		RouteID: 9, UpstreamID: 1, Endpoint: model.EndpointMessages,
-	}, health.AttemptRequestView{})
-	instr.Observer.TryHeaders(200, nil, time.Now())
-	instr.Observer.Finish(health.AttemptFinish{})
-	if sched.n != 0 {
-		t.Fatalf("Finish must not ObserveRealSuccess on 2xx alone, got %d calls", sched.n)
+func TestRealTraffic_ModelNotFoundIsRouteLocalAndKeepsStationReachable(t *testing.T) {
+	h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		drainBody(r)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(404)
+		_, _ = io.WriteString(w, liveMissingModel)
+	})
+	mn := &model.ModelName{Name: "privacy sibling", Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
+	mn.Defaults()
+	if err := h.store.CreateModelName(mn); err != nil {
+		t.Fatal(err)
+	}
+	sibling := &model.Route{ModelNameID: mn.ID, UpstreamID: h.up.ID, Priority: 1, Weight: 1, Enabled: true}
+	if err := h.store.CreateRoute(sibling); err != nil {
+		t.Fatal(err)
+	}
+	settings, settingsRevision, err := h.store.GetSettingsWithRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.OKThreshold = 1
+	if _, err := h.store.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	code, _ := h.requestProtocol(t, model.ProtoAnthropic)
+	if code != 404 {
+		t.Fatalf("response=%d", code)
+	}
+	settleRealTraffic(t, h)
+	execution := h.execution(t)
+	row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages)
+	if row.State != model.CapabilityConfigError || row.ErrorClass != model.ErrorModelNotFound || row.ExpiresAt != 0 || execution.CapabilityDisposition != model.ApplyCurrent {
+		t.Fatalf("route config evidence missing: %+v", row)
+	}
+	if h.tracker.State(h.route.ID) == model.StateDead || h.reach.Effective(h.up.ID, h.up.NetworkRevision) != model.ReachabilityReachable {
+		t.Fatalf("model_not_found health=%s reach=%s snapshot=%+v suppliedNetRev=%d disposition=%s", h.tracker.State(h.route.ID), h.reach.Effective(h.up.ID, h.up.NetworkRevision), h.reach.Snapshot(h.up.ID), h.up.NetworkRevision, execution.ReachabilityDisposition)
+	}
+	if got := h.caps.Effective(model.RecipeScopeRoute, sibling.ID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("sibling inherited config_error: %s", got)
+	}
+}
+
+func TestRealTraffic_ModelNotFoundCodeVariantsAcrossNativeProtocol(t *testing.T) {
+	for _, code := range []string{"model_not_found", "model_not_available", "invalid_model", "unknown_model"} {
+		t.Run(code, func(t *testing.T) {
+			h := newTrafficHTTPHarnessFor(t, model.ProtoOpenAIChat, func(w http.ResponseWriter, r *http.Request) {
+				drainBody(r)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(400)
+				_, _ = fmt.Fprintf(w, `{"error":{"type":"invalid_request_error","code":%q}}`, code)
+			})
+			status, _ := h.requestProtocol(t, model.ProtoOpenAIChat)
+			if status != 400 {
+				t.Fatalf("response=%d", status)
+			}
+			settleRealTraffic(t, h)
+			if got := h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointChatCompletions, ""); got != model.CapabilityConfigError {
+				t.Fatalf("code %s capability=%s", code, got)
+			}
+		})
+	}
+}
+
+func TestRealTraffic_ModelNotFoundWordsCannotCreateConfigurationEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		success    bool
+	}{
+		{"assistant prose", `{"type":"message","content":[{"type":"text","text":"model_not_found model not found"}]}`, true},
+		{"error message prose", `{"error":{"type":"server_error","message":"model_not_found in prose"}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				drainBody(r)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			})
+			h.request(t)
+			settleRealTraffic(t, h)
+			execution := h.execution(t)
+			if execution.Success != tc.success || execution.ErrorClass == model.ErrorModelNotFound || h.caps.Effective(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages, "") == model.CapabilityConfigError {
+				t.Fatalf("arbitrary words became model code: %+v", execution)
+			}
+		})
+	}
+}
+
+func TestRealTraffic_LateModelErrorCannotPoisonReusedRouteID(t *testing.T) {
+	h := newCountTrafficHarness(t)
+	late := h.beginEndpoint(model.EndpointMessages)
+	oldID, oldCreatedAt := h.route.ID, h.route.CreatedAt
+	if err := h.store.DeleteRouteWithRevision(context.Background(), oldID, h.route.Revision); err != nil {
+		t.Fatal(err)
+	}
+	semantic := health.NewSemanticInvalidator(nil, nil, h.caps, nil, nil)
+	semantic.InvalidateRoute(oldID)
+	time.Sleep(2 * time.Millisecond)
+	replacement := &model.Route{ModelNameID: h.route.ModelNameID, UpstreamID: h.up.ID, Priority: 1, Weight: 1, Enabled: true}
+	if err := h.store.CreateRoute(replacement); err != nil {
+		t.Fatal(err)
+	}
+	// AUTOINCREMENT protects ordinary creation. Simulate an imported/restored
+	// reused ID explicitly in this temporary database, retaining real CAS reads.
+	if _, err := h.store.DB().Exec(`DELETE FROM route_health WHERE route_id=?`, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.DB().Exec(`UPDATE route SET id=? WHERE id=?`, oldID, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	replacement.ID = oldID
+	if replacement.ID != oldID || replacement.CreatedAt == oldCreatedAt {
+		t.Fatalf("fixture must reuse the ID with a new incarnation: old=%d/%d new=%d/%d", oldID, oldCreatedAt, replacement.ID, replacement.CreatedAt)
+	}
+	h.route = replacement
+	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	h.finish(t, late, 404, liveMissingModel)
+	if got := h.caps.Effective(model.RecipeScopeRoute, oldID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("old incarnation poisoned reuse: %s", got)
+	}
+	if got := restartedRegistry(t, h.store).Effective(model.RecipeScopeRoute, oldID, model.EndpointMessages, ""); got != model.CapabilityUnknown {
+		t.Fatalf("restart revived stale result: %s", got)
+	}
+	h.finish(t, h.beginEndpoint(model.EndpointMessages), 404, liveMissingModel)
+	if got := h.caps.Effective(model.RecipeScopeRoute, oldID, model.EndpointMessages, ""); got != model.CapabilityConfigError {
+		t.Fatalf("matching new incarnation could not record config_error: %s", got)
+	}
+}
+
+type recordingSched struct{ n int }
+
+func (s *recordingSched) ObserveRealSuccess(ScheduleKey, time.Time) { s.n++ }
+
+func TestTrafficFinish_StatusAloneAndMissingOrderCannotSaveOrPiggyback(t *testing.T) {
+	h := newCountTrafficHarness(t)
+	recorder := &captureRecorder{}
+	scheduler := &recordingSched{}
+	manager := NewTrafficObserverManager(h.manager.cfg, nil, recorder, discardLogger()).WithScheduler(scheduler)
+	instrument := manager.PrepareAttempt(context.Background(), health.AttemptTarget{RouteID: h.route.ID, UpstreamID: h.up.ID, Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, health.AttemptRequestView{})
+	instrument.Observer.TryHeaders(200, http.Header{"Content-Type": {"application/json"}}, time.Now())
+	instrument.Observer.TryChunk([]byte(`{"type":"message","content":[{"type":"text","text":"not order-bound"}]}`), time.Now())
+	instrument.Observer.Finish(health.AttemptFinish{})
+	if instrument.Trace != nil || scheduler.n != 0 || recorder.calls != 0 || len(manager.queue) != 0 {
+		t.Fatal("status/body without an allocated observation order created evidence")
+	}
+	// A genuine ordered status-only response also cannot yield semantic success.
+	h.finish(t, h.beginEndpoint(model.EndpointMessages), 200, "")
+	page, err := h.store.ListProbeExecutions(context.Background(), model.ProbeExecutionFilter{Trigger: model.TriggerRealTraffic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Success || strings.Contains(page.Items[0].RedactedDetail, "not order-bound") {
+		t.Fatalf("status alone became success: %+v", page.Items)
+	}
+	if row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages); row != nil && (row.LastRealOKAt != 0 || row.LastRealOKToken != "") {
+		t.Fatal("status alone fabricated piggyback evidence")
 	}
 }

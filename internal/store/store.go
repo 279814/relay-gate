@@ -15,10 +15,11 @@ import (
 )
 
 type Store struct {
-	db     *sql.DB
-	cipher *Cipher
-	lock   *instanceLock
-	path   string
+	db            *sql.DB
+	cipher        *Cipher
+	lock          *instanceLock
+	path          string
+	readerBuildID string
 }
 
 // connPragmas 是必须写在 DSN 里的**连接级** pragma。
@@ -167,6 +168,14 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 	if err := repairLegacyAuthSecretBindings(context.Background(), db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("初始化 Auth Secret 绑定元数据: %w", err)
+	}
+	if err := ensureProbeRetentionIndexes(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化探活保留索引: %w", err)
+	}
+	if err := initializeCurrentSettings(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化分阶段设置: %w", err)
 	}
 	return st, nil
 }

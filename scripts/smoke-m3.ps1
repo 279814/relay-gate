@@ -105,11 +105,13 @@ try {
 
     Say '配置：3 个站 + 1 个 ModelName + 3 条 Route'
     # 探活间隔压到最短，让验证不必等分钟级
+    $settingsSnapshot = Admin GET '/admin/api/settings'
     Admin PUT '/admin/api/settings' @{
-        real_connect_sec = 5; real_first_token_sec = 300; real_idle_sec = 30; real_total_sec = 300
+        expected_revision = $settingsSnapshot.revision
+        real_connect_sec = 5; real_response_header_sec = 300; real_first_byte_sec = 300; real_first_semantic_sec = 300; real_idle_sec = 30; real_total_sec = 300
         l1_connect_sec = 3; l1_total_sec = 5
-        l2_connect_sec = 3; l2_first_token_sec = 5; l2_total_sec = 8
-        count_tokens_sec = 10
+        l2_connect_sec = 3; l2_response_header_sec = 5; l2_first_byte_sec = 5; l2_first_event_sec = 5; l2_first_semantic_sec = 5; l2_idle_sec = 5; l2_total_sec = 8
+        count_tokens_connect_sec = 10; count_tokens_total_sec = 10
         l1_interval_alive_sec = 2; l1_interval_dead_sec = 2
         l2_interval_alive_sec = 3; l2_interval_dead_sec = 2
         fail_threshold = 2; ok_threshold = 2; cooldown_sec = 5
@@ -125,15 +127,21 @@ try {
         name = 'claude-opus-5'; protocol = 'anthropic'; match_mode = 'exact'; enabled = $true
     }
 
+    $initialEndpoints = foreach ($kind in @('models','messages','responses','chat_completions','count_tokens')) {
+        @{ endpoint = $kind; auth_profile = @{ mode = 'x_api_key'; secret_ref = 'upstream_api_key' } }
+    }
     $upOK = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-ok'; base_url = "http://127.0.0.1:$MOCK_OK"
         api_key = 'sk-mock-ok-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upDead = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-dead'; base_url = "http://127.0.0.1:$MOCK_DEAD"
         api_key = 'sk-mock-dead-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upFake = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-fake'; base_url = "http://127.0.0.1:$MOCK_FAKE"
         api_key = 'sk-mock-fake-key-1234'; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }

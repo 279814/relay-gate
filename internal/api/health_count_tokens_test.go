@@ -42,7 +42,7 @@ func healthRowsByRoute(t *testing.T, h http.Handler) map[int64]map[string]any {
 func TestGetHealth_CountTokensPerRoute(t *testing.T) {
 	s, _ := newTestServer(t)
 	seedConfig(t, s, 2, 2)
-	routes, err := s.st.ListRoutes(0)
+	routes, err := fixtureRoutes(s.st, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestGetHealth_CountTokensPerRoute(t *testing.T) {
 		scopes: map[model.RecipeScope]int{},
 		eps:    map[model.EndpointKind]int{},
 	}
-	h := s.WithHealth(stubHealth{}, nil, nil).WithCountTokensView(view).Routes(testAdminPW)
+	h := s.WithHealth(stubHealth{}, nil).WithCapabilities(view).Routes(testAdminPW)
 
 	rows := healthRowsByRoute(t, h)
 	for _, rt := range routes {
@@ -71,11 +71,11 @@ func TestGetHealth_CountTokensPerRoute(t *testing.T) {
 			t.Errorf("route %d count_tokens=%v, want %s", rt.ID, got, exp)
 		}
 	}
-	if view.scopes[model.RecipeScopeRoute] != len(routes) || len(view.scopes) != 1 {
+	if view.scopes[model.RecipeScopeRoute] != 2*len(routes) || len(view.scopes) != 1 {
 		t.Errorf("must read route-scope capability only: %v", view.scopes)
 	}
-	if view.eps[model.EndpointCountTokens] != len(routes) || len(view.eps) != 1 {
-		t.Errorf("must read count_tokens endpoint only: %v", view.eps)
+	if view.eps[model.EndpointCountTokens] != len(routes) || view.eps[model.EndpointMessages] != len(routes) || len(view.eps) != 2 {
+		t.Errorf("must independently read count_tokens and the model endpoint: %v", view.eps)
 	}
 }
 

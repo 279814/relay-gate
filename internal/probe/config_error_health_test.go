@@ -48,16 +48,16 @@ func reportsFor(track *recordingTracker, routeID int64) []health.Report {
 // 一个写错的 base_url 在 L2（定时与手动）都不得给 Route 报失败；同站另一条
 // 连不上的 Route 仍按连接失败计入 RouteHealth。
 func TestScheduler_L2URLConfigErrorLeavesRouteHealth(t *testing.T) {
-	for _, withExecutor := range []bool{true, false} {
-		name := "legacy prober"
-		if withExecutor {
-			name = "executor"
+	for _, withRecorder := range []bool{true, false} {
+		name := "fixture recorder"
+		if withRecorder {
+			name = "captured recorder"
 		}
 		t.Run(name, func(t *testing.T) {
 			hs := newSchedHarness(t, 2, aliveL2Handler)
 			recorder := &captureRecorder{}
-			if withExecutor {
-				hs.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+			if withRecorder {
+				hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 					ManagerTransports{Manager: outbound.NewManager()},
 					recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 			}
@@ -80,29 +80,45 @@ func TestScheduler_L2URLConfigErrorLeavesRouteHealth(t *testing.T) {
 			if got := reportsFor(hs.track, badRoute.ID); len(got) != 0 {
 				t.Fatalf("bad base_url L2 must not report RouteHealth, got %+v", got)
 			}
-			if withExecutor {
+			if withRecorder {
 				if recorder.obs == nil || recorder.obs.Execution.ErrorClass != model.ErrorConfig ||
 					recorder.obs.Execution.SentAtMS != 0 {
 					t.Fatalf("bad base_url must still record an unsent config_error execution, got %+v", recorder.obs)
 				}
 			}
 
-			_, l2, err := hs.sched.ProbeNow(context.Background(), snap, badRoute)
+			execution, err := manualFixtureService(hs.cfg, hs.sched).RunManual(context.Background(), badRoute.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if l2.Verdict != health.VerdictIgnore || !errors.Is(l2.Err, outbound.ErrURLConfig) {
-				t.Fatalf("manual L2 with bad base_url: verdict=%s err=%v, want ignore + ErrURLConfig",
-					l2.Verdict, l2.Err)
+			if execution.Success || execution.ErrorClass != model.ErrorConfig || execution.SentAtMS != 0 {
+				t.Fatalf("manual bad URL must be an unsent config_error: %+v", execution)
 			}
 			if got := reportsFor(hs.track, badRoute.ID); len(got) != 0 {
 				t.Fatalf("manual bad base_url L2 must not report RouteHealth, got %+v", got)
 			}
 
+			if !withRecorder {
+				ps, err := hs.cfg.ProbeSnapshot()
+				if err != nil {
+					t.Fatal(err)
+				}
+				recipe, err := hs.sched.resolveRecipeForExpectation(context.Background(), down.ID, downRoute.ID, model.EndpointMessages)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, _, _, _, err := buildL2Expectations(ps, down, downRoute, model.EndpointMessages, recipe); err != nil {
+					t.Fatalf("fixture must capture a current expectation: %v", err)
+				}
+			}
 			hs.sched.runL2(context.Background(), down, mn, downRoute, fastSettings(), 1)
 			got := reportsFor(hs.track, downRoute.ID)
-			if len(got) != 1 || got[0].Verdict != health.VerdictUnavailable {
-				t.Fatalf("connection refused L2 must report unavailable, got %+v", got)
+			if withRecorder {
+				if len(got) != 0 || recorder.obs == nil || recorder.obs.Execution.ErrorClass != model.ErrorUnreachable {
+					t.Fatalf("uncommitted capture must retain unreachable execution without reporting health: reports=%+v observation=%+v", got, recorder.obs)
+				}
+			} else if len(got) != 1 || got[0].Verdict != health.VerdictUnavailable {
+				t.Fatalf("committed connection failure must report unavailable: %+v", got)
 			}
 			if other := reportsFor(hs.track, badRoute.ID); len(other) != 0 {
 				t.Fatalf("another route's failure leaked into the bad-URL route: %+v", other)
@@ -118,7 +134,7 @@ func TestScheduler_L2ProxyPoolConfigErrorLeavesRouteHealth(t *testing.T) {
 	recorder := &captureRecorder{}
 	manager := outbound.NewManager()
 	t.Cleanup(manager.CloseIdleConnections)
-	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: manager},
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 
@@ -147,8 +163,8 @@ func TestScheduler_L2ProxyPoolConfigErrorLeavesRouteHealth(t *testing.T) {
 
 	hs.sched.runL2(context.Background(), down, mn, downRoute, fastSettings(), 1)
 	got := reportsFor(hs.track, downRoute.ID)
-	if len(got) != 1 || got[0].Verdict != health.VerdictUnavailable {
-		t.Fatalf("connection refused L2 must report unavailable, got %+v", got)
+	if len(got) != 0 || recorder.obs == nil || recorder.obs.Execution.ErrorClass != model.ErrorUnreachable {
+		t.Fatalf("capture records transport failure, but uncommitted evidence cannot report health: reports=%+v observation=%+v", got, recorder.obs)
 	}
 }
 

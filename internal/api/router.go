@@ -56,6 +56,18 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/probe-recipes", s.listProbeRecipes)
 	mux.HandleFunc("POST /admin/api/probe-recipes", s.createProbeRecipe)
 	mux.HandleFunc("GET /admin/api/probe-recipes/{id}", s.getProbeRecipe)
+	mux.HandleFunc("GET /admin/api/probe-recipes/{id}/versions", s.listRecipeVersions)
+	mux.HandleFunc("POST /admin/api/probe-recipes/{id}/versions", s.addRecipeVersion)
+	mux.HandleFunc("POST /admin/api/probe-recipe-versions/{id}/preview", s.previewRecipeVersion)
+	mux.HandleFunc("GET /admin/api/probe-recipe-versions/{id}", s.getRecipeVersion)
+	mux.HandleFunc("POST /admin/api/probe-recipe-versions/{id}/test", s.testRecipeVersion)
+	mux.HandleFunc("POST /admin/api/probe-recipes/{id}/versions/{version_id}/publish", s.publishRecipeVersion)
+	mux.HandleFunc("POST /admin/api/probe-recipes/{id}/{action}", s.retireRecipe)
+	mux.HandleFunc("GET /admin/api/client-probe-profiles", s.listClientProfiles)
+	mux.HandleFunc("GET /admin/api/client-probe-profiles/{id}", s.getClientProfile)
+	mux.HandleFunc("POST /admin/api/client-probe-profiles/{id}/preview", s.previewClientProfile)
+	mux.HandleFunc("POST /admin/api/client-probe-profiles/{id}/test", s.testClientProfile)
+	mux.HandleFunc("POST /admin/api/client-probe-profiles/{id}/disable", s.disableClientProfile)
 
 	mux.HandleFunc("GET /admin/api/probe-executions", s.listProbeExecutions)
 	mux.HandleFunc("GET /admin/api/probe-executions/{id}", s.getProbeExecution)
@@ -71,6 +83,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
+	mux.HandleFunc("POST /admin/api/samples/{id}/view", s.viewSample)
 	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)
 	mux.HandleFunc("DELETE /admin/api/samples", s.clearSamples)
 	// 从样本导出探活头模板（§3.6.4）。改探活指纹的正确方式是从真实样本导，

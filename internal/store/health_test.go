@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -89,7 +90,7 @@ func TestRouteHealth_CascadeOnRouteDelete(t *testing.T) {
 	st := testStore(t)
 	rt := mkRoute(t, st)
 
-	if err := st.DeleteRoute(rt.ID); err != nil {
+	if err := st.DeleteRouteWithRevision(context.Background(), rt.ID, rt.Revision); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := st.ListRouteHealth()

@@ -1,6 +1,7 @@
 package livecfg
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -84,15 +86,8 @@ func TestSource_LoadsFullConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.RealFirstTokenSec != model.DefaultSettings().RealFirstTokenSec {
-		t.Errorf("应返回默认设置，得到 %d", settings.RealFirstTokenSec)
-	}
-	state, err := s.RunState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state != store.StateRunning {
-		t.Errorf("默认应为 running，得到 %q", state)
+	if settings.RealFirstSemanticSec != model.DefaultSettings().RealFirstSemanticSec {
+		t.Errorf("应返回默认设置，得到 %d", settings.RealFirstSemanticSec)
 	}
 }
 
@@ -152,31 +147,48 @@ func TestSource_RefreshesAfterTTL(t *testing.T) {
 	}
 }
 
-// 总闸切换必须在 TTL 后生效 —— 点了「暂停」却还在转发是很糟的。
-func TestSource_PicksUpRunStateChange(t *testing.T) {
+// Controller changes take effect without refreshing routing or waiting for TTL.
+func TestSource_RunStateIsIndependentOfConfigurationTTL(t *testing.T) {
 	st := testStore(t)
 	seed(t, st)
-	s, clock := newSource(t, st)
-
-	if state, _ := s.RunState(); state != store.StateRunning {
-		t.Fatalf("初始应 running，得到 %q", state)
-	}
-	if err := st.SetRunState(store.StatePaused); err != nil {
-		t.Fatal(err)
-	}
-	*clock = clock.Add(DefaultTTL + time.Millisecond)
-
-	state, err := s.RunState()
+	source, _ := newSource(t, st)
+	initial, err := source.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state != store.StatePaused {
-		t.Errorf("应看到 paused，得到 %q", state)
+	controller, err := runstate.NewController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.BindSyntheticController(sourceSyntheticController{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := controller.Current()
+	if snapshot.State != model.RunStateRunning {
+		t.Fatal(snapshot)
+	}
+	paused, err := controller.Set(context.Background(), model.RunStatePaused, snapshot.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.State != model.RunStatePaused || controller.Current().Admitting() {
+		t.Fatal("pause not visible immediately")
+	}
+	cached, err := source.Snapshot()
+	if err != nil || cached != initial {
+		t.Fatalf("state change refreshed routing: %v", err)
 	}
 }
 
-// 三个方法必须来自同一次加载，否则可能出现「用新快照配旧超时」这种撕裂状态。
-func TestSource_ThreeGettersShareOneLoad(t *testing.T) {
+type sourceSyntheticController struct{}
+
+func (sourceSyntheticController) CancelSynthetic(context.Context, error) error { return nil }
+func (sourceSyntheticController) PrepareResume()                               {}
+func (sourceSyntheticController) ResumeGradually()                             {}
+
+// routing 与 Settings 必须来自同一次加载，否则可能出现「用新快照配旧超时」这种撕裂状态。
+func TestSource_RoutingAndSettingsShareOneLoad(t *testing.T) {
 	st := testStore(t)
 	seed(t, st)
 	s, _ := newSource(t, st)
@@ -185,12 +197,9 @@ func TestSource_ThreeGettersShareOneLoad(t *testing.T) {
 	if _, err := s.Settings(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RunState(); err != nil {
-		t.Fatal(err)
-	}
 	snap2, _ := s.Snapshot()
 	if snap1 != snap2 {
-		t.Error("三个 getter 应共用一次加载的结果")
+		t.Error("routing 与 Settings 应共用一次加载的结果")
 	}
 }
 
@@ -215,12 +224,9 @@ func TestSource_ServesStaleOnLoadError(t *testing.T) {
 	if stale != good {
 		t.Error("应继续返回上一次成功加载的配置")
 	}
-	// Settings 与 RunState 也要能继续服务
+	// Settings 也要继续服务
 	if _, err := s.Settings(); err != nil {
 		t.Errorf("Settings 也应回退到旧配置，得到 %v", err)
-	}
-	if _, err := s.RunState(); err != nil {
-		t.Errorf("RunState 也应回退到旧配置，得到 %v", err)
 	}
 }
 
@@ -272,8 +278,8 @@ func TestSource_InvalidSettingsFallsBackToDefaults(t *testing.T) {
 
 	// 直接写库绕过 SaveSettings 的校验
 	_, err := st.DB().Exec(
-		`INSERT INTO setting (key, value, updated_at) VALUES ('settings', ?, 0)`,
-		`{"real_first_token_sec":1,"real_total_sec":1}`)
+		`UPDATE setting SET value=?,updated_at=0 WHERE key='settings'`,
+		`{"real_first_semantic_sec":1,"real_total_sec":1}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,9 +289,9 @@ func TestSource_InvalidSettingsFallsBackToDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RealFirstTokenSec < model.MinRealFirstTokenSec {
-		t.Errorf("不合法的 settings 应降级为默认值，得到 real_first_token_sec=%d",
-			got.RealFirstTokenSec)
+	if got.RealFirstSemanticSec < model.MinRealFirstSemanticSec {
+		t.Errorf("不合法的 settings 应降级为默认值，得到 real_first_semantic_sec=%d",
+			got.RealFirstSemanticSec)
 	}
 }
 
@@ -312,8 +318,7 @@ func TestSource_ConcurrentReads(t *testing.T) {
 				done <- err
 				return
 			}
-			_, err = s.RunState()
-			done <- err
+			done <- nil
 		}()
 	}
 	for i := 0; i < n; i++ {

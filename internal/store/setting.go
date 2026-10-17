@@ -2,42 +2,44 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
 )
 
-const (
-	keySettings = "settings"
-	keyRunState = "run_state"
-)
+const keySettings = "settings"
 
-// GetSettings 读全局设置。未初始化时返回默认值（不写库），
-// 让首次启动不依赖任何初始化步骤。
-func (s *Store) GetSettings() (model.Settings, error) {
-	var raw string
-	err := s.db.QueryRow(`SELECT value FROM setting WHERE key = ?`, keySettings).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return model.DefaultSettings(), nil
+func decodeSettingsDocument(raw []byte, target any) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return model.WrapValidation("settings 必须是合法 JSON object")
 	}
-	if err != nil {
-		return model.Settings{}, err
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return model.WrapValidation("settings 字段无效")
 	}
-
-	return usableSettings(DecodeLegacySettings([]byte(raw)))
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return model.WrapValidation("settings 后存在多余 JSON")
+	}
+	return nil
 }
 
-// usableSettings 把解码结果收成转发和探活可以共用的一份。
-//
-// SaveSettings 会拒绝过短的超时，所以正常写入到不了这里。手改库或版本降级
-// 可以写出 Validate 不接受的值。原样放行会把长思考按 1 秒砍断；只在某一条
-// 读路径换成默认值、另一条仍用原值，则探活期望和提交时的指纹不同，结论全部
-// config_stale。JSON 本身不合法仍然返回错误，不能把损坏的行假装成默认设置。
+// Normal reads accept only the current runtime model. Legacy syntax belongs
+// exclusively to the controlled startup/import decoder below.
+func decodeCurrentSettings(raw []byte) (model.Settings, error) {
+	settings := model.DefaultSettings()
+	err := decodeSettingsDocument(raw, &settings)
+	return settings, err
+}
+
 func usableSettings(settings model.Settings, err error) (model.Settings, error) {
 	if err != nil {
 		return model.Settings{}, err
@@ -48,123 +50,94 @@ func usableSettings(settings model.Settings, err error) (model.Settings, error) 
 	return settings, nil
 }
 
-// DecodeLegacySettings is the only decoder allowed to accept pre-P0 keys
-// (timeout aliases and probe_enabled). API DTOs use their own strict decoder.
+// DecodeLegacySettings is used only by startup normalization and historical
+// migration readers. Explicit new stage keys win over the old coarse aliases.
 func DecodeLegacySettings(raw []byte) (model.Settings, error) {
-	var present map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &present); err != nil {
-		return model.Settings{}, model.WrapValidation("settings 不是合法 JSON: %v", err)
-	}
-	if present == nil {
-		return model.Settings{}, model.WrapValidation("settings 必须是 JSON object")
-	}
-
-	// Strip keys that exist only for migration; model.Settings no longer carries them.
-	filtered := make(map[string]json.RawMessage, len(present))
-	for k, v := range present {
-		switch k {
-		case "probe_enabled":
-			continue
-		default:
-			filtered[k] = v
-		}
-	}
-	stripped, err := json.Marshal(filtered)
-	if err != nil {
+	document := struct {
+		model.Settings
+		RealFirstToken *int  `json:"real_first_token_sec"`
+		L2FirstToken   *int  `json:"l2_first_token_sec"`
+		CountTokens    *int  `json:"count_tokens_sec"`
+		ProbeEnabled   *bool `json:"probe_enabled"`
+	}{Settings: model.DefaultSettings()}
+	if err := decodeSettingsDocument(raw, &document); err != nil {
 		return model.Settings{}, err
-	}
-
-	type settingsAlias model.Settings
-	decoded := settingsAlias(model.DefaultSettings())
-	decoder := json.NewDecoder(bytes.NewReader(stripped))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&decoded); err != nil {
-		return model.Settings{}, model.WrapValidation("settings 字段无效: %v", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return model.Settings{}, model.WrapValidation("settings 后存在多余 JSON")
-	}
-	out := model.Settings(decoded)
-
-	if _, legacy := present["real_first_token_sec"]; legacy {
-		if _, current := present["real_response_header_sec"]; !current {
-			out.RealResponseHeaderSec = out.RealFirstTokenSec
-		}
-		if _, current := present["real_first_byte_sec"]; !current {
-			out.RealFirstByteSec = out.RealFirstTokenSec
-		}
-		if _, current := present["real_first_semantic_sec"]; !current {
-			out.RealFirstSemanticSec = out.RealFirstTokenSec
-		}
-	} else {
-		out.RealFirstTokenSec = out.RealFirstSemanticSec
-	}
-	if _, legacy := present["l2_first_token_sec"]; legacy {
-		if _, current := present["l2_response_header_sec"]; !current {
-			out.L2ResponseHeaderSec = out.L2FirstTokenSec
-		}
-		if _, current := present["l2_first_byte_sec"]; !current {
-			out.L2FirstByteSec = out.L2FirstTokenSec
-		}
-		if _, current := present["l2_first_event_sec"]; !current {
-			out.L2FirstEventSec = out.L2FirstTokenSec
-		}
-		if _, current := present["l2_first_semantic_sec"]; !current {
-			out.L2FirstSemanticSec = out.L2FirstTokenSec
-		}
-	} else {
-		out.L2FirstTokenSec = out.L2FirstSemanticSec
-	}
-	if _, legacy := present["count_tokens_sec"]; legacy {
-		if _, current := present["count_tokens_connect_sec"]; !current {
-			out.CountTokensConnectSec = out.CountTokensSec
-		}
-		if _, current := present["count_tokens_total_sec"]; !current {
-			out.CountTokensTotalSec = out.CountTokensSec
-		}
-	} else {
-		out.CountTokensSec = out.CountTokensTotalSec
-	}
-	return out, nil
-}
-
-func encodeSettings(settings model.Settings) ([]byte, error) {
-	raw, err := json.Marshal(settings)
-	if err != nil {
-		return nil, err
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil, err
+		return model.Settings{}, model.WrapValidation("settings 必须是合法 JSON object")
 	}
-	delete(fields, "real_first_token_sec")
-	delete(fields, "l2_first_token_sec")
-	delete(fields, "count_tokens_sec")
-	return json.Marshal(fields)
+	present := func(name string) bool {
+		for key, value := range fields {
+			if strings.EqualFold(key, name) && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return true
+			}
+		}
+		return false
+	}
+	fill := func(name string, target *int, legacy *int) {
+		if legacy != nil && !present(name) {
+			*target = *legacy
+		}
+	}
+	fill("real_response_header_sec", &document.RealResponseHeaderSec, document.RealFirstToken)
+	fill("real_first_byte_sec", &document.RealFirstByteSec, document.RealFirstToken)
+	fill("real_first_semantic_sec", &document.RealFirstSemanticSec, document.RealFirstToken)
+	fill("l2_response_header_sec", &document.L2ResponseHeaderSec, document.L2FirstToken)
+	fill("l2_first_byte_sec", &document.L2FirstByteSec, document.L2FirstToken)
+	fill("l2_first_event_sec", &document.L2FirstEventSec, document.L2FirstToken)
+	fill("l2_first_semantic_sec", &document.L2FirstSemanticSec, document.L2FirstToken)
+	fill("count_tokens_connect_sec", &document.CountTokensConnectSec, document.CountTokens)
+	fill("count_tokens_total_sec", &document.CountTokensTotalSec, document.CountTokens)
+	return document.Settings, nil
 }
 
-// SaveSettings 校验后写入。校验失败返回 model.ErrValidation，API 层回 400。
-func (s *Store) SaveSettings(st model.Settings) error {
-	// Legacy API adapter: its three coarse knobs remain authoritative until
-	// P0-14 migrates the handler to the stage-specific DTO.
-	st.RealResponseHeaderSec = st.RealFirstTokenSec
-	st.RealFirstByteSec = st.RealFirstTokenSec
-	st.RealFirstSemanticSec = st.RealFirstTokenSec
-	st.L2ResponseHeaderSec = st.L2FirstTokenSec
-	st.L2FirstByteSec = st.L2FirstTokenSec
-	st.L2FirstEventSec = st.L2FirstTokenSec
-	st.L2FirstSemanticSec = st.L2FirstTokenSec
-	st.CountTokensConnectSec = st.CountTokensSec
-	st.CountTokensTotalSec = st.CountTokensSec
-	if err := st.Validate(); err != nil {
-		return err
-	}
-	_, revision, err := s.GetSettingsWithRevision()
+func encodeSettings(settings model.Settings) ([]byte, error) { return json.Marshal(settings) }
+
+// Initialization occurs under the existing instance lock before a listener or
+// Source is exposed. It never opens or rewrites a backup database.
+func initializeCurrentSettings(ctx context.Context, db *sql.DB) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	_, err = s.SaveSettingsWithRevision(st, revision)
-	return err
+	defer tx.Rollback()
+	var raw []byte
+	var revision int64
+	err = tx.QueryRowContext(ctx, `SELECT value,revision FROM setting WHERE key=?`, keySettings).Scan(&raw, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		encoded, encodeErr := encodeSettings(model.DefaultSettings())
+		if encodeErr != nil {
+			return encodeErr
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO setting(key,value,updated_at,revision) VALUES (?,?,?,1)`, keySettings, string(encoded), nowMS()); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if _, currentErr := decodeCurrentSettings(raw); currentErr == nil {
+		return tx.Commit()
+	}
+	settings, err := DecodeLegacySettings(raw)
+	if err != nil {
+		return err
+	}
+	encoded, err := encodeSettings(settings)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE setting SET value=?,updated_at=?,revision=revision+1 WHERE key=? AND revision=?`, string(encoded), nowMS(), keySettings, revision); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetSettings() (model.Settings, error) {
+	settings, _, err := s.GetSettingsWithRevision()
+	return settings, err
 }
 
 func (s *Store) GetSettingsWithRevision() (model.Settings, int64, error) {
@@ -177,7 +150,7 @@ func (s *Store) GetSettingsWithRevision() (model.Settings, int64, error) {
 	if err != nil {
 		return model.Settings{}, 0, err
 	}
-	settings, err := usableSettings(DecodeLegacySettings([]byte(raw)))
+	settings, err := usableSettings(decodeCurrentSettings([]byte(raw)))
 	return settings, revision, err
 }
 
@@ -196,14 +169,10 @@ func (s *Store) SaveSettingsWithRevision(settings model.Settings, expectedRevisi
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-	var currentRaw string
-	var currentRevision int64
-	scanErr := tx.QueryRow(`SELECT value,revision FROM setting WHERE key=?`, keySettings).Scan(&currentRaw, &currentRevision)
+	defer tx.Rollback()
+	var raw string
+	var revision int64
+	scanErr := tx.QueryRow(`SELECT value,revision FROM setting WHERE key=?`, keySettings).Scan(&raw, &revision)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		if expectedRevision != 0 {
 			return 0, ErrRevisionConflict
@@ -219,57 +188,35 @@ func (s *Store) SaveSettingsWithRevision(settings model.Settings, expectedRevisi
 	if scanErr != nil {
 		return 0, scanErr
 	}
-	if currentRevision != expectedRevision {
+	if revision != expectedRevision {
 		return 0, ErrRevisionConflict
 	}
-	current, decodeErr := DecodeLegacySettings([]byte(currentRaw))
-	if decodeErr != nil {
-		return 0, decodeErr
+	current, err := decodeCurrentSettings([]byte(raw))
+	if err != nil {
+		return 0, err
 	}
 	if reflect.DeepEqual(current, settings) {
 		if err = tx.Commit(); err != nil {
 			return 0, err
 		}
-		return currentRevision, nil
+		return revision, nil
 	}
-	newRevision = currentRevision + 1
-	result, err := tx.Exec(`UPDATE setting SET value=?,updated_at=?,revision=? WHERE key=? AND revision=?`,
-		string(encoded), nowMS(), newRevision, keySettings, currentRevision)
+	newRevision = revision + 1
+	result, err := tx.Exec(`UPDATE setting SET value=?,updated_at=?,revision=? WHERE key=? AND revision=?`, string(encoded), nowMS(), newRevision, keySettings, revision)
 	if err != nil {
 		return 0, err
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected != 1 {
 		return 0, ErrRevisionConflict
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
 	return newRevision, nil
-}
-
-// RunState remains a source-compatible alias until P0-17 removes the legacy
-// Store-facing API.
-type RunState = model.RunState
-
-const (
-	StateRunning RunState = model.RunStateRunning
-	StatePaused  RunState = model.RunStatePaused
-)
-
-// GetRunState 读运行状态，默认 running。
-// 状态持久化的意义在于「暂停时重启不会自动跑起来」（§4.8）。
-func (s *Store) GetRunState() (RunState, error) {
-	state, _, err := s.GetRunStateWithRevision()
-	return state, err
-}
-
-func (s *Store) SetRunState(st RunState) error {
-	_, revision, err := s.GetRunStateWithRevision()
-	if err != nil {
-		return err
-	}
-	_, err = s.SetRunStateWithRevision(st, revision)
-	return err
 }
 
 func (s *Store) GetRunStateWithRevision() (model.RunState, int64, error) {
@@ -324,11 +271,6 @@ func (s *Store) SetRunStateWithRevision(state model.RunState, expectedRevision i
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return 0, ErrRevisionConflict
-	}
-	if _, err = tx.Exec(`INSERT INTO setting(key,value,updated_at,revision) VALUES (?,?,?,1)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,revision=setting.revision+1`,
-		keyRunState, state, updatedAt); err != nil {
-		return 0, err
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err

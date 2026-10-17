@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"reflect"
 	"runtime/debug"
 
@@ -35,6 +34,9 @@ func (store *Store) InsertProbeExecution(ctx context.Context, execution *model.P
 	if err == nil {
 		if existing != copyValue.EvidenceHash {
 			return ErrIdempotencyConflict
+		}
+		if _, err := recordStoredExecutionCostTx(ctx, tx, copyValue.ID); err != nil {
+			return err
 		}
 		return tx.Commit()
 	}
@@ -77,6 +79,10 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 		if err != nil {
 			return result, err
 		}
+		result.CostCharged, err = recordStoredExecutionCostTx(ctx, tx, execution.ID)
+		if err != nil {
+			return model.ProbeApplyResult{}, err
+		}
 		if err = tx.Commit(); err != nil {
 			return result, err
 		}
@@ -100,42 +106,24 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 		return result, err
 	}
 	result.ExecutionStored = true
+	result.CostCharged, err = recordExecutionCostTx(ctx, tx, execution)
+	if err != nil {
+		return model.ProbeApplyResult{}, err
+	}
 	if err = tx.Commit(); err != nil {
-		return result, err
+		return model.ProbeApplyResult{}, err
 	}
-	// Stale / non-applied dispositions must not charge: a config_stale probe
-	// still stores the execution row, but must not insert probe_cost_*.
-	if result.Reachability != model.ApplyCurrent && result.Capability != model.ApplyCurrent {
-		return result, nil
-	}
-	// Cost is best-effort after the observation commits. A probe_cost_* write
-	// failure must not roll capability/reachability back to the pre-probe state.
-	charged, costErr := store.recordExecutionCostAfterCommit(ctx, execution)
-	if costErr != nil {
-		slog.Default().Error("探活成本落库失败", "err", costErr, "execution_id", execution.ID)
-		return result, nil
-	}
-	result.CostCharged = charged
 	return result, nil
 }
 
-// recordExecutionCostAfterCommit writes probe_cost_event/daily in its own
-// transaction so observation commit success is independent of cost flush.
-// charged is true only when an event was inserted or confirmed idempotent.
-func (store *Store) recordExecutionCostAfterCommit(ctx context.Context, execution model.ProbeExecution) (bool, error) {
-	tx, err := store.db.BeginTx(ctx, nil)
+// Repair an older partial write from its immutable stored evidence, never from
+// a replay's supplied cost fields. The cost event enforces exactly-once rollup.
+func recordStoredExecutionCostTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	execution, err := scanProbeExecution(tx.QueryRowContext(ctx, `SELECT `+probeExecutionCols+` FROM probe_execution WHERE id=?`, id))
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-	charged, err := recordExecutionCostTx(ctx, tx, execution)
-	if err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return charged, nil
+	return recordExecutionCostTx(ctx, tx, *execution)
 }
 
 func validateProbeExecutionEnvelope(execution model.ProbeExecution) error {
@@ -422,22 +410,6 @@ func stampCapabilityExpectation(row *model.EndpointCapability, expectation *mode
 	row.ProbeSettingsFingerprint = expectation.Revision.ProbeSettingsFingerprint
 	row.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(expectation.Revision.ProbeSecrets)
 	row.RequestTransformBindingRevision = expectation.Revision.RequestTransform
-}
-
-// SaveConfigErrorCapability 把真实流量观察到的 Route config_error 按
-// expectation 落库（docs/01 §5.2），token 与 RestoreConfigErrors 现算的一致。
-func (store *Store) SaveConfigErrorCapability(ctx context.Context, expectation *model.SemanticExpectation,
-	statusCode int, errorClass model.ErrorClass, detail string, observedAt int64) error {
-
-	tx, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := saveConfigErrorCapabilityTx(ctx, tx, expectation, statusCode, errorClass, detail, observedAt); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 // deleteConfigErrorCapabilitiesTx 在 Enabled false→true 时删掉 scope 下落库的
@@ -778,7 +750,7 @@ func loadSettingsTx(ctx context.Context, tx *sql.Tx) (model.Settings, error) {
 	} else if err != nil {
 		return model.Settings{}, err
 	}
-	return usableSettings(DecodeLegacySettings(raw))
+	return usableSettings(decodeCurrentSettings(raw))
 }
 
 func insertProbeExecutionTx(ctx context.Context, tx *sql.Tx, execution *model.ProbeExecution) error {

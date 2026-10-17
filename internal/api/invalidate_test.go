@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +19,15 @@ type recordingInvalidator struct {
 	routes     []int64
 	upstreams  []int64
 	modelNames []int64
+	scheduled  []probe.ScheduleKey
+	reasons    []probe.ScheduleReason
+}
+
+func (r *recordingInvalidator) Trigger(key probe.ScheduleKey, reason probe.ScheduleReason) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scheduled = append(r.scheduled, key)
+	r.reasons = append(r.reasons, reason)
 }
 
 func (r *recordingInvalidator) InvalidateRoute(id int64) {
@@ -57,7 +65,7 @@ func newInvalidatorServer(t *testing.T) (http.Handler, *recordingInvalidator) {
 // mkUpstreamViaAPI 经 API 建一个 Upstream，返回 id。
 func mkUpstreamViaAPI(t *testing.T, h http.Handler, body string) int64 {
 	t.Helper()
-	rec := do(t, h, "POST", "/admin/api/upstreams", body, true)
+	rec := do(t, h, "POST", "/admin/api/upstreams", upstreamFixture(t, body), true)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("建 upstream 失败 %d：%s", rec.Code, rec.Body.String())
 	}
@@ -114,8 +122,7 @@ func TestInvalidate_UpstreamMaskedKeyEchoKeepsSecret(t *testing.T) {
 		t.Fatalf("GET 应回脱敏值且 is_set：%+v", before)
 	}
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
-		`{"name":"u1-renamed","api_key":`+mustJSON(t, before.APIKey)+`}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"name":"u1-renamed","api_key":`+mustJSON(t, before.APIKey)+`}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT masked echo: %d %s", rec.Code, rec.Body.String())
 	}
@@ -173,8 +180,7 @@ func TestUpstream_ProxyURLPasswordNotInAPI(t *testing.T) {
 		t.Fatalf("GET should return host-visible redacted proxy_url, got %q", before.ProxyURL)
 	}
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
-		`{"name":"proxy-u-renamed","proxy_url":`+mustJSON(t, before.ProxyURL)+`}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"name":"proxy-u-renamed","proxy_url":`+mustJSON(t, before.ProxyURL)+`}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT masked proxy echo: %d %s", rec.Code, rec.Body.String())
 	}
@@ -204,9 +210,8 @@ func TestUpstream_ProxyURLPasswordNotInAPI(t *testing.T) {
 		t.Fatalf("stored proxy_url overwritten: got %q", got.ProxyURL)
 	}
 
-	bad := do(t, h, "POST", "/admin/api/upstreams",
-		`{"name":"bad-proxy","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb","proxy_url":`+
-			mustJSON(t, "http://user:"+pass+"@[%")+`}`, true)
+	bad := do(t, h, "POST", "/admin/api/upstreams", upstreamFixture(t, `{"name":"bad-proxy","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb","proxy_url":`+
+		mustJSON(t, "http://user:"+pass+"@[%")+`}`), true)
 	if bad.Code == http.StatusCreated || bad.Code == http.StatusOK {
 		t.Fatalf("invalid proxy_url must be rejected, got %d", bad.Code)
 	}
@@ -230,8 +235,7 @@ func TestInvalidate_UpstreamKeyChangeTriggersProbe(t *testing.T) {
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-oldoldoldold"}`)
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
-		`{"api_key":"sk-newnewnewnew"}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"api_key":"sk-newnewnewnew"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败 %d：%s", rec.Code, rec.Body.String())
 	}
@@ -247,7 +251,7 @@ func TestInvalidate_UpstreamNameChangeDoesNotTriggerProbe(t *testing.T) {
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), `{"name":"u1-renamed"}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"name":"u1-renamed"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -267,7 +271,7 @@ func TestInvalidate_UpstreamNoOpUpdateDoesNotTriggerProbe(t *testing.T) {
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), `{}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -283,7 +287,7 @@ func TestInvalidate_UpstreamReEnableDoesNotTriggerProbe(t *testing.T) {
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa","enabled":false}`)
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), `{"enabled":true}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"enabled":true}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -299,7 +303,7 @@ func TestInvalidate_UpstreamDisableDoesNotTriggerProbe(t *testing.T) {
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
 
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -315,8 +319,7 @@ func TestInvalidate_NilInvalidatorIsSafe(t *testing.T) {
 	_, h := newTestServer(t) // 没有 WithInvalidator
 	id := mkUpstreamViaAPI(t, h,
 		`{"name":"u1","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id),
-		`{"api_key":"sk-newnewnewnew"}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(id), withExpectedRevision(t, `{"api_key":"sk-newnewnewnew"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("没接钩子时更新应正常，得到 %d：%s", rec.Code, rec.Body.String())
 	}
@@ -380,8 +383,7 @@ func TestInvalidate_ModelNamePromptChangeTriggersProbe(t *testing.T) {
 		`{"name":"m1","protocol":"anthropic"}`, true)
 	id := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 
-	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id),
-		`{"probe_prompt":"2+2=?"}`, true)
+	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(id), withExpectedRevision(t, `{"probe_prompt":"2+2=?"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -405,6 +407,9 @@ func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T)
 			}
 			return []int64{101, 102}
 		},
+		RouteScheduleKey: func(routeID int64) (probe.ScheduleKey, bool) {
+			return probe.ScheduleKey{UpstreamID: 9, ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: model.EndpointMessages}, true
+		},
 	}
 	wrap.InvalidateModelName(5)
 	if len(sem.modelNames) != 1 || sem.modelNames[0] != 5 {
@@ -414,9 +419,13 @@ func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T)
 		sem.modelNameRoutes[0][0] != 101 || sem.modelNameRoutes[0][1] != 102 {
 		t.Fatalf("semantic routeIDs=%v", sem.modelNameRoutes)
 	}
-	_, _, mns := inner.counts()
-	if mns != 1 {
-		t.Fatalf("inner InvalidateModelName count=%d", mns)
+	if len(inner.modelNames) != 0 || len(inner.scheduled) != 2 {
+		t.Fatalf("expected per-route L2 Trigger keys, got legacy calls=%v keys=%v", inner.modelNames, inner.scheduled)
+	}
+	for index, key := range inner.scheduled {
+		if key.UpstreamID != 9 || key.ScopeType != model.RecipeScopeRoute || key.ScopeID != int64(101+index) || key.Endpoint != model.EndpointMessages || inner.reasons[index] != probe.ScheduleConfig {
+			t.Fatalf("wrong child L2 schedule key/reason: %+v %s", key, inner.reasons[index])
+		}
 	}
 }
 
@@ -497,7 +506,7 @@ func TestInvalidate_RoutePriorityChangeDoesNotTriggerProbe(t *testing.T) {
 	// 建 Route 时触发了一次，从这里开始只看增量。
 	before, _, _ := inv.counts()
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"priority":5,"weight":50}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"priority":5,"weight":50}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -523,7 +532,7 @@ func TestInvalidate_RouteReEnableDoesNotTriggerProbe(t *testing.T) {
 	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 	before, _, _ := inv.counts()
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":true}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"enabled":true}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("重新启用失败：%s", rec.Body.String())
 	}
@@ -574,11 +583,11 @@ func TestInvalidate_RouteReEnableClearsDeadWithoutProbe(t *testing.T) {
 	*caps = recordingCaps{}
 	beforeRoutes, beforeUps, _ := inner.counts()
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":true}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"enabled":true}`, 2), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("re-enable: %d %s", rec.Code, rec.Body.String())
 	}
@@ -642,11 +651,11 @@ func TestInvalidate_UpstreamReEnableClearsDeadWithoutProbe(t *testing.T) {
 	*caps = recordingCaps{}
 	beforeRoutes, beforeUps, _ := inner.counts()
 
-	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":true}`, true)
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":true}`, 2), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("re-enable: %d %s", rec.Code, rec.Body.String())
 	}
@@ -688,8 +697,7 @@ func TestInvalidate_RouteModelMappingChangeTriggersProbe(t *testing.T) {
 	rtID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 	before, _, _ := inv.counts()
 
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID),
-		`{"upstream_model":"claude-3-5-sonnet"}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"upstream_model":"claude-3-5-sonnet"}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("更新失败：%s", rec.Body.String())
 	}
@@ -738,7 +746,7 @@ func TestInvalidate_DeleteRouteClearsDeadRouteHealth(t *testing.T) {
 		t.Fatal("setup: acquire RecoveryGate")
 	}
 
-	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("删除 route 失败 %d：%s", rec.Code, rec.Body.String())
 	}
@@ -769,9 +777,8 @@ func TestInvalidate_DeleteRouteClearsDeadRouteHealth(t *testing.T) {
 	}
 }
 
-// Delete Upstream cascades child Routes in SQL; snapshot those ids before
-// DELETE, then Forget after success (RoutesOfUpstream would be empty post-CASCADE).
-func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
+// A referenced Upstream delete is refused without changing child health.
+func TestInvalidate_DeleteUpstreamPreservesChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
@@ -781,21 +788,9 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
+		Semantic:         sem,
+		Inner:            inner,
+		RoutesOfUpstream: s.routeIDsOfUpstream,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"del-up-u","base_url":"https://b.example.com","api_key":"sk-bbbbbbbbbbbb"}`)
@@ -817,28 +812,29 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 		t.Fatalf("setup state=%s want dead", tr.State(rtID))
 	}
 
-	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upID), "", true)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("删除 upstream 失败 %d：%s", rec.Code, rec.Body.String())
+	beforeRoutes, beforeUps, beforeNames := inner.counts()
+	beforeCaps, beforeUpCaps := len(caps.cleared), len(caps.upstreamCleared)
+	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upID)+"?expected_revision=1", "", true)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced parent deletion: %d", rec.Code)
 	}
-	if got := tr.State(rtID); got != model.StateUnknown {
-		t.Fatalf("delete upstream 后 child RouteHealth=%s want unknown", got)
+	if tr.State(rtID) != model.StateDead {
+		t.Fatal("refused deletion changed child health")
 	}
-	if !caps.has(rtID) {
-		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	if len(caps.cleared) != beforeCaps || len(caps.upstreamCleared) != beforeUpCaps {
+		t.Fatal("refused deletion cleared capability memory")
 	}
-	if !caps.hasUpstream(upID) {
-		t.Fatalf("upstream-scoped Capability 必须清除，upstreamCleared=%v", caps.upstreamCleared)
+	routes, ups, names := inner.counts()
+	if routes != beforeRoutes || ups != beforeUps || names != beforeNames {
+		t.Fatal("refused deletion scheduled synthetic work")
 	}
-	_, ups, _ := inner.counts()
-	if ups < 1 {
-		t.Fatal("delete upstream 应调用 InvalidateUpstream")
+	if _, err := s.st.GetRoute(rtID); err != nil {
+		t.Fatal("refused deletion removed external Route")
 	}
 }
 
-// Delete ModelName cascades child Routes in SQL; snapshot those ids before
-// DELETE, then Forget after success (RoutesOfModelName would be empty post-CASCADE).
-func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
+// A referenced ModelName delete must preserve health and recovery admission.
+func TestInvalidate_DeleteModelNamePreservesChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
@@ -848,19 +844,9 @@ func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 	sem := health.NewSemanticInvalidator(tr, gate, caps, nil, nil)
 	inner := &recordingInvalidator{}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := s.st.ListRoutes(modelNameID)
-			if err != nil {
-				return nil
-			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
-			}
-			return ids
-		},
+		Semantic:          sem,
+		Inner:             inner,
+		RoutesOfModelName: s.routeIDsOfModelName,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"del-mn-u","base_url":"https://c.example.com","api_key":"sk-cccccccccccc"}`)
@@ -885,22 +871,27 @@ func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 		t.Fatal("setup: acquire RecoveryGate")
 	}
 
-	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnID), "", true)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("删除 model_name 失败 %d：%s", rec.Code, rec.Body.String())
+	beforeRoutes, beforeUps, beforeNames := inner.counts()
+	beforeCaps, beforeUpCaps := len(caps.cleared), len(caps.upstreamCleared)
+	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnID)+"?expected_revision=1", "", true)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced parent deletion: %d", rec.Code)
 	}
-	if got := tr.State(rtID); got != model.StateUnknown {
-		t.Fatalf("delete model_name 后 child RouteHealth=%s want unknown", got)
+	if tr.State(rtID) != model.StateDead {
+		t.Fatal("refused deletion changed child health")
 	}
-	if gate.InFlight(rtID) {
-		t.Fatal("delete model_name 后 RecoveryGate 槽必须释放")
+	if len(caps.cleared) != beforeCaps || len(caps.upstreamCleared) != beforeUpCaps {
+		t.Fatal("refused deletion cleared capability memory")
 	}
-	if !caps.has(rtID) {
-		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	routes, ups, names := inner.counts()
+	if routes != beforeRoutes || ups != beforeUps || names != beforeNames {
+		t.Fatal("refused deletion scheduled synthetic work")
 	}
-	_, _, mns := inner.counts()
-	if mns < 1 {
-		t.Fatal("delete model_name 应调用 InvalidateModelName")
+	if _, err := s.st.GetRoute(rtID); err != nil {
+		t.Fatal("refused deletion removed external Route")
+	}
+	if !gate.InFlight(rtID) {
+		t.Fatal("refused deletion released recovery gate")
 	}
 }
 
@@ -915,16 +906,16 @@ func forceTableDeleteFail(t *testing.T, s *Server, table string) {
 	}
 }
 
-// reachForgetInner clears UpstreamGate on InvalidateUpstream (production Inner
-// is probe.Scheduler, which Forget-s reachability).
+// reachForgetInner clears the same committed Reachability evidence used by the
+// production Scheduler. Failed SQL deletion must never invoke this invalidator.
 type reachForgetInner struct {
 	*recordingInvalidator
-	gate *health.UpstreamGate
+	reach *health.ReachabilityTracker
 }
 
 func (r *reachForgetInner) InvalidateUpstream(id int64) {
-	if r.gate != nil {
-		r.gate.Forget(id)
+	if r.reach != nil {
+		r.reach.Invalidate(id)
 	}
 	r.recordingInvalidator.InvalidateUpstream(id)
 }
@@ -937,37 +928,15 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	fs.s.FailThreshold = 1
 	tr := health.NewTracker(fs)
 	recGate := health.NewRecoveryGate()
-	upGate := health.NewUpstreamGate()
+	reach := health.NewReachabilityTracker(fs)
 	caps := &recordingCaps{}
 	sem := health.NewSemanticInvalidator(tr, recGate, caps, nil, nil)
-	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, gate: upGate}
+	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, reach: reach}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
-		RoutesOfModelName: func(modelNameID int64) []int64 {
-			routes, err := s.st.ListRoutes(modelNameID)
-			if err != nil {
-				return nil
-			}
-			ids := make([]int64, 0, len(routes))
-			for _, rt := range routes {
-				ids = append(ids, rt.ID)
-			}
-			return ids
-		},
+		Semantic:          sem,
+		Inner:             inner,
+		RoutesOfUpstream:  s.routeIDsOfUpstream,
+		RoutesOfModelName: s.routeIDsOfModelName,
 	}).Routes(testAdminPW)
 
 	upA := mkUpstreamViaAPI(t, h, `{"name":"keep-h-a","base_url":"https://a.example.com","api_key":"sk-aaaaaaaaaaaa"}`)
@@ -1009,10 +978,18 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	}
 	seedDead(rtA)
 	seedDead(rtB)
-	upGate.Report(upA, 0, false, errors.New("forced probe fail"))
-	upGate.Report(upB, 0, false, errors.New("forced probe fail"))
-	if st := upGate.Status(upA); !st.Probed || st.OK {
-		t.Fatalf("setup upstream A reachability probed=%v ok=%v", st.Probed, st.OK)
+	upstreamA, err := s.st.GetUpstream(upA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamB, err := s.st.GetUpstream(upB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAPIReachability(t, reach, fs.s, upA, upstreamA.NetworkRevision, model.ReachabilityUnreachable, 1)
+	applyAPIReachability(t, reach, fs.s, upB, upstreamB.NetworkRevision, model.ReachabilityUnreachable, 1)
+	if st := reach.Effective(upA, upstreamA.NetworkRevision); st != model.ReachabilityUnreachable {
+		t.Fatalf("setup upstream A reachability=%s", st)
 	}
 	// createRoute triggers InvalidateRoute (counts + capability clears); only
 	// assert no further invalidate after the failed deletes below.
@@ -1035,8 +1012,12 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 			if caps.hasUpstream(upstreamID) {
 				t.Fatalf("%s: upstream Capability must not clear on failed delete", label)
 			}
-			if st := upGate.Status(upstreamID); !st.Probed || st.OK {
-				t.Fatalf("%s: Reachability probed=%v ok=%v want probed+not-ok", label, st.Probed, st.OK)
+			upstream, err := s.st.GetUpstream(upstreamID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := reach.Effective(upstreamID, upstream.NetworkRevision); st != model.ReachabilityUnreachable {
+				t.Fatalf("%s: Reachability=%s want unreachable", label, st)
 			}
 		}
 	}
@@ -1050,7 +1031,7 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	}
 
 	forceTableDeleteFail(t, s, "upstream")
-	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upA), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upA)+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("forced upstream delete must fail")
 	}
@@ -1059,7 +1040,7 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	assertKept("failed delete upstream A (sibling)", rtB, upB)
 
 	forceTableDeleteFail(t, s, "model_name")
-	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnA), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnA)+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("forced model_name delete must fail")
 	}
@@ -1068,7 +1049,7 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	assertKept("failed delete model_name A (sibling)", rtB, upB)
 
 	forceTableDeleteFail(t, s, "route")
-	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtA), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtA)+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("forced route delete must fail")
 	}
@@ -1210,21 +1191,9 @@ func TestInvalidate_EndpointURLChangeClearsAliveRouteHealth(t *testing.T) {
 	inner := &recordingInvalidator{}
 	probeAdmin := probe.NewService(s.st, nil, nil, nil, nil, nil)
 	h := s.WithProbeAdmin(probeAdmin).WithInvalidator(&SemanticConfigInvalidator{
-		Semantic: sem,
-		Inner:    inner,
-		RoutesOfUpstream: func(upstreamID int64) []int64 {
-			routes, err := s.st.ListRoutes(0)
-			if err != nil {
-				return nil
-			}
-			var ids []int64
-			for _, rt := range routes {
-				if rt.UpstreamID == upstreamID {
-					ids = append(ids, rt.ID)
-				}
-			}
-			return ids
-		},
+		Semantic:         sem,
+		Inner:            inner,
+		RoutesOfUpstream: s.routeIDsOfUpstream,
 	}).Routes(testAdminPW)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"ep-url-u","base_url":"https://ep.example.com","api_key":"sk-eeeeeeeeeeee"}`)
@@ -1260,9 +1229,9 @@ func TestInvalidate_EndpointURLChangeClearsAliveRouteHealth(t *testing.T) {
 	ep := page.Items[0]
 	ep.URLOverride = "https://ep.example.com/v1/custom"
 	body, err := json.Marshal(struct {
-		model.UpstreamEndpoint
+		probe.EndpointMutation
 		ExpectedRevision int64 `json:"expected_revision"`
-	}{UpstreamEndpoint: ep, ExpectedRevision: ep.Revision})
+	}{EndpointMutation: probe.EndpointMutationFrom(ep), ExpectedRevision: ep.Revision})
 	if err != nil {
 		t.Fatal(err)
 	}

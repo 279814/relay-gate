@@ -223,6 +223,9 @@ type PublishedRecipeBinding struct {
 }
 
 type UpstreamReachability struct {
+	// Captured SQL-CAS incarnation for the committed in-memory copy. Tokens
+	// intentionally remain network+settings; this field is not a DB column.
+	ObservedCreatedAt       int64 `json:"-"`
 	UpstreamID              int64
 	PolicySelector          EvidencePolicySelector
 	State                   ReachabilityState
@@ -399,8 +402,8 @@ type ProbeApplyResult struct {
 	CommittedReachability *UpstreamReachability
 	CommittedCapability   *EndpointCapability
 	// CostCharged is true only after probe_cost_event/daily was written
-	// (or confirmed idempotent). Memory Cost.Add* must follow this flag so
-	// GET /admin/api/probe-cost cannot exceed today's durable rollup.
+	// (or confirmed idempotent). Cost queries read only the durable daily
+	// rollup; no in-memory counter is maintained alongside it.
 	CostCharged bool
 }
 

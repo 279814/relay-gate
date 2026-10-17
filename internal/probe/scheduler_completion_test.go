@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"errors"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // §8.10：下一次到期时间从本次 Probe 完成时计算。同站 Route 被 beginL1 收敛进
@@ -43,7 +41,7 @@ func TestScheduler_L1CompletionRearmsFoldedSiblings(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := health.NewTracker(cfg)
 	for _, rt := range routes {
@@ -51,8 +49,7 @@ func TestScheduler_L1CompletionRearmsFoldedSiblings(t *testing.T) {
 		// 冷却挡住合成 L2，本用例只看 L1。
 		track.Report(health.Report{RouteID: rt.ID, Verdict: health.VerdictRateLimited, RetryAfter: time.Hour})
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil).
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	start := time.Now()
@@ -87,23 +84,22 @@ func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	if cfg.settings.FailThreshold < 2 {
 		t.Fatalf("setup: FailThreshold=%d, need >=2 so one L1 failure leaves the Route unknown", cfg.settings.FailThreshold)
 	}
 	track := health.NewTracker(cfg)
-	gate := health.NewUpstreamGate()
-	gate.Report(10, gate.EnsureGeneration(10), false, errors.New("connection refused"))
-	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).
-		WithTargets(testTargets(), nil).
+	reach := health.NewReachabilityTracker(cfg)
+	seedFixtureReach(reach, 10, model.ReachabilityUnreachable, cfg.settings)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, reach, discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	start := time.Now()
 	sched.tick(context.Background())
 	sched.wg.Wait()
 
-	if gate.OKAt(10, ups[0].NetworkRevision) {
+	if reach.OK(10, ups[0].NetworkRevision) {
 		t.Fatal("setup: connection refused must leave the station unreachable")
 	}
 	st := track.Status(100)
@@ -128,12 +124,12 @@ func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.
 // §8.10：周期到期因同站串行 / 全局上限 / 自身在途被拒时不得留下 pending，
 // 否则该 Route 下一次完成后会立刻再补一发，绕过从完成时刻起算的间隔。
 func TestScheduler_RefusedL2DoesNotBurstAfterCompletion(t *testing.T) {
-	cfg := &fakeCfg{settings: fastSettings(), state: store.StateRunning}
+	cfg := &fakeCfg{settings: fastSettings(), state: model.RunStateRunning}
 	track := health.NewTracker(cfg)
 	for _, id := range []int64{100, 101} {
 		track.Report(health.Report{RouteID: id, Verdict: health.VerdictFatal})
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger())
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger())
 
 	hold, ok := sched.beginL2(10, 100)
 	if !ok {

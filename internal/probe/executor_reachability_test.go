@@ -28,10 +28,13 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	settings := model.DefaultSettings()
+	settings, settingsRevision, err := st.GetSettingsWithRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings.OKThreshold = 1
 	settings.FailThreshold = 1
-	if err := st.SaveSettings(settings); err != nil {
+	if _, err := st.SaveSettingsWithRevision(settings, settingsRevision); err != nil {
 		t.Fatal(err)
 	}
 	up := &model.Upstream{
@@ -123,7 +126,7 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 	t.Cleanup(manager.CloseIdleConnections)
 	badProxyExec := NewExecutor(
 		outbound.NewProvider(testEndpoints{upstream: &badProxy}, nil, outbound.NewResolver(testHasher{})),
-		nil, nil, ManagerTransports{Manager: manager}, recorder, AlwaysOpenAdmission(), WallClock(), nil)
+		nil, builtinOnlyResolver(), ManagerTransports{Manager: manager}, recorder, AlwaysOpenAdmission(), WallClock(), nil)
 	for name, target := range map[string]*model.Upstream{
 		"bad_base_url": &badURL, "empty_key": &emptyKey, "bad_proxy_url": &badProxy,
 	} {

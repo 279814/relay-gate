@@ -58,7 +58,7 @@ func TestWrite_PublishesEnabledAndRouteBeforeHandlerReturns(t *testing.T) {
 
 	// ── disable route: Select must stop choosing it within TTL ──
 	beforeInv, beforeRef := pub.counts()
-	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable route: %d %s", rec.Code, rec.Body.String())
 	}
@@ -79,7 +79,7 @@ func TestWrite_PublishesEnabledAndRouteBeforeHandlerReturns(t *testing.T) {
 
 	// ── re-enable + create a higher-priority route on a new upstream ──
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), `{"enabled":true}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), withExpectedRevision(t, `{"enabled":true}`, 2), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("re-enable route: %d %s", rec.Code, rec.Body.String())
 	}
@@ -99,13 +99,13 @@ func TestWrite_PublishesEnabledAndRouteBeforeHandlerReturns(t *testing.T) {
 
 	// Demote older routes so Select is deterministic without waiting on TTL.
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtKeep), `{"priority":9}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtKeep), withExpectedRevision(t, `{"priority":9}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("demote rtKeep: %d %s", rec.Code, rec.Body.String())
 	}
 	assertPublished(t, pub, beforeInv, beforeRef)
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), `{"priority":9}`, true)
+	rec = do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), withExpectedRevision(t, `{"priority":9}`, 3), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("demote rtFlip: %d %s", rec.Code, rec.Body.String())
 	}
@@ -124,7 +124,7 @@ func TestWrite_PublishesEnabledAndRouteBeforeHandlerReturns(t *testing.T) {
 
 	// ── disable upstream: its routes must drop out of Select immediately ──
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upAlt), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upAlt), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
 	}
@@ -143,7 +143,7 @@ func TestWrite_PublishesEnabledAndRouteBeforeHandlerReturns(t *testing.T) {
 
 	// ── disable model_name: Select must fail closed for that name ──
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(mnID), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/model-names/"+itoa(mnID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable model_name: %d %s", rec.Code, rec.Body.String())
 	}
@@ -212,12 +212,12 @@ func TestWrite_RefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T)
 	pub.mu.Unlock()
 
 	beforeInv, beforeRef := pub.counts()
-	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtFlip), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("Refresh failure must not return 200 while routing may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want persisted 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
@@ -249,7 +249,7 @@ func TestWrite_FailedStoreDoesNotPublish(t *testing.T) {
 
 	beforeInv, beforeRef := pub.counts()
 	forceTableUpdateFail(t, s, "route")
-	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/routes/"+itoa(rtID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("expected update failure, got 200")
 	}
@@ -350,14 +350,29 @@ func TestWrite_EndpointRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 	if rec.Code == http.StatusOK {
 		t.Fatal("Refresh failure must not return 200 while Probe may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want persisted 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	pending := decodeBody[map[string]any](t, rec)
+	if pending["code"] != "config_activation_pending" || pending["persisted"] != true || pending["resource"] != "endpoint" || pending["id"] != float64(warm.ID) || pending["new_revision"] != float64(warm.Revision+1) {
+		t.Fatalf("pending metadata=%v", pending)
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
 		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
 	}
 
+	stored, err := s.st.GetEndpoint(warm.ID)
+	if err != nil || stored.URLOverride != override || stored.Revision != warm.Revision+1 {
+		t.Fatalf("pending SQL did not commit: %+v %v", stored, err)
+	}
+	replay := do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(warm.ID), `{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(warm.Revision)+`}`, true)
+	if replay.Code != http.StatusConflict {
+		t.Fatalf("pending write replay=%d %s", replay.Code, replay.Body.String())
+	}
+	if inv, ref := pub.counts(); inv != afterInv || ref != afterRef {
+		t.Fatal("stale replay retried publisher")
+	}
 	// Re-Invalidate forces get() to reload SQL: override must appear.
 	got, err := src.Endpoint(context.Background(), upID, model.EndpointMessages)
 	if err != nil {
@@ -417,7 +432,7 @@ func TestWrite_EndpointDeleteGoneBeforeHandlerReturns(t *testing.T) {
 	}
 
 	// DeleteEndpoint requires a disabled upstream with no Route dependents.
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
 	}
@@ -454,7 +469,7 @@ func TestWrite_EndpointDeleteRefreshFailureDoesNotReturnSuccessWithStaleSnapshot
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
 	}
@@ -471,14 +486,28 @@ func TestWrite_EndpointDeleteRefreshFailureDoesNotReturnSuccessWithStaleSnapshot
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("Refresh failure must not return 204 while Probe may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want deleted-persisted 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	pending := decodeBody[map[string]any](t, rec)
+	if pending["code"] != "config_activation_pending" || pending["persisted"] != true || pending["resource_id"] != float64(drop.ID) || pending["revision"] != float64(drop.Revision) {
+		t.Fatalf("delete pending identity=%v", pending)
+	}
+	if _, err := s.st.GetEndpoint(drop.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("503 deletion did not persist: %v", err)
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
 		t.Fatalf("want Invalidate x2 and Refresh x1: inv=%d ref=%d", afterInv-beforeInv, afterRef-beforeRef)
 	}
 
+	replay := do(t, h, "DELETE", "/admin/api/upstream-endpoints/"+itoa(drop.ID)+"?expected_revision="+itoa(drop.Revision), "", true)
+	if replay.Code != http.StatusNotFound {
+		t.Fatalf("deleted replay=%d %s", replay.Code, replay.Body.String())
+	}
+	if inv, ref := pub.counts(); inv != afterInv || ref != afterRef {
+		t.Fatal("deleted replay retried publisher")
+	}
 	// Re-Invalidate forces get() to reload SQL: deleted row must be gone.
 	_, err = src.Endpoint(context.Background(), upID, model.EndpointCountTokens)
 	if !errors.Is(err, store.ErrNotFound) {
@@ -496,7 +525,7 @@ func TestWrite_EndpointDeleteFailedStoreDoesNotPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	rec := do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
 	}
@@ -536,7 +565,7 @@ func TestWrite_SettingsVisibleBeforeHandlerReturns(t *testing.T) {
 
 	beforeInv, beforeRef := pub.counts()
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive","sample_enabled":false}`, true)
+		`{"expected_revision":1,"retry_policy":"aggressive","sample_enabled":false}`, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("update settings: %d %s", rec.Code, rec.Body.String())
 	}
@@ -556,7 +585,7 @@ func TestWrite_SettingsVisibleBeforeHandlerReturns(t *testing.T) {
 	// Validation failure must leave the published snapshot unchanged.
 	beforeInv, beforeRef = pub.counts()
 	rec = do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"not-a-policy"}`, true)
+		`{"expected_revision":2,"retry_policy":"not-a-policy"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("invalid retry_policy must be rejected")
 	}
@@ -592,12 +621,12 @@ func TestWrite_SettingsRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 
 	beforeInv, beforeRef := pub.counts()
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive"}`, true)
+		`{"expected_revision":1,"retry_policy":"aggressive"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("Refresh failure must not return 200 while Settings may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
 	}
 	afterInv, afterRef := pub.counts()
 	if afterInv != beforeInv+2 || afterRef != beforeRef+1 {
@@ -617,9 +646,9 @@ func TestWrite_SettingsRefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *te
 func TestWrite_SettingsFailedStoreDoesNotPublish(t *testing.T) {
 	s, h, _, pub := newLivecfgServer(t)
 
-	// First PUT inserts the settings row; subsequent PUTs UPDATE it.
+	// Startup initialized revision 1; every client PUT carries its own revision.
 	rec := do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"safe"}`, true)
+		`{"expected_revision":1,"retry_policy":"safe"}`, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed settings: %d %s", rec.Code, rec.Body.String())
 	}
@@ -627,7 +656,7 @@ func TestWrite_SettingsFailedStoreDoesNotPublish(t *testing.T) {
 	beforeInv, beforeRef := pub.counts()
 	forceTableUpdateFail(t, s, "setting")
 	rec = do(t, h, "PUT", "/admin/api/settings",
-		`{"retry_policy":"aggressive"}`, true)
+		`{"expected_revision":2,"retry_policy":"aggressive"}`, true)
 	if rec.Code == http.StatusOK {
 		t.Fatal("expected settings update failure, got 200")
 	}

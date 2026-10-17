@@ -7,7 +7,6 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // errBoom 是测试用的哨兵错误，只为触发「读配置失败」的分支。
@@ -34,10 +33,10 @@ func invHarness() (*Scheduler, *recordingTracker, *fakeCfg) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := newRecordingTracker()
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
+	sched := NewScheduler(cfg, track, health.NewReachabilityTracker(nil), discardLogger())
 	return sched, track, cfg
 }
 
@@ -81,14 +80,14 @@ func TestInvalidateUpstream_ForgetsGateVerdict(t *testing.T) {
 	// 直接跳过 L2 —— 用户明明改对了 key，界面上却一直显示不可用，
 	// 而唯一的出路是等一次 L1 周期。
 	sched, _, _ := invHarness()
-	sched.gate.Report(10, 0, false, nil) // 模拟 L1 失败（generation=0：测试未绑定世代）
-	if sched.gate.OK(10) {
+	seedFixtureReach(sched.reach, 10, model.ReachabilityUnreachable) // 模拟 L1 失败（generation=0：测试未绑定世代）
+	if sched.reach.OK(10, 0) {
 		t.Fatal("前置条件不成立：gate 应为失败态")
 	}
 
 	sched.InvalidateUpstream(10)
 
-	if !sched.gate.OK(10) {
+	if !sched.reach.OK(10, 0) {
 		t.Error("InvalidateUpstream 必须作废旧的站级 L1 结论，否则 L2 会被一直挡住")
 	}
 }
@@ -96,8 +95,10 @@ func TestInvalidateUpstream_ForgetsGateVerdict(t *testing.T) {
 func TestInvalidateModelName_ClearsL2Only(t *testing.T) {
 	// L1 打的是站的 /v1/models，与模型无关。改 probe_prompt 去清 L1
 	// 等于白发一次请求 —— 而 §5.2d 刚让这些请求变得可见。
-	sched, track, _ := invHarness()
-	sched.InvalidateModelName(1)
+	sched, track, cfg := invHarness()
+	for _, rt := range schedFixtureRoutes(cfg, 1) {
+		sched.Trigger(ScheduleKey{ScopeType: model.RecipeScopeRoute, ScopeID: rt.ID, UpstreamID: rt.UpstreamID, Endpoint: model.EndpointMessages}, ScheduleConfig)
+	}
 
 	track.mu.Lock()
 	defer track.mu.Unlock()
@@ -111,8 +112,10 @@ func TestInvalidateModelName_ClearsL2Only(t *testing.T) {
 
 func TestInvalidateModelName_UnknownIDIsNoOp(t *testing.T) {
 	// 删掉的 ModelName 或并发下的竞态可能传进一个不存在的 ID。
-	sched, track, _ := invHarness()
-	sched.InvalidateModelName(999)
+	sched, track, cfg := invHarness()
+	for _, rt := range schedFixtureRoutes(cfg, 999) {
+		sched.Trigger(ScheduleKey{ScopeType: model.RecipeScopeRoute, ScopeID: rt.ID, UpstreamID: rt.UpstreamID, Endpoint: model.EndpointMessages}, ScheduleConfig)
+	}
 
 	track.mu.Lock()
 	defer track.mu.Unlock()

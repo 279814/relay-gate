@@ -51,7 +51,6 @@ type PublishedConfig struct {
 	Routing    *router.Snapshot
 	Probe      *ProbeSnapshot
 	Settings   model.Settings
-	RunState   store.RunState
 }
 
 // Endpoint 取快照内的 Endpoint 配置，满足 outbound.EndpointConfigSource。
@@ -349,6 +348,5 @@ func buildPublishedConfig(bundle *store.ConfigBundle, generation uint64, loadedA
 		Routing:    routing,
 		Probe:      probe,
 		Settings:   settings,
-		RunState:   bundle.RunState,
 	}, nil
 }

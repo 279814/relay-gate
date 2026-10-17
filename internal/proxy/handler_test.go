@@ -20,7 +20,6 @@ import (
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/runstate"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // ── 测试替身 ──────────────────────────────────────────────
@@ -29,7 +28,7 @@ import (
 type fakeConfig struct {
 	snap     *router.Snapshot
 	settings model.Settings
-	state    store.RunState
+	state    model.RunState
 	err      error // 非 nil 时三个方法都返回它，用于测内部错误路径
 }
 
@@ -45,11 +44,8 @@ func (f *fakeConfig) Settings() (model.Settings, error) {
 	}
 	return f.settings, nil
 }
-func (f *fakeConfig) RunState() (store.RunState, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.state, nil
+func (f *fakeConfig) Current() runstate.Snapshot {
+	return runstate.Snapshot{State: f.state, Revision: 1}
 }
 
 // countingHealth 是测试用的健康视图：默认全部可用、不冷却，
@@ -119,9 +115,8 @@ func discardLog() *slog.Logger {
 
 // testSettings 用短超时，避免测试挂在生产的 300s 下限上。
 //
-// SaveSettings 卡 real_first_semantic_sec；TimeoutsFrom 在 Total ≥ 300s 时还会
-// 把投影后的 FirstToken 抬到同一下限。这里把 RealTotalSec 也压到 5s，使
-// CapTotal/Total 低于下限，转发层才不会把测试用的短 FirstToken 抬回去。
+// 这里显式配置独立阶段，Total 也压到 5s，避免测试用的短 semantic 阶段
+// 被原生长思考的 300s 下限抬高。
 func testSettings() model.Settings {
 	s := model.DefaultSettings()
 	s.RealConnectSec = 2
@@ -133,7 +128,6 @@ func testSettings() model.Settings {
 	// 读出来的配置两套都填好了。但这里是手工构造 Settings，只设旧字段的话
 	// 新字段仍是默认的 1200 秒 —— 于是「首 Token 超时 2 秒」静默变成 1200 秒，
 	// 被 total 兜住，而依赖它换站的重试用例会因为一个与本意无关的原因失败。
-	s.RealFirstTokenSec = 2
 	s.RealResponseHeaderSec = 2
 	s.RealFirstByteSec = 2
 	s.RealFirstSemanticSec = 2
@@ -240,11 +234,11 @@ func newHarness(t *testing.T, respond http.HandlerFunc) *harness {
 	hs.cfg = &fakeConfig{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, []*model.Route{rt}),
 		settings: testSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	// 默认关掉半开，让旧测试不受影响。需要半开的测试自己开。
 	hs.cfg.settings.HalfOpenEnabled = false
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(hs.cfg).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
@@ -482,7 +476,7 @@ func TestHandler_AcceptsKeyInAllThreePlaces(t *testing.T) {
 // 未配置任何 relay key 时必须全拒。「没配就放开」是最危险的默认值。
 func TestHandler_NoRelayKeysConfiguredRejectsAll(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog())
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).WithRunState(hs.cfg)
 
 	r := hs.anthropicRequest(`{"model":"claude-opus-5"}`)
 	if rec := hs.serve(r); rec.Code != 401 {
@@ -500,7 +494,7 @@ func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
 	if err := creds.SetActiveRelayKey(hs.relayPW); err != nil {
 		t.Fatal(err)
 	}
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, nil, discardLog()).WithRunState(hs.cfg).
 		WithRelayKeyValidator(creds).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
@@ -559,7 +553,7 @@ func TestHandler_RelayRotateGraceRevokeOnModelRoute(t *testing.T) {
 
 func TestHandler_PausedRejectsNewRequests(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.cfg.state = store.StatePaused
+	hs.cfg.state = model.RunStatePaused
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))
 	if rec.Code != 503 {
@@ -581,7 +575,7 @@ func (m maintSnap) Current() runstate.Snapshot { return m.snap }
 
 func TestHandler_MaintenanceRejectsNewRequests(t *testing.T) {
 	hs := newHarness(t, nil)
-	hs.cfg.state = store.StateRunning
+	hs.cfg.state = model.RunStateRunning
 	hs.h.WithRunState(maintSnap{snap: runstate.Snapshot{
 		State: model.RunStateRunning, Revision: 1, Maintenance: true,
 		MaintenanceReason: "master_key_rotation",
@@ -1029,30 +1023,29 @@ func TestHandler_ConfigErrorIsServerError(t *testing.T) {
 // 连接池必须按网络身份复用：每请求新建会丢掉连接复用，
 // 对高延迟的公益站来说每次都要重新 TLS 握手。
 func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
-	hs := newHarness(t, nil)
-	budget := outbound.RealBudget(testSettings())
-	up := hs.cfg.snap.Upstreams[10]
-
-	tr1, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
+	var remotes []string
+	var guard sync.Mutex
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		guard.Lock()
+		remotes = append(remotes, r.RemoteAddr)
+		guard.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+	send := func() {
+		t.Helper()
+		if response := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`)); response.Code != 200 {
+			t.Fatalf("status=%d", response.Code)
+		}
 	}
-	tr2, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr1 != tr2 {
-		t.Error("同一 Upstream 应复用同一个 Transport")
-	}
-
-	// 配置变更（尤其 proxy_url）后必须丢弃旧的，否则改了代理不生效
-	hs.h.InvalidateTransport(up.ID)
-	tr3, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr3 == tr1 {
-		t.Error("InvalidateTransport 后应重建 Transport")
+	send()
+	send()
+	hs.h.InvalidateTransport(10)
+	send()
+	guard.Lock()
+	defer guard.Unlock()
+	if len(remotes) != 3 || remotes[0] != remotes[1] || remotes[1] == remotes[2] {
+		t.Fatalf("actual connections were not reused then invalidated: %v", remotes)
 	}
 }
 
@@ -1760,7 +1753,7 @@ func TestHandler_HeaderPhaseStallIsNot200(t *testing.T) {
 		<-release // 连响应头都不回
 	})
 	defer close(release)
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealTotalSec = 30
 
 	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5"}`))

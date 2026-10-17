@@ -36,10 +36,10 @@ type Budget struct {
 func RealBudget(settings model.Settings) Budget {
 	return Budget{
 		Connect:       seconds(settings.RealConnectSec),
-		ResponseHead:  stageOrLegacy(settings.RealResponseHeaderSec, settings.RealFirstTokenSec),
-		FirstByte:     stageOrLegacy(settings.RealFirstByteSec, settings.RealFirstTokenSec),
-		FirstEvent:    stageOrLegacy(settings.RealFirstByteSec, settings.RealFirstTokenSec),
-		FirstSemantic: stageOrLegacy(settings.RealFirstSemanticSec, settings.RealFirstTokenSec),
+		ResponseHead:  seconds(settings.RealResponseHeaderSec),
+		FirstByte:     seconds(settings.RealFirstByteSec),
+		FirstEvent:    0, // Real requests record events but expose no first-event setting.
+		FirstSemantic: seconds(settings.RealFirstSemanticSec),
 		Idle:          seconds(settings.RealIdleSec),
 		Total:         seconds(settings.RealTotalSec),
 	}
@@ -67,10 +67,10 @@ func L1Budget(settings model.Settings) Budget {
 func L2Budget(settings model.Settings) Budget {
 	return Budget{
 		Connect:       seconds(settings.L2ConnectSec),
-		ResponseHead:  stageOrLegacy(settings.L2ResponseHeaderSec, settings.L2FirstTokenSec),
-		FirstByte:     stageOrLegacy(settings.L2FirstByteSec, settings.L2FirstTokenSec),
-		FirstEvent:    stageOrLegacy(settings.L2FirstEventSec, settings.L2FirstTokenSec),
-		FirstSemantic: stageOrLegacy(settings.L2FirstSemanticSec, settings.L2FirstTokenSec),
+		ResponseHead:  seconds(settings.L2ResponseHeaderSec),
+		FirstByte:     seconds(settings.L2FirstByteSec),
+		FirstEvent:    seconds(settings.L2FirstEventSec),
+		FirstSemantic: seconds(settings.L2FirstSemanticSec),
 		Idle:          seconds(settings.L2IdleSec),
 		Total:         seconds(settings.L2TotalSec),
 	}
@@ -181,24 +181,4 @@ func seconds(value int) time.Duration {
 		return 0
 	}
 	return time.Duration(value) * time.Second
-}
-
-// stageOrLegacy 取分阶段的值，为空时回落到那个粗粒度的旧字段。
-//
-// 存在的理由是一个真实的失效风险：`real_first_token_sec` 与
-// `l2_first_token_sec` 是 schema 1 的粗旋钮，schema 2 把它们拆成了四个阶段。
-// store.SaveSettings 会在写入时把旧值展开到新字段（见那里的 adapter），
-// 所以**从库里读出来的**配置两套都填好了。
-//
-// 但手工构造 model.Settings 的调用方（测试、冒烟脚本、将来的某个内部工具）
-// 只设旧字段是很自然的写法，而那时四个新字段还是 DefaultSettings 的 1200 秒 ——
-// 于是「首 Token 超时设成 2 秒」静默变成 1200 秒，被 total 兜住。症状是
-// 「超时配了不生效」，而它不报错。
-//
-// 这层回落在 P0-14 把管理 API 迁到分阶段 DTO、旧字段删掉之后即可移除。
-func stageOrLegacy(stage, legacy int) time.Duration {
-	if stage > 0 {
-		return seconds(stage)
-	}
-	return seconds(legacy)
 }

@@ -152,6 +152,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		tried:         map[int64]bool{},
 		maxLocalSkips: countCandidateRoutes(pre.snapshot, pre.inModel, proto),
 	}
+	// Every preparation/send shares this existing plan's absolute limit. A
+	// later Attempt cannot renew time consumed while resolving its target.
+	requestCtx, stopTotal := context.WithDeadlineCause(r.Context(), plan.deadline, ErrTotalTimeout)
+	defer stopTotal()
+	r = r.WithContext(requestCtx)
 	if plan.maxAttempts < 1 {
 		// Validate 已保证 ≥ 1。这里兜的是「旧库升级后该字段是零值」——
 		// 那种情况下 0 不是「关闭重试」而是「一次都不发」，等于关闭转发。
@@ -290,7 +295,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				oc.res = h.commitLive(w, la)
 				// fail_closed response transform before any client byte.
 				if oc.res != nil && oc.res.Err != nil && !oc.res.HeadersSent &&
-					la.compiled != nil {
+					la.compiled != nil && !isForwardError(oc.res.Err) {
 					writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
 					finishObserver(la, health.AttemptFinish{})
 					la.cand.Release()
@@ -318,20 +323,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			return oc, true
 		}
 
-		// 换站。这次尝试的健康结论**必须**在这里回写：它是一次真实请求的
-		// 失败证据，而 §3.5 把「真实请求失败立即回写 + 触发即时探活」列为
-		// 最快的故障发现路径 —— 比 dead 状态 20 秒的探活周期快得多。
-		// 丢弃掉就不回写的话，一个刚挂掉的站会因为「重试成功了所以没人报告」
-		// 而一直显示 alive，直到下一个定时探活撞上去。
-		//
-		// TriggerL2 由 Reporter.ReportResult 在判定非 OK 时自己发（见
-		// probe/reporter.go），这里不重复触发。
-		//
-		// 顺序：**先 Discard 再回写**。Discard 才会把错误响应体填进
-		// Result.ErrBody（那段字节是排水时顺手留下的），反过来的话回写拿到
-		// 的永远是空 body —— 于是 ClassifyHTTP 只能看状态码，
-		// 「500 + body 里写着 rate limit」会被判成故障而累计判死，
-		// 本该只是冷却 60 秒。
+		// Discard completes the original response observation before releasing this attempt.
 		la.at.Discard()
 		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
 		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
@@ -340,13 +332,6 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
 		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
 			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
-		if h.reporter != nil {
-			ep, _ := proto.Endpoint()
-			view := viewOf(la.at.Result(), la.keys, ep)
-			view.CapabilityObserved = h.observers != nil
-			view.HalfOpen = armedHalfOpen(la.cand.Route.ID, attempt)
-			h.reporter.ReportResult(la.cand.Route.ID, la.cand.HealthGeneration, view)
-		}
 		la.cand.Release()
 		cand = next
 		held = cand
@@ -510,9 +495,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			h.log.Warn("出站 URL 配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
@@ -531,9 +513,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			h.log.Warn("出站认证配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
@@ -605,15 +584,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
-	tr, err := h.TransportFor(cand.Upstream, realBudget)
+	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
 	if err != nil {
 		if errors.Is(err, outbound.ErrURLConfig) && r.Context().Err() == nil {
 			h.log.Warn("出站网络配置不可用，跳过本 Route", "err", err,
 				"upstream", cand.Upstream.ID, "route", cand.Route.ID)
 			configError = true
-			if h.observers == nil {
-				h.markRouteConfigError(cand, kind)
-			}
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
@@ -625,7 +601,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	if settings.RetryPolicy.Normalize() == model.RetryPolicyAggressive {
 		to = to.WithAggressivePeek(time.Duration(settings.RealFirstByteSec) * time.Second)
 	}
-	fwd := &Forwarder{Transport: tr, Timeouts: to,
+	fwd := &Forwarder{Transport: tr, Timeouts: to, Protocol: proto,
 		RequestHost: target.RequestHost, RedactSecrets: redactKeys}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会
@@ -743,19 +719,19 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 	return cand
 }
 
-// retryableAttempt 在旧 classifyPayload 之上叠加 P0-13 RetryDecider 与 P1 RetryPolicy。
+// retryableAttempt combines the shared RetryAdvice with transport/status policy.
 func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy model.RetryPolicy) bool {
 	if la == nil || la.at == nil {
 		return false
 	}
-	// With observation installed, payload replay belongs solely to its bounded
-	// structured parser. A failed/no-op decider must not fall back to heuristics.
-	if res := la.at.Result(); h.observers != nil && res != nil && res.Err == nil && res.Status >= 200 && res.Status < 300 {
-		if policy.Normalize() != model.RetryPolicyAggressive || la.instr.Retry == nil {
-			return false
-		}
+	// Payload replay belongs solely to the bounded Decoder/Classifier advice.
+	// Missing observation, a failed or no-op decider must always keep the attempt.
+	if res := la.at.Result(); res != nil && res.Err == nil && res.Status >= 200 && res.Status < 300 {
 		prefix := la.at.Peek()
 		if res.Err == nil {
+			if policy.Normalize() != model.RetryPolicyAggressive || la.instr.Retry == nil {
+				return false
+			}
 			return safeRetryAdvice(la.instr.Retry, r.Context(), res.Status, res.RespHeaders, prefix).Disposition == health.RetryTryNextRoute
 		}
 	}
@@ -895,26 +871,8 @@ func retryable(at *Attempt) bool {
 		return false
 	}
 
-	// 2xx：要看载荷才知道（§3.5 的「200 但流内立刻 error」）。
-	// 判据必须保守，见 errorpayload.go 的开头：拿不准一律放行，因为误判的
-	// 代价是丢掉一个已经生成好的答案，而且它不报错、只表现为「偶尔慢一倍」。
-	ct := ""
-	if h := at.Result().RespHeaders; h != nil {
-		ct = h.Get("Content-Type")
-	}
-	verdict := classifyPayload(at.Peek(), ct)
-
-	// Peek **自己**可能失败：上游回了响应头却迟迟不吐 body（首 Token 超时），
-	// 或者吐了头就断开。那时 Err 是刚刚才填上的，所以必须在预读之后再读
-	// 一次 —— 只在函数开头读一次的话，这一整类故障永远等不到重试，
-	// 而「响应头回得很快、body 一个字节都不来」正是公益站最常见的挂法。
-	if err := at.Result().Err; err != nil {
-		if errors.Is(err, ErrUpstreamBroke) {
-			return false
-		}
-		return IsUpstreamFault(err)
-	}
-	return verdict == payloadError
+	// A 2xx payload is never classified by the proxy transport/status path.
+	return false
 }
 
 func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
@@ -930,8 +888,7 @@ func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
 		fin.ReadErr = res.upstreamReadErr
 		fin.ClientCanceled = errors.Is(res.Err, ErrCanceled) || errors.Is(res.Err, ErrClientGone)
 		if fin.ReadErr == nil && res.Err != nil && !fin.ClientCanceled {
-			if errors.Is(res.Err, ErrConnect) || errors.Is(res.Err, ErrFirstTokenTimeout) || errors.Is(res.Err, ErrStreamStalled) ||
-				errors.Is(res.Err, ErrTotalTimeout) || errors.Is(res.Err, ErrUpstreamBroke) || errors.Is(res.Err, ErrStreamBroke) {
+			if isForwardError(res.Err) {
 				fin.ReadErr = res.Err
 			} else {
 				// Local response-transform failures provide no upstream health evidence.

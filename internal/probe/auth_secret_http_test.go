@@ -77,7 +77,7 @@ func TestDeclaredAuthSecretRealHTTPAndCountTokensKeepUsedValuesPrivate(t *testin
 			secrets := &countedAuthSecretStore{Store: h.store}
 			targets := outbound.NewProvider(cfg, h.store, outbound.NewResolver(testHasher{}))
 			handler := proxy.NewHandler(cfg, h.tracker, recorder, []string{"test-relay-key"}, discardLogger()).
-				WithTargets(targets, secrets).WithObservers(h.manager).WithCountTokensCapability(h.caps)
+				WithRunState(fixtureController(t, h.store)).WithTargets(targets, secrets).WithObservers(h.manager).WithCountTokensCapability(h.caps)
 			mux := http.NewServeMux()
 			handler.Routes(mux)
 			gate := httptest.NewServer(mux)
@@ -205,7 +205,7 @@ func manualAuthProbeService(t *testing.T, h *trafficHTTPHarness, secrets outboun
 		t.Fatal(err)
 	}
 	t.Cleanup(seq.Close)
-	scheduler := NewScheduler(cfg, nil, health.NewTracker(cfg), nil, discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
+	scheduler := NewScheduler(cfg, health.NewTracker(cfg), nil, discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
 	return NewService(h.store, executor, nil, cfg, nil, nil).WithManualPreparer(scheduler)
 }
 

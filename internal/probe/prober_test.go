@@ -33,13 +33,19 @@ func drainBody(r *http.Request) {
 func fastSettings() model.Settings {
 	s := model.DefaultSettings()
 	s.L1TotalSec = 2
+	s.L1ConnectSec = 1
 	s.L2TotalSec = 2
-	s.L2FirstTokenSec = 1
+	s.L2ConnectSec = 1
+	s.L2IdleSec = 1
+	s.L2ResponseHeaderSec = 1
+	s.L2FirstByteSec = 1
+	s.L2FirstEventSec = 1
+	s.L2FirstSemanticSec = 1
 	return s
 }
 
-func testProber() *Prober {
-	return &Prober{Transport: http.DefaultTransport, Targets: testTargets()}
+func testProbeExecutor() *executorProbeHarness {
+	return &executorProbeHarness{Transport: http.DefaultTransport, Targets: testTargets(), Recipes: builtinOnlyResolver()}
 }
 
 // testTargets 造一个内存版 TargetProvider，行为与生产装配一致：
@@ -108,11 +114,12 @@ func (testHasher) SumRequestURL(raw []byte) string {
 	return fmt.Sprintf("test:%x", len(raw))
 }
 
-// proberFor 造一个 Endpoint 配置跟随该 Upstream 的 Prober。
+// executorFor 造一个 Endpoint 配置跟随该 Upstream 的 Prober。
 // 需要覆盖 l1_path / full_url_mode 行为的用例用它。
-func proberFor(up *model.Upstream) *Prober {
-	return &Prober{
+func executorFor(up *model.Upstream) *executorProbeHarness {
+	return &executorProbeHarness{
 		Transport: http.DefaultTransport,
+		Recipes:   builtinOnlyResolver(),
 		Targets: outbound.NewProvider(testEndpoints{upstream: up}, nil,
 			outbound.NewResolver(testHasher{})),
 	}
@@ -168,7 +175,7 @@ func TestL1_Verdicts(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			out := testProber().L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+			out := testProbeExecutor().L1(context.Background(), upstreamFor(srv.URL), fastSettings())
 			if out.Verdict != tc.want {
 				t.Errorf("期望 %s，得到 %s（err=%v）", tc.want, out.Verdict, out.Err)
 			}
@@ -193,7 +200,7 @@ func TestL1_DoesNotFollowRedirect(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out := testProber().L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+	out := testProbeExecutor().L1(context.Background(), upstreamFor(srv.URL), fastSettings())
 	if out.Status != http.StatusFound {
 		t.Fatalf("探活应观察到 302，得到 status=%d verdict=%s err=%v",
 			out.Status, out.Verdict, out.Err)
@@ -217,7 +224,7 @@ func TestL1_SendsAuthAndClaudeCodeFingerprint(t *testing.T) {
 	defer srv.Close()
 
 	up := upstreamFor(srv.URL)
-	proberFor(up).L1(context.Background(), up, fastSettings())
+	executorFor(up).L1(context.Background(), up, fastSettings())
 
 	// 认证由 outbound.ApplyAuth 按 Endpoint 的 auth profile 写入 ——
 	// x_api_key 这一种就只发这一个头，不再双发（§7.2）。
@@ -258,7 +265,7 @@ func TestProbe_LegacyAutoFailsClosedWithoutSendingRequest(t *testing.T) {
 	up := upstreamFor(srv.URL)
 	up.AuthStyle = model.AuthAuto // → legacy_auto_real_only
 
-	out := proberFor(up).L1(context.Background(), up, fastSettings())
+	out := executorFor(up).L1(context.Background(), up, fastSettings())
 	if out.Verdict == health.VerdictOK {
 		t.Error("未校准的 auto 认证不该判成功")
 	}
@@ -277,22 +284,17 @@ func TestProbe_LegacyAutoFailsClosedWithoutSendingRequest(t *testing.T) {
 	}
 }
 
-// l1_path 为空表示只做连接层探测，给连 /v1/models 都报错的站留退路。
-func TestL1_EmptyPathProbesConnectionOnly(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodHead {
-			t.Errorf("空 l1_path 应发 HEAD，得到 %s", r.Method)
-		}
-		// 故意回 500：连接层探测只关心能不能建立连接
-		w.WriteHeader(500)
-	}))
+// An explicit HEAD recipe probes network reachability without interpreting 500 as success.
+func TestL1_HeadRecipeKeepsHTTPFailureReachable(t *testing.T) {
+	var method string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { method = r.Method; w.WriteHeader(500) }))
 	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.L1Path = ""
-	out := testProber().L1(context.Background(), up, fastSettings())
-	if out.Verdict != health.VerdictOK {
-		t.Errorf("连接层探测只要能连上就算通，得到 %s（err=%v）", out.Verdict, out.Err)
+	binding := testBinding(8, 80, 4, "HEAD")
+	binding.Recipe.Endpoint = model.EndpointModels
+	executor := executorWithRecipes(&fakeRecipeSource{upstreamBinding: binding}, nil)
+	out := executor.L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+	if method != "HEAD" || !executor.Last.Execution.Reachable || executor.Last.Execution.StatusCode != 500 || out.Verdict == health.VerdictOK {
+		t.Fatalf("HEAD must preserve HTTP/network distinction: method=%s execution=%+v outcome=%+v", method, executor.Last.Execution, out)
 	}
 }
 
@@ -302,7 +304,7 @@ func TestL1_ConnectionRefusedIsUnavailable(t *testing.T) {
 	url := srv.URL
 	srv.Close()
 
-	out := testProber().L1(context.Background(), upstreamFor(url), fastSettings())
+	out := testProbeExecutor().L1(context.Background(), upstreamFor(url), fastSettings())
 	if out.Verdict != health.VerdictUnavailable {
 		t.Errorf("连不上应判服务不可用，得到 %s", out.Verdict)
 	}
@@ -321,7 +323,7 @@ func TestL1_CanceledContextIsIgnored(t *testing.T) {
 		cancel()
 	}()
 
-	out := testProber().L1(ctx, upstreamFor(srv.URL), fastSettings())
+	out := testProbeExecutor().L1(ctx, upstreamFor(srv.URL), fastSettings())
 	if out.Verdict != health.VerdictIgnore {
 		t.Errorf("被取消的探活不该算上游故障，得到 %s（err=%v）", out.Verdict, out.Err)
 	}
@@ -376,7 +378,7 @@ func TestL2_AliveStream(t *testing.T) {
 	srv := sseServer(t, aliveSSE)
 	defer srv.Close()
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Verdict != health.VerdictOK {
@@ -393,14 +395,14 @@ func TestL2_FakeAliveIsUnavailable(t *testing.T) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	defer srv.Close()
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Verdict != health.VerdictUnavailable {
 		t.Errorf("200 但无有效 delta 是假活，应判不可用，得到 %s", out.Verdict)
 	}
-	if out.Err == nil || !contains(out.Err.Error(), "假活") {
-		t.Errorf("错误信息应说明是假活，得到 %v", out.Err)
+	if out.Err == nil || !contains(out.Err.Error(), "without_semantic") {
+		t.Errorf("错误信息应说明没有语义证据，得到 %v", out.Err)
 	}
 }
 
@@ -412,7 +414,8 @@ func TestL2_StreamErrorIsClassifiedByContent(t *testing.T) {
 		want    health.Verdict
 	}{
 		{"overloaded 判限流", `{"type":"error","error":{"type":"overloaded_error"}}`, health.VerdictRateLimited},
-		{"流内 401 判致命", `{"type":"error","error":{"code":401,"message":"invalid key"}}`, health.VerdictFatal},
+		{"numeric code不是HTTP status", `{"type":"error","error":{"code":401,"message":"invalid key"}}`, health.VerdictUnavailable},
+		{"明确认证type", `{"type":"error","error":{"type":"authentication_error"}}`, health.VerdictFatal},
 		{"其余判不可用", `{"type":"error","error":{"message":"internal"}}`, health.VerdictUnavailable},
 	}
 	for _, tc := range tests {
@@ -420,7 +423,7 @@ func TestL2_StreamErrorIsClassifiedByContent(t *testing.T) {
 			srv := sseServer(t, "event: error\ndata: "+tc.payload+"\n\n")
 			defer srv.Close()
 
-			out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+			out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 				modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 			if out.Verdict != tc.want {
 				t.Errorf("期望 %s，得到 %s（err=%v）", tc.want, out.Verdict, out.Err)
@@ -444,11 +447,11 @@ func TestL2_FirstTokenTimeout(t *testing.T) {
 	defer srv.Close()
 
 	s := fastSettings()
-	s.L2FirstTokenSec = 1
+	s.L2FirstSemanticSec = 1
 	s.L2TotalSec = 10
 
 	start := time.Now()
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, s)
 	elapsed := time.Since(start)
 
@@ -456,7 +459,7 @@ func TestL2_FirstTokenTimeout(t *testing.T) {
 		t.Errorf("首 Token 超时应判不可用，得到 %s", out.Verdict)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("应在 L2FirstTokenSec(1s) 附近超时，实际用了 %v", elapsed)
+		t.Errorf("应在 L2FirstSemanticSec(1s) 附近超时，实际用了 %v", elapsed)
 	}
 	// 主动断流的证据：服务端的 request context 被取消了
 	select {
@@ -498,7 +501,7 @@ func TestL2_ClosesStreamAfterVerdict(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("应判存活，得到 %s", out.Verdict)
@@ -519,7 +522,8 @@ func TestL2_HTTPErrorStatuses(t *testing.T) {
 		want   health.Verdict
 	}{
 		{401, `{"error":"bad key"}`, health.VerdictFatal},
-		{400, `{"error":{"message":"model not found"}}`, health.VerdictFatal},
+		{400, `{"error":{"message":"model not found"}}`, health.VerdictUnavailable},
+		{400, `{"error":{"code":"model_not_found"}}`, health.VerdictFatal},
 		{429, `{"error":"rate limited"}`, health.VerdictRateLimited},
 		{503, `unavailable`, health.VerdictUnavailable},
 	}
@@ -531,7 +535,7 @@ func TestL2_HTTPErrorStatuses(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+			out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 				modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 			if out.Verdict != tc.want {
 				t.Errorf("HTTP %d：期望 %s，得到 %s", tc.status, tc.want, out.Verdict)
@@ -558,12 +562,18 @@ func captureL2(t *testing.T, proto model.Protocol, rt *model.Route) (*http.Reque
 		got = r.Clone(context.Background())
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
+		proto := model.ProtoAnthropic
+		if r.URL.Path == "/v1/chat/completions" {
+			proto = model.ProtoOpenAIChat
+		} else if r.URL.Path == "/v1/responses" {
+			proto = model.ProtoOpenAIResponses
+		}
+		_, _ = w.Write([]byte(nativeSemanticWire(proto)))
 	}))
 	defer srv.Close()
 
 	mn := modelNameFor(proto)
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL), mn, rt, fastSettings())
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL), mn, rt, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("探活未成功，无法断言请求内容: %s（err=%v）", out.Verdict, out.Err)
 	}
@@ -649,7 +659,7 @@ func TestL2_RejectsUnknownProtocolWithoutSendingRequest(t *testing.T) {
 	defer srv.Close()
 
 	mn := &model.ModelName{Name: "x", Protocol: "telepathy", ProbeMaxTokens: 1, ProbePrompt: "1+1=?"}
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL), mn,
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL), mn,
 		&model.Route{ID: 1}, fastSettings())
 	if out.Verdict == health.VerdictOK {
 		t.Error("未知协议不该判成功")
@@ -720,14 +730,15 @@ func TestL2_CostUsesBuiltinManifestEstimate(t *testing.T) {
 		t.Skip("两种估算值恰好相等，这条断言此刻无法区分来源")
 	}
 
-	out := testProber().L2(context.Background(), upstreamFor(server.URL), modelName,
+	executor := testProbeExecutor()
+	out := executor.L2(context.Background(), upstreamFor(server.URL), modelName,
 		&model.Route{ID: 1}, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
 	}
-	if int64(out.EstTokens) != template.EstimatedCost() {
+	if executor.Last.Execution.EstimatedInputTokens != template.EstimatedCost() {
 		t.Errorf("成本应取 manifest 的声明值 %d，得到 %d",
-			template.EstimatedCost(), out.EstTokens)
+			template.EstimatedCost(), executor.Last.Execution.EstimatedInputTokens)
 	}
 	// Sent 必须置位：countL2 用它区分「出网了所以花了钱」与「prepare 阶段就
 	// 失败了」。不钉这条的话，一个永不置位的 Sent 会让每次真实 L2 都记 0 token，
@@ -752,7 +763,7 @@ func TestL2_ConfigErrorLeavesSentFalse(t *testing.T) {
 	// 未知协议：在解析之前就失败。
 	modelName := &model.ModelName{Name: "x", Protocol: "telepathy",
 		ProbeMaxTokens: 1, ProbePrompt: "1+1=?"}
-	out := testProber().L2(context.Background(), upstreamFor(server.URL), modelName,
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(server.URL), modelName,
 		&model.Route{ID: 1}, fastSettings())
 
 	if hits != 0 {
@@ -768,172 +779,117 @@ func TestL2_ConfigErrorLeavesSentFalse(t *testing.T) {
 
 // ── 探活头 ────────────────────────────────────────────────
 
-// Upstream 级 probe_headers 覆盖模板给的头（§3.6.4），
-// 给「按 UA 白名单拦截」这类站单独调指纹用。
-//
-// 断言上游实际收到的头，而不是某个构造函数的返回值：覆盖发生在渲染之后、
-// 认证装配之前（execute.go 的 applyProbeHeaders），只验中间产物测不到
-// 「覆盖了但随后被别的步骤改回去」。
-func TestProbeHeaders_UpstreamOverride(t *testing.T) {
-	var got http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.ProbeHeaders = map[string]string{
-		"user-agent": "custom-agent/1.0",
-		"x-custom":   "yes",
+// modelsExecutorWithHeaders publishes immutable safe header templates, rather than
+// sending legacy plaintext Upstream.probe_headers overrides.
+func modelsExecutorWithHeaders(t *testing.T, patch map[string][]string) *executorProbeHarness {
+	t.Helper()
+	builtin, err := loadBuiltins(t).Compact(model.EndpointModels)
+	if err != nil {
+		t.Fatal(err)
 	}
-	proberFor(up).L1(context.Background(), up, fastSettings())
-
-	if value := got.Get("User-Agent"); value != "custom-agent/1.0" {
-		t.Errorf("Upstream 级应覆盖模板给的 UA，得到 %q", value)
-	}
-	if value := got.Get("X-Custom"); value != "yes" {
-		t.Errorf("应能加新头，得到 %q", value)
-	}
-	// 没被覆盖的模板项要保留。
-	if value := got.Get("X-App"); value != "cli" {
-		t.Errorf("未覆盖的模板头应保留，得到 %q", value)
-	}
-}
-
-// 空值语义是「删掉这个头」。有站会因为多一个头而拒绝请求，
-// 需要一个能减头的手段。
-func TestProbeHeaders_EmptyValueDeletesHeader(t *testing.T) {
-	var got http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.ProbeHeaders = map[string]string{"anthropic-beta": ""}
-	proberFor(up).L1(context.Background(), up, fastSettings())
-
-	if value := got.Get("Anthropic-Beta"); value != "" {
-		t.Errorf("空值应删掉该头，得到 %q", value)
-	}
-}
-
-// probe_headers 里的鉴权头必须被忽略。放行的话就是给这个站开了
-// 第二个 key 来源，而 probe_headers 是明文 JSON，不受加密存储保护。
-// 配置层已拒绝这种输入（model.Validate），这里是纵深防御。
-//
-// 断言的是「注入的假 key 没有出现在出站请求里」：buildHeaders 自己不再写
-// 认证（那是 outbound.ApplyAuth 的职责），所以这条必须走完整条探活路径，
-// 否则它测不到真正要防的东西。
-func TestProbe_IgnoresAuthHeaderOverrideFromProbeHeaders(t *testing.T) {
-	var got http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.ProbeHeaders = map[string]string{
-		"authorization": "Bearer leaked-key",
-		"x-api-key":     "another-leaked-key",
-	}
-
-	proberFor(up).L1(context.Background(), up, fastSettings())
-
-	if got.Get("X-Api-Key") != up.APIKey {
-		t.Errorf("鉴权头必须来自 api_key 字段，得到 %q", got.Get("X-Api-Key"))
-	}
-	for _, leaked := range []string{"leaked-key", "another-leaked-key"} {
-		for name, values := range got {
-			for _, value := range values {
-				if contains(value, leaked) {
-					t.Errorf("probe_headers 里的假 key 漏进了出站请求头 %s: %q", name, value)
-				}
-			}
+	binding := testBinding(8, 80, 4, builtin.Method)
+	for _, header := range builtin.Headers {
+		if _, replaced := patch[strings.ToLower(header.Name)]; !replaced {
+			binding.Version.Headers = append(binding.Version.Headers, model.HeaderTemplate{Name: header.Name, Values: append([]string(nil), header.Values...)})
 		}
 	}
+	for name, values := range patch {
+		if len(values) > 0 {
+			binding.Version.Headers = append(binding.Version.Headers, model.HeaderTemplate{Name: name, Values: values})
+		}
+	}
+	return executorWithRecipes(&fakeRecipeSource{upstreamBinding: binding}, nil)
 }
 
-// 库里若已有带 CRLF 的 probe_headers 脏行，应用点必须跳过，不能把注入头发出去。
-// 配置写入层另有 Validate 拒绝；这里覆盖「脏行已经落库」的纵深防御。
-func TestProbeHeaders_SkipsCRLFInjectionAtApply(t *testing.T) {
+func TestRecipeHeadersOverrideFingerprintWithoutLosingOtherHeaders(t *testing.T) {
 	var got http.Header
-	var sawRequest bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawRequest = true
-		got = r.Header.Clone()
-		w.WriteHeader(200)
-	}))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Clone(); w.WriteHeader(200) }))
 	defer srv.Close()
-
-	up := upstreamFor(srv.URL)
-	up.ProbeHeaders = map[string]string{
-		"x-custom":                 "ok-value",
-		"x-evil":                   "a\r\nX-Injected: y",
-		"x-bad\r\nX-Injected-Name": "z",
-	}
-	proberFor(up).L1(context.Background(), up, fastSettings())
-
-	if !sawRequest {
-		t.Fatal("探活应仍发出请求（脏行被跳过，干净覆盖仍生效）")
-	}
-	if got.Get("X-Custom") != "ok-value" {
-		t.Errorf("干净覆盖应生效，得到 X-Custom=%q", got.Get("X-Custom"))
-	}
-	if got.Get("X-Injected") != "" || got.Get("X-Injected-Name") != "" {
-		t.Fatalf("注入头不得出现在上游请求上：X-Injected=%q X-Injected-Name=%q",
-			got.Get("X-Injected"), got.Get("X-Injected-Name"))
-	}
-	for name, values := range got {
-		if strings.ContainsAny(name, "\r\n\x00") {
-			t.Fatalf("上游请求头名含控制字符：%q", name)
-		}
-		for _, value := range values {
-			if strings.ContainsAny(value, "\r\n\x00") {
-				t.Fatalf("上游请求头 %q 值含控制字符：%q", name, value)
-			}
-			if strings.Contains(value, "X-Injected") {
-				t.Fatalf("上游请求头 %q 值含注入痕迹：%q", name, value)
-			}
-		}
+	executor := modelsExecutorWithHeaders(t, map[string][]string{"user-agent": {"custom-agent/1.0"}, "x-custom": {"yes"}})
+	executor.L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+	if got.Get("User-Agent") != "custom-agent/1.0" || got.Get("X-Custom") != "yes" || got.Get("X-App") != "cli" {
+		t.Fatalf("published fingerprint/other template headers lost: %v", got)
 	}
 }
 
-// auth_style 经 Endpoint 的 auth profile 决定发哪一种认证头。
-//
-// 这条覆盖的是「旧字段 → auth profile → ApplyAuth」这整条翻译链：只测
-// ApplyAuth 的话，翻译那一段错了照样全绿，而症状是「配了 bearer 却发
-// x-api-key」。
-func TestProbe_AuthStyleDecidesSingleAuthHeader(t *testing.T) {
-	tests := []struct {
-		style      model.AuthStyle
-		wantXKey   string
-		wantBearer string
+func TestRecipeHeaderOmissionRemovesBuiltinHeader(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Clone(); w.WriteHeader(200) }))
+	defer srv.Close()
+	executor := modelsExecutorWithHeaders(t, map[string][]string{"anthropic-beta": nil})
+	executor.L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+	if got == nil || got.Get("Anthropic-Beta") != "" {
+		t.Fatalf("omitted header still sent: %v", got)
+	}
+}
+
+func TestRecipeRejectsLiteralCredentialHeadersBeforeIO(t *testing.T) {
+	for _, name := range []string{"authorization", "x-api-key"} {
+		t.Run(name, func(t *testing.T) {
+			counter := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+				t.Fatal("literal credential header reached transport")
+				return nil, nil
+			}}
+			executor := modelsExecutorWithHeaders(t, map[string][]string{name: {"literal-private-key"}})
+			executor.Transport = counter
+			out := executor.L1(context.Background(), upstreamFor("https://invalid.example"), fastSettings())
+			if counter.count() != 0 || out.Err == nil || executor.Last.Execution.ErrorClass != model.ErrorConfig {
+				t.Fatalf("literal credential was not rejected: %+v", out)
+			}
+		})
+	}
+}
+
+func TestRecipeHeadersRejectCRLFInsteadOfSendingPartialCandidate(t *testing.T) {
+	for _, header := range []model.HeaderTemplate{
+		{Name: "X-Evil", Values: []string{"a\r\nX-Injected: y"}},
+		{Name: "X-Bad\r\nX-Injected-Name", Values: []string{"z"}},
+	} {
+		t.Run(header.Name, func(t *testing.T) {
+			counter := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+				t.Fatal("control characters reached transport")
+				return nil, nil
+			}}
+			executor := modelsExecutorWithHeaders(t, map[string][]string{strings.ToLower(header.Name): header.Values, "x-custom": {"clean"}})
+			executor.Transport = counter
+			out := executor.L1(context.Background(), upstreamFor("https://invalid.example"), fastSettings())
+			if out.Err == nil || counter.count() != 0 || executor.Last.Execution.ErrorClass != model.ErrorConfig {
+				t.Fatalf("unsafe recipe was partially sent: %+v", out)
+			}
+		})
+	}
+}
+
+// The Endpoint profile chooses one credential location independently of legacy fields.
+type explicitAuthEndpoints struct{ mode model.AuthMode }
+
+func (s explicitAuthEndpoints) Endpoint(ctx context.Context, id int64, kind model.EndpointKind) (*model.UpstreamEndpoint, error) {
+	ep, err := (testEndpoints{}).Endpoint(ctx, id, kind)
+	if err != nil {
+		return nil, err
+	}
+	ep.AuthProfile.Mode = s.mode
+	ep.AuthProfile.HeaderName = ""
+	return ep, nil
+}
+
+func TestEndpointAuthProfileDecidesSingleAuthHeader(t *testing.T) {
+	for _, tc := range []struct {
+		mode         model.AuthMode
+		xkey, bearer string
 	}{
-		{model.AuthXAPIKey, "sk-test-key-123456", ""},
-		{model.AuthBearer, "", "Bearer sk-test-key-123456"},
-	}
-	for _, tc := range tests {
-		t.Run(string(tc.style), func(t *testing.T) {
+		{model.AuthModeXAPIKey, "sk-test-key-123456", ""},
+		{model.AuthModeBearer, "", "Bearer sk-test-key-123456"},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
 			var got http.Header
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				got = r.Header.Clone()
-				w.WriteHeader(200)
-			}))
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Clone(); w.WriteHeader(200) }))
 			defer srv.Close()
-
-			up := upstreamFor(srv.URL)
-			up.AuthStyle = tc.style
-			proberFor(up).L1(context.Background(), up, fastSettings())
-
-			if v := got.Get("X-Api-Key"); v != tc.wantXKey {
-				t.Errorf("X-Api-Key：期望 %q，得到 %q", tc.wantXKey, v)
-			}
-			if v := got.Get("Authorization"); v != tc.wantBearer {
-				t.Errorf("Authorization：期望 %q，得到 %q", tc.wantBearer, v)
+			executor := testProbeExecutor()
+			executor.Targets = outbound.NewProvider(explicitAuthEndpoints{mode: tc.mode}, nil, outbound.NewResolver(testHasher{}))
+			out := executor.L1(context.Background(), upstreamFor(srv.URL), fastSettings())
+			if got == nil || got.Get("X-Api-Key") != tc.xkey || got.Get("Authorization") != tc.bearer {
+				t.Fatalf("explicit profile not applied: mode=%s headers=%v outcome=%+v", tc.mode, got, out)
 			}
 		})
 	}
@@ -941,9 +897,7 @@ func TestProbe_AuthStyleDecidesSingleAuthHeader(t *testing.T) {
 
 // 探活请求里除 ApplyAuth 写的那一个之外没有别的认证头（§7.2）。
 //
-// 模板层与覆盖层都不该写认证：模板经 probetemplate 的凭据门禁（认证头必须是
-// 占位符），probe_headers 经 applyUpstreamHeaderOverrides 的静默跳过。这条
-// 走完整条路径，所以它同时覆盖那两道。
+// Recipe credential placeholders are rendered then removed; ApplyAuth alone writes credentials.
 func TestProbeHeaders_OnlyApplyAuthWritesCredentials(t *testing.T) {
 	var got http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -953,7 +907,7 @@ func TestProbeHeaders_OnlyApplyAuthWritesCredentials(t *testing.T) {
 	defer srv.Close()
 
 	up := upstreamFor(srv.URL)
-	proberFor(up).L1(context.Background(), up, fastSettings())
+	executorFor(up).L1(context.Background(), up, fastSettings())
 
 	var present []string
 	for _, name := range model.AuthHeaders {
@@ -982,7 +936,7 @@ func TestProbeHeaders_AnthropicVersionIsSent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	out := testProbeExecutor().L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 	if out.Verdict != health.VerdictOK {
 		t.Fatalf("探活未成功: %s（err=%v）", out.Verdict, out.Err)
@@ -1008,15 +962,26 @@ func TestProbeHeaders_NoAnthropicVersionOnOpenAIEndpoints(t *testing.T) {
 	}
 }
 
-// DefaultHeaderTemplate 返回新 map，改它不影响后续调用。
-func TestDefaultHeaderTemplate_IsCopy(t *testing.T) {
-	tpl := DefaultHeaderTemplate()
-	if len(tpl) == 0 {
-		t.Fatal("默认头模板是空的")
+// Rendering never shares mutable headers/body between requests.
+func TestBuiltinTemplateRenderReturnsIndependentRequests(t *testing.T) {
+	template, err := loadBuiltins(t).Compact(model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
 	}
-	tpl["user-agent"] = "tampered"
-
-	if again := DefaultHeaderTemplate(); again["user-agent"] == "tampered" {
-		t.Error("修改返回值污染了后续调用")
+	first, err := template.Compiled().Render(context.Background(), testValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalUA := first.Header.Get("User-Agent")
+	first.Header.Set("User-Agent", "tampered")
+	if len(first.Body) > 0 {
+		first.Body[0] = 'X'
+	}
+	again, err := template.Compiled().Render(context.Background(), testValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Header.Get("User-Agent") != originalUA || len(again.Body) == 0 || again.Body[0] != '{' {
+		t.Fatalf("render mutation leaked: headers=%v body=%s", again.Header, again.Body)
 	}
 }

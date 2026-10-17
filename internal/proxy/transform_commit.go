@@ -50,13 +50,25 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
-	if at.f.RespObserver != nil {
-		observer := observerTee{at.f.RespObserver}
-		if len(at.peeked) > 0 {
+	if at.failBeforeCommit() {
+		return at.res
+	}
+	stop := at.watchResponse()
+	defer stop()
+	observer := observerTee{at.f.RespObserver}
+	if len(at.peeked) > 0 {
+		if at.f.RespObserver != nil {
 			_, _ = observer.Write(at.peeked)
 		}
-		at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, readError: &at.res.upstreamReadErr}
-		at.f.RespObserver = nil // transformed/fail-open writes must not duplicate input
+		at.wire.feed(at.peeked, time.Now())
+	}
+	at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, wire: at.wire, readError: &at.res.upstreamReadErr}
+	if !responseRulesTouchBody(compiled) && !responseRulesTouchSSE(compiled) {
+		var src io.Reader = at.resp.Body
+		if len(at.peeked) > 0 {
+			src = io.MultiReader(bytes.NewReader(at.peeked), src)
+		}
+		return at.commitHeaderTransformed(w, compiled, record, src)
 	}
 
 	ct := at.resp.Header.Get("Content-Type")
@@ -80,18 +92,17 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		if policy == "" {
 			policy = transform.FailOpen
 		}
-		if policy == transform.FailClosed {
-			if record != nil {
-				record(transform.ExecutionRecord{
-					Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
-					InputHash: transform.HashBytes(nil),
-				})
-			}
-			return res
+		if record != nil {
+			record(transform.ExecutionRecord{
+				Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
+			})
 		}
-		// fail_open on transport read error: pass empty body into ApplyResponse
-		// so header rules still run; body stays empty.
-		body = nil
+		// fail_open handles local transform failures. It cannot recover a
+		// failed upstream read by turning an incomplete body into empty 200.
+		return res
+	}
+	if at.failBeforeCommit() {
+		return res
 	}
 
 	// §15: non-stream body transform requires a complete read within MaxBodyBuffer.
@@ -160,6 +171,9 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		Body:   body,
 	}
 	out := compiled.ApplyResponse(in)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if out.Err != nil && out.PolicyUsed == transform.FailClosed {
 		res.Err = out.Err
 		if record != nil {
@@ -185,6 +199,9 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		}
 	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range out.Header {
 		for _, v := range vs {
@@ -214,13 +231,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
-	// flush 之后再判语义：body 已完整缓冲在 transform 路径，不额外读上游。
-	if res.Status >= 200 && res.Status < 400 &&
-		!IsStructuredErrorPayload(out.Body, out.Header.Get("Content-Type")) &&
-		HasSemanticEvidence(out.Body, out.Header.Get("Content-Type")) {
-		res.SemanticSeen = true
-		res.stampFirstSemantic(f)
-	}
+	at.projectWire()
 	now := time.Now()
 	if n > 0 && res.FirstByteAt.IsZero() {
 		res.FirstByteAt = now
@@ -260,6 +271,9 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 	}
 
 	// fail_open: original status/headers/body, no transform (§15.7).
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
@@ -274,7 +288,7 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 
 	// prefix already includes peeked bytes from readResponseBody; do not replay peeked.
 	src := io.MultiReader(bytes.NewReader(prefix), at.resp.Body)
-	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	n, werr := at.streamBody(w, src, true)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if werr != nil && res.Err == nil {
@@ -288,6 +302,9 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 // under fail_open (client keeps a consistent encoding + unmodified bytes).
 func (at *Attempt) commitEncodedPassthrough(w http.ResponseWriter, f *Forwarder, body []byte) *Result {
 	res := at.res
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
@@ -335,10 +352,34 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 
 	enc := normalizeContentEncoding(at.resp.Header.Get("Content-Encoding"))
 	decodedFromEncoding := false
+	var decoder io.ReadCloser
+	defer func() {
+		if decoder != nil {
+			_ = decoder.Close()
+		}
+	}()
+	startDecoding := func() bool {
+		var err error
+		decoder, err = newContentEncodingStream(enc, src)
+		if err != nil {
+			if record != nil {
+				record(transform.ExecutionRecord{Phase: "sse", OK: false, Error: err.Error(), FailPolicyUsed: policy})
+			}
+			// A failed decoder may already have consumed input. It cannot
+			// safely fall back to a reconstructed original stream.
+			res.Err = err
+			if at.stageTimeout.Load() != 0 || at.ctx.Err() != nil || at.clientCtx.Err() != nil {
+				res.Err = at.readFailure(err, 0)
+			}
+			return false
+		}
+		src = decoder
+		return true
+	}
 	if enc != "" {
 		if !responseRulesTouchSSE(compiled) {
 			// Header/status-only: do not frame or re-encode; keep compressed bytes + CE.
-			return at.commitSSEEncodedPassthrough(w, compiled, record, src)
+			return at.commitHeaderTransformed(w, compiled, record, src)
 		}
 		if !contentEncodingDecodable(enc) {
 			err := fmt.Errorf("cannot transform SSE with Content-Encoding %q", enc)
@@ -351,30 +392,8 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 				res.Err = err
 				return res
 			}
-			return at.commitSSEEncodedPassthrough(w, compiled, record, src)
+			return at.commitHeaderTransformed(w, compiled, record, src)
 		}
-		dec, derr := newContentEncodingStream(enc, src)
-		if derr != nil {
-			if record != nil {
-				record(transform.ExecutionRecord{
-					Phase: "sse", OK: false, Error: derr.Error(), FailPolicyUsed: policy,
-				})
-			}
-			if policy == transform.FailClosed {
-				res.Err = derr
-				return res
-			}
-			// Reconstruct src — peek was already consumed into MultiReader; for
-			// fail_open after NewReader failure, gzip/zlib may have read a few
-			// header bytes. Refuse partial decode: stream nothing and keep CE
-			// only if we can rebuild. Safest fail_open: passthrough via original
-			// body is unsafe after a failed decoder peek. Fall closed on stream
-			// setup failure even under fail_open when peeked bytes may be lost.
-			res.Err = derr
-			return res
-		}
-		defer dec.Close()
-		src = dec
 		decodedFromEncoding = true
 	}
 
@@ -391,6 +410,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		hdrIn.Header.Del("ETag")
 	}
 	hdrOut := compiled.ApplyResponse(hdrIn)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
 		res.Err = hdrOut.Err
 		if record != nil {
@@ -402,6 +424,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		return res
 	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range hdrOut.Header {
 		for _, v := range vs {
@@ -421,23 +446,22 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	res.HeadersSent = true
 	res.Status = hdrOut.Status
 	res.RespHeaders = hdrOut.Header.Clone()
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	// Even a nonempty peek may contain only one byte of a compression header.
+	// Streaming setup must not wait for more bytes before committing known
+	// headers. Unsupported encodings/header-rule errors were checked above;
+	// actual decoder setup/read failures now terminate this committed stream.
+	if decodedFromEncoding && !startDecoding() {
+		return res
+	}
 
 	scanner := &transform.SSEScanner{}
 	buf := make([]byte, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
 	var total int64
 	var hitAll []string
-	ct := ""
-	if res.RespHeaders != nil {
-		ct = res.RespHeaders.Get("Content-Type")
-	}
-	if ct == "" && at.resp != nil {
-		ct = at.resp.Header.Get("Content-Type")
-	}
-	var semSniffer *streamSemanticSniffer
-	if res.Status >= 200 && res.Status < 400 {
-		semSniffer = newStreamSemanticSniffer(ct)
-	}
 
 	writeEv := func(ev transform.SSEEvent) error {
 		if len(ev.Raw) == 0 {
@@ -452,13 +476,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		if f.RespTee != nil && wn > 0 {
 			_, _ = f.RespTee.Write(ev.Raw[:wn])
 		}
-		if semSniffer != nil && !semSniffer.Seen() && wn > 0 {
-			semSniffer.Feed(ev.Raw[:wn], ct)
-			if semSniffer.Seen() {
-				res.SemanticSeen = true
-				res.stampFirstSemantic(f)
-			}
-		}
+		at.projectWire()
 		if res.FirstByteAt.IsZero() && wn > 0 {
 			res.FirstByteAt = time.Now()
 		}
@@ -529,7 +547,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			break
 		}
 		if err != nil {
-			res.Err = err
+			res.Err = at.readFailure(err, total)
 			res.BytesWritten = total
 			return res
 		}
@@ -568,10 +586,10 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	return res
 }
 
-// commitSSEEncodedPassthrough applies header/status rules only and streams the
-// original encoded body with Content-Encoding kept. Used when SSE rewrite would
-// otherwise parse compressed bytes, or when decoding is unavailable under fail_open.
-func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *transform.Compiled,
+// commitHeaderTransformed applies decidable header/status rules and immediately
+// streams the original body, keeping encoding and wire bytes intact. It also
+// serves fail_open when an encoded SSE body cannot be rewritten safely.
+func (at *Attempt) commitHeaderTransformed(w http.ResponseWriter, compiled *transform.Compiled,
 	record func(transform.ExecutionRecord), src io.Reader) *Result {
 
 	res, f := at.res, at.f
@@ -581,6 +599,9 @@ func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *
 		Body:   nil,
 	}
 	hdrOut := compiled.ApplyResponse(hdrIn)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
 		res.Err = hdrOut.Err
 		if record != nil {
@@ -591,7 +612,20 @@ func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *
 		}
 		return res
 	}
+	if record != nil && (hdrOut.Changed || hdrOut.Err != nil) {
+		errText := ""
+		if hdrOut.Err != nil {
+			errText = hdrOut.Err.Error()
+		}
+		// Header-only execution has no buffered body hash. Empty means absent;
+		// do not label hash(empty) as the hash of an unread upstream response.
+		record(transform.ExecutionRecord{Phase: "response", OK: hdrOut.Err == nil,
+			Error: errText, FailPolicyUsed: hdrOut.PolicyUsed, HitRules: hdrOut.HitRules})
+	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range hdrOut.Header {
 		for _, v := range vs {
@@ -604,8 +638,11 @@ func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *
 	res.HeadersSent = true
 	res.Status = hdrOut.Status
 	res.RespHeaders = hdrOut.Header.Clone()
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 
-	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	n, werr := at.streamBody(w, src, true)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if werr != nil && res.Err == nil {
@@ -623,7 +660,7 @@ func (at *Attempt) readResponseBody(limit int) ([]byte, error) {
 	// Read limit+1 so ApplyResponse can detect overflow and apply fail policy.
 	_, err := io.Copy(&buf, io.LimitReader(src, int64(limit)+1))
 	if err != nil && err != io.EOF {
-		return buf.Bytes(), err
+		return buf.Bytes(), at.readFailure(err, int64(buf.Len()))
 	}
 	return buf.Bytes(), nil
 }

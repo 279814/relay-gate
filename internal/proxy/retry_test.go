@@ -14,7 +14,6 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
 )
 
 // 请求内重试（§3.5）。
@@ -117,10 +116,11 @@ func newMultiHarness(t *testing.T, responders ...http.HandlerFunc) *multiHarness
 	hs.cfg = &fakeConfig{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: s,
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
-	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
-		WithTargets(testTargets(hs.cfg), nil)
+	hs.h = NewHandler(hs.cfg, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(hs.cfg).
+		WithTargets(testTargets(hs.cfg), nil).
+		WithObservers(&attemptRecorder{})
 	t.Cleanup(hs.h.CloseIdleConnections)
 	return hs
 }
@@ -428,7 +428,7 @@ func TestRetry_SharesTotalTimeBudget(t *testing.T) {
 	// FirstByte, …, Total). Leaving ResponseHeaderSec at testSettings' 2s
 	// while Total=2s makes header timer and Total race → intermittent 502
 	// (ErrConnect) instead of 504 (ErrFirstTokenTimeout) under -race.
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1
@@ -468,7 +468,7 @@ func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 	hs := newMultiHarness(t, stall, stall)
 	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
 	hs.cfg.settings.RetryMaxAttempts = 2
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1
@@ -491,12 +491,12 @@ func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 // 漏掉的后果很隐蔽：站挂了，但因为重试成功兜住了，没人报告它失败 ——
 // 于是它一直显示 alive，直到下一个定时探活撞上去。而 §3.5 把真实请求的
 // 回写列为「最快的故障发现路径」，漏了它就等于放弃了这条路径。
-func TestRetry_ReportsHealthForEveryAttempt(t *testing.T) {
+func TestRetry_ObservesEveryAttempt(t *testing.T) {
 	hs := newMultiHarness(t,
 		respondStatus(502, `s0 down`),
 		respondOK(`{"id":"ok"}`))
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -528,8 +528,8 @@ func TestRetry_DiscardedAttemptCarriesErrBody(t *testing.T) {
 	hs := newMultiHarness(t,
 		respondStatus(502, `{"error":{"type":"overloaded_error","message":"rate limit"}}`),
 		respondOK(`{"id":"ok"}`))
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -551,8 +551,8 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 		respondStatus(200, `{"type":"error","error":{"type":"server_error","message":"boom"}}`),
 		respondOK(`{"id":"ok"}`))
 	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -571,76 +571,7 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 	}
 }
 
-// 每次尝试的 ErrBody 必须用**那一次自己的** key 脱敏。
-//
-// 用第一次的 key 去脱敏第二次的响应体,B 站回显的 key 就会明文流进
-// route_health.last_error 并显示在管理界面上（§3.6.3b 的要求是无条件的）。
-func TestRetry_RedactsEachAttemptWithItsOwnKey(t *testing.T) {
-	// 两个站都把自己收到的 key 回显在错误信息里（真实中转站的常见格式）
-	// 用 Balanced 点名的 502，以便换站并覆盖两次回写脱敏。
-	echoKey := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(502)
-		fmt.Fprintf(w, `{"error":"Invalid API key: %s"}`, r.Header.Get("X-Api-Key"))
-	}
-	hs := newMultiHarness(t, echoKey, echoKey)
-	hs.cfg.settings.RetryMaxAttempts = 2
-	hs.cfg.settings.RealTotalSec = 30
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
-
-	hs.serve(hs.req())
-
-	got := spy.all()
-	if len(got) != 2 {
-		t.Fatalf("应回写 2 次，得到 %d", len(got))
-	}
-	for i, rep := range got {
-		for _, st := range hs.stations {
-			if strings.Contains(string(rep.errBody), st.key) {
-				t.Errorf("第 %d 次回写的 ErrBody 里有明文 key %q —— 它会落进 "+
-					"route_health.last_error 并显示在管理界面上：%q",
-					i+1, st.key, rep.errBody)
-			}
-		}
-		// 脱敏不该毁掉错误信息本身
-		if !strings.Contains(string(rep.errBody), "Invalid API key") {
-			t.Errorf("第 %d 次回写丢掉了错误信息本身：%q", i+1, rep.errBody)
-		}
-	}
-}
-
-// multiReporter 按顺序记下每次回写。
-type multiReporter struct {
-	mu   sync.Mutex
-	got  []reportedView
-	prob []int64
-}
-
-type reportedView struct {
-	routeID int64
-	status  int
-	errBody []byte
-	err     error
-}
-
-func (m *multiReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.got = append(m.got, reportedView{routeID: routeID, status: res.Status,
-		errBody: res.ErrBody, err: res.Err})
-}
-
-func (m *multiReporter) TriggerProbe(routeID int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.prob = append(m.prob, routeID)
-}
-
-func (m *multiReporter) all() []reportedView {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]reportedView(nil), m.got...)
-}
+// Per-attempt key privacy is checked after durable observer commits in probe.
 
 // ── 并发额度：被丢弃的尝试必须立刻归还 ──────────────────────
 
@@ -765,7 +696,7 @@ func TestRetry_StopsWhenClientGone(t *testing.T) {
 		},
 		respondOK(`{"id":"should-not-reach"}`))
 	hs.cfg.settings.RetryMaxAttempts = 3
-	hs.cfg.settings.RealFirstTokenSec = 5
+	hs.cfg.settings.RealFirstSemanticSec = 5
 	hs.cfg.settings.RealTotalSec = 30
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -904,7 +835,7 @@ func TestSafeRetryEvidence_NilTraceUsesSentAt(t *testing.T) {
 }
 
 // §11.2: 提交前首响应体字节超时 (ErrFirstTokenTimeout) 仅 Aggressive 换站。
-// 默认 Balanced：一站、网关 504、无第二次 RoundTrip。
+// Balanced：头部失败为504；短窗口未知body则提交原始头，之后只终止、不重发。
 func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 	stallHeader := func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
@@ -916,7 +847,7 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 		time.Sleep(5 * time.Second)
 	}
 	shortStages := func(hs *multiHarness) {
-		hs.cfg.settings.RealFirstTokenSec = 1
+		hs.cfg.settings.RealFirstSemanticSec = 1
 		hs.cfg.settings.RealResponseHeaderSec = 1
 		hs.cfg.settings.RealFirstByteSec = 1
 		hs.cfg.settings.RealFirstSemanticSec = 1
@@ -948,10 +879,22 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 
 		rec := hs.serve(hs.req())
 		if rec.Code != http.StatusGatewayTimeout {
-			t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+			t.Fatalf("1s first-byte deadline must expire before the 2s retry inspection window: %d", rec.Code)
 		}
 		if strings.Contains(rec.Body.String(), "must-not-reach") {
 			t.Error("Balanced 不应因 Peek 首字节超时换站")
+		}
+		hs.assertHits(t, 1, 0)
+	})
+
+	t.Run("balanced undecided short window still commits when byte budget remains", func(t *testing.T) {
+		hs := newMultiHarness(t, stallBody, respondOK(`{"id":"must-not-reach"}`))
+		shortStages(hs)
+		hs.cfg.settings.RealFirstByteSec = 3
+		hs.cfg.settings.RealFirstSemanticSec = 3
+		rec := hs.serve(hs.req())
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Fatalf("2s undecided retry window must commit original headers while 3s stage budget remains: %d %q", rec.Code, rec.Body.String())
 		}
 		hs.assertHits(t, 1, 0)
 	})

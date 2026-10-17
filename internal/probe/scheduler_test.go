@@ -17,6 +17,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/runstate"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -30,7 +31,7 @@ type fakeCfg struct {
 	mu       sync.Mutex
 	snap     *router.Snapshot
 	settings model.Settings
-	state    store.RunState
+	state    model.RunState
 	// snapErr 让 Snapshot 报错，用于测「配置读不出来时不崩」的路径。
 	snapErr error
 }
@@ -48,12 +49,12 @@ func (f *fakeCfg) Settings() (model.Settings, error) {
 	defer f.mu.Unlock()
 	return f.settings, nil
 }
-func (f *fakeCfg) RunState() (store.RunState, error) {
+func (f *fakeCfg) Current() runstate.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.state, nil
+	return runstate.Snapshot{State: f.state, Revision: 1}
 }
-func (f *fakeCfg) setState(s store.RunState) {
+func (f *fakeCfg) setState(s model.RunState) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state = s
@@ -69,10 +70,8 @@ func newFakeTransport() fakeTransport {
 	return fakeTransport{manager: outbound.NewManager()}
 }
 
-func (transport fakeTransport) TransportFor(up *model.Upstream,
-	budget outbound.Budget) (*outbound.Transport, error) {
-
-	return transport.manager.Transport(outbound.NetworkFor(up.ProbeConfig(), budget.Connect))
+func (transport fakeTransport) RoundTripper(network outbound.NetworkConfig) (http.RoundTripper, error) {
+	return transport.manager.Transport(network)
 }
 
 // recordingTracker 记录调度器对状态机的每次调用。
@@ -166,6 +165,8 @@ func (r *recordingTracker) DemotePositiveConclusions() {
 func (r *recordingTracker) CompleteL1(int64, time.Time, float64) {}
 func (r *recordingTracker) CompleteL2(int64, time.Time, float64) {}
 
+func (r *recordingTracker) EnsureGeneration(int64) uint64 { return 1 }
+
 func (r *recordingTracker) snapshot() ([]int64, []int64, []health.Report, []int64, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -180,7 +181,7 @@ func (r *recordingTracker) snapshot() ([]int64, []int64, []health.Report, []int6
 type schedHarness struct {
 	sched *Scheduler
 	track *recordingTracker
-	gate  *health.UpstreamGate
+	reach *health.ReachabilityTracker
 	cfg   *fakeCfg
 
 	l1Hits map[int64]*int32 // 每个 Upstream 收到的 L1 次数
@@ -213,14 +214,14 @@ func newSchedHarness(t *testing.T, n int, handler http.HandlerFunc) *schedHarnes
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, ups, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	track := newRecordingTracker()
-	gate := health.NewUpstreamGate()
+	reach := health.NewReachabilityTracker(cfg)
 
 	return &schedHarness{
-		sched: NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil),
-		track: track, gate: gate, cfg: cfg,
+		sched: newSchedulerFixture(t, cfg, newFakeTransport(), track, reach, discardLogger()),
+		track: track, reach: reach, cfg: cfg,
 	}
 }
 
@@ -234,7 +235,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 	mn.Defaults()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(503) // 整站挂了
+		disconnectBeforeHeaders(w) // 真实响应头前断连
 	}))
 	defer srv.Close()
 
@@ -252,11 +253,12 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 		snap: router.BuildSnapshot([]*model.ModelName{mn},
 			[]*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
+	cfg.settings.FailThreshold = 1
 	track := newRecordingTracker()
-	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	reach := health.NewReachabilityTracker(cfg)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, reach, discardLogger())
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
@@ -268,7 +270,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 		if rep.Source == health.SourceL1 {
 			got[rep.RouteID] = true
 			if rep.Verdict != health.VerdictUnavailable {
-				t.Errorf("503 应判不可用，Route %d 得到 %s", rep.RouteID, rep.Verdict)
+				t.Errorf("响应头前断连应判不可用，Route %d 得到 %s", rep.RouteID, rep.Verdict)
 			}
 		}
 	}
@@ -277,7 +279,7 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 			t.Errorf("L1 失败应传播到该站所有 Route，Route %d 没收到", rt.ID)
 		}
 	}
-	if gate.OK(10) {
+	if reach.OK(10, 0) {
 		t.Error("L1 失败后站级结论应为不通")
 	}
 }
@@ -285,9 +287,10 @@ func TestScheduler_L1FailurePropagatesToAllRoutes(t *testing.T) {
 // L1 失败时跳过 L2：站都连不上，探模型纯属浪费 token。
 func TestScheduler_SkipsL2WhenL1Down(t *testing.T) {
 	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(503)
+		disconnectBeforeHeaders(w)
 	})
 
+	hs.cfg.settings.FailThreshold = 1
 	// 第一轮：L1 失败并记下站级结论
 	hs.sched.tick(context.Background())
 	hs.sched.wg.Wait()
@@ -339,10 +342,10 @@ func TestScheduler_CoalescesL1PerUpstream(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), newRecordingTracker(),
-		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), newRecordingTracker(),
+		health.NewReachabilityTracker(nil), discardLogger())
 
 	sched.tick(context.Background())
 	sched.wg.Wait()
@@ -370,7 +373,7 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 		isDown := down
 		mu.Unlock()
 		if isDown {
-			w.WriteHeader(503)
+			disconnectBeforeHeaders(w)
 			return
 		}
 		w.WriteHeader(200)
@@ -388,19 +391,20 @@ func TestScheduler_L1RecoveryTriggersDeadRoutesL2(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
+	cfg.settings.FailThreshold = 1
 	track := newRecordingTracker()
 	// 两条 Route 都已被判死
 	track.states[100] = model.StateDead
 	track.states[101] = model.StateDead
-	gate := health.NewUpstreamGate()
-	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	reach := health.NewReachabilityTracker(cfg)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, reach, discardLogger())
 
 	// 第一轮：L1 失败，站级记为不通
 	sched.tick(context.Background())
 	sched.wg.Wait()
-	if gate.OK(10) {
+	if reach.OK(10, 0) {
 		t.Fatal("前置条件：站级应为不通")
 	}
 
@@ -475,10 +479,10 @@ func TestScheduler_SerializesL2PerUpstream(t *testing.T) {
 	cfg := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), newRecordingTracker(),
-		health.NewUpstreamGate(), discardLogger()).WithTargets(testTargets(), nil)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), newRecordingTracker(),
+		health.NewReachabilityTracker(nil), discardLogger())
 
 	// 连跑几轮，让被拒的 Route 有机会重试
 	for i := 0; i < 5; i++ {
@@ -607,7 +611,7 @@ func TestScheduler_PausedStopsAllProbing(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(200)
 	})
-	hs.cfg.setState(store.StatePaused)
+	hs.cfg.setState(model.RunStatePaused)
 
 	for i := 0; i < 3; i++ {
 		hs.sched.tick(context.Background())
@@ -628,10 +632,10 @@ func TestScheduler_ResumeResetsState(t *testing.T) {
 		w.WriteHeader(200)
 	})
 
-	hs.cfg.setState(store.StatePaused)
+	hs.cfg.setState(model.RunStatePaused)
 	hs.sched.tick(context.Background())
 
-	hs.cfg.setState(store.StateRunning)
+	hs.cfg.setState(model.RunStateRunning)
 	hs.sched.tick(context.Background())
 	hs.sched.wg.Wait()
 
@@ -734,7 +738,7 @@ func (g *gatingCfg) Snapshot() (*router.Snapshot, error) {
 	return g.inner.Snapshot()
 }
 func (g *gatingCfg) Settings() (model.Settings, error) { return g.inner.Settings() }
-func (g *gatingCfg) RunState() (store.RunState, error) { return g.inner.RunState() }
+func (g *gatingCfg) Current() runstate.Snapshot        { return g.inner.Current() }
 
 // Armed L2 must not RoundTrip after the Route is disabled between Claim and send.
 // An enabled sibling's armed probe still sends. Re-enable does not replay the skip.
@@ -775,7 +779,7 @@ func TestScheduler_ArmedL2SkipsRoundTripAfterDisable(t *testing.T) {
 	inner := &fakeCfg{
 		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{upA, upB}, []*model.Route{rtA, rtB}),
 		settings: fastSettings(),
-		state:    store.StateRunning,
+		state:    model.RunStateRunning,
 	}
 	gate := &gatingCfg{
 		inner:       inner,
@@ -785,8 +789,7 @@ func TestScheduler_ArmedL2SkipsRoundTripAfterDisable(t *testing.T) {
 	track := newRecordingTracker()
 	track.l1Allowed = map[int64]bool{} // L1 would also re-check Snapshot; keep this race on L2 only
 	track.l2Allowed = map[int64]bool{100: true}
-	sched := NewScheduler(gate, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil)
+	sched := newSchedulerFixture(t, gate, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger())
 
 	done := make(chan struct{})
 	go func() {
@@ -871,303 +874,141 @@ func TestScheduler_RunStopsOnContextCancel(t *testing.T) {
 
 // ── 手动探活（§4.5）─────────────────────────────────────
 
-func TestScheduler_ProbeNow(t *testing.T) {
+func TestRunManualExecutesOnceWithoutUnarmedHealthReport(t *testing.T) {
+	var hits atomic.Int32
 	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		if r.URL.Path == "/v1/models" {
-			w.WriteHeader(200)
-			return
+			t.Error("manual must not run a second L1 request")
 		}
-		drainBody(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
+		aliveL2Handler(w, r)
 	})
-
+	recorder := &captureRecorder{}
+	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
+		ManagerTransports{Manager: outbound.NewManager()}, recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 	snap, _ := hs.cfg.Snapshot()
 	rt := snap.RoutesByModelName[1][0]
-
-	l1, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	execution, err := manualFixtureService(hs.cfg, hs.sched).RunManual(context.Background(), rt.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// P0-12：ProbeNow 是一次 manual L2；l1 为零值兼容旧签名。
-	if l1.Verdict != 0 {
-		t.Errorf("兼容 adapter 的 L1 应为零值，得到 %s", l1.Verdict)
+	if !execution.Success || execution.Trigger != model.TriggerManual || execution.Endpoint != model.EndpointMessages {
+		t.Fatalf("manual execution: %+v", execution)
 	}
-	if l2.Verdict != health.VerdictOK {
-		t.Errorf("L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
+	if hits.Load() != 1 || recorder.calls != 1 {
+		t.Fatalf("one HTTP request and one recorded execution required: hits=%d records=%d", hits.Load(), recorder.calls)
 	}
-
-	_, _, reports, _, _ := hs.track.snapshot()
-	if len(reports) == 0 {
-		t.Error("手动探活的结果也要落到状态机，否则界面看到「测试通过」而状态没变")
-	}
-	for _, rep := range reports {
-		if rep.HalfOpen {
-			t.Fatal("未武装的手动 ProbeNow 不得把 Report.HalfOpen 置 true")
-		}
+	_, _, reports, claims, _ := hs.track.snapshot()
+	if len(reports) != 0 || len(claims) != 0 {
+		t.Fatalf("manual execution cannot synthesize an armed health recovery: reports=%+v claims=%+v", reports, claims)
 	}
 }
 
-// §9.1：ProbeNow 不占 ClaimL2 / RecoveryGate；dead 上的 2xx 必须留在 dead。
-func TestScheduler_ProbeNowOKOnDeadStaysDead(t *testing.T) {
+// A successful explicit test is evidence; it does not bypass the armed recovery gate.
+func TestRunManualOKOnDeadStaysDead(t *testing.T) {
 	settings := fastSettings()
-	settings.FailThreshold = 1
-	settings.OKThreshold = 1
-
-	mn := &model.ModelName{ID: 1, Name: "claude-opus-5",
-		Protocol: model.ProtoAnthropic, MatchMode: model.MatchExact, Enabled: true}
-	mn.Defaults()
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		drainBody(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
-	}))
-	t.Cleanup(srv.Close)
-
-	up := &model.Upstream{
-		ID: 10, Name: "up1", BaseURL: srv.URL,
-		APIKey: "sk-probe-key-abcdefgh", AuthStyle: model.AuthXAPIKey,
-		L1Path: "/v1/models", Enabled: true,
+	settings.FailThreshold, settings.OKThreshold = 1, 1
+	hs := newSchedHarness(t, 1, aliveL2Handler)
+	hs.cfg.settings = settings
+	snap, _ := hs.cfg.Snapshot()
+	rt := snap.RoutesByModelName[1][0]
+	tr := health.NewTracker(hs.cfg)
+	if !tr.Report(health.Report{RouteID: rt.ID, Verdict: health.VerdictUnavailable, Source: health.SourceL2}) || tr.State(rt.ID) != model.StateDead {
+		t.Fatal("setup: expected dead")
 	}
-	rt := &model.Route{
-		ID: 100, ModelNameID: 1, UpstreamID: 10,
-		Priority: 1, Weight: 100, Enabled: true,
-	}
-	cfg := &fakeCfg{
-		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, []*model.Route{rt}),
-		settings: settings,
-		state:    store.StateRunning,
-	}
-	tr := health.NewTracker(cfg)
-	sched := NewScheduler(cfg, newFakeTransport(), tr, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil)
-
-	if !tr.Report(health.Report{
-		RouteID: rt.ID, Verdict: health.VerdictUnavailable, Source: health.SourceL2,
-	}) {
-		t.Fatal("setup: 应进入 dead")
-	}
-	if tr.State(rt.ID) != model.StateDead {
-		t.Fatalf("setup: want dead, got %s", tr.State(rt.ID))
-	}
-
-	snap, err := cfg.Snapshot()
+	sched := newSchedulerFixture(t, hs.cfg, newFakeTransport(), tr, health.NewReachabilityTracker(hs.cfg), discardLogger())
+	execution, err := manualFixtureService(hs.cfg, sched).RunManual(context.Background(), rt.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, l2, err := sched.ProbeNow(context.Background(), snap, rt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l2.Verdict != health.VerdictOK {
-		t.Fatalf("ProbeNow L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
+	if !execution.Success {
+		t.Fatalf("manual execution failed: %+v", execution)
 	}
 	if got := tr.State(rt.ID); got != model.StateDead {
-		t.Fatalf("未武装手动 ProbeNow 的 2xx 应留在 dead，得到 %s", got)
+		t.Fatalf("unarmed manual success changed dead to %s", got)
 	}
 }
 
-// 装配 Executor 后，ProbeNow 恰好一次 manual Execute。
-func TestScheduler_ProbeNowUsesExecutor(t *testing.T) {
-	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		drainBody(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
-	})
-
+func TestRunManualUsesExecutorTransportExactlyOnce(t *testing.T) {
+	hs := newSchedHarness(t, 1, aliveL2Handler)
 	recorder := &captureRecorder{}
-	executor := NewExecutor(testTargets(), nil, nil,
-		ManagerTransports{Manager: outbound.NewManager()},
-		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
-	hs.sched.WithExecutor(executor)
-
-	spy := &spyTransportSource{}
-	hs.sched.tr = spy
-
+	counter := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(aliveSSE))}, nil
+	}}
+	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(), fakeTransports{rt: counter},
+		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 	snap, _ := hs.cfg.Snapshot()
-	rt := snap.RoutesByModelName[1][0]
-
-	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	execution, err := manualFixtureService(hs.cfg, hs.sched).RunManual(context.Background(), snap.RoutesByModelName[1][0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l2.Verdict != health.VerdictOK {
-		t.Errorf("经 Executor 的 L2 应通过，得到 %s（%v）", l2.Verdict, l2.Err)
-	}
-	if recorder.calls != 1 {
-		t.Errorf("恰好一次 manual execution，实际落库 %d 次", recorder.calls)
-	}
-	if got := spy.count(); got != 0 {
-		t.Errorf("Executor 在场时绝不该走 Prober 回落，但 TransportFor 被调用了 %d 次", got)
+	if !execution.Success || counter.count() != 1 || recorder.calls != 1 {
+		t.Fatalf("manual must use the Executor transport and recorder once: execution=%+v requests=%d records=%d", execution, counter.count(), recorder.calls)
 	}
 }
 
-// Failed or skipped probe_cost_* must not raise GET /admin/api/probe-cost
-// (Cost.Snapshot) above probe_cost_daily: AddL2 runs only when CostCharged.
-func TestScheduler_ProbeNowSkipsMemoryCostWhenNotCharged(t *testing.T) {
-	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		drainBody(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
-	})
-	cost := NewCost()
-	hs.sched.WithCost(cost)
-
-	recorder := &captureRecorder{} // CostCharged stays false: insert failed/skipped
-	executor := NewExecutor(testTargets(), nil, nil,
-		ManagerTransports{Manager: outbound.NewManager()},
-		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
-	hs.sched.WithExecutor(executor)
-
-	snap, _ := hs.cfg.Snapshot()
-	rt := snap.RoutesByModelName[1][0]
-	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l2.Verdict != health.VerdictOK {
-		t.Fatalf("probe should succeed, got %s (%v)", l2.Verdict, l2.Err)
-	}
-	if mem := cost.Snapshot(); mem.L2Count != 0 || mem.EstTokens != 0 {
-		t.Fatalf("memory snapshot must stay empty when CostCharged=false, got L2=%d tokens=%d",
-			mem.L2Count, mem.EstTokens)
-	}
-
-	recorder.costCharged = true
-	_, l2, err = hs.sched.ProbeNow(context.Background(), snap, rt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l2.Verdict != health.VerdictOK {
-		t.Fatalf("probe should succeed, got %s (%v)", l2.Verdict, l2.Err)
-	}
-	if mem := cost.Snapshot(); mem.L2Count != 1 {
-		t.Fatalf("CostCharged=true must AddL2 once, got L2Count=%d", mem.L2Count)
-	}
-}
-
-// spyTransportSource 是一个「一被调用就记账」的 TransportSource 探针。
-//
-// 它存在只为一件事：证明装配 Executor 后 Scheduler 不再经 Prober 回落取池。
-// 返回 error 而不是可用的池 —— 万一真被走到，回落路径会以错误显形，
-// 而不是静默发出一次请求让断言更难写。
-type spyTransportSource struct {
-	mu     sync.Mutex
-	calls  int
-	lastUp string
-}
-
-func (s *spyTransportSource) TransportFor(up *model.Upstream,
-	_ outbound.Budget) (*outbound.Transport, error) {
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls++
-	s.lastUp = up.Name
-	return nil, errProberFallbackUsed
-}
-
-func (s *spyTransportSource) count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
-var errProberFallbackUsed = errorString("不该走到的 Prober 回落取池")
-
-type errorString string
-
-func (e errorString) Error() string { return string(e) }
-
-// Lazy 站的手动 ProbeNow 仍可发一次，且不改变 ProbeMode。
-func TestScheduler_ProbeNowLazyManualOnce(t *testing.T) {
-	var hits int
-	var mu sync.Mutex
-	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		hits++
-		mu.Unlock()
-		drainBody(r)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(aliveSSE))
-	})
+// Lazy mode permits one explicit test without changing periodic policy.
+func TestRunManualLazyManualOnce(t *testing.T) {
+	var hits atomic.Int32
+	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) { hits.Add(1); aliveL2Handler(w, r) })
 	for _, up := range hs.cfg.snap.Upstreams {
 		up.ProbeMode = model.ProbeModeLazy
 	}
-
 	snap, _ := hs.cfg.Snapshot()
 	rt := snap.RoutesByModelName[1][0]
-	modeBefore := snap.Upstreams[rt.UpstreamID].ProbeMode
-
-	_, l2, err := hs.sched.ProbeNow(context.Background(), snap, rt)
+	execution, err := manualFixtureService(hs.cfg, hs.sched).RunManual(context.Background(), rt.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l2.Verdict != health.VerdictOK {
-		t.Errorf("Lazy 手动测试应成功，得到 %s", l2.Verdict)
+	if !execution.Success || hits.Load() != 1 {
+		t.Fatalf("expected one successful explicit execution: %+v hits=%d", execution, hits.Load())
 	}
-	if snap.Upstreams[rt.UpstreamID].ProbeMode != modeBefore {
-		t.Error("手动测试不得改变 ProbeMode")
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if hits != 1 {
-		t.Errorf("恰好一次请求，实际 %d", hits)
+	if snap.Upstreams[rt.UpstreamID].ProbeMode != model.ProbeModeLazy {
+		t.Fatal("manual changed ProbeMode")
 	}
 }
 
-// 配置不一致时要报错，而不是无声无息什么都不发生。
-func TestScheduler_ProbeNowRejectsBrokenConfig(t *testing.T) {
-	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-	})
-	snap, _ := hs.cfg.Snapshot()
-
-	if _, _, err := hs.sched.ProbeNow(context.Background(), snap,
-		&model.Route{ID: 999, ModelNameID: 1, UpstreamID: 88888}); err == nil {
-		t.Error("Upstream 不存在应报错")
+func TestRunManualRejectsBrokenConfigBeforeSending(t *testing.T) {
+	var hits atomic.Int32
+	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(200) })
+	svc := manualFixtureService(hs.cfg, hs.sched)
+	if _, err := svc.RunManual(context.Background(), 999); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing route: %v", err)
 	}
-	if _, _, err := hs.sched.ProbeNow(context.Background(), snap,
-		&model.Route{ID: 999, ModelNameID: 88888, UpstreamID: 10}); err == nil {
-		t.Error("ModelName 不存在应报错")
-	}
-}
-
-func TestScheduler_ProbeNowRejectsDisabled(t *testing.T) {
-	var hits int32
-	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		w.WriteHeader(200)
-	})
 	snap, _ := hs.cfg.Snapshot()
 	rt := snap.RoutesByModelName[1][0]
-
-	disabledRoute := *rt
-	disabledRoute.Enabled = false
-	if _, _, err := hs.sched.ProbeNow(context.Background(), snap, &disabledRoute); err == nil {
-		t.Fatal("停用 Route 的 ProbeNow 必须拒绝")
-	} else if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Route") {
-		t.Fatalf("应为配置校验错误且点名 Route: %v", err)
+	upID, mnID := rt.UpstreamID, rt.ModelNameID
+	rt.UpstreamID = 88888
+	if _, err := svc.RunManual(context.Background(), rt.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing upstream: %v", err)
 	}
-
-	up := snap.Upstreams[rt.UpstreamID]
-	disabledUp := *up
-	disabledUp.Enabled = false
-	snap.Upstreams[rt.UpstreamID] = &disabledUp
-	if _, _, err := hs.sched.ProbeNow(context.Background(), snap, rt); err == nil {
-		t.Fatal("停用 Upstream 的 ProbeNow 必须拒绝")
-	} else if !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Upstream") {
-		t.Fatalf("应为配置校验错误且点名 Upstream: %v", err)
+	rt.UpstreamID, rt.ModelNameID = upID, 88888
+	if _, err := svc.RunManual(context.Background(), rt.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing ModelName: %v", err)
 	}
+	rt.ModelNameID = mnID
+	if hits.Load() != 0 {
+		t.Fatalf("broken config sent %d requests", hits.Load())
+	}
+}
 
-	if hits != 0 {
-		t.Fatalf("配置拒绝后不得 RoundTrip，hits=%d", hits)
+func TestRunManualRejectsDisabledBeforeSending(t *testing.T) {
+	var hits atomic.Int32
+	hs := newSchedHarness(t, 1, func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(200) })
+	snap, _ := hs.cfg.Snapshot()
+	rt := snap.RoutesByModelName[1][0]
+	svc := manualFixtureService(hs.cfg, hs.sched)
+	rt.Enabled = false
+	if _, err := svc.RunManual(context.Background(), rt.ID); !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Route") {
+		t.Fatalf("disabled Route: %v", err)
+	}
+	rt.Enabled = true
+	snap.Upstreams[rt.UpstreamID].Enabled = false
+	if _, err := svc.RunManual(context.Background(), rt.ID); !errors.Is(err, model.ErrValidation) || !strings.Contains(err.Error(), "Upstream") {
+		t.Fatalf("disabled Upstream: %v", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("disabled config sent %d requests", hits.Load())
 	}
 }
 
@@ -1204,8 +1045,8 @@ func TestL1StationEffectDoesNotSpreadConfigErrors(t *testing.T) {
 // Delete must drop inflightL2 / pendingL2 / busyUp for that id. Otherwise a
 // reused SQLite rowid is skipped as still in flight until the stale endL2.
 func TestForgetRoute_ClearsL2FlagsForIDReuse(t *testing.T) {
-	sched := NewScheduler(&fakeCfg{state: store.StateRunning, settings: fastSettings()},
-		newFakeTransport(), newRecordingTracker(), health.NewUpstreamGate(), discardLogger())
+	sched := newSchedulerFixture(t, &fakeCfg{state: model.RunStateRunning, settings: fastSettings()},
+		newFakeTransport(), newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger())
 
 	hold, ok := sched.beginL2(10, 100)
 	if !ok {

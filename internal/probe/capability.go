@@ -7,7 +7,6 @@ package probe
 // 本 Registry **永不**写 RouteHealth（§P0-10 验收第 19 条）。
 
 import (
-	"net/http"
 	"sync"
 	"time"
 
@@ -28,16 +27,13 @@ type CapabilityRegistry struct {
 	rows     map[capabilityKey]*model.EndpointCapability
 	now      func() time.Time
 	settings SettingsSource
-	// routeGen peeks RouteHealth generation for real-traffic count_tokens
-	// marks (same incarnation check as Reporter.routeGenerationCurrent).
+	// routeGen guards committed Route results across lifecycle invalidation.
 	routeGen interface {
 		GenerationOf(routeID int64) uint64
 	}
-	// configErrors / configs / recipes persist live config_error marks under
-	// the token RestoreConfigErrors recomputes; see WithConfigErrorPersistence.
-	configErrors ConfigErrorStore
-	configs      PublishedConfigSource
-	recipes      *RecipeResolver
+	// configs / recipes resolve the current binding for calibration and restore.
+	configs PublishedConfigSource
+	recipes *RecipeResolver
 }
 
 // SettingsSource 提供读侧失效所需的当前 Settings。
@@ -54,8 +50,7 @@ func NewCapabilityRegistry(settings SettingsSource) *CapabilityRegistry {
 	}
 }
 
-// WithRouteGeneration binds RouteHealth generation peeks so MarkCountTokens*
-// can drop stale writes after delete+reinsert reused a numeric route id.
+// WithRouteGeneration guards in-memory committed writes after a Route reset.
 func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
 	GenerationOf(routeID int64) uint64
 }) *CapabilityRegistry {
@@ -68,9 +63,8 @@ func (registry *CapabilityRegistry) WithRouteGeneration(viewer interface {
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
 //
 // CAS：同 token 时只接受更大（或相等时保留已有）order，强制反转两个已提交
-// 结果的返回顺序时仍保留 order 最大者。token 不同表示新 incarnation（含
-// MarkCountTokens* / real_model_not_found 用 UnixMilli 占位 order 之后，
-// sequencer 提交的新 token），即使 order 更低也必须替换。空 ObservationToken
+// 结果的返回顺序时仍保留 order 最大者。token 不同表示新的配置身份，
+// 即使 order 更低也必须替换。空 ObservationToken
 // 的旁路占位不得覆盖已有非空 token；非空 token 仍可替换空占位。
 func (registry *CapabilityRegistry) ApplyCommitted(row *model.EndpointCapability) {
 	registry.applyCommitted(row, nil)
@@ -137,205 +131,8 @@ func (registry *CapabilityRegistry) Snapshot(scope model.RecipeScope, scopeID in
 	return &copyValue
 }
 
-// MarkCountTokensUnsupported records §10.3 / §8.12: upstream 404/405 on
-// count_tokens → that Route's count_tokens Capability is unsupported.
-// Does not touch RouteHealth or other endpoints (messages stays selectable).
-// TTL comes from the existing CapabilityReductionPolicy; config changes still
-// clear via fingerprint / Invalidate — no new invalidation trigger.
-//
-// generation is the RouteHealth generation captured at select/TryAcquire;
-// mismatched generations drop ApplyCommitted (same hole as real-traffic
-// model_not_found after delete+reinsert reused the numeric id).
-func (registry *CapabilityRegistry) MarkCountTokensUnsupported(routeID int64, generation uint64, statusCode int) {
-	if registry == nil || routeID <= 0 {
-		return
-	}
-	if statusCode != 404 && statusCode != 405 {
-		return
-	}
-	if !registry.routeGenerationCurrent(routeID, generation) {
-		return
-	}
-	selector := model.EvidencePolicySelector{
-		Kind:     model.EvidenceCountTokens,
-		Endpoint: model.EndpointCountTokens,
-	}
-	settings := model.DefaultSettings()
-	if registry.settings != nil {
-		if s, err := registry.settings.Settings(); err == nil {
-			settings = s
-		}
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
-	if err != nil {
-		return
-	}
-	fp := revisioncodec.ProbeSettingsFingerprint(policy)
-	nowMS := registry.now().UnixMilli()
-	expiresAt := int64(0)
-	if policy.State.UnsupportedTTL > 0 {
-		expiresAt = nowMS + policy.State.UnsupportedTTL.Milliseconds()
-	}
-	registry.ApplyCommitted(&model.EndpointCapability{
-		ScopeType:                model.RecipeScopeRoute,
-		ScopeID:                  routeID,
-		Endpoint:                 model.EndpointCountTokens,
-		PolicySelector:           selector,
-		State:                    model.CapabilityUnsupported,
-		ErrorClass:               model.ErrorUnsupported,
-		StatusCode:               statusCode,
-		ObservationToken:         "",
-		ProbeSettingsFingerprint: fp,
-		LastObservationOrder:     nowMS,
-		ObservedAt:               nowMS,
-		ExpiresAt:                expiresAt,
-		RedactedDetail:           string(model.ErrorUnsupported),
-	})
-}
-
-// MarkCountTokensSupported records §10.3 / §8.13: a real count_tokens 200 with
-// positive input_tokens → that Route's count_tokens Capability is supported.
-// TTL is the existing SupportedTTL; generation mirrors MarkCountTokensUnsupported.
-func (registry *CapabilityRegistry) MarkCountTokensSupported(routeID int64, generation uint64) {
-	if registry == nil || routeID <= 0 {
-		return
-	}
-	if !registry.routeGenerationCurrent(routeID, generation) {
-		return
-	}
-	selector := model.EvidencePolicySelector{
-		Kind:     model.EvidenceCountTokens,
-		Endpoint: model.EndpointCountTokens,
-	}
-	settings := model.DefaultSettings()
-	if registry.settings != nil {
-		if s, err := registry.settings.Settings(); err == nil {
-			settings = s
-		}
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
-	if err != nil {
-		return
-	}
-	fp := revisioncodec.ProbeSettingsFingerprint(policy)
-	nowMS := registry.now().UnixMilli()
-	expiresAt := int64(0)
-	if policy.State.SupportedTTL > 0 {
-		expiresAt = nowMS + policy.State.SupportedTTL.Milliseconds()
-	}
-	registry.ApplyCommitted(&model.EndpointCapability{
-		ScopeType:                model.RecipeScopeRoute,
-		ScopeID:                  routeID,
-		Endpoint:                 model.EndpointCountTokens,
-		PolicySelector:           selector,
-		State:                    model.CapabilitySupported,
-		ErrorClass:               model.ErrorNone,
-		StatusCode:               http.StatusOK,
-		ObservationToken:         "",
-		ProbeSettingsFingerprint: fp,
-		LastObservationOrder:     nowMS,
-		ObservedAt:               nowMS,
-		ExpiresAt:                expiresAt,
-	})
-}
-
-// MarkCountTokensConfigError records §10.3: upstream 401/403 on count_tokens
-// → that Route's count_tokens Capability is config_error (端点配置错误).
-// Does not touch RouteHealth or other endpoints; ExpiresAt stays 0 (§8.13).
-// generation mirrors MarkCountTokensUnsupported (drop stale after id reuse).
-func (registry *CapabilityRegistry) MarkCountTokensConfigError(routeID int64, generation uint64, statusCode int) {
-	if registry == nil || routeID <= 0 {
-		return
-	}
-	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
-		return
-	}
-	if !registry.routeGenerationCurrent(routeID, generation) {
-		return
-	}
-	selector := model.EvidencePolicySelector{
-		Kind:     model.EvidenceCountTokens,
-		Endpoint: model.EndpointCountTokens,
-	}
-	settings := model.DefaultSettings()
-	if registry.settings != nil {
-		if s, err := registry.settings.Settings(); err == nil {
-			settings = s
-		}
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
-	if err != nil {
-		return
-	}
-	fp := revisioncodec.ProbeSettingsFingerprint(policy)
-	nowMS := registry.now().UnixMilli()
-	registry.ApplyCommitted(&model.EndpointCapability{
-		ScopeType:                model.RecipeScopeRoute,
-		ScopeID:                  routeID,
-		Endpoint:                 model.EndpointCountTokens,
-		PolicySelector:           selector,
-		State:                    model.CapabilityConfigError,
-		ErrorClass:               model.ErrorAuthRejected,
-		StatusCode:               statusCode,
-		ObservationToken:         "",
-		ProbeSettingsFingerprint: fp,
-		LastObservationOrder:     nowMS,
-		ObservedAt:               nowMS,
-		ExpiresAt:                0, // §8.13: config_error 不自动过期
-		RedactedDetail:           string(model.ErrorAuthRejected),
-	})
-}
-
-// MarkRouteConfigError records §6.5 / §7.2 on real traffic: the Route's Auth
-// Secret is unusable (e.g. empty upstream api_key), so that Route's endpoint
-// Capability is config_error and nothing was sent. Same shape as the real-traffic
-// model_not_found mark: empty token in memory, persisted under the current
-// Observation Token when persistence is wired. Does not touch RouteHealth.
-func (registry *CapabilityRegistry) MarkRouteConfigError(routeID int64, generation uint64, endpoint model.EndpointKind) {
-	if registry == nil || routeID <= 0 || !endpoint.Valid() {
-		return
-	}
-	if !registry.routeGenerationCurrent(routeID, generation) {
-		return
-	}
-	selector := model.EvidencePolicySelector{
-		Kind:     model.EvidenceRealTraffic,
-		Endpoint: endpoint,
-	}
-	settings := model.DefaultSettings()
-	if registry.settings != nil {
-		if s, err := registry.settings.Settings(); err == nil {
-			settings = s
-		}
-	}
-	policy, err := revisioncodec.BuildCapabilityEvidencePolicy(settings, selector)
-	if err != nil {
-		return
-	}
-	fp := revisioncodec.ProbeSettingsFingerprint(policy)
-	nowMS := registry.now().UnixMilli()
-	registry.ApplyCommitted(&model.EndpointCapability{
-		ScopeType:                model.RecipeScopeRoute,
-		ScopeID:                  routeID,
-		Endpoint:                 endpoint,
-		PolicySelector:           selector,
-		State:                    model.CapabilityConfigError,
-		ErrorClass:               model.ErrorConfig,
-		ObservationToken:         "",
-		ProbeSettingsFingerprint: fp,
-		LastObservationOrder:     nowMS,
-		ObservedAt:               nowMS,
-		ExpiresAt:                0, // §8.13: config_error 不自动过期
-		RedactedDetail:           string(model.ErrorConfig),
-	})
-	registry.persistRouteConfigError(routeID, endpoint, 0, model.ErrorConfig, nowMS)
-}
-
-// routeGenerationCurrent mirrors Reporter.routeGenerationCurrent for count_tokens
-// marks. generation == 0 is unbound (tests / first mark before TryAcquire): apply
-// only when the live RouteHealth generation is also 0. A zero argument against a
-// non-zero live generation is dropped so a caller that forgot the generation
-// cannot poison a reused id.
+// routeGenerationCurrent checks the in-memory apply against a generation
+// captured before SQL commit. Zero is valid only for a still-unbound route.
 func (registry *CapabilityRegistry) routeGenerationCurrent(routeID int64, generation uint64) bool {
 	if registry == nil || registry.routeGen == nil {
 		return true

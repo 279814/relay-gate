@@ -3,7 +3,9 @@
  */
 
 export function createMigrationFeature(shell, api) {
+  let owner = {};
   shell.confirmEndpointReview = async function confirmEndpointReview(ep) {
+    const requestOwner = owner;
     const id = this.f(ep, 'id', 'ID');
     const rev = this.f(ep, 'revision', 'Revision') || 0;
     const override = window.prompt(
@@ -23,12 +25,19 @@ export function createMigrationFeature(shell, api) {
         url_override: url,
         expected_revision: rev,
       });
+      if (requestOwner !== owner) return;
       this.msg = 'Endpoint #' + id + ' 已确认审核并转为 canonical';
       if (typeof this.loadEndpoints === 'function') await this.loadEndpoints(true);
     } catch (e) {
+      if (requestOwner !== owner) return;
       this.err = e && e.message ? e.message : String(e);
     } finally {
-      this.busy = false;
+      if (requestOwner === owner) this.busy = false;
     }
+  };
+  const originalReset = shell.reset;
+  shell.reset = function resetMigration() {
+    owner = {};
+    return originalReset?.call(this);
   };
 }

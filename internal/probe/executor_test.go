@@ -109,7 +109,7 @@ func newTestExecutorFor(up *model.Upstream, rt http.RoundTripper, recorder Execu
 	admission SyntheticAdmission, clock Clock) *Executor {
 
 	targets := outbound.NewProvider(testEndpoints{upstream: up}, nil, outbound.NewResolver(testHasher{}))
-	return NewExecutor(targets, nil, nil, fakeTransports{rt: rt}, recorder, admission, clock, nil)
+	return NewExecutor(targets, nil, builtinOnlyResolver(), fakeTransports{rt: rt}, recorder, admission, clock, nil)
 }
 
 func l2RequestFor(up *model.Upstream) ExecutionRequest {

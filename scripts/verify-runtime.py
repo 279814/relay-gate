@@ -9,6 +9,7 @@ import argparse
 import concurrent.futures
 from contextlib import closing
 import gzip
+import hashlib
 import http.server
 import json
 import os
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -171,7 +173,9 @@ class Runtime:
             return database.execute(query, args).fetchall()
 
     def seed(self, upstream_port):
-        upstream = self.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{upstream_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy"}, 201)
+        endpoints = [{"endpoint": kind, "auth_profile": {"mode": "header_bearer", "secret_ref": "upstream_api_key"}}
+                     for kind in ("models", "messages", "responses", "chat_completions", "count_tokens")]
+        upstream = self.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{upstream_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy", "initial_endpoints": endpoints}, 201)
         model = self.api("POST", "/model-names", {"name": "runtime-model", "protocol": "anthropic"}, 201)
         self.api("POST", "/routes", {"upstream_id": upstream["id"], "model_name_id": model["id"], "priority": 1, "weight": 100}, 201)
         body = {"model": "runtime-model", "messages": [{"role": "user", "content": PRIVATE}], "stream": True}
@@ -202,7 +206,8 @@ def verify(binary):
             assert PRIVATE not in repr(profiles) and profiles[0][-1] == 1, "private content or telemetry changed profile identity"
             eventually(lambda: runtime.sql("SELECT COUNT(*) FROM sample_request") == [(3,)])
             before_samples = 3
-            runtime.api("PUT", "/settings", {"sample_enabled": False})
+            settings = runtime.api("GET", "/settings")
+            runtime.api("PUT", "/settings", {"sample_enabled": False, "expected_revision": settings["revision"]})
             MockUpstream.mode = "complete"
             assert runtime.request("POST", "/v1/messages", body, proxy=True)[0] == 200
             eventually(lambda: runtime.sql("SELECT seen_count FROM client_probe_profile") == [(3,)])
@@ -231,6 +236,15 @@ def verify(binary):
             assert not runtime.api("GET", "/state").get("maintenance"), "successful rotation left maintenance active"
             backups = list(runtime.root.glob("backups/*/manifest.json"))
             assert backups and all(path.with_name("secrets.json").is_file() for path in backups), "backup did not pair DB and secrets"
+            digest = hashlib.sha256()
+            with binary.open("rb") as executable:
+                for block in iter(lambda: executable.read(1024 * 1024), b""):
+                    digest.update(block)
+            version = json.loads(runtime.request("GET", "/healthz", auth=False)[1])["version"]
+            for path in backups:
+                paired = json.loads(path.read_text(encoding="utf-8"))["paired_build_id"]
+                assert paired.startswith("sha256:" + digest.hexdigest() + " "), "backup did not identify the actual reader artifact"
+                assert " version=" + urllib.parse.quote_plus(version) + " " in paired, "backup lost the actual build version label"
             state = runtime.api("GET", "/state")
             runtime.api("POST", "/state", {"state": "paused", "expected_revision": state["revision"]})
             runtime.stop()

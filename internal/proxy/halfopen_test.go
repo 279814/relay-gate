@@ -4,14 +4,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
-	"github.com/279814/relay-gate/internal/store"
+	"github.com/279814/relay-gate/internal/runstate"
 )
 
 // ── 半开放行（§4.4c）─────────────────────────────────────
@@ -167,7 +166,7 @@ func TestHandler_HalfOpenGatewayErrorCarriesHeader(t *testing.T) {
 		time.Sleep(5 * time.Second)
 	})
 	hs.cfg.settings.HalfOpenEnabled = true
-	hs.cfg.settings.RealFirstTokenSec = 1
+	hs.cfg.settings.RealFirstSemanticSec = 1
 	hs.cfg.settings.RealResponseHeaderSec = 1
 	hs.cfg.settings.RealFirstByteSec = 1
 	hs.cfg.settings.RealFirstSemanticSec = 1
@@ -207,9 +206,9 @@ func (g *gatingConfig) Snapshot() (*router.Snapshot, error) {
 	return g.inner.Snapshot()
 }
 func (g *gatingConfig) Settings() (model.Settings, error) { return g.inner.Settings() }
-func (g *gatingConfig) RunState() (store.RunState, error) { return g.inner.RunState() }
+func (g *gatingConfig) Current() runstate.Snapshot        { return g.inner.Current() }
 
-// HalfOpen on ResultView / request_log must stay on the Route that claimed
+// HalfOpen on observer completion / request_log must stay on the Route that claimed
 // RecoveryGate. A sibling tried in the same client request (failover after
 // the claimed Route fails) must not inherit the request-scoped flag.
 func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
@@ -237,8 +236,8 @@ func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
 		t.Fatal("pre-hold RecoveryGate on recovering sibling")
 	}
 
-	rep := &halfOpenRouteReporter{}
-	hs.h.WithHealthReporter(rep)
+	rep := &attemptRecorder{}
+	hs.h.WithObservers(rep)
 
 	rec := hs.serve(hs.req())
 	if rec.Code != 200 {
@@ -273,34 +272,6 @@ func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
 	}
 }
 
-type halfOpenRouteReporter struct {
-	mu  sync.Mutex
-	got []halfOpenReport
-}
-
-type halfOpenReport struct {
-	routeID  int64
-	halfOpen bool
-}
-
-func (r *halfOpenRouteReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ho := false
-	if res != nil {
-		ho = res.HalfOpen
-	}
-	r.got = append(r.got, halfOpenReport{routeID: routeID, halfOpen: ho})
-}
-
-func (r *halfOpenRouteReporter) TriggerProbe(int64) {}
-
-func (r *halfOpenRouteReporter) all() []halfOpenReport {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]halfOpenReport(nil), r.got...)
-}
-
 // Armed half-open must not RoundTrip after the Route is disabled between
 // RecoveryGate acquire and send. Re-enable does not replay the skipped send.
 func TestHandler_ArmedHalfOpenSkipsRoundTripAfterDisable(t *testing.T) {
@@ -319,7 +290,7 @@ func TestHandler_ArmedHalfOpenSkipsRoundTripAfterDisable(t *testing.T) {
 		blockSecond: make(chan struct{}),
 		secondSeen:  make(chan struct{}),
 	}
-	hs.h = NewHandler(gate, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).
+	hs.h = NewHandler(gate, hs.health, hs.sink, []string{hs.relayPW}, discardLog()).WithRunState(gate).
 		WithTargets(testTargets(hs.cfg), nil)
 	t.Cleanup(hs.h.CloseIdleConnections)
 

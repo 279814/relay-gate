@@ -14,6 +14,7 @@ package probe
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -598,37 +599,28 @@ func TestBuiltinLoaderRejectsBadManifests(t *testing.T) {
 	}
 }
 
-// 默认探活头模板必须来自内置 manifest，不能是第二份硬编码。
-//
-// 管理界面展示的「默认头」与探活实际发的头必须是同一份。两份的后果是
-// 用户照着界面上的清单调指纹，而实际发出去的是另一套 —— 排查时对着
-// 界面完全看不出问题。
-func TestDefaultHeaderTemplateComesFromBuiltinManifest(t *testing.T) {
-	set := loadBuiltins(t)
-	compact, err := set.Compact(model.EndpointMessages)
+// The displayed template vocabulary must be the same compiled manifest used
+// for outbound preparation, with isolated mutable headers on every render.
+func TestBuiltinManifestHeadersRenderWithoutLegacyDefaults(t *testing.T) {
+	compact, err := loadBuiltins(t).Compact(model.EndpointMessages)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	shown := DefaultHeaderTemplate()
-	if len(shown) == 0 {
-		t.Fatal("默认头模板是空的")
+	shown, err := compact.Compiled().Render(context.Background(), testValues())
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, header := range compact.Headers {
-		value, ok := shown[strings.ToLower(header.Name)]
-		if !ok {
-			t.Errorf("内置 compact 模板有头 %q，界面上的默认清单里没有", header.Name)
-			continue
-		}
-		if value != strings.Join(header.Values, ",") {
-			t.Errorf("头 %q 的值不一致：模板 %q，界面 %q",
-				header.Name, strings.Join(header.Values, ","), value)
+		if got, want := shown.Header.Get(header.Name), strings.Join(header.Values, ","); got != want {
+			t.Fatalf("manifest header %s=%q want %q", header.Name, got, want)
 		}
 	}
-
-	// 副本语义：改返回值不能污染全局。
-	shown["user-agent"] = "tampered"
-	if again := DefaultHeaderTemplate(); again["user-agent"] == "tampered" {
-		t.Error("DefaultHeaderTemplate 返回的必须是副本")
+	shown.Header.Set("User-Agent", "tampered")
+	again, err := compact.Compiled().Render(context.Background(), testValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Header.Get("User-Agent") == "tampered" {
+		t.Fatal("rendered request aliases template headers")
 	}
 }

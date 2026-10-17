@@ -1,14 +1,15 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/279814/relay-gate/internal/probe"
 )
 
-// CostView 暴露探活成本快照。由 probe.Cost 实现。
+// CostView reads committed daily cost; no process-local counters are restored.
 type CostView interface {
-	Snapshot() probe.CostSnapshot
+	Snapshot(context.Context) (probe.CostSnapshot, error)
 }
 
 // WithCost 接上探活成本视图（§5.2d）。
@@ -33,8 +34,13 @@ func (s *Server) getProbeCost(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	snapshot, err := s.cost.Snapshot(r.Context())
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"cost": s.cost.Snapshot(),
+		"cost": snapshot,
 		"intervals": map[string]int{
 			"l1_alive_sec": settings.L1IntervalAliveSec,
 			"l1_dead_sec":  settings.L1IntervalDeadSec,

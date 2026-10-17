@@ -17,12 +17,67 @@ const PROBE_TABS = [
   { id: 'probe-runtime', name: '探活诊断' },
 ];
 
+const ENDPOINTS = ['models', 'messages', 'count_tokens', 'responses', 'chat_completions'];
+const CAPABILITIES = ['unknown', 'supported', 'unsupported', 'transient_error', 'config_error'];
+const TRIGGERS = ['scheduled', 'manual', 'calibration', 'recovery', 'real_traffic'];
+const ORIGINS = ['manual', 'learned', 'compact_native', 'calibration_native', 'basic_protocol', 'legacy_migration'];
+const FILTER_FIELDS = {
+  endpoints: [{ key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'needs_review', label: '待审核', options: ['true', 'false'] }],
+  secrets: [{ key: 'name_prefix', label: '名称前缀' }],
+  recipes: [{ key: 'upstream_id' }, { key: 'route_id' }, { key: 'endpoint' }, { key: 'status' }],
+  executions: [
+    { key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'route_id', label: 'Route ID', type: 'number' },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'error_class', label: '错误类别', options: ['none', 'unreachable', 'auth_rejected', 'request_shape_rejected', 'config_error', 'unsupported', 'model_not_found', 'rate_limited', 'transient_error', 'fake_alive', 'partial_failure', 'ignored'] },
+    { key: 'trigger', label: '触发来源', options: TRIGGERS }, { key: 'capability_state', label: '能力结论', options: CAPABILITIES },
+  ],
+  capabilities: [
+    { key: 'upstream_id', label: 'Upstream 范围 ID', type: 'number' }, { key: 'route_id', label: 'Route 范围 ID', type: 'number' },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'state', label: '能力结论', options: CAPABILITIES }, { key: 'expired', label: '已过期', options: ['true', 'false'] },
+  ],
+  reachability: [{ key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'state', label: '可达状态', options: ['unknown', 'reachable', 'unreachable'] }, { key: 'current', label: '当前网络配置', options: ['true', 'false'] }],
+  calibrations: [{ key: 'route_id', label: 'Route ID', type: 'number' }, { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'state', label: '校准状态', options: ['planned', 'running', 'succeeded', 'failed', 'canceled', 'interrupted'] }],
+  probeCostDaily: [
+    { key: 'day_from', label: 'UTC 起始日', type: 'date' }, { key: 'day_to', label: 'UTC 截止日', type: 'date' },
+    { key: 'trigger', label: '触发来源', options: TRIGGERS }, { key: 'origin', label: '配方来源', options: ORIGINS },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'route_id', label: 'Route ID', type: 'number' }, { key: 'upstream_id', label: 'Upstream ID', type: 'number' },
+  ],
+};
+
+function emptyFilter(list) {
+  return Object.fromEntries(FILTER_FIELDS[list].map(field => [field.key, '']));
+}
+
 function emptyList(extraFilter) {
   return {
     items: [],
     next_cursor: '',
     loading: false,
     filter: Object.assign({}, extraFilter || {}),
+  };
+}
+
+function initialData() {
+  return {
+    endpoints: emptyList(emptyFilter('endpoints')),
+    secrets: emptyList(emptyFilter('secrets')),
+    recipes: emptyList(emptyFilter('recipes')),
+    executions: emptyList(emptyFilter('executions')),
+    capabilities: emptyList(emptyFilter('capabilities')),
+    reachability: emptyList(emptyFilter('reachability')),
+    calibrations: emptyList(emptyFilter('calibrations')),
+    probeCostDaily: emptyList(emptyFilter('probeCostDaily')),
+    probeRuntime: null,
+    executionDrawer: null,
+    recipeDetail: null,
+    calibrationDetail: null,
+    endpointForm: null,
+    secretForm: null,
+    recipeForm: null,
+    calibForm: { route_id: 0, endpoint: 'messages' },
+    reachByUpstream: {},
+    capByRouteEndpoint: {},
+    _modalUnlock: null,
+    _escUnbind: null,
   };
 }
 
@@ -36,26 +91,8 @@ export function createProbeFeature(shell, api) {
     probeModuleError: '',
     stateRevision: 0,
 
-    endpoints: emptyList({ upstream_id: '' }),
-    secrets: emptyList({}),
-    recipes: emptyList({}),
-    executions: emptyList({}),
-    capabilities: emptyList({}),
-    reachability: emptyList({}),
-    calibrations: emptyList({}),
-    probeCostDaily: emptyList({}),
-    probeRuntime: null,
-    executionDrawer: null,
-    recipeDetail: null,
-    calibrationDetail: null,
-    endpointForm: null,
-    secretForm: null,
-    recipeForm: null,
-    calibForm: { route_id: 0, endpoint: 'messages' },
-    reachByUpstream: {},
-    capByRouteEndpoint: {},
-    _modalUnlock: null,
-    _escUnbind: null,
+    probeFilterFields: FILTER_FIELDS,
+    ...initialData(),
 
     f: field,
 
@@ -102,8 +139,10 @@ export function createProbeFeature(shell, api) {
     },
 
     async loadPaged(listKey, path, reset) {
+      if (this.authed === false) return false;
       const list = this[listKey];
       if (!list) return;
+      const request = list.request = (list.request || 0) + 1;
       if (reset) {
         list.items = [];
         list.next_cursor = '';
@@ -119,10 +158,12 @@ export function createProbeFeature(shell, api) {
           }
         }
         const page = await api.get(`${path}?${q}`);
+        if (this[listKey] !== list || list.request !== request) return false;
         const items = field(page, 'Items', 'items') || [];
         list.items = reset ? items : list.items.concat(items);
         list.next_cursor = field(page, 'NextCursor', 'next_cursor') || '';
       } catch (e) {
+        if (this[listKey] !== list || list.request !== request) return false;
         if (e.status === 400) {
           this.err = (e.message || '分页游标无效') + '。已清空筛选，请从首屏重载。';
           list.items = [];
@@ -131,13 +172,15 @@ export function createProbeFeature(shell, api) {
           this.err = e.message;
         }
       } finally {
-        list.loading = false;
+        if (list.request === request) list.loading = false;
       }
     },
 
     onProbeFilterChange(listKey) {
       const list = this[listKey];
       if (!list) return;
+      list.request = (list.request || 0) + 1;
+      list.loading = false;
       list.next_cursor = '';
       list.items = [];
     },
@@ -179,9 +222,13 @@ export function createProbeFeature(shell, api) {
     },
 
     async loadProbeRuntime() {
+      const owner = this.endpoints;
       try {
-        this.probeRuntime = await api.get('/probe-runtime');
+        const data = await api.get('/probe-runtime');
+        if (this.endpoints !== owner) return;
+        this.probeRuntime = data;
       } catch (e) {
+        if (this.endpoints !== owner) return;
         if (e.status !== 503) this.err = e.message;
       }
     },
@@ -198,11 +245,15 @@ export function createProbeFeature(shell, api) {
     },
 
     async openExecution(id) {
+      const owner = this.endpoints;
       try {
-        this.executionDrawer = await api.get('/probe-executions/' + encodeURIComponent(id));
+        const data = await api.get('/probe-executions/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.executionDrawer = data;
         this._lockModal(() => this.closeExecution());
         this.$nextTick(() => focusFirst(this.$refs && this.$refs.execDrawer));
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
@@ -212,19 +263,27 @@ export function createProbeFeature(shell, api) {
     },
 
     async openRecipe(id) {
+      const owner = this.endpoints;
       try {
-        this.recipeDetail = await api.get('/probe-recipes/' + encodeURIComponent(id));
+        const data = await api.get('/probe-recipes/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.recipeDetail = data;
         this._lockModal(() => { this.recipeDetail = null; this._unlockModal(); });
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
 
     async openCalibration(id) {
+      const owner = this.endpoints;
       try {
-        this.calibrationDetail = await api.get('/calibrations/' + encodeURIComponent(id));
+        const data = await api.get('/calibrations/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.calibrationDetail = data;
         this._lockModal(() => { this.calibrationDetail = null; this._unlockModal(); });
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
@@ -276,29 +335,141 @@ export function createProbeFeature(shell, api) {
       if (ok) await this.loadSecrets(true);
     },
 
+    endpointEditable(endpoint) {
+      const auth = field(endpoint, 'auth_profile', 'AuthProfile') || {};
+      const mode = field(endpoint, 'url_mode', 'URLMode');
+      return (!mode || mode === 'canonical') &&
+        !field(endpoint, 'needs_review', 'NeedsReview') &&
+        !field(endpoint, 'legacy_compat_real_only', 'LegacyCompatRealOnly') &&
+        !field(endpoint, 'legacy_full_url_id', 'LegacyFullURLID') &&
+        !field(endpoint, 'legacy_full_url_revision', 'LegacyFullURLRevision') &&
+        field(auth, 'mode', 'Mode') !== 'legacy_auto_real_only';
+    },
+
+    editEndpoint(endpoint) {
+      if (endpoint && !this.endpointEditable(endpoint)) {
+        this.err = '旧兼容端点请使用 URL 审核或认证校准';
+        return;
+      }
+      const auth = endpoint ? field(endpoint, 'auth_profile', 'AuthProfile') || {} : { mode: 'x_api_key', secret_ref: 'upstream_api_key' };
+      const headers = field(auth, 'manual_headers', 'ManualHeaders') || [];
+      this.endpointForm = {
+        saving: false,
+        conflict: false,
+        pending: false,
+        id: field(endpoint, 'id', 'ID'),
+        upstream_id: field(endpoint, 'upstream_id', 'UpstreamID') || '',
+        endpoint: field(endpoint, 'endpoint', 'Endpoint', 'Kind') || 'messages',
+        url_override: field(endpoint, 'url_override', 'URLOverride') || '',
+        fixed_query_template: field(endpoint, 'fixed_query_template', 'FixedQueryTemplate') || '',
+        revision: field(endpoint, 'revision', 'Revision') || 0,
+        auth_profile: {
+          mode: field(auth, 'mode', 'Mode') || '',
+          secret_ref: field(auth, 'secret_ref', 'SecretRef') || '',
+          header_name: field(auth, 'header_name', 'HeaderName') || '',
+          query_name: field(auth, 'query_name', 'QueryName') || '',
+          manual_headers: JSON.parse(JSON.stringify(headers)),
+        },
+        manual_headers_raw: JSON.stringify(headers, null, 2),
+      };
+    },
+
     async saveEndpoint() {
       const f = this.endpointForm;
-      if (!f) return;
+      if (!f || f.saving || f.conflict || f.pending || this.authed !== true) return;
+      if (!this.endpointEditable(f)) { this.err = '旧兼容端点请使用 URL 审核或认证校准'; return; }
       const id = field(f, 'id', 'ID');
+      const revision = Number(field(f, 'revision', 'Revision')) || 0;
+      if (id && revision < 1) { this.err = '请重新读取 Endpoint 版本后再编辑'; return; }
+      const profile = field(f, 'auth_profile', 'AuthProfile') || {};
+      const auth = {};
+      for (const key of ['mode', 'header_name', 'query_name', 'secret_ref', 'manual_headers']) {
+        if (profile[key] !== undefined) auth[key] = profile[key];
+      }
+      if (f.manual_headers_raw !== undefined) {
+        try { auth.manual_headers = JSON.parse(f.manual_headers_raw); }
+        catch { this.err = '认证头模板须为合法 JSON 数组'; return; }
+        if (!Array.isArray(auth.manual_headers)) { this.err = '认证头模板须为 JSON 数组'; return; }
+      }
       const body = {
         upstream_id: Number(field(f, 'upstream_id', 'UpstreamID')) || 0,
         endpoint: field(f, 'endpoint', 'Endpoint', 'Kind') || 'messages',
-        url_mode: field(f, 'url_mode', 'URLMode') || 'canonical',
         url_override: field(f, 'url_override', 'URLOverride') || '',
         fixed_query_template: field(f, 'fixed_query_template', 'FixedQueryTemplate') || '',
-        auth_profile: field(f, 'auth_profile', 'AuthProfile') || {},
-        expected_revision: Number(field(f, 'revision', 'Revision')) || 0,
+        auth_profile: auth,
       };
-      const { ok } = await this.run(async () => {
-        if (id) {
-          await api.put('/upstream-endpoints/' + id, body);
-        } else {
-          await api.post('/upstream-endpoints', body);
-        }
-      }, id ? '已更新 Endpoint' : '已创建 Endpoint');
-      if (ok) {
+      if (id) body.expected_revision = revision;
+      f.saving = true;
+      this.err = ''; this.msg = '';
+      try {
+        if (id) await api.put('/upstream-endpoints/' + id, body);
+        else await api.post('/upstream-endpoints', body);
+        if (this.endpointForm !== f || this.authed !== true) return;
         this.endpointForm = null;
+        this.msg = id ? '已更新 Endpoint' : '已创建 Endpoint';
         await this.loadEndpoints(true);
+      } catch (error) {
+        if (this.endpointForm !== f || this.authed !== true) return;
+        if (error.status === 409) {
+          f.conflict = true;
+          this.err = 'Endpoint 版本已变化，草稿已保留；请重新读取后确认';
+        } else if (error.status === 503 && error.data?.code === 'config_activation_pending' && error.data.persisted === true) {
+          f.pending = true;
+          f.persisted_id = error.data.id;
+          f.persisted_revision = error.data.new_revision;
+          this.err = 'Endpoint 已保存，激活待确认；草稿已保留，请重新读取已保存版本后确认';
+        } else {
+          this.err = error.message || 'Endpoint 保存失败';
+        }
+      } finally {
+        f.saving = false;
+      }
+    },
+
+    async deleteEndpoint(endpoint) {
+      const list = this.endpoints;
+      if (this.authed !== true || !endpoint || endpoint.deleting || endpoint.delete_pending || endpoint.delete_conflict) return;
+      if (!this.endpointEditable(endpoint)) { this.err = '旧兼容端点不能通过普通管理入口删除'; return; }
+      const id = Number(field(endpoint, 'id', 'ID'));
+      const revision = Number(field(endpoint, 'revision', 'Revision'));
+      if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(revision) || revision < 1) { this.err = '请重新加载 Endpoint 版本'; return; }
+      if (!globalThis.confirm('仅停用 Upstream 且没有 Route 或历史记录时允许删除 Endpoint。确认删除？')) return;
+      endpoint.deleting = true;
+      this.err = ''; this.msg = '';
+      try {
+        await api.del('/upstream-endpoints/' + id + '?expected_revision=' + revision);
+        if (this.authed !== true || this.endpoints !== list || !list.items.includes(endpoint)) return;
+        list.items = list.items.filter(row => Number(field(row, 'id', 'ID')) !== id);
+        this.msg = 'Endpoint #' + id + ' 已删除';
+      } catch (error) {
+        if (this.authed !== true || this.endpoints !== list || !list.items.includes(endpoint)) return;
+        if (error.status === 503 && error.data?.code === 'config_activation_pending' && error.data.persisted === true) {
+          endpoint.delete_pending = true;
+          this.msg = 'Endpoint #' + id + ' 已删除，待激活；请重新加载列表确认';
+        } else if (error.status === 409 || error.status === 404) {
+          endpoint.delete_conflict = true;
+          this.err = 'Endpoint 版本已变化或记录已不存在；请重新加载列表确认';
+        } else { this.err = error.message || 'Endpoint 删除失败'; }
+      } finally { endpoint.deleting = false; }
+    },
+
+    async reloadEndpoint() {
+      const f = this.endpointForm;
+      if (!f || f.saving || this.authed !== true) return;
+      const id = f.id || f.persisted_id;
+      if (!id || !globalThis.confirm('重新读取会替换当前草稿。确认已复制需要保留的修改？')) return;
+      f.saving = true;
+      try {
+        const endpoint = await api.get('/upstream-endpoints/' + id);
+        if (this.endpointForm !== f || this.authed !== true) return;
+        this.editEndpoint(endpoint);
+        this.err = '';
+        this.msg = '已重新读取 Endpoint 保存版本，请确认配置后继续';
+      } catch (error) {
+        if (this.endpointForm !== f || this.authed !== true) return;
+        this.err = error.message || 'Endpoint 重新读取失败';
+      } finally {
+        f.saving = false;
       }
     },
 
@@ -345,6 +516,13 @@ export function createProbeFeature(shell, api) {
       return (b - a) + 'ms';
     },
   });
+
+  const originalReset = shell.reset;
+  shell.reset = function resetProbes() {
+    this._unlockModal();
+    Object.assign(this, initialData());
+    return originalReset?.call(this);
+  };
 
   return shell;
 }

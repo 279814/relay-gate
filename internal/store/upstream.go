@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/outbound"
 )
 
 // ErrNotFound 供 API 层判定回 404。
@@ -43,25 +44,6 @@ func (s *Store) scanUpstream(sc interface{ Scan(...any) error }) (*model.Upstrea
 		}
 	}
 	return &u, nil
-}
-
-func (s *Store) ListUpstreams() ([]*model.Upstream, error) {
-	// id<=0 is the internal recipe-archive holder, not an operator-facing site.
-	rows, err := s.db.Query(`SELECT ` + upstreamCols + ` FROM upstream WHERE id>0 ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []*model.Upstream{}
-	for rows.Next() {
-		u, err := s.scanUpstream(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, u)
-	}
-	return out, rows.Err()
 }
 
 func (s *Store) ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error) {
@@ -140,19 +122,14 @@ func (s *Store) CreateUpstream(u *model.Upstream) error {
 	return s.CreateUpstreamWithEndpoints(context.Background(), u, canonicalEndpointBundle(u))
 }
 
-// UpdateUpstream 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
+// UpdateUpstreamWithRevision 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
 // GET/list 回显的是脱敏值，前端把它原样提交回来时不能当作真 key 写入，
 // 否则一次编辑就会把 key 破坏成 "sk-abcd…wxyz"。
 // proxy_url 同理：回显经 MaskProxyURL 去掉 password，原样提交必须保留库中真凭据。
-func (s *Store) UpdateUpstream(u *model.Upstream) error {
-	current, err := s.GetUpstream(u.ID)
-	if err != nil {
-		return err
-	}
-	return s.UpdateUpstreamWithRevision(context.Background(), u, current.Revision)
-}
-
 func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) (err error) {
+	if expectedRevision < 1 {
+		return model.WrapValidation("expected_revision 必须为正数")
+	}
 	upstream.Defaults()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -172,6 +149,12 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	}
 	if current.Revision != expectedRevision {
 		return ErrRevisionConflict
+	}
+	if len(upstream.ProbeHeaders) == 0 && len(current.ProbeHeaders) == 0 {
+		upstream.ProbeHeaders = current.ProbeHeaders
+	}
+	if upstream.AuthStyle != current.AuthStyle || upstream.FullURLMode != current.FullURLMode || upstream.L1Path != current.L1Path || !reflect.DeepEqual(upstream.ProbeHeaders, current.ProbeHeaders) {
+		return model.WrapValidation("旧全局 auth_style/full_url_mode/l1_path/probe_headers 不可修改，请编辑对应 Endpoint 或 Recipe")
 	}
 	// 由停用转启用时必须先补齐五类 Endpoint。放行一个缺 Endpoint 的站，
 	// 症状是「界面看起来一切正常，客户端一调那个协议就报错」——
@@ -197,6 +180,11 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	}
 	if err := upstream.Validate(); err != nil {
 		return err
+	}
+	if upstream.BaseURL != current.BaseURL {
+		if err := validateCurrentEndpointOrigins(ctx, tx, upstream.ID, upstream.BaseURL); err != nil {
+			return err
+		}
 	}
 	// 脏行/历史短钥：留空或 mask 回显不能再成功「保留」——否则短钥继续
 	// 出现在 Location 等 URI 头且 RedactText 不会遮。必须提交足够长的新钥。
@@ -272,49 +260,6 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 			return err
 		}
 	}
-	if upstream.AuthStyle != current.AuthStyle {
-		mode, headerName := legacyAuthProfile(upstream.AuthStyle)
-		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET auth_mode=?,auth_header_name=?,
-			legacy_compat_real_only=?,auth_profile_revision=auth_profile_revision+1,
-			revision=revision+1,updated_at=? WHERE upstream_id=?`,
-			mode, headerName, mode == model.AuthModeLegacyAutoRealOnly, upstream.UpdatedAt, upstream.ID); err != nil {
-			return err
-		}
-	}
-	// base_url、full_url_mode 与 l1_path 任一改变，都要重新翻译受影响 Endpoint
-	// 的 url_override —— 它们三个共同决定 override 的值（EndpointURLOverride），
-	// 只盯 l1_path 的话，改 base_url 会留下一个指向旧域名的 override。
-	if upstream.L1Path != current.L1Path || upstream.BaseURL != current.BaseURL ||
-		upstream.FullURLMode != current.FullURLMode {
-
-		// 只改 canonical Endpoint：legacy_exact 的 URL 存在加密记录里，
-		// 它的行为必须逐字节保持不变（§19.2），碰它就是改动线上语义。
-		//
-		// `url_override<>?` 是必须的：Endpoint revision 会失效对应的
-		// Capability（§4.2），无条件 bump 等于把「改了 base_url」变成
-		// 「五个端点全部重新探活」，而其中四个的 override 通常都是空、
-		// 压根没变。规范也明确要求仅时间戳不构成一次写入。
-		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,
-			revision=revision+1,updated_at=? WHERE upstream_id=? AND endpoint=? AND url_mode=?
-			AND url_override<>?`,
-			upstream.EndpointURLOverride(model.EndpointModels), upstream.UpdatedAt, upstream.ID,
-			model.EndpointModels, model.EndpointURLCanonical,
-			upstream.EndpointURLOverride(model.EndpointModels)); err != nil {
-			return err
-		}
-		// 协议端点的 override 不由站级字段决定：用户逐个设置的值必须保留。
-		// 只清掉旧创建路径按 full_url_mode 写下的猜测值（base_url 本身）。
-		if legacyStamp := strings.TrimRight(current.BaseURL, "/"); current.FullURLMode && legacyStamp != "" {
-			if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override='',
-				revision=revision+1,updated_at=? WHERE upstream_id=? AND url_mode=? AND url_override=?
-				AND endpoint IN (?,?,?,?)`,
-				upstream.UpdatedAt, upstream.ID, model.EndpointURLCanonical, legacyStamp,
-				model.EndpointMessages, model.EndpointResponses,
-				model.EndpointChatCompletions, model.EndpointCountTokens); err != nil {
-				return err
-			}
-		}
-	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
@@ -324,94 +269,70 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 	return nil
 }
 
-// DeleteUpstream removes an Upstream and detaches its probe-recipe bindings.
-//
-// probe_recipe.upstream_id / route_id are ON DELETE RESTRICT and publishedBinding
-// looks up by numeric id alone. Child Routes CASCADE without going through
-// DeleteRoute, so route-scoped recipes must be detached here too. Archive and
-// re-home onto the internal holder in the same transaction as the delete so a
-// rollback cannot leave recipes detached from a still-living Upstream, and so a
-// later row that reuses the id cannot inherit the old published body.
-func (s *Store) DeleteUpstream(id int64) (err error) {
-	if id < 1 {
-		return ErrNotFound
-	}
-	tx, err := s.db.Begin()
+func validateCurrentEndpointOrigins(ctx context.Context, tx *sql.Tx, upstreamID int64, baseURL string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT url_mode,url_override FROM upstream_endpoint WHERE upstream_id=?`, upstreamID)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
+	defer rows.Close()
+	for rows.Next() {
+		var mode model.EndpointURLMode
+		var override string
+		if err := rows.Scan(&mode, &override); err != nil {
+			return err
 		}
-	}()
+		if mode == model.EndpointURLLegacyExact {
+			return model.WrapValidation("legacy_exact Endpoint 保留捕获的 URL，不能通过修改 base_url 改写，请先人工审核或新建 Upstream")
+		}
+		if err := outbound.ValidateURLOverride(baseURL, override); err != nil {
+			return model.WrapValidation("现有 Endpoint URL 与新 base_url 不兼容，请先调整 Endpoint: %v", err)
+		}
+	}
+	return rows.Err()
+}
 
-	var exists int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM upstream WHERE id=?`, id).Scan(&exists); err != nil {
+// DeleteUpstreamWithRevision rejects a stale administrator view in the same
+// transaction as detaching references and deleting the row.
+func (s *Store) DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return model.WrapValidation("expected_revision 必须为正数")
+	}
+	return s.deleteUpstream(ctx, id, expectedRevision)
+}
+
+func (s *Store) deleteUpstream(ctx context.Context, id, expectedRevision int64) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	if exists == 0 {
+	defer tx.Rollback()
+	var revision int64
+	err = tx.QueryRowContext(ctx, `SELECT revision FROM upstream WHERE id=?`, id).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
-
-	if err = ensureRecipeArchiveHolderTx(tx); err != nil {
+	if err != nil {
 		return err
 	}
-	// Upstream-scoped and child route-scoped recipes (CASCADE skips DeleteRoute).
-	if err = detachProbeRecipesRehomeTx(tx, recipeArchiveHolderID,
-		`upstream_id=? OR route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id, id); err != nil {
+	if revision != expectedRevision {
+		return ErrRevisionConflict
+	}
+	if err = requireEntityDeleteUnreferenced(ctx, tx, "upstream", id); err != nil {
 		return err
 	}
-
-	// Executions / profiles / SQL reachability+capability rows also RESTRICT.
-	// Drop them with the Upstream; in-memory invalidation is handled by the API.
-	if _, err = tx.Exec(`DELETE FROM calibration_candidate WHERE run_id IN (
-		SELECT id FROM calibration_run WHERE route_id IN (SELECT id FROM route WHERE upstream_id=?))`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM probe_recipe WHERE upstream_id=?`, id); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM calibration_run WHERE route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM transform_binding WHERE endpoint_id IN (SELECT id FROM upstream_endpoint WHERE upstream_id=?)`, id); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM probe_execution WHERE upstream_id=?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM upstream_endpoint WHERE upstream_id=?`, id); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM client_profile_active_secret_ref WHERE client_profile_id IN (
-		SELECT id FROM client_probe_profile WHERE upstream_id=?)`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM legacy_full_url WHERE upstream_id=?`, id); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM client_profile_required_secret WHERE client_profile_id IN (
-		SELECT id FROM client_probe_profile WHERE upstream_id=?)`, id); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`DELETE FROM client_probe_profile WHERE upstream_id=?`, id); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`DELETE FROM upstream_reachability WHERE upstream_id=?`, id); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_upstream_id=?
-		OR scope_route_id IN (SELECT id FROM route WHERE upstream_id=?)
-		OR endpoint_id IN (SELECT id FROM upstream_endpoint WHERE upstream_id=?)`, id, id, id); err != nil {
-		return err
-	}
-
-	// §15: child Routes CASCADE without DeleteRoute, so drop their transform
-	// bindings here. Same transaction as the Upstream row — rollback keeps
-	// bindings, and a reused route id cannot inherit a published transform.
-	if _, err = tx.Exec(`DELETE FROM transform_binding WHERE route_id IN (
-		SELECT id FROM route WHERE upstream_id=?)`, id); err != nil {
-		return err
-	}
-
-	// probe_cost_daily has no FK; ListProbeCostDaily filters by bare ids.
-	// Drop rollups for this Upstream and its child Routes in the same
-	// transaction so a reused id cannot inherit the previous station's totals.
-	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE upstream_id=?
-		OR route_id IN (SELECT id FROM route WHERE upstream_id=?)`, id, id); err != nil {
-		return err
-	}
-
-	res, err := tx.Exec(`DELETE FROM upstream WHERE id=?`, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM upstream WHERE id=?`, id)
 	if err != nil {
 		return err
 	}

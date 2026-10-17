@@ -96,7 +96,8 @@ def run(args):
             version = json.loads(runtime.request("GET", "/healthz", auth=False)[1])["version"]
             assert version == args.source_revision, "binary version does not match the recorded source revision"
             _, body = runtime.seed(remote.server_port)
-            runtime.api("PUT", "/settings", {"real_total_sec": max(1800, math.ceil(args.seconds) + 120)})
+            settings = runtime.api("GET", "/settings")
+            runtime.api("PUT", "/settings", {"real_total_sec": max(1800, math.ceil(args.seconds) + 120), "expected_revision": settings["revision"]})
             started = time.monotonic()
             next_sample, next_pause = started, started + 1800
             future = pool.submit(runtime.request, "POST", "/v1/messages", body, True, True) if args.mode == "long" else None

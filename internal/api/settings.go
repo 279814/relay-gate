@@ -26,45 +26,59 @@ func (s *Server) WithRunState(ctrl RunStateAdmin) *Server {
 	return s
 }
 
+// SettingsAdmin is the settings management boundary; HTTP never replaces a
+// client-held revision with a freshly read one.
+type SettingsAdmin interface {
+	GetSettings(context.Context) (model.Settings, int64, error)
+	UpdateSettings(context.Context, model.Settings, int64) (model.Settings, int64, error)
+}
+
+func (s *Server) WithSettingsAdmin(admin SettingsAdmin) *Server { s.settingsAdmin = admin; return s }
+
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
-	st, err := s.st.GetSettings()
+	settings, revision, err := s.settingsAdmin.GetSettings(r.Context())
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"settings": st,
-		"limits": map[string]int{
-			"min_real_first_token_sec": model.MinRealFirstTokenSec,
-			"max_retry_attempts":       model.MaxRetryAttempts,
-		},
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "revision": revision, "limits": map[string]int{
+		"min_real_first_semantic_sec": model.MinRealFirstSemanticSec, "max_retry_attempts": model.MaxRetryAttempts,
+	}})
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	cur, err := s.st.GetSettings()
+	current, readRevision, err := s.settingsAdmin.GetSettings(r.Context())
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := decodeJSON(r, &cur); err != nil {
+	input := struct {
+		model.Settings
+		ExpectedRevision *int64 `json:"expected_revision"`
+	}{Settings: current}
+	if err := decodeJSON(r, &input); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.SaveSettings(cur); err != nil {
+	if input.ExpectedRevision == nil || requireRevision(*input.ExpectedRevision) != nil {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须是正整数，请先读取设置"))
+		return
+	}
+	if *input.ExpectedRevision != readRevision {
+		s.writeErr(w, store.ErrRevisionConflict)
+		return
+	}
+	updated, revision, err := s.settingsAdmin.UpdateSettings(r.Context(), input.Settings, *input.ExpectedRevision)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	// Settings live in the same livecfg PublishedConfig preamble reads
-	// (timeouts, retry_policy, sample knobs). Without Invalidate+Refresh the
-	// next new request can keep the pre-write values for up to DefaultTTL.
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "设置已保存，激活待重试，请重新读取后确认", "code": "config_activation_pending", "persisted": true, "resource": "settings", "resource_id": "settings", "new_revision": revision})
 		return
 	}
-	s.log.Info("更新全局设置", "real_first_token_sec", cur.RealFirstTokenSec,
-		"sample_enabled", cur.SampleEnabled)
-	writeJSON(w, http.StatusOK, cur)
+	s.log.Info("更新全局设置", "revision", revision, "real_first_semantic_sec", updated.RealFirstSemanticSec, "sample_enabled", updated.SampleEnabled)
+	writeJSON(w, http.StatusOK, map[string]any{"settings": updated, "revision": revision})
 }
 
 // getState / setState 是服务总闸（§4.8 / §P0-12）。
@@ -111,13 +125,11 @@ func (s *Server) setState(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, model.WrapValidation("state 必须是 running 或 paused"))
 		return
 	}
-	expected := int64(0)
-	if body.ExpectedRevision != nil {
-		expected = *body.ExpectedRevision
-	} else {
-		expected = s.runState.Current().Revision
+	if body.ExpectedRevision == nil || requireRevision(*body.ExpectedRevision) != nil {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须是正整数，请先读取服务状态"))
+		return
 	}
-	snap, err := s.runState.Set(r.Context(), state, expected)
+	snap, err := s.runState.Set(r.Context(), state, *body.ExpectedRevision)
 	if err != nil {
 		var pending *runstate.TransitionPendingError
 		if errors.As(err, &pending) {

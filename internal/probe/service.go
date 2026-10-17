@@ -31,8 +31,14 @@ type AdminStore interface {
 	CreateRecipe(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) (int64, error)
 	ListRecipeVersionsPage(ctx context.Context, filter model.RecipeVersionFilter) (model.Page[*model.ProbeRecipeVersion], error)
 	GetRecipeVersion(ctx context.Context, id int64) (*model.ProbeRecipeVersion, error)
+	AddRecipeVersion(version *model.ProbeRecipeVersion, expectedRecipeRevision int64) error
+	PublishRecipeVersion(recipeID, versionID int64, testExecutionID string, expectedRecipeRevision int64, force bool) error
 	DisableRecipe(ctx context.Context, recipeID, expectedRevision int64) error
 	ArchiveRecipe(ctx context.Context, recipeID, expectedRevision int64) error
+	ListClientProfilesPage(ctx context.Context, filter model.ClientProfileFilter) (model.Page[*model.ClientProbeProfile], error)
+	GetClientProfile(ctx context.Context, id int64) (*model.ClientProbeProfile, error)
+	MarkClientProfileTested(ctx context.Context, id int64, executionID string, expectedRevision int64) error
+	DisableClientProfile(ctx context.Context, id, expectedRevision int64) error
 
 	ListProbeExecutions(ctx context.Context, filter model.ProbeExecutionFilter) (model.Page[*model.ProbeExecution], error)
 	GetProbeExecution(ctx context.Context, id string) (*model.ProbeExecution, error)
@@ -126,24 +132,21 @@ func (s *Service) RunManual(ctx context.Context, routeID int64) (model.ProbeExec
 	if err != nil {
 		return model.ProbeExecution{}, err
 	}
-	order := int64(0)
 	req := ExecutionRequest{
 		ExecutionID: sample.NewReqID(), Trigger: model.TriggerManual,
 		Upstream: up, ModelName: mn, Route: rt, Endpoint: kind,
-		Mode: ObserveProbe, Budget: outbound.L2Budget(settings), ObservationOrder: order,
+		Mode: ObserveProbe, Budget: outbound.L2Budget(settings),
 	}
-	if src, ok := s.snapshots.(ProbeSnapshotSource); ok {
-		if snap, err := src.ProbeSnapshot(); err == nil && snap != nil {
-			_ = snap // expectation 由 ManualPreparer 附上；未装配时走 not_applicable
-		} else if err == livecfg.ErrProbeSnapshotUnavailable {
-			return model.ProbeExecution{}, err
-		}
+	if s.manual == nil {
+		return model.ProbeExecution{}, livecfg.ErrProbeSnapshotUnavailable
 	}
-	if s.manual != nil {
-		if err := s.manual.PrepareManual(ctx, &req); err != nil {
-			return model.ProbeExecution{}, err
-		}
+	if err := s.manual.PrepareManual(ctx, &req); err != nil {
+		return model.ProbeExecution{}, err
 	}
+	if req.ObservationOrder <= 0 || req.ReachabilityExpectation == nil || req.CapabilityExpectation == nil || req.ReachabilityPolicy == nil || req.CapabilityPolicy == nil {
+		return model.ProbeExecution{}, livecfg.ErrProbeSnapshotUnavailable
+	}
+
 	res, err := s.executor.Execute(ctx, req)
 	if err != nil {
 		return model.ProbeExecution{}, err
@@ -165,28 +168,6 @@ func (s *Service) GetEndpoint(_ context.Context, id int64) (model.UpstreamEndpoi
 		return model.UpstreamEndpoint{}, err
 	}
 	return *ep, nil
-}
-
-func (s *Service) CreateEndpoint(_ context.Context, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error) {
-	cp := in
-	if err := s.store.CreateEndpoint(&cp); err != nil {
-		return model.UpstreamEndpoint{}, err
-	}
-	if s.invalidator != nil && cp.UpstreamID > 0 {
-		s.invalidator.InvalidateUpstream(cp.UpstreamID)
-	}
-	return cp, nil
-}
-
-func (s *Service) UpdateEndpoint(_ context.Context, id, expectedRevision int64, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error) {
-	in.ID = id
-	if err := s.store.UpdateEndpoint(&in, expectedRevision); err != nil {
-		return model.UpstreamEndpoint{}, err
-	}
-	if s.invalidator != nil && in.UpstreamID > 0 {
-		s.invalidator.InvalidateUpstream(in.UpstreamID)
-	}
-	return in, nil
 }
 
 func (s *Service) DeleteEndpoint(_ context.Context, id, expectedRevision int64) error {
@@ -232,11 +213,18 @@ func (s *Service) GetRecipe(ctx context.Context, id int64) (model.ProbeRecipe, e
 }
 
 func (s *Service) CreateRecipe(ctx context.Context, scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) (model.ProbeRecipe, error) {
+	if scope == model.RecipeScopeRoute && endpoint == model.EndpointModels {
+		return model.ProbeRecipe{}, model.WrapValidation("models Recipe 只能绑定 Upstream")
+	}
 	id, err := s.store.CreateRecipe(scope, scopeID, endpoint)
 	if err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	return s.GetRecipe(ctx, id)
+	recipe, err := s.GetRecipe(ctx, id)
+	if err != nil {
+		return recipe, err
+	}
+	return recipe, s.publishAdminCommit("probe_recipe", id, recipe.Revision, nil)
 }
 
 func (s *Service) ListVersions(ctx context.Context, f model.RecipeVersionFilter) (model.Page[model.ProbeRecipeVersion], error) {
@@ -260,7 +248,9 @@ func (s *Service) DisableRecipe(ctx context.Context, recipeID, expectedRevision 
 	if err := s.store.DisableRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
+	if err := s.publishAdminCommit("probe_recipe", recipeID, expectedRevision+1, func() { s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID) }); err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	return s.GetRecipe(ctx, recipeID)
 }
 
@@ -272,7 +262,9 @@ func (s *Service) ArchiveRecipe(ctx context.Context, recipeID, expectedRevision 
 	if err := s.store.ArchiveRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
+	if err := s.publishAdminCommit("probe_recipe", recipeID, expectedRevision+1, func() { s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID) }); err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	return s.GetRecipe(ctx, recipeID)
 }
 

@@ -13,21 +13,25 @@ import (
 type Store interface {
 	ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error)
 	GetUpstream(id int64) (*model.Upstream, error)
-	CreateUpstream(u *model.Upstream) error
+	GetUpstreamByName(context.Context, string) (*model.Upstream, error)
+	CreateUpstreamWithEndpoints(context.Context, *model.Upstream, []*model.UpstreamEndpoint) error
 	UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) error
-	DeleteUpstream(id int64) error
+	DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error
 
 	ListModelNamesPage(ctx context.Context, filter model.ModelNameFilter) (model.Page[*model.ModelName], error)
 	GetModelName(id int64) (*model.ModelName, error)
 	CreateModelName(m *model.ModelName) error
 	UpdateModelNameWithRevision(ctx context.Context, value *model.ModelName, expectedRevision int64) error
-	DeleteModelName(id int64) error
+	DeleteModelNameWithRevision(ctx context.Context, id, expectedRevision int64) error
 
 	ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error)
+	ListRouteMetadataPage(context.Context, model.RouteFilter) (model.Page[model.RouteMetadata], error)
+	RouteIDsOfUpstream(context.Context, int64) ([]int64, error)
+	RouteIDsOfModelName(context.Context, int64) ([]int64, error)
 	GetRoute(id int64) (*model.Route, error)
 	CreateRoute(r *model.Route) error
 	UpdateRouteWithRevision(ctx context.Context, value *model.Route, expectedRevision int64) error
-	DeleteRoute(id int64) error
+	DeleteRouteWithRevision(ctx context.Context, id, expectedRevision int64) error
 }
 
 // Publisher 在写提交后通知热配置刷新（可为 nil）。
@@ -65,9 +69,46 @@ func (s *Service) GetUpstream(_ context.Context, id int64) (model.Upstream, erro
 	return *u, nil
 }
 
-func (s *Service) CreateUpstream(_ context.Context, in model.Upstream) (model.Upstream, error) {
+func (s *Service) GetUpstreamByName(ctx context.Context, name string) (model.Upstream, error) {
+	u, err := s.store.GetUpstreamByName(ctx, name)
+	if err != nil {
+		return model.Upstream{}, err
+	}
+	return *u, nil
+}
+
+func (s *Service) ListRouteMetadata(ctx context.Context, f model.RouteFilter) (model.Page[model.RouteMetadata], error) {
+	return s.store.ListRouteMetadataPage(ctx, f)
+}
+
+func (s *Service) RouteIDsOfUpstream(ctx context.Context, id int64) ([]int64, error) {
+	return s.store.RouteIDsOfUpstream(ctx, id)
+}
+
+func (s *Service) RouteIDsOfModelName(ctx context.Context, id int64) ([]int64, error) {
+	return s.store.RouteIDsOfModelName(ctx, id)
+}
+
+type EndpointMutation struct {
+	Endpoint           model.EndpointKind
+	URLOverride        string
+	FixedQueryTemplate string
+	AuthProfile        model.EndpointAuthProfile
+}
+
+func (s *Service) CreateUpstream(ctx context.Context, in model.Upstream, initial []EndpointMutation) (model.Upstream, error) {
 	cp := in
-	if err := s.store.CreateUpstream(&cp); err != nil {
+	endpoints := make([]*model.UpstreamEndpoint, 0, len(initial))
+	for _, item := range initial {
+		if !item.AuthProfile.Mode.Valid() || item.AuthProfile.SecretRef == "" {
+			return model.Upstream{}, model.WrapValidation("每个 Endpoint 必须显式配置认证 mode 和 secret_ref")
+		}
+		if item.AuthProfile.Mode == model.AuthModeLegacyAutoRealOnly || item.AuthProfile.CalibratedMode != "" || item.AuthProfile.Revision != 0 {
+			return model.Upstream{}, model.WrapValidation("不能创建迁移或已校准认证状态")
+		}
+		endpoints = append(endpoints, &model.UpstreamEndpoint{Kind: item.Endpoint, URLMode: model.EndpointURLCanonical, URLOverride: item.URLOverride, FixedQueryTemplate: item.FixedQueryTemplate, AuthProfile: item.AuthProfile})
+	}
+	if err := s.store.CreateUpstreamWithEndpoints(ctx, &cp, endpoints); err != nil {
 		return model.Upstream{}, err
 	}
 	s.publish()
@@ -83,8 +124,8 @@ func (s *Service) UpdateUpstream(ctx context.Context, id, expectedRevision int64
 	return in, nil
 }
 
-func (s *Service) DeleteUpstream(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteUpstream(id); err != nil {
+func (s *Service) DeleteUpstream(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteUpstreamWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()
@@ -122,8 +163,8 @@ func (s *Service) UpdateModelName(ctx context.Context, id, expectedRevision int6
 	return in, nil
 }
 
-func (s *Service) DeleteModelName(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteModelName(id); err != nil {
+func (s *Service) DeleteModelName(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteModelNameWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()
@@ -161,8 +202,8 @@ func (s *Service) UpdateRoute(ctx context.Context, id, expectedRevision int64, i
 	return in, nil
 }
 
-func (s *Service) DeleteRoute(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteRoute(id); err != nil {
+func (s *Service) DeleteRoute(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteRouteWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()

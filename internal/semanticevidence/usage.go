@@ -8,7 +8,7 @@ import "encoding/json"
 // 嵌套的 response.usage。正数 completion_tokens / output_tokens 才算；
 // 0、缺失、负数、以及仅 input_tokens / prompt_tokens 都不算。
 //
-// 真实流量 HasSemanticEvidence 与探活 Decoder 必须调用本函数，避免各写一份比较。
+// 统一协议 Decoder 必须调用本函数，避免各写一份比较。
 func PositiveOutputUsage(top map[string]json.RawMessage) bool {
 	if usageHasPositiveOutput(top["usage"]) {
 		return true

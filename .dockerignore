@@ -31,6 +31,8 @@ scripts/*.local.*
 docs/02-上游能力矩阵.md
 .local/p0/
 .vs/
+.playwright-cli/
+output/playwright/
 **/__pycache__
 **/*.pyc
 

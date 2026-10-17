@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -563,7 +562,7 @@ func TestProbeHeaders_ExcludesAuthHeaders(t *testing.T) {
 	}
 	h.Set("User-Agent", "claude-cli/2.1.220")
 
-	tmpl, skipped := probeHeadersFromSample(h)
+	tmpl, skipped := candidateHeadersForTest(t, h)
 	for _, name := range model.AuthHeaders {
 		if _, ok := tmpl[strings.ToLower(name)]; ok {
 			t.Errorf("导出的模板里不该有鉴权头 %s", name)
@@ -590,7 +589,7 @@ func TestProbeHeaders_ExcludesAllSensitiveHeadersNotJustAuthHeaders(t *testing.T
 	h.Set("Cookie", "session=abcd…wxyz")
 	h.Set("User-Agent", "claude-cli/2.1.220")
 
-	tmpl, skipped := probeHeadersFromSample(h)
+	tmpl, skipped := candidateHeadersForTest(t, h)
 	for _, bad := range []string{"proxy-authorization", "cookie"} {
 		if _, ok := tmpl[bad]; ok {
 			t.Errorf("%s 携带凭据，不该进探活模板", bad)
@@ -604,29 +603,14 @@ func TestProbeHeaders_ExcludesAllSensitiveHeadersNotJustAuthHeaders(t *testing.T
 	}
 }
 
-func TestProbeHeaders_ExcludesHeadersTheRecipeOwns(t *testing.T) {
-	// probe_headers 的覆盖发生在 Recipe 渲染**之后**
-	// （probe.applyUpstreamHeaderOverrides），所以从样本抄来的值会赢。
-	//
-	// 两个头都属于「模板声明的协议形状」：让样本盖掉它们，等于用一个端点的
-	// 形状去探另一个端点。anthropic-version 的后果最直接（带到 OpenAI 端点上
-	// 就是跨协议串味）；accept 同类 —— 注意内置模板发的本来就是
-	// application/json（§3.1 实测真实 Claude Code 即使流式也发它，流式开关在
-	// body 的 stream 字段上），所以这里防的不是「被覆盖成非 SSE」。
+func TestSampleCandidatePreservesOnlyItsEndpointProtocolHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("Anthropic-Version", "2023-06-01")
 	h.Set("Accept", "application/json")
 	h.Set("X-App", "cli")
-
-	tmpl, _ := probeHeadersFromSample(h)
-	if _, ok := tmpl["accept"]; ok {
-		t.Error("accept 由内置模板按端点声明，从样本抄会让探活用错端点的形状")
-	}
-	if _, ok := tmpl["anthropic-version"]; ok {
-		t.Error("anthropic-version 由内置模板按端点设，抄了会跨协议串味")
-	}
-	if tmpl["x-app"] != "cli" {
-		t.Error("x-app 应保留")
+	tmpl, _ := candidateHeadersForTest(t, h)
+	if tmpl["anthropic-version"] != "2023-06-01" || tmpl["accept"] != "application/json" || tmpl["x-app"] != "cli" {
+		t.Fatalf("safe endpoint-scoped protocol shape was lost: %v", tmpl)
 	}
 }
 
@@ -641,7 +625,7 @@ func TestProbeHeaders_ExcludesTransportManagedHeaders(t *testing.T) {
 	h.Set("Cookie", "session=secret")
 	h.Set("X-App", "cli")
 
-	tmpl, _ := probeHeadersFromSample(h)
+	tmpl, _ := candidateHeadersForTest(t, h)
 	for _, bad := range []string{"host", "content-length", "connection",
 		"accept-encoding", "cookie"} {
 		if _, ok := tmpl[bad]; ok {
@@ -659,15 +643,13 @@ func TestProbeHeaders_NormalizesToLowercase(t *testing.T) {
 	// 但模板里存的键是小写 —— 界面上的 diff 要能对上，就得同样小写。
 	h := http.Header{}
 	h.Set("X-Stainless-Lang", "js")
-	tmpl, _ := probeHeadersFromSample(h)
+	tmpl, _ := candidateHeadersForTest(t, h)
 	if _, ok := tmpl["x-stainless-lang"]; !ok {
 		t.Errorf("头名应规范化为小写，得到 %v", tmpl)
 	}
 }
 
-func TestProbeHeaders_EndpointReturnsDefaults(t *testing.T) {
-	// defaults 一并返回，让界面能对比「真实请求的头」与「当前默认模板」
-	// 的差异 —— 那个 diff 正是要不要导出的判断依据。
+func TestSampleCandidate_MissingSampleIsNotFound(t *testing.T) {
 	_, h := newTestServer(t)
 	// 没有样本时应 404 而不是 500。
 	rec := do(t, h, "GET", "/admin/api/samples/999/probe-headers", "", true)
@@ -676,16 +658,11 @@ func TestProbeHeaders_EndpointReturnsDefaults(t *testing.T) {
 	}
 }
 
-func TestOutcomeJSON_ZeroVerdictWouldReportOK(t *testing.T) {
-	// 这条测试记录一个陷阱，它是 probeRoute 里那段显式判断的全部理由：
-	// health.Verdict 的零值是 VerdictOK（iota 的第一个），所以一个
-	// **从未执行**的 Outcome 序列化出来是 `"verdict": "ok"`。
-	//
-	// 端到端跑的时候真的撞上了：L1 连不上的站，界面显示「L1 失败、L2 成功」。
-	// 用户完全无法据此判断这个 Route 能不能用。
-	m := outcomeJSON(probe.Outcome{})
-	if m["verdict"] != "ok" {
-		t.Skipf("Verdict 零值语义已变（现在是 %v），probeRoute 里的显式判断可以简化", m["verdict"])
+func TestManualProbeWithoutRunnerNeverReportsUnexecutedSuccess(t *testing.T) {
+	_, h := newTestServer(t)
+	response := do(t, h, "POST", "/admin/api/routes/1/probe", "", true)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexecuted probe must not report zero-value success: %d %s", response.Code, response.Body.String())
 	}
 }
 

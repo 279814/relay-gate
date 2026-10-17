@@ -20,10 +20,10 @@ func (m *TrafficObserverManager) applyHealth(item trafficWrite, result model.Pro
 		execution.ErrorClass == model.ErrorAuthRejected {
 		return
 	}
-	if execution.StatusCode > 0 && result.Capability != model.ApplyCurrent {
+	if execution.StatusCode > 0 && (result.Capability != model.ApplyCurrent || !capabilityHealthCurrent(m.cfg, item.observation.CapabilityExpectation)) {
 		return
 	}
-	if execution.StatusCode == 0 && result.Reachability != model.ApplyCurrent {
+	if execution.StatusCode == 0 && (result.Reachability != model.ApplyCurrent || !reachabilityHealthCurrent(m.cfg, item.observation.ReachabilityExpectation)) {
 		return
 	}
 	if current, ok := m.tracker.(interface{ GenerationOf(int64) uint64 }); ok && current.GenerationOf(execution.RouteID) != item.target.HealthGeneration {

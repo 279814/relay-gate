@@ -17,6 +17,7 @@ import (
 // capabilityTraffic parses original upstream bytes into bounded summaries and
 // commits real observations through the same expectations as synthetic probes.
 type capabilityTraffic struct {
+	progress      *trafficProgress
 	recipe        ResolvedRecipe
 	req           ExecutionRequest
 	decoder       Decoder
@@ -139,6 +140,9 @@ func (c *capabilityTraffic) feed(body []byte, at time.Time) {
 
 func (c *capabilityTraffic) accept(events []ProtocolEvent, at time.Time) {
 	for _, event := range events {
+		if c.progress != nil {
+			c.progress.accept(event, at)
+		}
 		if c.firstEventAt.IsZero() {
 			c.firstEventAt = at
 		}

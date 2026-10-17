@@ -88,7 +88,7 @@ func (tc urlConfigCase) setup(t *testing.T, hs *harness, twoRoutes bool) *routeC
 	}, nil, outbound.NewResolver(testHasher{}))
 	hs.h = hs.h.WithTargets(provider, nil)
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 	return caps
 }
 
@@ -124,11 +124,11 @@ func TestURLConfigError_SkipsRouteAndServesNext(t *testing.T) {
 			if n := badHits.Load(); n != 0 {
 				t.Fatalf("broken-URL Route must not reach the wire, hits = %d", n)
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-				t.Fatalf("broken-URL Route capability = %s, want config_error", got)
+			if got := caps.configFailures(100); got != 1 {
+				t.Fatalf("broken-URL Route config error observations = %d, want 1", got)
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 101, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-				t.Fatalf("healthy Route capability = %s, want unknown", got)
+			if got := caps.configFailures(101); got != 0 {
+				t.Fatalf("healthy Route config error observations = %d, want 0", got)
 			}
 			if _, open, _ := hs.health.stats(); open != 0 {
 				t.Fatalf("concurrency slots leaked: open = %d", open)
@@ -161,8 +161,8 @@ func TestURLConfigError_OnlyRouteReturnsNoRoute(t *testing.T) {
 					t.Fatalf("response leaks config text %q: header=%q body=%s", leak, reason, body)
 				}
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-				t.Fatalf("capability = %s, want config_error", got)
+			if got := caps.configFailures(100); got != 1 {
+				t.Fatalf("config error observations = %d, want 1", got)
 			}
 		})
 	}
@@ -191,8 +191,8 @@ func TestURLConfigError_ValidHostOverrideSetsOutboundHost(t *testing.T) {
 	if got, _ := gotHost.Load().(string); got != "real.example:8443" {
 		t.Fatalf("outbound Host = %q, want real.example:8443", got)
 	}
-	if caps.marks != 0 {
-		t.Fatalf("config_error marks = %d, want 0 for a valid host override", caps.marks)
+	if caps.configFailures(0) != 0 {
+		t.Fatalf("config_error marks = %d, want 0 for a valid host override", caps.configFailures(0))
 	}
 }
 
@@ -228,7 +228,7 @@ func TestURLConfigError_TransportErrorIsNotConfigSkip(t *testing.T) {
 	if n := goodHits.Load(); n != 0 {
 		t.Fatalf("healthy upstream hits = %d, want 0 (retry_max_attempts=1)", n)
 	}
-	if caps.marks != 0 {
-		t.Fatalf("config_error marks = %d, want 0 for a transport error", caps.marks)
+	if caps.configFailures(0) != 0 {
+		t.Fatalf("config_error marks = %d, want 0 for a transport error", caps.configFailures(0))
 	}
 }

@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -32,12 +32,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: Stream cancellation race regression
+        run: go test -race -run='^TestNativeStreamStopsReadingAfterFirstSemanticVerdict$' -count=100 ./internal/probe
+
       # -race 只能在这里跑：竞态检测要 cgo，开发机（Windows，无 cgo）
       # 起不来。而这个项目的核心恰恰是并发 —— 在途计数、样本队列、
       # livecfg 的快照替换、SSE 流的三个超时看门狗，全是多协程共享状态。
       # 功能断言只能证明「这次对了」，证不了「没有数据竞争」。
       - name: go test -race
-        run: go test -race -count=1 ./...
+        # 保留真实 50k/200k 保留上限及清理本身的 2s 断言。
+        # pure-Go SQLite 在 -race 下构造这些数据会超过默认的包级 10m。
+        run: go test -race -timeout=20m -count=1 ./...
 
       # 第二轮不开 -race：竞态检测会把调度拉慢一个数量级，掩盖
       # 时序敏感的偶发失败（超时、TTFT、后台 writer 的进度）。
@@ -66,10 +71,20 @@ jobs:
         run: node internal/web/bindings.check.js
 
       - name: 前端契约测试
-        run: node internal/web/app.contract.test.js
+        run: |
+          node internal/web/app.contract.test.js
+          node internal/web/configadmin.contract.test.js
+          node internal/web/manual-probe.contract.test.js
+          node --test internal/web/recipe_admin.contract.test.mjs
 
       - name: 前端模块契约测试
         run: node --test internal/web/modules.contract.test.mjs
+
+      - name: Settings and service-state revision contracts
+        run: node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/privacy.contract.test.mjs
+
+      - name: Endpoint editor mutation contract
+        run: node --test internal/web/endpoint.contract.test.mjs
 
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

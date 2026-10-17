@@ -1,32 +1,6 @@
 package health
 
-import (
-	"errors"
-	"net/http"
-	"time"
-
-	"github.com/279814/relay-gate/internal/model"
-)
-
-// ResultView is the compatibility reporting boundary; production observations
-// use AttemptObserver without coupling probe and proxy packages.
-type ResultView struct {
-	Status             int
-	Err                error
-	ErrBody            []byte
-	Header             http.Header
-	Endpoint           model.EndpointKind
-	TTFT               time.Duration
-	BytesWritten       int64
-	SemanticSeen       bool
-	HalfOpen           bool
-	CapabilityObserved bool
-}
-
-type ResultReporter interface {
-	ReportResult(int64, uint64, *ResultView)
-	TriggerProbe(int64)
-}
+import "errors"
 
 var (
 	ErrConnect           = errors.New("连接上游失败")

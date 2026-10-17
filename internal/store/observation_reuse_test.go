@@ -34,7 +34,7 @@ func TestCommitProbeObservation_ReusedIDSameNetworkRevisionIsConfigStale(t *test
 	late.ErrorClass = model.ErrorUnreachable
 	late.StatusCode = 0
 
-	if err := st.DeleteUpstream(oldID); err != nil {
+	if err := st.DeleteUpstreamWithRevision(context.Background(), oldID, upstream.Revision); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := st.db.Exec(`DELETE FROM sqlite_sequence WHERE name='upstream'`); err != nil {
@@ -150,7 +150,7 @@ func TestCommitProbeObservation_ReusedRouteIDSameCapabilityRevisionIsConfigStale
 		ObservationOrder: 30, SentAtMS: 1, DoneAtMS: 2,
 	}
 
-	if err := st.DeleteRoute(oldID); err != nil {
+	if err := st.DeleteRouteWithRevision(context.Background(), oldID, route.Revision); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := st.db.Exec(`DELETE FROM sqlite_sequence WHERE name='route'`); err != nil {
@@ -244,7 +244,7 @@ func TestCommitProbeObservation_ReusedUpstreamIDSameNetworkRevisionCapabilityIsC
 		ObservationOrder: 40, SentAtMS: 1, DoneAtMS: 2,
 	}
 
-	if err := st.DeleteUpstream(oldID); err != nil {
+	if err := st.DeleteUpstreamWithRevision(context.Background(), oldID, upstream.Revision); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := st.db.Exec(`DELETE FROM sqlite_sequence WHERE name='upstream'`); err != nil {

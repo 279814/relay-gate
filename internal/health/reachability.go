@@ -21,6 +21,10 @@ type ReachabilityTracker struct {
 	settings SettingsSource
 }
 
+type reachabilityRevisionSource interface {
+	CurrentReachabilityRevision(int64, model.EvidencePolicySelector) (model.ReachabilityRevision, bool)
+}
+
 // NewReachabilityTracker 构造空 Tracker。settings 用于 effective 读侧失效。
 func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 	return &ReachabilityTracker{
@@ -33,9 +37,8 @@ func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
 //
 // CAS：同 token 时只接受更大（或相等时保留已有）order，回调返回顺序反转
-// 也不能让旧行盖住新行。token 不同表示新 incarnation（含 Mark* 等用
-// UnixMilli 占位 order 的旁路写入之后，sequencer 提交的新 token），即使
-// order 更低也必须替换，否则新行会输给上一 incarnation 留下的更高 order。
+// 也不能让旧行盖住新行。token 不同表示新的网络或策略身份，即使
+// order 更低也必须替换，否则新行会输给上一身份留下的更高 order。
 // 空 ObservationToken 的旁路占位不得覆盖已有非空 token；非空 token 仍可
 // 替换空占位。
 //
@@ -49,11 +52,16 @@ func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachabili
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
+	if _, ok := tracker.settings.(reachabilityRevisionSource); ok {
+		if !tracker.rowCurrentLocked(row, row.ObservedNetworkRevision) {
+			return false
+		}
+	}
 	current := tracker.rows[row.UpstreamID]
 	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
 		return false
 	}
-	if current != nil && current.ObservationToken == row.ObservationToken &&
+	if current != nil && current.ObservedCreatedAt == row.ObservedCreatedAt && current.ObservationToken == row.ObservationToken &&
 		current.LastObservationOrder >= row.LastObservationOrder {
 		return false
 	}
@@ -151,6 +159,10 @@ func (tracker *ReachabilityTracker) InvalidateStale(networkByUpstream map[int64]
 func (tracker *ReachabilityTracker) rowCurrentLocked(row *model.UpstreamReachability, networkRevision int64) bool {
 	if row.ObservedNetworkRevision != networkRevision {
 		return false
+	}
+	if source, ok := tracker.settings.(reachabilityRevisionSource); ok {
+		revision, ready := source.CurrentReachabilityRevision(row.UpstreamID, row.PolicySelector)
+		return ready && revision.CreatedAt == row.ObservedCreatedAt && revision.NetworkRevision == row.ObservedNetworkRevision && revision.SettingsFingerprint == row.SettingsFingerprint && revisioncodec.NewReachabilityToken(revision) == row.ObservationToken
 	}
 	settings := model.DefaultSettings()
 	if tracker.settings != nil {

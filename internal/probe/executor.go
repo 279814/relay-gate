@@ -4,13 +4,9 @@ package probe
 //
 // 它把探活主链收敛成唯一一条路径：admission → 准备（解析/渲染/认证）→
 // 单次 RoundTrip → 按 Clock 分阶段读流 → 用 ResponseClassifier 归约成 Decision →
-// 展平进 ProbeExecution 并交给 recorder 落库。L1/L2/ProbeNow 与将来的真实流量
-// 旁路都走这一条，所以「探活到底发了什么、看到了什么」只有一个答案。
-//
-// 为什么不复用旧 Prober.L1/L2 的发送段：那两段各自拼请求、各自读流、各自
-// 把结果映射成 health.Verdict，而 §4.6 要的是一个带**作用范围**的 Decision。
-// 本执行器只产出 Decision（+ 一份供 P0-10 之前的 health.Tracker 消费的
-// 兼容 Outcome 映射），状态推进留给 P0-10 的 Registry。
+// 展平进 ProbeExecution 并交给 recorder 原子落库。定时、人工测试和校准
+// 共享这一执行单元；真实流量观察复用 Decoder、Classifier 与 ResultRecorder。
+// Decision 的作用范围与事务 disposition 决定 Registry/RouteHealth 更新。
 //
 // 时间只从注入的 Clock 取（§4.6/§7.4）：阶段超时、绝对时间戳、Retry-After
 // 的 headerAt 必须同一口径，否则「同一次响应」会在 execution 行里出现互相
@@ -199,9 +195,8 @@ func (e *Executor) Execute(ctx context.Context, req ExecutionRequest) (Execution
 	}
 
 	// 准备阶段：解析 → 渲染 → 认证。任何一步失败都是 route-local 的
-	// config_error，**不出网**（§8.6）。这里刻意不传 Transport 构造 Prober ——
-	// 它只借用 prepare，不发送。
-	preparer := &Prober{Targets: e.resolver, Secrets: e.secrets, Recipes: e.recipes}
+	// config_error，**不出网**（§8.6）。准备器没有网络发送能力。
+	preparer := &requestPreparer{Targets: e.resolver, Secrets: e.secrets, Recipes: e.recipes}
 	var prepared *preparedProbe
 	var resolved ResolvedRecipe
 	var err error
@@ -347,46 +342,57 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	timing := sendTiming{sentAtMS: sentAt.UnixMilli()}
 	estInputTokens := int64(prepared.estimatedTokens(req.ModelName))
 
-	totalTimer := e.clock.NewTimer(budget.Total)
-	defer totalTimer.Stop()
-
-	// 响应头阶段：仅当配了 ResponseHead 才单独设时限（L1 只有 connect+total）。
-	var headerTimer Timer
-	if budget.ResponseHead > 0 {
-		headerTimer = e.clock.NewTimer(stageDuration(sentAt, budget.ResponseHeadDeadline(sentAt)))
-		defer headerTimer.Stop()
-	}
+	deadline, deadlineCause := nextExecutionDeadline(budget, sentAt, &timing, time.Time{})
+	stageTimer := resetExecutionTimer(nil, e.clock, deadline)
+	defer stageTimer.Stop()
 
 	// RoundTrip 在自己的 goroutine 里跑，主 goroutine 用 select 守住时限。
 	type rtResult struct {
 		resp *http.Response
 		err  error
+		at   time.Time
 	}
 	rtCh := make(chan rtResult, 1)
 	go func() {
 		resp, rtErr := transport.RoundTrip(httpReq)
-		rtCh <- rtResult{resp: resp, err: rtErr}
+		rtCh <- rtResult{resp: resp, err: rtErr, at: e.clock.Now()}
 	}()
 
 	var resp *http.Response
 	var rtErr error
-	headerTimedOut := false
+	var timeoutErr error
 	select {
 	case res := <-rtCh:
 		resp, rtErr = res.resp, res.err
-	case <-timerC(headerTimer):
-		headerTimedOut = true
+		if !res.at.Before(deadline) {
+			timeoutErr = deadlineCause
+			cancel()
+			rtErr = timeoutErr
+		}
+	case <-stageTimer.C():
+		timeoutErr = deadlineCause
 		cancel()
 		res := <-rtCh
 		resp, rtErr = res.resp, res.err
-	case <-timerC(totalTimer):
+		if rtErr == nil {
+			rtErr = timeoutErr
+		}
+	case <-ctx.Done():
 		cancel()
 		res := <-rtCh
 		resp, rtErr = res.resp, res.err
+		if rtErr == nil {
+			rtErr = ctx.Err()
+		}
 	}
 
 	// RoundTrip 已返回：建连观测点此刻定稿，读它是 happens-after（经 rtCh）。
 	timing.applyTrace(trace)
+	if ctx.Err() != nil {
+		// Both the response/deadline and external cancellation can already be
+		// ready. Never turn the caller's cancellation into an upstream failure.
+		rtErr = ctx.Err()
+	}
 
 	// 传输层失败：连响应头都没拿到，status=0 → unreachable（§8.9）。
 	if rtErr != nil {
@@ -394,7 +400,7 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 			resp.Body.Close()
 		}
 		timing.doneAtMS = e.clock.Now().UnixMilli()
-		return e.finishTransportFailure(ctx, req, prepared, rtErr, headerTimedOut,
+		return e.finishTransportFailure(ctx, req, prepared, rtErr, timeoutErr,
 			requestBytes, estInputTokens, timing, sentAt)
 	}
 	defer resp.Body.Close()
@@ -403,16 +409,6 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	timing.responseHeaderAtMS = headerAt.UnixMilli()
 
 	classifier := NewResponseClassifier(req.Mode, req.Endpoint, resp.StatusCode, resp.Header, headerAt)
-
-	// 连接层探测（空 l1_path）：拿到任何响应头即算通，不必读流（§4.1）。
-	if prepared.connectionOnly {
-		timing.doneAtMS = e.clock.Now().UnixMilli()
-		decision := classifier.Finish(nil, nil)
-		// connectionOnly 覆盖 models 的「必须是模型列表」判据：这里只探连接。
-		decision.Success = decision.Reachable
-		return e.finishSuccessPath(ctx, req, prepared, decision, timing,
-			requestBytes, 0, estInputTokens, false, sentAt)
-	}
 
 	protocol := model.Protocol("")
 	if req.ModelName != nil {
@@ -429,19 +425,15 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 			estInputTokens, timing, sentAt)
 	}
 
-	// 按 Content-Encoding 解压响应体再喂解码器（§P0-09 第 3 条）。未知/畸形
-	// 编码就地失败，且绝不把正文明文泄进 RedactedDetail —— 内容解码器只吐
-	// 结构化哨兵错误。identity/gzip/br 之外一律拒绝。
-	bodyReader, cdErr := NewContentDecoder(resp.Header.Get("Content-Encoding"), resp.Body,
-		ContentCodingLimits{MaxEncodedBytes: defaultMaxTotalBytes, MaxDecodedBytes: defaultMaxTotalBytes})
-	if cdErr != nil {
+	readResult := e.readStream(sendCtx, ctx, cancel, resp.Body, resp.Header.Get("Content-Encoding"), decoder, classifier, req, budget, sentAt, &timing, stageTimer)
+	if ctx.Err() != nil && !readResult.expectedCancel {
+		readResult.cancelCause = ErrServicePaused
+	}
+	if readResult.setupErr != nil && readResult.cancelCause == nil {
 		return e.finishObserverIncomplete(ctx, req, prepared, resp.StatusCode,
 			model.ObserverDecodeFailure, "observer_content_encoding", requestBytes,
 			estInputTokens, timing, sentAt)
 	}
-	defer bodyReader.Close()
-
-	readResult := e.readStream(sendCtx, cancel, bodyReader, decoder, classifier, req, budget, sentAt, &timing)
 	timing.doneAtMS = e.clock.Now().UnixMilli()
 
 	decision := classifier.Finish(readResult.readErr, readResult.cancelCause)
@@ -456,122 +448,167 @@ type streamResultExec struct {
 	readErr        error
 	cancelCause    error
 	expectedCancel bool
+	setupErr       error
 }
 
-// readStream 分阶段读响应体，把事件喂给 decoder+classifier。
-//
-// probe 模式下 classifier 在首个语义证据后回 final=true，此时立即 cancel 停止
-// 消耗 token，并标记 expectedCancel（§4.1、§6.8、§P0-09 第 6 条）。
-func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, body io.Reader,
+type executorReaderFunc func([]byte) (int, error)
+
+func (read executorReaderFunc) Read(p []byte) (int, error) { return read(p) }
+
+// readStream shares the SentAt-anchored deadline with RoundTrip. Probe mode
+// still cancels immediately after the first semantic verdict.
+func (e *Executor) readStream(ctx, callerCtx context.Context, cancel context.CancelFunc, rawBody io.Reader, encoding string,
 	decoder Decoder, classifier *ResponseClassifier, req ExecutionRequest, budget outbound.Budget,
-	sentAt time.Time, timing *sendTiming) streamResultExec {
-
+	sentAt time.Time, timing *sendTiming, timer Timer) streamResultExec {
 	var result streamResultExec
-
-	// 首字节/首事件/首语义阶段共用一个「等语义」定时器：在拿到首语义前，
-	// 用 FirstSemantic 截止时刻兜底；拿到后（probe 模式已 final）不再需要。
-	var semanticTimer Timer
-	if budget.FirstSemantic > 0 {
-		semanticTimer = e.clock.NewTimer(stageDuration(sentAt, budget.FirstSemanticDeadline(sentAt)))
-		defer func() {
-			if semanticTimer != nil {
-				semanticTimer.Stop()
-			}
-		}()
-	}
-	totalTimer := e.clock.NewTimer(stageDuration(sentAt, budget.TotalDeadline(sentAt)))
-	defer totalTimer.Stop()
-
-	// 读 goroutine：每读到一块就投递，读完/出错投递终止。
+	var lastActivity time.Time
 	type chunk struct {
-		data []byte
-		err  error
+		data       []byte
+		err        error
+		at         time.Time
+		raw, setup bool
 	}
 	chunks := make(chan chunk)
+	deliver := func(c chunk) bool {
+		select {
+		case chunks <- c:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// gzip.NewReader reads its header synchronously. Keep codec construction in
+	// the same cancellable worker as reads so it cannot escape any stage/total.
 	go func() {
+		tracked := executorReaderFunc(func(p []byte) (int, error) {
+			n, err := rawBody.Read(p)
+			if n > 0 && !deliver(chunk{raw: true, at: e.clock.Now()}) {
+				return 0, ctx.Err()
+			}
+			return n, err
+		})
+		body, err := NewContentDecoder(encoding, tracked, ContentCodingLimits{MaxEncodedBytes: defaultMaxTotalBytes, MaxDecodedBytes: defaultMaxTotalBytes})
+		if err != nil {
+			deliver(chunk{err: err, at: e.clock.Now(), setup: true})
+			return
+		}
+		defer body.Close()
 		buf := make([]byte, readChunk)
 		for {
 			n, err := body.Read(buf)
 			if n > 0 {
-				cp := make([]byte, n)
-				copy(cp, buf[:n])
-				select {
-				case chunks <- chunk{data: cp}:
-				case <-ctx.Done():
+				cp := append([]byte(nil), buf[:n]...)
+				if !deliver(chunk{data: cp, at: e.clock.Now()}) {
 					return
 				}
 			}
 			if err != nil {
-				select {
-				case chunks <- chunk{err: err}:
-				case <-ctx.Done():
-				}
+				deliver(chunk{err: err, at: e.clock.Now()})
 				return
 			}
 		}
 	}()
-
-	feed := func(events []ProtocolEvent) (finalReached bool) {
-		for _, event := range events {
-			if timing.firstEventAtMS == 0 {
-				timing.firstEventAtMS = e.clock.Now().UnixMilli()
-			}
-			_, final := classifier.Observe(event)
-			if event.Semantic && timing.firstSemanticAtMS == 0 {
-				timing.firstSemanticAtMS = e.clock.Now().UnixMilli()
-			}
-			if final {
-				return true
-			}
+	callerCanceled := func() bool {
+		// ctx also carries our stage/semantic cancellation; only the original
+		// caller may suppress an upstream verdict as an ignored observation.
+		if callerCtx.Err() != nil {
+			result.cancelCause = ErrServicePaused
+			return true
 		}
 		return false
 	}
-
-	for {
-		select {
-		case c := <-chunks:
-			if c.err != nil {
-				if c.err == io.EOF {
-					events, finishErr := decoder.Finish()
-					feed(events)
-					result.readErr = finishErr
-				} else {
-					result.readErr = fmt.Errorf("%w: %v", ErrProbeTransportFailed, c.err)
-				}
-				return result
+	expired := func(now time.Time) bool {
+		if callerCanceled() {
+			return true
+		}
+		deadline, cause := nextExecutionDeadline(budget, sentAt, timing, lastActivity)
+		if !now.Before(deadline) {
+			result.readErr = cause
+			cancel()
+			return true
+		}
+		return false
+	}
+	feed := func(events []ProtocolEvent) bool {
+		for _, event := range events {
+			now := e.clock.Now()
+			if expired(now) {
+				return true
 			}
-			if timing.firstByteAtMS == 0 {
-				timing.firstByteAtMS = e.clock.Now().UnixMilli()
+			if timing.firstEventAtMS == 0 {
+				timing.firstEventAtMS = now.UnixMilli()
 			}
-			result.bytesRead += int64(len(c.data))
-			events, decErr := decoder.Feed(c.data)
-			if final := feed(events); final {
-				// probe 模式首语义后主动断流：预期取消 = 成功（§6.8 末句）。
+			_, final := classifier.Observe(event)
+			if event.Semantic && timing.firstSemanticAtMS == 0 {
+				timing.firstSemanticAtMS = now.UnixMilli()
+				lastActivity = now
+			}
+			if final {
 				if req.Mode == ObserveProbe {
 					result.expectedCancel = true
 					result.cancelCause = ErrProbeCanceledAfterSemantic
 					cancel()
 				}
+				return true
+			}
+		}
+		return false
+	}
+	for {
+		if callerCanceled() {
+			return result
+		}
+		deadline, cause := nextExecutionDeadline(budget, sentAt, timing, lastActivity)
+		timer = resetExecutionTimer(timer, e.clock, deadline)
+		select {
+		case c := <-chunks:
+			if expired(c.at) {
 				return result
 			}
-			if decErr != nil {
-				result.readErr = decErr
+			if c.raw {
+				if timing.firstByteAtMS == 0 {
+					timing.firstByteAtMS = c.at.UnixMilli()
+				}
+				// Raw transport activity only. Transform output and pre-semantic pings
+				// never start/reset the semantic deadline or the post-semantic idle clock.
+				if timing.firstSemanticAtMS != 0 {
+					lastActivity = c.at
+				}
+				continue
+			}
+			if c.setup {
+				result.setupErr = c.err
 				return result
 			}
-
-		case <-timerC(semanticTimer):
-			// 首语义超时：响应头已到但迟迟没有语义证据。
-			result.readErr = ErrProbeSemanticTimeout
+			if c.err != nil {
+				if c.err == io.EOF {
+					events, err := decoder.Finish()
+					if feed(events) {
+						return result
+					}
+					result.readErr = err
+				} else {
+					result.readErr = fmt.Errorf("%w: %v", ErrProbeTransportFailed, c.err)
+				}
+				return result
+			}
+			result.bytesRead += int64(len(c.data))
+			events, err := decoder.Feed(c.data)
+			if feed(events) {
+				return result
+			}
+			if err != nil {
+				result.readErr = err
+				return result
+			}
+		case <-timer.C():
+			if callerCanceled() {
+				return result
+			}
+			result.readErr = cause
 			cancel()
 			return result
-
-		case <-timerC(totalTimer):
-			result.readErr = context.DeadlineExceeded
-			cancel()
-			return result
-
 		case <-ctx.Done():
-			// 外层取消（暂停/关闭/客户端断开）：交给 classifier 归为 ignored。
 			result.cancelCause = ErrServicePaused
 			return result
 		}
@@ -586,7 +623,7 @@ func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, bo
 // 记成一次完整探测成本，违反 §8.6「实际发出去那份内容」。GotConn 已到则
 // 可能已写过请求，按「可能已执行」记账，不清发送事实。
 func (e *Executor) finishTransportFailure(ctx context.Context, req ExecutionRequest,
-	prepared *preparedProbe, rtErr error, headerTimedOut bool, requestBytes, estInputTokens int64,
+	prepared *preparedProbe, rtErr error, timeoutErr error, requestBytes, estInputTokens int64,
 	timing sendTiming, sentAt time.Time) (ExecutionResult, error) {
 
 	sent := true
@@ -603,18 +640,21 @@ func (e *Executor) finishTransportFailure(ctx context.Context, req ExecutionRequ
 		cancelCause = ErrServicePaused
 	}
 	var readErr error
-	if headerTimedOut {
-		readErr = ErrProbeSemanticTimeout
+	if timeoutErr != nil {
+		readErr = timeoutErr
 	}
 	// status=0 的分类器：走 unreachable / ignored。
 	classifier := NewResponseClassifier(req.Mode, req.Endpoint, 0, nil, sentAt)
 	decision := classifier.Finish(readErr, cancelCause)
+	if cancelCause == nil && timeoutErr != nil {
+		decision.RedactedDetail = probeTimeoutReason(timeoutErr)
+	}
 	if cancelCause == nil && readErr == nil {
 		// 纯传输错误。
 		decision.RedactedDetail = "transport_failure"
 	}
 
-	outcome := e.transportOutcome(ctx, req, decision, rtErr, headerTimedOut)
+	outcome := e.transportOutcome(ctx, req, decision, rtErr, timeoutErr)
 	outcome.Sent = sent
 	exec := e.buildExecution(req, prepared.recipe, decision, timing, requestBytes, 0, estInputTokens, false,
 		prepared.resolvedURLHash, prepared.requestURLHash)
@@ -891,6 +931,7 @@ func applyExpectationColumns(exec *model.ProbeExecution,
 		exec.CapabilityPolicySelector = capExp.PolicySelector
 		exec.CapabilityToken = capExp.ObservationToken
 		exec.ProbeSettingsFingerprint = capExp.Revision.ProbeSettingsFingerprint
+		exec.ProbeSecretRevisionsHash = revisioncodec.SecretRevisionSetHash(capExp.Revision.ProbeSecrets)
 		exec.UpstreamNetworkRevision = capExp.Revision.UpstreamNetwork
 		exec.UpstreamCredentialRevision = capExp.Revision.UpstreamCredential
 		exec.EndpointID = capExp.Revision.EndpointID
@@ -976,31 +1017,22 @@ func (e *Executor) l1Outcome(decision Decision) Outcome {
 // net/http 的 *url.Error 会把完整请求 URL（含 fixed_query 里的 Secret）
 // 拼进 Error()，而 Scheduler 会把 out.Err 打进「上游 L1 失败」等日志。
 func (e *Executor) transportOutcome(ctx context.Context, req ExecutionRequest, decision Decision,
-	_ error, headerTimedOut bool) Outcome {
+	_ error, timeoutErr error) Outcome {
 
 	if decision.ErrorClass == model.ErrorIgnored || ctx.Err() != nil {
 		return Outcome{Verdict: health.VerdictIgnore}
 	}
-	if headerTimedOut {
-		return Outcome{Verdict: health.VerdictUnavailable,
-			Err: fmt.Errorf("%w: 响应头未按时返回", ErrProbeSemanticTimeout)}
+	if timeoutErr != nil {
+		return Outcome{Verdict: health.VerdictUnavailable, Err: timeoutErr}
 	}
 	return Outcome{Verdict: health.VerdictUnavailable, Err: detailErr(decision)}
 }
 
 // ── 小工具 ────────────────────────────────────────────────
 
-// timerC 安全地取 Timer 的通道；nil timer 返回一个永不触发的通道。
-func timerC(t Timer) <-chan time.Time {
-	if t == nil {
-		return nil
-	}
-	return t.C()
-}
-
 // stageDuration 把绝对截止时刻换算成从现在起的时长，下限为 0。
-func stageDuration(sentAt time.Time, deadline time.Time) time.Duration {
-	d := deadline.Sub(sentAt)
+func stageDuration(now time.Time, deadline time.Time) time.Duration {
+	d := deadline.Sub(now)
 	if d < 0 {
 		return 0
 	}
