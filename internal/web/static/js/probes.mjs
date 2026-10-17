@@ -17,6 +17,36 @@ const PROBE_TABS = [
   { id: 'probe-runtime', name: '探活诊断' },
 ];
 
+const ENDPOINTS = ['models', 'messages', 'count_tokens', 'responses', 'chat_completions'];
+const CAPABILITIES = ['unknown', 'supported', 'unsupported', 'transient_error', 'config_error'];
+const TRIGGERS = ['scheduled', 'manual', 'calibration', 'recovery', 'real_traffic'];
+const ORIGINS = ['manual', 'learned', 'compact_native', 'calibration_native', 'basic_protocol', 'legacy_migration'];
+const FILTER_FIELDS = {
+  endpoints: [{ key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'needs_review', label: '待审核', options: ['true', 'false'] }],
+  secrets: [{ key: 'name_prefix', label: '名称前缀' }],
+  recipes: [{ key: 'upstream_id' }, { key: 'route_id' }, { key: 'endpoint' }, { key: 'status' }],
+  executions: [
+    { key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'route_id', label: 'Route ID', type: 'number' },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'error_class', label: '错误类别', options: ['none', 'unreachable', 'auth_rejected', 'request_shape_rejected', 'config_error', 'unsupported', 'model_not_found', 'rate_limited', 'transient_error', 'fake_alive', 'partial_failure', 'ignored'] },
+    { key: 'trigger', label: '触发来源', options: TRIGGERS }, { key: 'capability_state', label: '能力结论', options: CAPABILITIES },
+  ],
+  capabilities: [
+    { key: 'upstream_id', label: 'Upstream 范围 ID', type: 'number' }, { key: 'route_id', label: 'Route 范围 ID', type: 'number' },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'state', label: '能力结论', options: CAPABILITIES }, { key: 'expired', label: '已过期', options: ['true', 'false'] },
+  ],
+  reachability: [{ key: 'upstream_id', label: 'Upstream ID', type: 'number' }, { key: 'state', label: '可达状态', options: ['unknown', 'reachable', 'unreachable'] }, { key: 'current', label: '当前网络配置', options: ['true', 'false'] }],
+  calibrations: [{ key: 'route_id', label: 'Route ID', type: 'number' }, { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'state', label: '校准状态', options: ['planned', 'running', 'succeeded', 'failed', 'canceled', 'interrupted'] }],
+  probeCostDaily: [
+    { key: 'day_from', label: 'UTC 起始日', type: 'date' }, { key: 'day_to', label: 'UTC 截止日', type: 'date' },
+    { key: 'trigger', label: '触发来源', options: TRIGGERS }, { key: 'origin', label: '配方来源', options: ORIGINS },
+    { key: 'endpoint', label: '端点', options: ENDPOINTS }, { key: 'route_id', label: 'Route ID', type: 'number' }, { key: 'upstream_id', label: 'Upstream ID', type: 'number' },
+  ],
+};
+
+function emptyFilter(list) {
+  return Object.fromEntries(FILTER_FIELDS[list].map(field => [field.key, '']));
+}
+
 function emptyList(extraFilter) {
   return {
     items: [],
@@ -36,14 +66,15 @@ export function createProbeFeature(shell, api) {
     probeModuleError: '',
     stateRevision: 0,
 
-    endpoints: emptyList({ upstream_id: '' }),
-    secrets: emptyList({}),
-    recipes: emptyList({}),
-    executions: emptyList({}),
-    capabilities: emptyList({}),
-    reachability: emptyList({}),
-    calibrations: emptyList({}),
-    probeCostDaily: emptyList({}),
+    probeFilterFields: FILTER_FIELDS,
+    endpoints: emptyList(emptyFilter('endpoints')),
+    secrets: emptyList(emptyFilter('secrets')),
+    recipes: emptyList(emptyFilter('recipes')),
+    executions: emptyList(emptyFilter('executions')),
+    capabilities: emptyList(emptyFilter('capabilities')),
+    reachability: emptyList(emptyFilter('reachability')),
+    calibrations: emptyList(emptyFilter('calibrations')),
+    probeCostDaily: emptyList(emptyFilter('probeCostDaily')),
     probeRuntime: null,
     executionDrawer: null,
     recipeDetail: null,

@@ -1216,6 +1216,22 @@
               <span class="grow"></span>
               <button @click="loadReachability(true)" :disabled="reachability.loading">刷新</button>
             </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.reachability" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="reachability.filter[filterField.key]" @change="onProbeFilterChange('reachability'); loadReachability(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="reachability.filter[filterField.key]" @change="onProbeFilterChange('reachability'); loadReachability(true)">
+                  </template>
+                </label>
+              </template>
+            </div>
             <table>
               <thead><tr><th>Upstream</th><th>状态</th><th>连续 OK/Fail</th><th>最近错误</th><th>观测序</th></tr></thead>
               <tbody>
@@ -1240,6 +1256,22 @@
               <span class="dim">过期行显示派生 expired 徽标；stale 不可提交</span>
               <span class="grow"></span>
               <button @click="loadCapabilities(true)" :disabled="capabilities.loading">刷新</button>
+            </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.capabilities" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="capabilities.filter[filterField.key]" @change="onProbeFilterChange('capabilities'); loadCapabilities(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="capabilities.filter[filterField.key]" @change="onProbeFilterChange('capabilities'); loadCapabilities(true)">
+                  </template>
+                </label>
+              </template>
             </div>
             <table>
               <thead><tr><th>范围</th><th>端点</th><th>状态</th><th>到期</th><th>脱敏原因</th></tr></thead>
@@ -1275,6 +1307,22 @@
               <button class="primary" @click="endpointForm = { upstream_id: '', endpoint: 'messages', url_mode: 'canonical', url_override: '', fixed_query_template: '', auth_profile: {} }">新增 Endpoint</button>
               <button @click="loadEndpoints(true)">刷新</button>
             </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.endpoints" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="endpoints.filter[filterField.key]" @change="onProbeFilterChange('endpoints'); loadEndpoints(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="endpoints.filter[filterField.key]" @change="onProbeFilterChange('endpoints'); loadEndpoints(true)">
+                  </template>
+                </label>
+              </template>
+            </div>
             <table>
               <thead><tr><th>ID</th><th>Upstream</th><th>端点</th><th>URL</th><th>NeedsReview</th><th></th></tr></thead>
               <tbody>
@@ -1305,6 +1353,22 @@
               <span class="grow"></span>
               <button class="primary" @click="secretForm = { name: '', value: '' }">新增 Secret</button>
               <button @click="loadSecrets(true)">刷新</button>
+            </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.secrets" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="secrets.filter[filterField.key]" @change="onProbeFilterChange('secrets'); loadSecrets(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="secrets.filter[filterField.key]" @change="onProbeFilterChange('secrets'); loadSecrets(true)">
+                  </template>
+                </label>
+              </template>
             </div>
             <table>
               <thead><tr><th>名称</th><th>脱敏</th><th>指纹</th><th></th></tr></thead>
@@ -1505,6 +1569,22 @@
               <span class="grow"></span>
               <button @click="loadExecutions(true)">刷新</button>
             </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.executions" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="executions.filter[filterField.key]" @change="onProbeFilterChange('executions'); loadExecutions(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="executions.filter[filterField.key]" @change="onProbeFilterChange('executions'); loadExecutions(true)">
+                  </template>
+                </label>
+              </template>
+            </div>
             <table>
               <thead><tr><th>ID</th><th>触发</th><th>Route</th><th>端点</th><th>成功</th><th>状态码</th><th>Capability</th><th></th></tr></thead>
               <tbody>
@@ -1533,10 +1613,26 @@
               <span class="grow"></span>
               <button @click="loadProbeCostDaily(true)">刷新</button>
             </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.probeCostDaily" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="probeCostDaily.filter[filterField.key]" @change="onProbeFilterChange('probeCostDaily'); loadProbeCostDaily(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="probeCostDaily.filter[filterField.key]" @change="onProbeFilterChange('probeCostDaily'); loadProbeCostDaily(true)">
+                  </template>
+                </label>
+              </template>
+            </div>
             <table>
               <thead><tr><th>日</th><th>触发</th><th>Route</th><th>Upstream</th><th>请求</th><th>成功/失败/取消</th><th>估入/观出</th><th>PiggybackL2Saved</th></tr></thead>
               <tbody>
-                <template x-for="c in probeCostDaily.items" :key="`${f(c,'DayUTC','day_utc')}-${f(c,'RouteID','route_id')}-${f(c,'Trigger','trigger')}`">
+                <template x-for="c in probeCostDaily.items" :key="JSON.stringify([f(c,'DayUTC','day_utc'),f(c,'Trigger','trigger'),f(c,'Origin','origin'),f(c,'Endpoint','endpoint'),f(c,'RouteID','route_id'),f(c,'UpstreamID','upstream_id')])">
                   <tr>
                     <td x-text="f(c,'DayUTC','day_utc')"></td>
                     <td x-text="f(c,'Trigger','trigger')"></td>
@@ -1573,6 +1669,22 @@
               </select>
               <button class="primary" @click="planCalibration()">创建计划</button>
               <button @click="loadCalibrations(true)">刷新</button>
+            </div>
+            <div class="bar">
+              <template x-for="filterField in probeFilterFields.calibrations" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="calibrations.filter[filterField.key]" @change="onProbeFilterChange('calibrations'); loadCalibrations(true)">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" x-model="calibrations.filter[filterField.key]" @change="onProbeFilterChange('calibrations'); loadCalibrations(true)">
+                  </template>
+                </label>
+              </template>
             </div>
             <table>
               <thead><tr><th>ID</th><th>Route</th><th>端点</th><th>状态</th><th>修订</th><th></th></tr></thead>
