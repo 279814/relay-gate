@@ -41,6 +41,9 @@ go vet ./...                            # 静态检查
 go test -race -timeout=20m -count=1 ./... # 竞态，含真实大数据保留 fixture
 node internal/web/bindings.check.js     # 前端绑定（查 x-model 写向不存在的属性）
 node internal/web/app.contract.test.js  # 前端契约
+node internal/web/configadmin.contract.test.js
+node internal/web/manual-probe.contract.test.js
+node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/recipe_admin.contract.test.mjs
 node --test internal/web/modules.contract.test.mjs  # 前端业务模块契约
 python scripts/deploy.contract.test.py  # 安装脚本行为（假 Docker，临时目录）
 bash scripts/check-p0.sh                # 探活离线门禁
