@@ -36,7 +36,7 @@ for name in forbidden:
             raise SystemExit(f'tracked forbidden path: {line}')
 for line in tracked:
     parts = line.replace('\\', '/').split('/')
-    if any(part in ('backups', 'secrets') or part.startswith(('.secrets-restore-', 'isolated-')) for part in parts):
+    if any(part in ('backups', 'secrets', 'data-public', '.vs') or part.startswith(('.secrets-restore-', 'isolated-')) for part in parts) or parts[:2] == ['.local', 'p0']:
         raise SystemExit(f'tracked forbidden path: {line}')
 print('ok')
 PY

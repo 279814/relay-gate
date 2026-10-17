@@ -145,6 +145,10 @@ python scripts/deploy.contract.test.py
 
 Go 版本以 `go.mod` 为准。检查脚本需要 Bash、Python 3、Node.js 和 PowerShell 7（`pwsh`）；它们只用于验证，运行服务不需要。Windows 无 CGO 时不要用 `-race`，竞态检测与容器冒烟由 Linux CI 执行。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
 
+### 公网 IP HTTPS
+
+Linux 公网部署支持 `./deploy.sh --public --ip <公网IP>`，确认目标后只发布 Nginx 边缘的 80/443，后端保持私网访问。签发与链/SAN/私钥/有效期校验成功前只提供 ACME 挑战；证书续期独立于网关暂停状态。命令、恢复与验收边界见 [公网 IP HTTPS](docs/13-公网IP-HTTPS.md)。真实公网签发和多日运行尚待对应主机上的验收记录。
+
 ### 离线备份检查与恢复
 
 先停止容器或二进制进程，并备份完整 `data/`（SQLite、WAL/SHM 与 `secrets/` 一起保留）。确认备份 manifest 指定的配对 image/binary 可用，再执行只读检查；不要在服务运行时直接复制或覆盖数据库。
