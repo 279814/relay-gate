@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/httpbody"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -441,6 +442,7 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	if h.runState != nil {
 		snap := h.runState.Current()
 		if !snap.Admitting() {
+			httpbody.DiscardRejected(w, r)
 			eff := snap.Effective()
 			w.Header().Set("X-Relay-State", eff)
 			w.Header().Set("Retry-After", "60")
@@ -459,6 +461,7 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 			return nil, false
 		}
 		if state == store.StatePaused {
+			httpbody.DiscardRejected(w, r)
 			w.Header().Set("X-Relay-State", "paused")
 			w.Header().Set("Retry-After", "60")
 			writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error",

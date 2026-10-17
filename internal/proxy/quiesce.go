@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/279814/relay-gate/internal/httpbody"
 	"github.com/279814/relay-gate/internal/model"
 )
 
@@ -22,6 +23,7 @@ func (h *Handler) withAdmission(protocol model.Protocol, next http.HandlerFunc) 
 		gate.mu.Lock()
 		if gate.frozen {
 			gate.mu.Unlock()
+			httpbody.DiscardRejected(w, r)
 			w.Header().Set("Retry-After", "60")
 			writeAPIError(w, http.StatusServiceUnavailable, protocol, "overloaded_error", "服务维护中")
 			return
