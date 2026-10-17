@@ -1,6 +1,10 @@
 package store
 
-import "context"
+import (
+	"context"
+
+	"github.com/279814/relay-gate/internal/model"
+)
 
 // DiagnosticRedactionKeys is the complete current key set needed to redact
 // administrative diagnostics, including disabled sites without routes. It is
@@ -24,6 +28,9 @@ func (s *Store) DiagnosticRedactionKeys(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		if key != "" {
+			if len(key) < model.MinRedactableKeyLen {
+				return nil, model.WrapValidation("历史上游凭据过短，诊断无法安全脱敏，请先替换凭据")
+			}
 			keys = append(keys, key)
 		}
 	}
