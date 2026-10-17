@@ -27,9 +27,36 @@ const unreferencedExecution = `NOT EXISTS (SELECT 1 FROM probe_recipe r WHERE r.
 	AND NOT EXISTS (SELECT 1 FROM client_probe_profile p WHERE p.tested_execution_id=e.id)
 	AND NOT EXISTS (SELECT 1 FROM calibration_candidate c WHERE c.execution_id=e.id)`
 
+// Count the indexed class, then subtract distinct referenced executions. Drive
+// these lookups from the reference indexes rather than doing three correlated
+// reference searches for every high-frequency execution. UNION also handles a
+// single execution referenced simultaneously by Recipe/Profile/Calibration.
+const countRetainedExecutionsSQL = `SELECT
+	(SELECT COUNT(*) FROM probe_execution WHERE trigger=?) -
+	(SELECT COUNT(*) FROM (
+		SELECT e.id FROM probe_recipe r CROSS JOIN probe_execution e ON e.id=r.last_test_execution_id
+		WHERE r.last_test_execution_id IS NOT NULL AND e.trigger=?
+		UNION
+		SELECT e.id FROM client_probe_profile p CROSS JOIN probe_execution e ON e.id=p.tested_execution_id
+		WHERE p.tested_execution_id IS NOT NULL AND e.trigger=?
+		UNION
+		SELECT e.id FROM calibration_candidate c CROSS JOIN probe_execution e ON e.id=c.execution_id
+		WHERE c.execution_id IS NOT NULL AND e.trigger=?
+	))`
+const oldestRetainedExecutionsSQL = `SELECT id,created_at FROM probe_execution e WHERE trigger=? AND ` + unreferencedExecution
+
 type retainedExecution struct {
 	id      string
 	created int64
+}
+
+func sortRetainedExecutions(values []retainedExecution) {
+	sort.Slice(values, func(i, j int) bool {
+		if values[i].created == values[j].created {
+			return values[i].id < values[j].id
+		}
+		return values[i].created < values[j].created
+	})
 }
 
 // PruneProbeExecutions enforces independent real/automatic/manual policies.
@@ -48,39 +75,67 @@ func (s *Store) PruneProbeExecutions(ctx context.Context, nowUTC time.Time, limi
 	defer tx.Rollback()
 	var candidates []retainedExecution
 	for _, policy := range []struct {
-		triggers  string
+		triggers  []model.ProbeTrigger
 		days, cap int
 	}{
-		{`'real_traffic'`, 7, 50000}, {`'scheduled','recovery'`, 90, 200000}, {`'manual'`, 90, 50000},
+		{[]model.ProbeTrigger{model.TriggerRealTraffic}, 7, 50000},
+		{[]model.ProbeTrigger{model.TriggerScheduled, model.TriggerRecovery}, 90, 200000},
+		{[]model.ProbeTrigger{model.TriggerManual}, 90, 50000},
 	} {
-		rows, err := tx.QueryContext(ctx, `WITH eligible AS MATERIALIZED (
-			SELECT id,created_at FROM probe_execution e WHERE trigger IN (`+policy.triggers+`) AND `+unreferencedExecution+`)
-			SELECT id,created_at FROM eligible WHERE created_at<? OR id IN
-			(SELECT id FROM eligible ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?)
-			ORDER BY created_at,id LIMIT ?`, nowUTC.AddDate(0, 0, -policy.days).UnixMilli(), policy.cap, limit)
-		if err != nil {
-			return 0, err
-		}
-		for rows.Next() {
-			var candidate retainedExecution
-			if err := rows.Scan(&candidate.id, &candidate.created); err != nil {
-				rows.Close()
+		// Count precisely the same unreferenced domain we may delete. Current
+		// diagnostic references are exempt rather than consuming the row cap.
+		count := 0
+		for _, trigger := range policy.triggers {
+			var n int
+			if err := tx.QueryRowContext(ctx, countRetainedExecutionsSQL, trigger, trigger, trigger, trigger).Scan(&n); err != nil {
 				return 0, err
 			}
-			candidates = append(candidates, candidate)
+			count += n
 		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return 0, err
+		excess := count - policy.cap
+		cutoff := nowUTC.AddDate(0, 0, -policy.days).UnixMilli()
+		var oldest []retainedExecution
+		// Each lookup walks (trigger,created_at,id) and returns <= batch rows.
+		// Split automatic's triggers before merging so SQLite never materializes
+		// or sorts the full 200,000-row class merely to find a tiny excess.
+		for _, trigger := range policy.triggers {
+			query := oldestRetainedExecutionsSQL
+			args := []any{trigger}
+			if excess <= 0 {
+				query += ` AND created_at<?`
+				args = append(args, cutoff)
+			}
+			query += ` ORDER BY created_at,id LIMIT ?`
+			args = append(args, limit)
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				return 0, err
+			}
+			for rows.Next() {
+				var candidate retainedExecution
+				if err := rows.Scan(&candidate.id, &candidate.created); err != nil {
+					rows.Close()
+					return 0, err
+				}
+				oldest = append(oldest, candidate)
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return 0, err
+			}
+		}
+		sortRetainedExecutions(oldest)
+		if len(oldest) > limit {
+			oldest = oldest[:limit]
+		}
+		for i, candidate := range oldest {
+			if candidate.created < cutoff || i < excess {
+				candidates = append(candidates, candidate)
+			}
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].created == candidates[j].created {
-			return candidates[i].id < candidates[j].id
-		}
-		return candidates[i].created < candidates[j].created
-	})
+	sortRetainedExecutions(candidates)
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
