@@ -11,8 +11,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/relay-public-edge 
  && CGO_ENABLED=0 go test -c -o /out/acmeip.test ./internal/acmeip
 
 FROM certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20 AS runtime
+COPY deploy/requirements-public-security.txt /tmp/requirements-public-security.txt
 RUN apk upgrade --no-cache \
  && apk add --no-cache nginx ca-certificates \
+ && uv pip install --system --no-cache --no-deps --require-hashes -r /tmp/requirements-public-security.txt \
+ # Certbot's fixed webroot runtime does not need pip. Its bundled vendor copies
+ # remain vulnerable even after upgrading the separately installed packages.
+ && uv pip uninstall --system pip \
+ && uv pip check --system \
  && mkdir -p /webroot /state \
  && chmod 755 /webroot && chmod 700 /state
 COPY --from=builder /out/relay-public-edge /usr/local/bin/relay-public-edge
