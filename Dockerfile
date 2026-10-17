@@ -7,7 +7,7 @@
 # ── 构建阶段 ─────────────────────────────────────────────
 # 版本与 go.mod 的 toolchain 对齐。写死大版本而不是 latest：
 # 一个能构建的镜像不该因为上游发了新版而在某天早上突然构建不出来。
-FROM golang:1.26.9-alpine AS builder
+FROM golang:1.27.2-alpine AS builder
 
 WORKDIR /src
 
