@@ -194,6 +194,27 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	if err := probeChallenge(ctx, webroot, "8.8.8.8", "127.0.0.1:80"); err != nil {
 		t.Fatalf("expiry disabled renewal challenge: %v", err)
 	}
+	if err := m.process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-m.processDone:
+	case <-ctx.Done():
+		t.Fatal("killed Nginx did not exit")
+	}
+	m.process = nil
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:80", 100*time.Millisecond)
+		if err != nil {
+			break
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("orphan worker retained ACME/business listener after forced shutdown")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestRealChallengeAndTLSProbesUseLocalSockets(t *testing.T) {

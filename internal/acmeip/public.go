@@ -27,7 +27,7 @@ type ManagedProcess interface {
 type nginxProcess struct{ command *exec.Cmd }
 
 func (p *nginxProcess) Wait() error { return p.command.Wait() }
-func (p *nginxProcess) Kill() error { return p.command.Process.Kill() }
+func (p *nginxProcess) Kill() error { return killNginxProcess(p.command) }
 
 type PublicOptions struct {
 	IP, StateDir, Webroot, Upstream string
@@ -202,6 +202,7 @@ func (m *PublicManager) start(config string) error {
 		process, err = m.options.StartNginx(config)
 	} else {
 		cmd := exec.Command(m.options.NginxBinary, "-c", config, "-g", "daemon off;")
+		configureNginxProcess(cmd)
 		cmd.Stdout = m.options.Output
 		cmd.Stderr = m.options.Output
 		err = cmd.Start()
