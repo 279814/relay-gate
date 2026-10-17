@@ -7,8 +7,8 @@
 面向多个异构 LLM 中转站的**主动探活 + 优先级路由**透传网关。
 
 手里有几个可用性时好时坏的中转站时，客户端（Claude Code 等）通常要**撞上死站才知道它死了**，
-白等一次超时。relay-gate 常驻探活，请求到达时目标渠道的健康状态**已经是已知的**，
-直接投递到当前存活且优先级最高的渠道。
+白等一次超时。relay-gate 通过后台探活与真实流量观察维护健康状态，按有效结论与优先级选路；
+Active 站点周期复核，Lazy 站点按需复核，未知或过期的结论按恢复规则处理。
 
 ```
 Claude Code ──▶ relay-gate ──▶ 站 A（优先级 1，健康）✅
@@ -94,6 +94,19 @@ export ANTHROPIC_AUTH_TOKEN=<RELAY_KEYS 打印出的值>
 
 网关三个位置都认凭据（`x-api-key` / `Authorization: Bearer` / `Api-Key`）。
 
+### 管理设置与启停版本
+
+管理页面会保留编辑时读取的版本。自行调用管理 API 时，先读取版本，再随写请求提交正整数 `expected_revision`：
+
+| 操作 | 读取与写入 |
+|---|---|
+| 全局设置 | `GET /admin/api/settings` 返回 `{settings, revision, limits}`；`PUT /admin/api/settings` 提交变更字段及该 `expected_revision`，省略字段保持原值 |
+| 服务启停 | `GET /admin/api/state` 返回独立 `revision`；`POST /admin/api/state` 提交 `state`（`running` 或 `paused`）及该 `expected_revision` |
+
+缺少有效版本返回 400，旧版本返回 409。设置只接受新的分阶段字段，例如 `real_first_semantic_sec`、`count_tokens_connect_sec`、`count_tokens_total_sec`；旧 `real_first_token_sec`、`l2_first_token_sec`、`count_tokens_sec` 仅用于启动时迁移，不能写入 API。设置与启停使用各自的版本，不能混用。
+
+503 若带 `persisted=true` 和 `new_revision`，表示已持久化、激活或暂停 drain 尚待完成；先重新读取并确认，不用旧版本自动重发。页面遇到冲突或激活待确认时会保留草稿，并要求显式重新加载。登出会清空已加载的凭据、证据与编辑状态；样本原文另需显式再次验证口令。
+
 ### 单独测一个中转站（probe-matrix）
 
 不启动网关，直接对 sub2api / New API / One API 等中转站测 `/v1/models`、`/v1/messages`、
@@ -108,8 +121,13 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
   --claude-model claude-opus-5 --gpt-model gpt-5.6-sol
 ```
 
-多站批量：按 `scripts/upstreams.example.tsv` 填 `scripts/upstreams.tsv`（已 gitignore），
-再 `bash scripts/probe-all.sh scripts/upstreams.tsv`；可选 `--output x.json --report x.md` 落盘。
+模型 ID 应替换为该站实际支持的值。多站批量可按 `scripts/upstreams.example.tsv` 填 `scripts/upstreams.tsv`（已 gitignore），再运行 `bash scripts/probe-all.sh scripts/upstreams.tsv`。该包装脚本会启用线上调用与费用确认，执行前须核对 TSV 中的目标；默认输出到 `.local/p0/reports/`。第二、第三个位置参数可指定 JSON、Markdown 输出：
+
+```bash
+bash scripts/probe-all.sh scripts/upstreams.tsv .local/p0/reports/matrix.json .local/p0/reports/matrix.md
+```
+
+直接调用 `probe-matrix` 时才使用 `--output` / `--report` 选项；私有输入与报告路径必须被 Git 忽略。
 
 ## 为什么不是「重试就行了」
 
@@ -131,7 +149,7 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
 
 ```bash
 go build ./...
-go test ./...
+go test -timeout=20m -count=1 ./...
 go vet ./...
 bash scripts/check-p0.sh
 bash scripts/check-p5.sh
@@ -139,15 +157,19 @@ sh scripts/check-deploy.sh
 sh scripts/check-entrypoint.sh
 node internal/web/bindings.check.js
 node internal/web/app.contract.test.js
+node internal/web/configadmin.contract.test.js
+node internal/web/manual-probe.contract.test.js
 node --test internal/web/modules.contract.test.mjs
+node --test internal/web/recipe_admin.contract.test.mjs internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/privacy.contract.test.mjs internal/web/endpoint.contract.test.mjs
 python scripts/deploy.contract.test.py
+python scripts/deploy-public.contract.test.py
 ```
 
 Go 版本以 `go.mod` 为准。检查脚本需要 Bash、Python 3、Node.js 和 PowerShell 7（`pwsh`）；它们只用于验证，运行服务不需要。Windows 无 CGO 时不要用 `-race`，竞态检测与容器冒烟由 Linux CI 执行。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
 
 ### 公网 IP HTTPS
 
-Linux 公网部署支持 `./deploy.sh --public --ip <公网IP>`，确认目标后只发布 Nginx 边缘的 80/443，后端保持私网访问。签发与链/SAN/私钥/有效期校验成功前只提供 ACME 挑战；证书续期独立于网关暂停状态。命令、恢复与验收边界见 [公网 IP HTTPS](docs/13-公网IP-HTTPS.md)。真实公网签发和多日运行尚待对应主机上的验收记录。
+Linux 公网部署支持 `sudo ./deploy.sh --public`，交互确认本机公网 IP；自动化部署须同时提供 `--ip <公网IP> --confirm-ip <相同公网IP>`。仅 Nginx 边缘发布 80/443，后端保持私网访问。签发与链/SAN/私钥/有效期校验成功前只提供 ACME 挑战；证书续期独立于网关暂停状态。命令、恢复与验收边界见 [公网 IP HTTPS](docs/13-公网IP-HTTPS.md)。真实 Nginx／本地 CA 测试不能证明公网证书已签发；真实公网验收与最终目标提交的长流、48 小时持续运行记录仍需分别完成，见 [实际时长验收](docs/15-实际时长验收.md)。
 
 ### 离线备份检查与恢复
 

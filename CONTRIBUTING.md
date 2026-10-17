@@ -2,7 +2,7 @@
 
 欢迎 issue 与 PR。这是个人维护的项目，回应速度取决于我的空闲时间。
 
-改 v1.0.0 之前先读需求基线 `docs/01-需求与设计.md` 与当前交接记录 `docs/10-维护与交接.md`；历史阶段记录见 docs/04–09。README 描述今天已经能部署的行为（HTTP `IP:port` 一行安装）。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`。
+修改前先读[需求基线](docs/01-需求与设计.md)与当前[交接记录](docs/10-维护与交接.md)；历史阶段记录见 docs/04–09。默认安装为 HTTP `IP:port`，Linux 另有独立[公网 IP HTTPS 入口](docs/13-公网IP-HTTPS.md)；实现入口不代表真实公网签发已验收。生产探活经 `probe.Executor` 与 `SyntheticCoordinator`；RunState 走 `runstate.Controller`。
 
 ## 提 issue
 
@@ -13,7 +13,7 @@
 - 复现步骤，以及你**期望**发生什么
 
 **不要在 issue 里贴**：真实的上游站地址、任何 key、未脱敏的样本内容。
-`/admin/api/samples` 的输出里含完整对话原文。
+样本详情经再次验证口令后可返回完整对话原文，不要粘贴其输出。
 
 安全问题请走 [SECURITY.md](SECURITY.md)，不要开公开 issue。
 
@@ -23,7 +23,7 @@
 
 ```bash
 go build ./...
-go test ./...
+go test -timeout=20m -count=1 ./...
 go vet ./...
 gofmt -l .          # 应该没有输出
 ```
@@ -43,19 +43,24 @@ node internal/web/bindings.check.js     # 前端绑定（查 x-model 写向不�
 node internal/web/app.contract.test.js  # 前端契约
 node internal/web/configadmin.contract.test.js
 node internal/web/manual-probe.contract.test.js
-node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/recipe_admin.contract.test.mjs
+node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/recipe_admin.contract.test.mjs internal/web/privacy.contract.test.mjs internal/web/endpoint.contract.test.mjs
 node --test internal/web/modules.contract.test.mjs  # 前端业务模块契约
 python scripts/deploy.contract.test.py  # 安装脚本行为（假 Docker，临时目录）
+python scripts/deploy-public.contract.test.py # 公网安装器离线行为，不申请公网证书
 bash scripts/check-p0.sh                # 探活离线门禁
 bash scripts/check-p5.sh                # 发布与私有文件门禁
 sh scripts/check-entrypoint.sh          # entrypoint 静态不变量
 sh scripts/check-deploy.sh              # 部署清单静态不变量
 ```
 
-部署行为测试需要 Bash、Python 3 与 PowerShell 7（`pwsh`）；Linux 与 Windows CI 都会运行。Windows 未启用 CGO 时用 `go test -count=1 ./...`，将 `-race` 留给 Linux CI。
+部署行为测试需要 Bash、Python 3 与 PowerShell 7（`pwsh`）；Linux 与 Windows CI 都会运行。Windows 未启用 CGO 时用 `go test -timeout=20m -count=1 ./...`，将 `-race` 留给 Linux CI。
 
 改动涉及容器/部署时，`scripts/smoke-m7.ps1` 会在 CI 的 `container` job 里跑。
 它需要 Docker 引擎，本地没有也没关系——推上来看 CI 结果。
+
+`public-edge` CI 使用真实 Nginx 与本地 CA 验证 TLS、原字节流、续期故障和过期关门，不向公共 CA 申请证书。真实公网签发、最终目标提交的长流及 48 小时持续运行，须按[验收说明](docs/15-实际时长验收.md)另留记录；短时门禁、开发版本或本地 CA 结果不能替代它们。
+
+管理 API 测试须由调用方固定 `expected_revision`，不要在共享 HTTP helper 中自动读取最新版本。Settings 的部分更新只提交当前字段，RunState 使用独立版本；旧版本应 409，缺少有效版本应 400，已提交但激活／drain 待完成应保留 503 的 `persisted=true` 元数据。前端回归应覆盖草稿保留、显式重载、登出清理和迟到响应隔离；Endpoint 表单还要覆盖其受限字段与提交后的激活失败。
 
 ## 这个项目的一些约定
 
