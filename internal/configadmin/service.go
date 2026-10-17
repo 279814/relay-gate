@@ -15,19 +15,19 @@ type Store interface {
 	GetUpstream(id int64) (*model.Upstream, error)
 	CreateUpstream(u *model.Upstream) error
 	UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) error
-	DeleteUpstream(id int64) error
+	DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error
 
 	ListModelNamesPage(ctx context.Context, filter model.ModelNameFilter) (model.Page[*model.ModelName], error)
 	GetModelName(id int64) (*model.ModelName, error)
 	CreateModelName(m *model.ModelName) error
 	UpdateModelNameWithRevision(ctx context.Context, value *model.ModelName, expectedRevision int64) error
-	DeleteModelName(id int64) error
+	DeleteModelNameWithRevision(ctx context.Context, id, expectedRevision int64) error
 
 	ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error)
 	GetRoute(id int64) (*model.Route, error)
 	CreateRoute(r *model.Route) error
 	UpdateRouteWithRevision(ctx context.Context, value *model.Route, expectedRevision int64) error
-	DeleteRoute(id int64) error
+	DeleteRouteWithRevision(ctx context.Context, id, expectedRevision int64) error
 }
 
 // Publisher 在写提交后通知热配置刷新（可为 nil）。
@@ -83,8 +83,8 @@ func (s *Service) UpdateUpstream(ctx context.Context, id, expectedRevision int64
 	return in, nil
 }
 
-func (s *Service) DeleteUpstream(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteUpstream(id); err != nil {
+func (s *Service) DeleteUpstream(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteUpstreamWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()
@@ -122,8 +122,8 @@ func (s *Service) UpdateModelName(ctx context.Context, id, expectedRevision int6
 	return in, nil
 }
 
-func (s *Service) DeleteModelName(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteModelName(id); err != nil {
+func (s *Service) DeleteModelName(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteModelNameWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()
@@ -161,8 +161,8 @@ func (s *Service) UpdateRoute(ctx context.Context, id, expectedRevision int64, i
 	return in, nil
 }
 
-func (s *Service) DeleteRoute(_ context.Context, id, _ int64) error {
-	if err := s.store.DeleteRoute(id); err != nil {
+func (s *Service) DeleteRoute(ctx context.Context, id, expectedRevision int64) error {
+	if err := s.store.DeleteRouteWithRevision(ctx, id, expectedRevision); err != nil {
 		return err
 	}
 	s.publish()

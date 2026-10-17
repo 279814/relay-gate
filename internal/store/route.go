@@ -273,8 +273,21 @@ func validateRouteEndpointCompleteness(query interface {
 // — after id reuse — make a new Route send the previous Route's published body.
 // Versions stay (immutable); archive + clear route_id so the resolver ignores
 // them. Executions keep history but drop the route pin (also RESTRICT).
-func (s *Store) DeleteRoute(id int64) (err error) {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteRoute(id int64) error {
+	return s.deleteRoute(context.Background(), id, 0)
+}
+
+// DeleteRouteWithRevision rejects a stale administrator view in the same
+// transaction as detaching references and deleting the row.
+func (s *Store) DeleteRouteWithRevision(ctx context.Context, id, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return model.WrapValidation("expected_revision 必须为正数")
+	}
+	return s.deleteRoute(ctx, id, expectedRevision)
+}
+
+func (s *Store) deleteRoute(ctx context.Context, id, expectedRevision int64) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -284,13 +297,16 @@ func (s *Store) DeleteRoute(id int64) (err error) {
 		}
 	}()
 
-	var upstreamID int64
-	err = tx.QueryRow(`SELECT upstream_id FROM route WHERE id=?`, id).Scan(&upstreamID)
+	var upstreamID, revision int64
+	err = tx.QueryRowContext(ctx, `SELECT upstream_id,revision FROM route WHERE id=?`, id).Scan(&upstreamID, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
+	}
+	if expectedRevision > 0 && revision != expectedRevision {
+		return ErrRevisionConflict
 	}
 
 	// CHECK requires exactly one of upstream_id/route_id. Re-home archived rows
