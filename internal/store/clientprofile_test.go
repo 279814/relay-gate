@@ -298,7 +298,7 @@ func profileTestExecution(t *testing.T, store *Store, profile *model.ClientProbe
 	}
 	endpoint := page.Items[0]
 	order := nextTestObservationOrder(t, store)
-	return model.ProbeExecution{
+	execution := model.ProbeExecution{
 		ID: id, Trigger: model.TriggerManual, UpstreamID: upstream.ID,
 		UpstreamNetworkRevision:    upstream.NetworkRevision,
 		UpstreamCredentialRevision: upstream.CredentialRevision,
@@ -317,6 +317,8 @@ func profileTestExecution(t *testing.T, store *Store, profile *model.ClientProbe
 		Reachable:              true, Final: true, Success: true,
 		ObservationOrder: order, SentAtMS: order, DoneAtMS: order + 1,
 	}
+	completeExplicitTestEvidence(t, store, &execution)
+	return execution
 }
 
 func nextTestObservationOrder(t *testing.T, store *Store) int64 {
