@@ -14,21 +14,25 @@ import (
 	"github.com/279814/relay-gate/internal/sample"
 )
 
-// capabilityTraffic reuses the bounded observer queue and committed observation
-// path for count_tokens and structured model_not_found. It retains summaries.
+// capabilityTraffic parses original upstream bytes into bounded summaries and
+// commits real observations through the same expectations as synthetic probes.
 type capabilityTraffic struct {
-	recipe                                                  ResolvedRecipe
-	req                                                     ExecutionRequest
-	decoder                                                 Decoder
-	classifier                                              *ResponseClassifier
-	decodeErr                                               error
-	encoding                                                string
-	responseBytes                                           int64
-	firstByteAt, firstEventAt, firstSemanticAt, lastInputAt time.Time
-	decodeWork                                              time.Duration
-	shape                                                   model.ClientRequestShape
-	shapeReason                                             model.RequestShapeUnavailableReason
-	requestBytes                                            int64
+	recipe        ResolvedRecipe
+	req           ExecutionRequest
+	decoder       Decoder
+	classifier    *ResponseClassifier
+	decodeErr     error
+	encoding      string
+	responseBytes int64
+	decodeWork    time.Duration
+	shape         model.ClientRequestShape
+	shapeReason   model.RequestShapeUnavailableReason
+	requestBytes  int64
+
+	firstByteAt     time.Time
+	firstEventAt    time.Time
+	firstSemanticAt time.Time
+	lastInputAt     time.Time
 }
 
 func prepareCapabilityTraffic(ctx context.Context, snap *livecfg.ProbeSnapshot, target health.AttemptTarget, order int64) *capabilityTraffic {

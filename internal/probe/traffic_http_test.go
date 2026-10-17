@@ -346,3 +346,102 @@ func TestTrafficHTTP_TruncatedTransportAfterSemanticIsPartial(t *testing.T) {
 		})
 	}
 }
+
+func TestTrafficHTTP_SamplesDisabledStillObserveAndLearn(t *testing.T) {
+	h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}]}`)
+	})
+	settings, err := h.store.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.SampleEnabled = false
+	if err := h.store.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	h.request(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	release, err := h.handler.Quiesce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := h.manager.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	execution := h.execution(t)
+	profiles, err := h.store.ListClientProfilesPage(ctx, model.ClientProfileFilter{UpstreamID: h.up.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !execution.Success || !execution.RealRequestShapeLearnable || len(profiles.Items) != 1 {
+		t.Fatal("sample_enabled=false disabled independent health or learning")
+	}
+}
+
+func TestTrafficHTTP_DiscardedAndFinalAttemptsEachCommitExecution(t *testing.T) {
+	h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error"}}`)
+	})
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"final"}]}`)
+	}))
+	t.Cleanup(remote.Close)
+	up := &model.Upstream{Name: "second", BaseURL: remote.URL, APIKey: "sk-second-upstream-key", AuthStyle: model.AuthAuto, Enabled: true, ProbeMode: model.ProbeModeActive}
+	if err := h.store.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	route := &model.Route{ModelNameID: h.route.ModelNameID, UpstreamID: up.ID, Priority: 2, Weight: 1, Enabled: true}
+	if err := h.store.CreateRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := h.store.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.RetryPolicy = model.RetryPolicyBalanced
+	if err := h.store.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.manager.cfg.(interface{ Refresh() error }).Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if body := h.request(t); !bytes.Contains(body, []byte("final")) {
+		t.Fatalf("retry did not reach final route: %s", body)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	release, err := h.handler.Quiesce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := h.manager.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	page, err := h.store.ListProbeExecutions(ctx, model.ProbeExecutionFilter{Trigger: model.TriggerRealTraffic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("attempt executions=%d", len(page.Items))
+	}
+	seen := make(map[int64]*model.ProbeExecution)
+	for _, execution := range page.Items {
+		if execution.ObservationOrder <= 0 || execution.CapabilityDisposition != model.ApplyCurrent || execution.ReachabilityDisposition != model.ApplyCurrent || execution.RecipeBindingUse != model.BindingRealTrafficContext || execution.SentAtMS == 0 || execution.GotConnAtMS == 0 {
+			t.Fatalf("attempt lacks current dual evidence/trace: %+v", execution)
+		}
+		seen[execution.RouteID] = execution
+	}
+	if seen[h.route.ID] == nil || seen[route.ID] == nil || seen[h.route.ID].Success || !seen[route.ID].Success || seen[h.route.ID].ObservationOrder >= seen[route.ID].ObservationOrder {
+		t.Fatal("discarded and final attempt identities/order were conflated")
+	}
+}

@@ -67,15 +67,17 @@ func NewTrafficObserverManager(
 		log = slog.Default()
 	}
 	m := &TrafficObserverManager{
-		cfg:       cfg,
-		seq:       seq,
-		record:    record,
-		log:       log,
-		leases:    make(chan struct{}, fullObserverLeases),
-		queue:     make(chan trafficWrite, persistQueueCap),
-		stop:      make(chan struct{}),
-		startedAt: time.Now(),
-		active:    make(map[*trafficObserver]struct{}), workersIdle: make(chan struct{}), runDone: make(chan struct{}),
+		cfg:         cfg,
+		seq:         seq,
+		record:      record,
+		log:         log,
+		leases:      make(chan struct{}, fullObserverLeases),
+		queue:       make(chan trafficWrite, persistQueueCap),
+		stop:        make(chan struct{}),
+		startedAt:   time.Now(),
+		active:      make(map[*trafficObserver]struct{}),
+		workersIdle: make(chan struct{}),
+		runDone:     make(chan struct{}),
 	}
 	close(m.workersIdle)
 	for i := 0; i < fullObserverLeases; i++ {
@@ -500,7 +502,7 @@ func (o *trafficObserver) worker() {
 	defer func() {
 		if recover() != nil {
 			o.mu.Lock()
-			o.incomplete = "panic"
+			o.incomplete = model.ObserverPanic
 			o.mu.Unlock()
 			o.capability.decodeErr = errTrafficObserverPanic
 		}

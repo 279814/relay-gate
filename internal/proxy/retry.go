@@ -225,7 +225,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	for {
 		plan.tried[cand.Route.ID] = true
 
-		la, status := h.dispatch(w, r, proto, pre, cand, time.Until(plan.deadline))
+		la, status := h.dispatch(w, r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline))
 		observing = la
 		if status == dispatchFatal {
 			cand.Release()
@@ -455,7 +455,7 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // dispatchSent：已发出上游请求，la 非空。
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
-	budget time.Duration) (*liveAttempt, dispatchStatus) {
+	reqID string, attempt int, budget time.Duration) (*liveAttempt, dispatchStatus) {
 
 	settings := pre.settings
 
@@ -483,6 +483,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	instr := health.NoopInstrumentation()
 	if h.observers != nil {
 		instr = prepareInstrumentation(h.observers, r.Context(), health.AttemptTarget{
+			ReqID: reqID, Attempt: attempt,
 			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, HealthGeneration: cand.HealthGeneration,
 			Config: health.AttemptConfigFacts{
 				Generation:                 pre.snapshot.Generation,

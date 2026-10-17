@@ -40,3 +40,28 @@ func TestRetry_KeepAndPanicAdviceNeverReplaysStructured200(t *testing.T) {
 		})
 	}
 }
+
+type targetRecordingFactory struct{ targets []health.AttemptTarget }
+
+func (factory *targetRecordingFactory) PrepareAttempt(_ context.Context, target health.AttemptTarget, _ health.AttemptRequestView) health.AttemptInstrumentation {
+	factory.targets = append(factory.targets, target)
+	return health.NoopInstrumentation()
+}
+
+func TestRetry_EveryAttemptHasSharedRequestIdentityAndOrdinal(t *testing.T) {
+	hs := newMultiHarness(t, respondStatus(503, `{"error":{"type":"server_error"}}`), respondOK(`{"id":"final"}`))
+	hs.cfg.settings.RetryPolicy = model.RetryPolicyBalanced
+	factory := &targetRecordingFactory{}
+	hs.h.WithObservers(factory)
+	response := hs.serve(hs.req())
+	if response.Code != 200 {
+		t.Fatalf("final response=%d", response.Code)
+	}
+	if len(factory.targets) != 2 {
+		t.Fatalf("instrumented attempts=%d", len(factory.targets))
+	}
+	first, second := factory.targets[0], factory.targets[1]
+	if first.ReqID == "" || first.ReqID != second.ReqID || first.Attempt != 1 || second.Attempt != 2 || first.RouteID == second.RouteID {
+		t.Fatalf("attempt metadata not fixed independently: first=%+v second=%+v", first, second)
+	}
+}
