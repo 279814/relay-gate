@@ -291,14 +291,9 @@ func (s *Store) deleteRoute(ctx context.Context, id, expectedRevision int64) (er
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	var upstreamID, revision int64
-	err = tx.QueryRowContext(ctx, `SELECT upstream_id,revision FROM route WHERE id=?`, id).Scan(&upstreamID, &revision)
+	defer tx.Rollback()
+	var revision int64
+	err = tx.QueryRowContext(ctx, `SELECT revision FROM route WHERE id=?`, id).Scan(&revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -308,37 +303,16 @@ func (s *Store) deleteRoute(ctx context.Context, id, expectedRevision int64) (er
 	if expectedRevision > 0 && revision != expectedRevision {
 		return ErrRevisionConflict
 	}
-
-	// CHECK requires exactly one of upstream_id/route_id. Re-home archived rows
-	// onto the Route's Upstream so route_id can be cleared; archived status
-	// keeps them out of publishedBinding for both scopes.
-	if err = detachProbeRecipesRehomeTx(tx, upstreamID, `route_id=?`, id); err != nil {
+	if err = requireEntityDeleteUnreferenced(ctx, tx, "route", id); err != nil {
 		return err
 	}
-
-	if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM probe_recipe WHERE route_id=?`, id); err != nil {
 		return err
 	}
-
-	// §9.2: route-scoped capability rows pin route_id with ON DELETE RESTRICT.
-	if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_route_id=?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM transform_binding WHERE route_id=?`, id); err != nil {
 		return err
 	}
-
-	// §15: transform bindings are keyed by numeric route id. Drop them in this
-	// same transaction so a later row that reuses the id cannot inherit a
-	// published transform, and a failed delete rolls the detach back.
-	if _, err = tx.Exec(`DELETE FROM transform_binding WHERE route_id=?`, id); err != nil {
-		return err
-	}
-
-	// probe_cost_daily has no FK; ListProbeCostDaily filters by bare route_id.
-	// Drop rollups in this transaction so a reused id cannot inherit totals.
-	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE route_id=?`, id); err != nil {
-		return err
-	}
-
-	res, err := tx.Exec(`DELETE FROM route WHERE id=?`, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM route WHERE id=?`, id)
 	if err != nil {
 		return err
 	}

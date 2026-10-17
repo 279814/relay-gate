@@ -62,6 +62,14 @@ func TestConfigDeleteRevisionConflictKeepsRowsAndChildren(t *testing.T) {
 			if err := remove(ctx, revision+1); !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled deletion ignored context: %v", err)
 			}
+			if kind != "route" {
+				if err := remove(context.Background(), revision+1); !errors.Is(err, ErrDependencyConflict) {
+					t.Fatalf("parent delete must retain external route: %v", err)
+				}
+				if err := st.DeleteRouteWithRevision(context.Background(), route.ID, route.Revision); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := remove(context.Background(), revision+1); err != nil {
 				t.Fatal(err)
 			}

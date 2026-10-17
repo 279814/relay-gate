@@ -762,9 +762,8 @@ func TestInvalidate_DeleteRouteClearsDeadRouteHealth(t *testing.T) {
 	}
 }
 
-// Delete Upstream cascades child Routes in SQL; snapshot those ids before
-// DELETE, then Forget after success (RoutesOfUpstream would be empty post-CASCADE).
-func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
+// A referenced Upstream delete is refused without changing child health.
+func TestInvalidate_DeleteUpstreamPreservesChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
@@ -810,28 +809,29 @@ func TestInvalidate_DeleteUpstreamClearsChildRouteHealth(t *testing.T) {
 		t.Fatalf("setup state=%s want dead", tr.State(rtID))
 	}
 
+	beforeRoutes, beforeUps, beforeNames := inner.counts()
+	beforeCaps, beforeUpCaps := len(caps.cleared), len(caps.upstreamCleared)
 	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upID)+"?expected_revision=1", "", true)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("删除 upstream 失败 %d：%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced parent deletion: %d", rec.Code)
 	}
-	if got := tr.State(rtID); got != model.StateUnknown {
-		t.Fatalf("delete upstream 后 child RouteHealth=%s want unknown", got)
+	if tr.State(rtID) != model.StateDead {
+		t.Fatal("refused deletion changed child health")
 	}
-	if !caps.has(rtID) {
-		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	if len(caps.cleared) != beforeCaps || len(caps.upstreamCleared) != beforeUpCaps {
+		t.Fatal("refused deletion cleared capability memory")
 	}
-	if !caps.hasUpstream(upID) {
-		t.Fatalf("upstream-scoped Capability 必须清除，upstreamCleared=%v", caps.upstreamCleared)
+	routes, ups, names := inner.counts()
+	if routes != beforeRoutes || ups != beforeUps || names != beforeNames {
+		t.Fatal("refused deletion scheduled synthetic work")
 	}
-	_, ups, _ := inner.counts()
-	if ups < 1 {
-		t.Fatal("delete upstream 应调用 InvalidateUpstream")
+	if _, err := s.st.GetRoute(rtID); err != nil {
+		t.Fatal("refused deletion removed external Route")
 	}
 }
 
-// Delete ModelName cascades child Routes in SQL; snapshot those ids before
-// DELETE, then Forget after success (RoutesOfModelName would be empty post-CASCADE).
-func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
+// A referenced ModelName delete must preserve health and recovery admission.
+func TestInvalidate_DeleteModelNamePreservesChildRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	fs.s.FailThreshold = 1
@@ -878,22 +878,27 @@ func TestInvalidate_DeleteModelNameClearsChildRouteHealth(t *testing.T) {
 		t.Fatal("setup: acquire RecoveryGate")
 	}
 
+	beforeRoutes, beforeUps, beforeNames := inner.counts()
+	beforeCaps, beforeUpCaps := len(caps.cleared), len(caps.upstreamCleared)
 	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnID)+"?expected_revision=1", "", true)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("删除 model_name 失败 %d：%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced parent deletion: %d", rec.Code)
 	}
-	if got := tr.State(rtID); got != model.StateUnknown {
-		t.Fatalf("delete model_name 后 child RouteHealth=%s want unknown", got)
+	if tr.State(rtID) != model.StateDead {
+		t.Fatal("refused deletion changed child health")
 	}
-	if gate.InFlight(rtID) {
-		t.Fatal("delete model_name 后 RecoveryGate 槽必须释放")
+	if len(caps.cleared) != beforeCaps || len(caps.upstreamCleared) != beforeUpCaps {
+		t.Fatal("refused deletion cleared capability memory")
 	}
-	if !caps.has(rtID) {
-		t.Fatalf("child Capability 必须清除，cleared=%v", caps.cleared)
+	routes, ups, names := inner.counts()
+	if routes != beforeRoutes || ups != beforeUps || names != beforeNames {
+		t.Fatal("refused deletion scheduled synthetic work")
 	}
-	_, _, mns := inner.counts()
-	if mns < 1 {
-		t.Fatal("delete model_name 应调用 InvalidateModelName")
+	if _, err := s.st.GetRoute(rtID); err != nil {
+		t.Fatal("refused deletion removed external Route")
+	}
+	if !gate.InFlight(rtID) {
+		t.Fatal("refused deletion released recovery gate")
 	}
 }
 

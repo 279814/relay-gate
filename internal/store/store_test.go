@@ -253,8 +253,8 @@ func TestRouteForeignKeyEnforced(t *testing.T) {
 	}
 }
 
-// 删除 ModelName 应级联删掉它的 Route，否则会留下悬挂绑定。
-func TestCascadeDelete(t *testing.T) {
+// 删除主体必须先显式处理独立 Route，不能把引用当作隐式删除授权。
+func TestModelNameDeleteRequiresExplicitRouteCleanup(t *testing.T) {
 	st := testStore(t)
 	u := mkUpstream(t, st, "sta")
 	m := mkModelName(t, st, "m1", model.ProtoAnthropic)
@@ -263,11 +263,20 @@ func TestCascadeDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := st.DeleteModelName(m.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("external Route deletion must conflict: %v", err)
+	}
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("refused parent deletion removed Route")
+	}
+	if err := st.DeleteRoute(r.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.DeleteModelName(m.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetRoute(r.ID); !errors.Is(err, ErrNotFound) {
-		t.Errorf("ModelName 删除后其 Route 应级联消失，得到 %v", err)
+	if _, err := st.GetModelName(m.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatal("empty parent deletion failed")
 	}
 }
 
@@ -503,10 +512,8 @@ func TestForeignKeysOnEveryConn(t *testing.T) {
 	}
 }
 
-// ON DELETE CASCADE 必须真的生效：删 ModelName 要连带清掉它的 Route。
-// 这是上一条的另一面 —— 外键失效时级联也失效，而级联失效的症状是
-// 「删了模型，选路里还留着一堆悬挂 Route」。
-func TestDeleteModelNameCascadesRoutes(t *testing.T) {
+// 业务删除不借 CASCADE 清除外部 Route，显式清理后才允许删除空主体。
+func TestModelNameDeleteDoesNotCascadeExternalRoutes(t *testing.T) {
 	st := testStore(t)
 	up := mkUpstream(t, st, "s1")
 	mn := mkModelName(t, st, "m1", model.ProtoAnthropic)
@@ -517,23 +524,23 @@ func TestDeleteModelNameCascadesRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := st.DeleteModelName(mn.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("external Route deletion must conflict: %v", err)
+	}
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("refused parent deletion removed Route")
+	}
+	if err := st.DeleteRoute(r.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.DeleteModelName(mn.ID); err != nil {
 		t.Fatal(err)
 	}
-	rs, err := st.ListRoutes(0) // 0 = 不筛 ModelName，列全部
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, got := range rs {
-		if got.ID == r.ID {
-			t.Fatal("删除 ModelName 后它的 Route 仍在（ON DELETE CASCADE 未生效）")
-		}
+	if _, err := st.GetModelName(mn.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatal("empty parent deletion failed")
 	}
 }
 
-// DeleteModelName archives child-route recipes in the same transaction as the
-// DELETE. A RESTRICT pin that blocks CASCADE must roll the archive back so a
-// still-living ModelName does not lose its published route recipe.
 func TestDeleteModelName_RollbackKeepsChildRouteRecipes(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

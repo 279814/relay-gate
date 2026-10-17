@@ -328,10 +328,9 @@ func TestDeleteRoute_DetachesTransformBindingsInSameTx(t *testing.T) {
 	}
 }
 
-// DeleteUpstream must drop child-route transform_binding rows in the same
-// transaction (CASCADE skips DeleteRoute). A sibling upstream's route bindings
-// stay; post-commit binds for a reused id must survive.
-func TestDeleteUpstream_DetachesChildRouteTransformBindingsInSameTx(t *testing.T) {
+// A parent delete cannot implicitly discard independent Routes or bindings.
+// Explicit history-free Route cleanup makes the empty parent removable.
+func TestDeleteUpstream_RequiresRouteCleanupAndPreservesSiblingTransforms(t *testing.T) {
 	store := testStore(t)
 	targetUp := mkUpstream(t, store, "xform-up-detach-u")
 	siblingUp := mkUpstream(t, store, "xform-up-detach-u2")
@@ -347,9 +346,9 @@ func TestDeleteUpstream_DetachesChildRouteTransformBindingsInSameTx(t *testing.T
 		t.Fatal(err)
 	}
 
-	const endpointID int64 = 1
+	endpointID := endpointOf(t, store, targetUp.ID, model.EndpointMessages).ID
 	insertTransformBinding(t, store, target.ID, endpointID, 70)
-	insertTransformBinding(t, store, sibling.ID, endpointID, 70)
+	insertTransformBinding(t, store, sibling.ID, endpointOf(t, store, siblingUp.ID, model.EndpointMessages).ID, 70)
 
 	if err := store.DeleteUpstream(0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing upstream error=%v want ErrNotFound", err)
@@ -358,6 +357,15 @@ func TestDeleteUpstream_DetachesChildRouteTransformBindingsInSameTx(t *testing.T
 		t.Fatalf("failed delete must keep bindings: got %d", got)
 	}
 
+	if err := store.DeleteUpstream(targetUp.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("parent must retain external Route: %v", err)
+	}
+	if countTransformBindingsByRoute(t, store, target.ID) != 1 {
+		t.Fatal("refused parent delete detached Transform")
+	}
+	if err := store.DeleteRoute(target.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.DeleteUpstream(targetUp.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -374,10 +382,8 @@ func TestDeleteUpstream_DetachesChildRouteTransformBindingsInSameTx(t *testing.T
 	}
 }
 
-// DeleteModelName must drop child-route transform_binding rows in the same
-// transaction. A failed delete rolls the detach back; a sibling model_name's
-// route bindings stay.
-func TestDeleteModelName_DetachesChildRouteTransformBindingsInSameTx(t *testing.T) {
+// ModelName deletion preserves external Route bindings until explicit cleanup.
+func TestDeleteModelName_RequiresRouteCleanupAndPreservesSiblingTransforms(t *testing.T) {
 	store := testStore(t)
 	up := mkUpstream(t, store, "xform-mn-detach-u")
 	upSibling := mkUpstream(t, store, "xform-mn-detach-u2")
@@ -413,6 +419,15 @@ func TestDeleteModelName_DetachesChildRouteTransformBindingsInSameTx(t *testing.
 	}
 
 	if _, err := store.db.Exec(`DELETE FROM calibration_run WHERE id='xform-mn-cal'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteModelName(targetMN.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("parent must retain external Route: %v", err)
+	}
+	if countTransformBindingsByRoute(t, store, target.ID) != 1 {
+		t.Fatal("refused parent delete detached Transform")
+	}
+	if err := store.DeleteRoute(target.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DeleteModelName(targetMN.ID); err != nil {

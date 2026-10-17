@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -46,36 +47,35 @@ func routeCapabilityCount(t *testing.T, st *Store, routeID int64) int {
 	return n
 }
 
-// §9.2: Route delete clears Capability. The route-scoped row is ON DELETE
-// RESTRICT, so leaving it makes every probed Route undeletable.
-func TestDeleteRoute_ClearsRouteScopedCapability(t *testing.T) {
+// Capability evidence is history; deletion must preserve its Route owner.
+func TestDeleteRoute_PreservesRouteScopedCapability(t *testing.T) {
 	st := testStore(t)
 	_, r := routeWithCapability(t, st, "del-rt-cap")
-	if err := st.DeleteRoute(r.ID); err != nil {
-		t.Fatalf("DeleteRoute with route-scoped capability: %v", err)
+	if err := st.DeleteRoute(r.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("DeleteRoute must reject capability history: %v", err)
 	}
-	if _, err := st.GetRoute(r.ID); err == nil {
-		t.Fatal("route still exists after delete")
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("rejected delete removed route")
 	}
-	if n := routeCapabilityCount(t, st, r.ID); n != 0 {
-		t.Fatalf("route-scoped capability rows left behind: %d", n)
+	if n := routeCapabilityCount(t, st, r.ID); n != 1 {
+		t.Fatalf("capability history changed: %d", n)
 	}
 }
 
-// §9.2: ModelName delete CASCADEs child Routes and clears their Capability.
-func TestDeleteModelName_ClearsChildRouteScopedCapability(t *testing.T) {
+// A ModelName cannot delete its independently owned child Route or evidence.
+func TestDeleteModelName_PreservesChildRouteScopedCapability(t *testing.T) {
 	st := testStore(t)
 	mn, r := routeWithCapability(t, st, "del-mn-cap")
-	if err := st.DeleteModelName(mn.ID); err != nil {
-		t.Fatalf("DeleteModelName with child route capability: %v", err)
+	if err := st.DeleteModelName(mn.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("DeleteModelName must reject child reference: %v", err)
 	}
-	if _, err := st.GetModelName(mn.ID); err == nil {
-		t.Fatal("model name still exists after delete")
+	if _, err := st.GetModelName(mn.ID); err != nil {
+		t.Fatal("rejected delete removed model")
 	}
-	if _, err := st.GetRoute(r.ID); err == nil {
-		t.Fatal("child route still exists after model name delete")
+	if _, err := st.GetRoute(r.ID); err != nil {
+		t.Fatal("rejected delete removed route")
 	}
-	if n := routeCapabilityCount(t, st, r.ID); n != 0 {
-		t.Fatalf("child route-scoped capability rows left behind: %d", n)
+	if n := routeCapabilityCount(t, st, r.ID); n != 1 {
+		t.Fatalf("child capability history changed: %d", n)
 	}
 }

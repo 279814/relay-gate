@@ -86,11 +86,8 @@ func TestRequestLogInsertAndList(t *testing.T) {
 	}
 }
 
-// upstream_name 冗余存一份，站被删掉后日志仍要能说清当时走的是哪个站。
-//
-// 只存 upstream_id 关联查的话，删站等于把历史抹平 —— 而「我删掉的那个站
-// 当时表现如何」正是决定要不要重新加回来的依据。
-func TestRequestLogKeepsUpstreamNameAfterDelete(t *testing.T) {
+// 日志保留可读名称，硬删除同时不能让历史关联失去原始主体。
+func TestRequestLogKeepsUpstreamNameAfterRejectedDelete(t *testing.T) {
 	st := testStore(t)
 	up := mkUpstream(t, st, "doomed")
 
@@ -100,8 +97,8 @@ func TestRequestLogKeepsUpstreamNameAfterDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteUpstream(up.ID); err != nil {
-		t.Fatal(err)
+	if err := st.DeleteUpstream(up.ID); !errors.Is(err, ErrDependencyConflict) {
+		t.Fatalf("request log history must retain its upstream: %v", err)
 	}
 
 	got, err := st.ListRequestLogs(RequestLogFilter{ReqID: "req-x"})
@@ -109,7 +106,7 @@ func TestRequestLogKeepsUpstreamNameAfterDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 {
-		t.Fatalf("删站不该删掉日志（没有外键级联），得到 %d 行", len(got))
+		t.Fatalf("拒绝删除后历史日志必须完整保留，得到 %d 行", len(got))
 	}
 	if got[0].UpstreamName != "doomed" {
 		t.Errorf("站名应仍可读，得到 %q", got[0].UpstreamName)

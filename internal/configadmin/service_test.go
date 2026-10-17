@@ -68,10 +68,20 @@ func TestServiceDeletionHonorsClientRevisionBeforePublishing(t *testing.T) {
 			if _, err := st.GetRoute(route.ID); err != nil {
 				t.Fatalf("stale delete changed child route: %v", err)
 			}
+			wantCalls := 4
+			if kind != "route" {
+				if err := remove(revision); !errors.Is(err, store.ErrDependencyConflict) || pub.calls != 3 {
+					t.Fatalf("referenced parent changed or published: %v calls=%d", err, pub.calls)
+				}
+				if err := svc.DeleteRoute(ctx, route.ID, route.Revision); err != nil {
+					t.Fatal(err)
+				}
+				wantCalls++
+			}
 			if err := remove(revision); err != nil {
 				t.Fatal(err)
 			}
-			if pub.calls != 4 {
+			if pub.calls != wantCalls {
 				t.Fatalf("committed delete was not published once: %d", pub.calls)
 			}
 		})

@@ -206,13 +206,7 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 	return tx.Commit()
 }
 
-// DeleteModelName removes a ModelName and detaches probe recipes on its child
-// Routes. Routes CASCADE without going through DeleteRoute, and probe_recipe
-// / probe_execution pin route_id with ON DELETE RESTRICT — so a bare DELETE
-// either fails when recipes exist, or (if those pins were cleared some other
-// way) would leave published rows keyed by the numeric route id for SQLite
-// reuse. Archive + re-home onto each Route's Upstream in the same transaction
-// as the delete; upstream-scoped recipes are untouched.
+// DeleteModelName removes only a ModelName with no external Routes or history.
 func (s *Store) DeleteModelName(id int64) error {
 	return s.deleteModelName(context.Background(), id, 0)
 }
@@ -231,12 +225,7 @@ func (s *Store) deleteModelName(ctx context.Context, id, expectedRevision int64)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
+	defer tx.Rollback()
 	var revision int64
 	err = tx.QueryRowContext(ctx, `SELECT revision FROM model_name WHERE id=?`, id).Scan(&revision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -248,61 +237,10 @@ func (s *Store) deleteModelName(ctx context.Context, id, expectedRevision int64)
 	if expectedRevision > 0 && revision != expectedRevision {
 		return ErrRevisionConflict
 	}
-
-	rows, err := tx.Query(`SELECT id, upstream_id FROM route WHERE model_name_id=?`, id)
-	if err != nil {
+	if err = requireEntityDeleteUnreferenced(ctx, tx, "model_name", id); err != nil {
 		return err
 	}
-	type childRoute struct {
-		id         int64
-		upstreamID int64
-	}
-	children := make([]childRoute, 0, 4)
-	for rows.Next() {
-		var child childRoute
-		if err = rows.Scan(&child.id, &child.upstreamID); err != nil {
-			rows.Close()
-			return err
-		}
-		children = append(children, child)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-
-	for _, child := range children {
-		// Same helper as DeleteRoute: archive and re-home onto the Route's
-		// Upstream so CHECK still holds while route_id is cleared.
-		if err = detachProbeRecipesRehomeTx(tx, child.upstreamID, `route_id=?`, child.id); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(`UPDATE probe_execution SET route_id=NULL WHERE route_id=?`, child.id); err != nil {
-			return err
-		}
-		// §9.2: route-scoped capability rows pin route_id with ON DELETE RESTRICT.
-		if _, err = tx.Exec(`DELETE FROM endpoint_capability WHERE scope_route_id=?`, child.id); err != nil {
-			return err
-		}
-	}
-
-	// §15: child Routes CASCADE without DeleteRoute, so drop their transform
-	// bindings here. Same transaction as the ModelName row — rollback keeps
-	// bindings, and a reused route id cannot inherit a published transform.
-	if _, err = tx.Exec(`DELETE FROM transform_binding WHERE route_id IN (
-		SELECT id FROM route WHERE model_name_id=?)`, id); err != nil {
-		return err
-	}
-
-	// probe_cost_daily has no FK; child Routes CASCADE without DeleteRoute.
-	// Drop their rollups here so a reused route id cannot inherit totals.
-	if _, err = tx.Exec(`DELETE FROM probe_cost_daily WHERE route_id IN (
-		SELECT id FROM route WHERE model_name_id=?)`, id); err != nil {
-		return err
-	}
-
-	res, err := tx.Exec(`DELETE FROM model_name WHERE id=?`, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM model_name WHERE id=?`, id)
 	if err != nil {
 		return err
 	}

@@ -149,6 +149,9 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 	cur.ID = id
 	updated, err := s.configAdmin.UpdateUpstream(r.Context(), id, in.ExpectedRevision, *cur)
 	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			err = model.WrapValidation("%s", sample.RedactDiagnosticText(err.Error(), []string{before.APIKey, cur.APIKey}))
+		}
 		s.writeErr(w, err)
 		return
 	}

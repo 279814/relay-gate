@@ -135,7 +135,7 @@ func assertPublished(t *testing.T, pub *recordingPublisher, beforeInv, beforeRef
 
 // After a successful delete, the next select/preamble snapshot must omit the
 // deleted row without waiting out livecfg's TTL. Sibling routes stay selectable;
-// cascaded children of a deleted parent must also be gone.
+// independent child Routes are removed explicitly before deleting a parent.
 func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 	_, h, src, pub := newLivecfgServer(t)
 
@@ -187,7 +187,11 @@ func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 		t.Fatalf("Select keep-model got route %d want %d", id, rtKeep)
 	}
 
-	// ── delete upstream: cascaded child routes must vanish; unrelated stay ──
+	// Remove independently owned Routes explicitly before deleting an empty parent.
+	if rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtCascaded)+"?expected_revision=1", "", true); rec.Code != http.StatusNoContent {
+		t.Fatalf("explicit child delete: %d", rec.Code)
+	}
+	// ── delete now-empty upstream; unrelated routes stay ──
 	beforeInv, beforeRef = pub.counts()
 	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upDrop)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
@@ -212,7 +216,11 @@ func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 		t.Fatal("route on kept upstream must remain")
 	}
 
-	// ── delete model_name: its routes cascade out; other models stay ──
+	// Remove this ModelName's independently owned Route before parent deletion.
+	if rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtDropModel)+"?expected_revision=1", "", true); rec.Code != http.StatusNoContent {
+		t.Fatalf("explicit model route delete: %d", rec.Code)
+	}
+	// ── delete now-empty model_name; other models stay ──
 	beforeInv, beforeRef = pub.counts()
 	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnDrop)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
