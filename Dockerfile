@@ -7,7 +7,7 @@
 # ── 构建阶段 ─────────────────────────────────────────────
 # 版本与 go.mod 的 toolchain 对齐。写死大版本而不是 latest：
 # 一个能构建的镜像不该因为上游发了新版而在某天早上突然构建不出来。
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.9-alpine AS builder
 
 WORKDIR /src
 
@@ -84,7 +84,8 @@ ENV RELAY_UID=10001 \
 
 # 容器内监听 0.0.0.0：容器的网络命名空间是隔离的，绑 127.0.0.1 会让
 # 端口映射打不进来。**对外的收紧在 compose 的 ports 上做**
-# （127.0.0.1:18787:18787），§5.2f 要求的「只监听内网」由那一层保证。
+# （当前默认发布所有宿主机接口，支持 README 的 HTTP IP:port 安装）。
+# 需要限制来源时由宿主机防火墙或操作员自己的端口绑定配置处理。
 ENV RELAY_ADDR=0.0.0.0:18787 \
     RELAY_DB=/app/data/relay-gate.db
 

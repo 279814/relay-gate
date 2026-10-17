@@ -19,19 +19,8 @@ docker-compose.yml text eol=lf
 go.mod text eol=lf
 go.sum text eol=lf
 
-# M7 的部署清单。这几个同样必须是 LF，而 `* text=auto` 给不了这个保证 ——
-# Windows 上 core.autocrlf=true 时它们会被检出成 CRLF（实测过全新克隆）。
-#
-# compose.yaml 的 `command:` 里嵌着一段 shell（Caddy 启动前按邮箱是否为空
-# 条件删除 email 行）。YAML 块标量带 CRLF 的话，容器里的 sh 会收到行尾的
-# `\r`，sed 表达式当场报错 —— 而症状是 Caddy 起不来，看不出与行尾有关。
-#
-# .env.example 是**后果最重的一个**：用户 `cp .env.example .env` 之后，
-# compose 的 env_file 解析器不会去掉 `\r`，于是 ENCRYPTION_KEY 的值里
-# 多一个回车。它照样通过长度校验、服务照常起、上游 key 也能正常加解密 ——
-# 直到在 Linux 上用同一份 .env 重新部署：那时 `\r` 没了，密钥变了，
-# **所有已存的上游 key 全部解不开**。（RELAY_KEYS 走 TrimSpace 不受影响，
-# ENCRYPTION_KEY 与 ADMIN_PASSWORD 是裸 os.Getenv。）
+# 部署模板固定 LF，避免复制 .env.example 或跨平台执行时引入行尾差异。
+# 当前安装为 HTTP IP:port，Compose 使用 .env 做插值；主密钥读取会 TrimSpace。
 compose.yaml    text eol=lf
 .env.example    text eol=lf
 Caddyfile       text eol=lf
@@ -44,8 +33,7 @@ Caddyfile       text eol=lf
 *.css  text eol=lf
 *.js   text eol=lf
 
-# PowerShell 脚本只在 Windows 上跑，CRLF 是它的原生行尾。
-# 显式写出来，免得以后误以为是漏了一条 eol=lf。
+# PowerShell 脚本保留 CRLF；Windows 和 Linux 的 pwsh 都支持该行尾。
 *.ps1  text eol=crlf
 
 # SQLite 库与二进制产物不做行尾转换
