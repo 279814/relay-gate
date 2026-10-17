@@ -171,3 +171,48 @@ func TestConfigAdminHTTP_DeleteSQLFailureRestoresTransformAndEmptyDraft(t *testi
 		t.Error("failed SQL delete published configuration")
 	}
 }
+
+func TestConfigAdminHTTP_RealSnapshotReadFailureRecoversCommittedRevision(t *testing.T) {
+	s, h, source, _ := newLivecfgServer(t)
+	seedConfig(t, s, 1, 1)
+	warm, err := source.Snapshot()
+	if err != nil || len(warm.RoutesByModelName[1]) != 1 {
+		t.Fatal("cannot warm real routing snapshot")
+	}
+	// Break a read that belongs only to ConfigBundle publication. The Route
+	// mutation still commits successfully; no fake publisher reports success.
+	if _, err := s.st.DB().Exec(`ALTER TABLE client_probe_profile RENAME TO audit_unavailable_profiles`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.st.DB().Exec(`ALTER TABLE audit_unavailable_profiles RENAME TO client_probe_profile`) })
+	response := do(t, h, "PUT", "/admin/api/routes/1", `{"expected_revision":1,"priority":8}`, true)
+	var state struct {
+		Persisted bool   `json:"persisted"`
+		Revision  int64  `json:"revision"`
+		Code      string `json:"code"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusServiceUnavailable || !state.Persisted || state.Revision != 2 || state.Code != "config_activation_pending" {
+		t.Fatalf("real snapshot failure did not report committed revision: HTTP %d", response.Code)
+	}
+	if _, err := source.ProbeSnapshot(); err == nil {
+		t.Error("failed publication left a probe snapshot eligible for sending")
+	}
+	if _, err := s.st.DB().Exec(`ALTER TABLE audit_unavailable_profiles RENAME TO client_probe_profile`); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := source.Snapshot()
+	if err != nil || len(refreshed.RoutesByModelName[1]) != 1 || refreshed.RoutesByModelName[1][0].Priority != 8 {
+		t.Fatal("real snapshot did not recover the committed mutation after storage repair")
+	}
+	response = do(t, h, "PUT", "/admin/api/routes/1", `{"expected_revision":2,"priority":8}`, true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("retry with confirmed revision did not activate configuration: HTTP %d", response.Code)
+	}
+	row, err := s.st.GetRoute(1)
+	if err != nil || row.Revision != 2 {
+		t.Error("activation recovery repeated the already committed mutation")
+	}
+}
