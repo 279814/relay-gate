@@ -45,30 +45,6 @@ func (s *Server) writeRecipeErr(w http.ResponseWriter, err error) {
 	}
 }
 
-func recipePage(r *http.Request) (model.PageRequest, error) {
-	page := model.PageRequest{Cursor: r.URL.Query().Get("cursor")}
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 0 || limit > store.MaximumPageLimit {
-			return page, store.ErrInvalidCursor
-		}
-		page.Limit = limit
-	}
-	return page, nil
-}
-
-func recipeFilterID(r *http.Request, name string) (int64, error) {
-	raw := r.URL.Query().Get(name)
-	if raw == "" {
-		return 0, nil
-	}
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id < 1 {
-		return 0, model.WrapValidation("ID 筛选必须是正整数")
-	}
-	return id, nil
-}
-
 func versionOutput(v model.ProbeRecipeVersion) recipeVersionOut {
 	out := recipeVersionOut{ID: v.ID, RecipeID: v.RecipeID, Version: v.Version, Origin: v.Origin, Method: v.Method, FixedRawQuery: v.FixedRawQuery, Headers: v.Headers, StreamExpected: v.StreamExpected, TimeoutProfile: v.TimeoutProfile, CreatedAt: v.CreatedAt}
 	if v.BodyIsText {
@@ -145,12 +121,13 @@ func (s *Server) listRecipeVersions(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	request, err := recipePage(r)
-	if err != nil {
-		s.writeRecipeErr(w, err)
+	q := &probeListQuery{r: r}
+	filter := model.RecipeVersionFilter{PageRequest: q.page(), RecipeID: id, Origin: probeEnum(q, "origin", model.RecipeSource.Valid)}
+	if q.err != nil {
+		s.writeRecipeErr(w, q.err)
 		return
 	}
-	page, err := s.probeAdmin.ListVersions(r.Context(), model.RecipeVersionFilter{PageRequest: request, RecipeID: id, Origin: model.RecipeSource(r.URL.Query().Get("origin"))})
+	page, err := s.probeAdmin.ListVersions(r.Context(), filter)
 	if err != nil {
 		s.writeRecipeErr(w, err)
 		return
@@ -166,19 +143,12 @@ func (s *Server) listClientProfiles(w http.ResponseWriter, r *http.Request) {
 	if !s.probeAdminReady(w) {
 		return
 	}
-	request, err := recipePage(r)
-	if err != nil {
-		s.writeRecipeErr(w, err)
+	q := &probeListQuery{r: r}
+	f := model.ClientProfileFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid),
+		Status: model.ProbeProfileStatus(q.oneOf("status", string(model.ProfileCandidate), string(model.ProfileTested), string(model.ProfileDisabled))), ClientFamily: q.text("client_family")}
+	if q.err != nil {
+		s.writeRecipeErr(w, q.err)
 		return
-	}
-	f := model.ClientProfileFilter{PageRequest: request, Endpoint: model.EndpointKind(r.URL.Query().Get("endpoint")), Status: model.ProbeProfileStatus(r.URL.Query().Get("status")), ClientFamily: r.URL.Query().Get("client_family")}
-	if raw := r.URL.Query().Get("upstream_id"); raw != "" {
-		id, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || id < 1 {
-			s.writeErr(w, model.WrapValidation("upstream_id 必须是正整数"))
-			return
-		}
-		f.UpstreamID = id
 	}
 	page, err := s.probeAdmin.ListClientProfiles(r.Context(), f)
 	if err != nil {
