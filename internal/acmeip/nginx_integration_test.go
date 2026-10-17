@@ -98,8 +98,13 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	if err := m.Bootstrap(ctx); err == nil {
 		t.Fatal("injected issuance failure accepted")
 	}
+	// A new configuration is observed on fresh connections. A shared default
+	// transport may retain an HTTP connection to a retiring ACME-only worker.
+	plainTransport := &http.Transport{Proxy: nil, DisableKeepAlives: true}
+	defer plainTransport.CloseIdleConnections()
+	plain := http.Client{Transport: plainTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Timeout: 2 * time.Second}
 	for _, path := range []string{"/admin/", "/v1/models", "/healthz"} {
-		response, err := http.Get("http://127.0.0.1" + path)
+		response, err := plain.Get("http://127.0.0.1" + path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,14 +160,13 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	if err != nil || !strings.Contains(string(rest), "data: second") {
 		t.Fatalf("SSE stream truncated: %q, %v", rest, err)
 	}
-	plain := http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Timeout: 2 * time.Second}
 	redirect, err := plain.Get("http://127.0.0.1/admin/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	redirect.Body.Close()
 	if redirect.StatusCode != 308 || redirect.Header.Get("Location") != "https://8.8.8.8/admin/" {
-		t.Fatal("HTTP did not redirect to the confirmed IP")
+		t.Fatalf("HTTP did not redirect to the confirmed IP: status=%d location=%q", redirect.StatusCode, redirect.Header.Get("Location"))
 	}
 	before := m.Snapshot()
 	fixture.failRenew = true

@@ -211,3 +211,5 @@ jobs:
       - name: Local CA, real Nginx, streaming and Certbot capability integration
         # No published host ports, public ACME requests or production data.
         run: docker run --rm relay-public-edge-test -test.v -test.count=1 -test.timeout=3m
+      - name: Repeat real Nginx configuration transitions
+        run: docker run --rm relay-public-edge-test -test.run='^TestPublicRealNginxLocalCAIntegration$' -test.count=5 -test.timeout=3m

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/279814/relay-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/279814/relay-gate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
 
 面向多个异构 LLM 中转站的**主动探活 + 优先级路由**透传网关。
 
