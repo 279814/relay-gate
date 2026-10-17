@@ -24,7 +24,14 @@ func dataKeyBackupFixture(t *testing.T) (*Store, MigrationBackupResult, []byte) 
 	if err := kr.EnsureInitialized(c.KeyID(), "backup-data-key-master-long-enough"); err != nil {
 		t.Fatal(err)
 	}
-	credentials := []byte(`{"fixture":"original credential root"}`)
+	relay, err := c.EncryptEnvelope("rk-original-backup-relay-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := json.Marshal(map[string]any{"format_version": 1, "relay_key": relay})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "secrets", "bootstrap-credentials.json"), credentials, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var backupSecretNames = []string{"keyring.json", "keyring.previous", "bootstrap-credentials.json", "credentials-bootstrap.journal", "credentials-migration.journal"}
@@ -201,5 +202,39 @@ func cipherFromArchivedKeyring(values map[string][]byte, m *BackupManifest) (*Ci
 	if c.KeyID() != m.LegacyCipherID {
 		return nil, fmt.Errorf("%w: 归档 active Master 与备份不配对", ErrRestoreRejected)
 	}
+	if err := validateArchivedCredentials(values, c, m.SourceSchema); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// The archive may contain credentials even when its Master is supplied by the
+// environment. Validate the same v1 envelope contract without importing the
+// credential service (which itself depends on Store).
+func validateArchivedCredentials(values map[string][]byte, c *Cipher, sourceSchema int) error {
+	raw, present := values["bootstrap-credentials.json"]
+	if !present {
+		return nil
+	}
+	var document *struct {
+		FormatVersion int    `json:"format_version"`
+		RelayKey      string `json:"relay_key"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil || document == nil || document.FormatVersion != 1 {
+		return fmt.Errorf("%w: 归档持久凭据格式无效", ErrRestoreRejected)
+	}
+	relay := strings.TrimSpace(document.RelayKey)
+	if relay == "" {
+		return nil
+	}
+	if !strings.HasPrefix(relay, sampleEnvelopePrefix) {
+		if sourceSchema < 8 {
+			return nil // Historical readers still accept legacy plaintext.
+		}
+		return fmt.Errorf("%w: schema 8 归档 Relay Key 缺少认证信封", ErrRestoreRejected)
+	}
+	if _, err := c.cloneMasterCipher().DecryptEnvelope(relay); err != nil {
+		return fmt.Errorf("%w: 归档 Relay Key 与备份 Master 不配对或密文损坏", ErrRestoreRejected)
+	}
+	return nil
 }

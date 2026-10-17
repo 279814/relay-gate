@@ -202,6 +202,17 @@ func TestRestoreAcceptsPairedBackupAfterCompletedMasterRotation(t *testing.T) {
 			if err := st.RewrapDirectSecrets(master, rid); err != nil {
 				t.Fatal(err)
 			}
+			relay, err := SealEnvelopeUnder(master, "rk-original-backup-relay-fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			credentials, err := json.Marshal(map[string]any{"format_version": 1, "relay_key": relay})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(st.path), "secrets", "bootstrap-credentials.json"), credentials, 0600); err != nil {
+				t.Fatal(err)
+			}
 			if err := kr.MarkDBCommitted(rid); err != nil {
 				t.Fatal(err)
 			}
@@ -268,4 +279,123 @@ func TestRestoreAcceptsPairedBackupAfterCompletedMasterRotation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRestoreRejectsInvalidArchivedRelayBeforeReplacement(t *testing.T) {
+	for _, damage := range []string{"invalid-json", "null-json", "wrong-master", "corrupt-envelope", "wrong-master-without-keyring", "plaintext", "bad-magic"} {
+		t.Run(damage, func(t *testing.T) {
+			st, backup, _ := dataKeyBackupFixture(t)
+			st.Close()
+			values, err := readBackupSecrets(backup.Directory, &backup.Manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if damage == "invalid-json" {
+				values["bootstrap-credentials.json"] = []byte("invalid")
+			} else if damage == "null-json" {
+				values["bootstrap-credentials.json"] = []byte("null")
+			} else {
+				envelope := "v1:damaged:AAAA"
+				if damage == "plaintext" {
+					envelope = "rk-legacy-plaintext-not-valid-for-schema-eight"
+				} else if damage == "bad-magic" {
+					envelope = "w1:damaged:AAAA"
+				} else if damage != "corrupt-envelope" {
+					envelope, err = SealEnvelopeUnder("unrelated-archived-relay-master", "rk-archived-relay-fixture")
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				values["bootstrap-credentials.json"], err = json.Marshal(map[string]any{"format_version": 1, "relay_key": envelope})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if damage == "wrong-master-without-keyring" {
+				delete(values, "keyring.json")
+			}
+			raw, err := json.Marshal(values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := filepath.Join(backup.Directory, backup.Manifest.SecretsFile)
+			if err := os.WriteFile(archive, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			backup.Manifest.SecretsSize, backup.Manifest.SecretsSHA256, err = fileEvidence(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rewriteBackupManifest(t, &backup)
+			if _, err := CipherFromBackupKeyring(st.path, backup.ManifestPath); err == nil {
+				t.Error("archive key selector accepted unusable archived relay credentials")
+			}
+			assertBackupRejectedWithoutReplacement(t, st.path, backup, st.cipher)
+		})
+	}
+}
+
+func TestCheckBackupAcceptsVerifiedRelayWithoutArchivedKeyring(t *testing.T) {
+	st, backup, _ := dataKeyBackupFixture(t)
+	values, err := readBackupSecrets(backup.Directory, &backup.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(values, "keyring.json")
+	raw, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(backup.Directory, backup.Manifest.SecretsFile)
+	if err := os.WriteFile(archive, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	backup.Manifest.SecretsSize, backup.Manifest.SecretsSHA256, err = fileEvidence(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteBackupManifest(t, &backup)
+	if _, err := CheckBackup(context.Background(), st.path, backup.ManifestPath, st.cipher); err != nil {
+		t.Fatalf("environment-managed archive rejected despite correct supplied master: %v", err)
+	}
+}
+
+func TestRestorePreservesLegacyPlaintextRelayForSchemaSevenReader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	const master = "restore-legacy-relay-master-long-enough"
+	c, _ := NewCipher(master)
+	kr := keyring.Open(filepath.Dir(path))
+	if err := kr.EnsureInitialized(c.KeyID(), master); err != nil {
+		t.Fatal(err)
+	}
+	credentials := []byte(`{"format_version":1,"relay_key":"rk-legacy-schema-seven-relay"}`)
+	credentialsPath := filepath.Join(filepath.Dir(path), "secrets", "bootstrap-credentials.json")
+	if err := os.WriteFile(credentialsPath, credentials, 0600); err != nil {
+		t.Fatal(err)
+	}
+	db := openDatabaseAtPath(t, path)
+	if err := initializeEmptySchemaSeven(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := migrateSchemaSevenToEight(context.Background(), db, path, c, MigrationBackupIdentity{})
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckBackup(context.Background(), path, backup.ManifestPath, c); err != nil {
+		t.Fatalf("historical reader lost its plaintext Relay compatibility: %v", err)
+	}
+	if _, err := RestoreDatabase(context.Background(), path, backup.ManifestPath, c, true, backup.Manifest.ReaderContract); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(credentialsPath)
+	if err != nil || string(raw) != string(credentials) {
+		t.Fatal("legacy restore changed persisted Relay bytes")
+	}
+	fresh, _ := NewCipher(master)
+	reopened, err := Open(path, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.Close()
 }

@@ -359,6 +359,13 @@ func verifyBackupEvidence(path string, manifest *BackupManifest) error {
 }
 
 func validateBackupDatabase(ctx context.Context, path string, cipher *Cipher, manifest *BackupManifest) error {
+	values, err := readBackupSecrets(filepath.Dir(path), manifest)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	}
+	if err := validateArchivedCredentials(values, cipher, manifest.SourceSchema); err != nil {
+		return err
+	}
 	db, err := openReadOnlySQLite(path)
 	if err != nil {
 		return fmt.Errorf("打开 backup 数据库: %w", err)

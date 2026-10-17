@@ -304,6 +304,15 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer releaseRuntime()
+	_, oldMaster, err := s.keyring.LoadActive()
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := validateRotationRelay(filepath.Dir(s.st.DatabasePath()), oldMaster); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	if err := s.st.ValidateEncryptedState(); err != nil {
 		s.writeErr(w, err)
 		return
@@ -313,12 +322,12 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
-	_, oldMaster, err := s.keyring.LoadActive()
+	backupCipher, err := store.NewCipher(oldMaster)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := store.ValidateDatabaseEncryption(r.Context(), backup.DatabasePath, oldMaster); err != nil {
+	if _, err := store.CheckBackup(r.Context(), s.st.DatabasePath(), backup.ManifestPath, backupCipher); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -403,6 +412,9 @@ func validateRotationRelay(dataDir, master string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if doc.FormatVersion != 1 {
+		return errors.New("持久凭据格式无效，不能完成 Master Key 轮换")
 	}
 	if doc.RelayKey == "" {
 		return nil
