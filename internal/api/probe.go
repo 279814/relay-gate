@@ -415,7 +415,10 @@ func (s *Server) listProbeExecutions(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	keys := s.knownUpstreamRedactKeys()
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
 	for i := range page.Items {
 		page.Items[i] = redactExecutionDetail(page.Items[i], keys)
 	}
@@ -440,7 +443,7 @@ func (s *Server) getProbeExecution(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactExecutionDetail(exec, s.knownUpstreamRedactKeys()))
+	s.writeExecutionDetail(w, r, exec)
 }
 
 func (s *Server) listCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -454,7 +457,10 @@ func (s *Server) listCapabilities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 能力行的 redacted_detail 由 reducer 从 execution 原样复制，历史行同样要兜底。
-	keys := s.knownUpstreamRedactKeys()
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
 	for i := range page.Items {
 		page.Items[i].RedactedDetail = sample.RedactDiagnosticText(page.Items[i].RedactedDetail, keys)
 	}
@@ -472,7 +478,10 @@ func (s *Server) listReachability(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// last_error 取自 execution.redacted_detail，历史行同样要兜底。
-	keys := s.knownUpstreamRedactKeys()
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
 	for i := range page.Items {
 		page.Items[i].LastError = sample.RedactDiagnosticText(page.Items[i].LastError, keys)
 	}

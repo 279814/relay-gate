@@ -231,5 +231,9 @@ func (s *Server) probeRoute(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"execution_id": execution.ID, "execution": redactExecutionDetail(execution, s.knownUpstreamRedactKeys()), "ok": execution.Success})
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"execution_id": execution.ID, "execution": redactExecutionDetail(execution, keys), "ok": execution.Success})
 }

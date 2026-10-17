@@ -49,8 +49,12 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		list, err := s.st.ListSecurityFindings(string(sev), pageLimit)
 		if err == nil {
 			total, _ := s.st.CountSecurityFindings()
+			keys, ok := s.diagnosticKeys(w, r)
+			if !ok {
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"findings": s.redactFindingsForAPI(list),
+				"findings": redactFindingsForAPI(list, keys),
 				"total":    total,
 			})
 			return
@@ -61,8 +65,12 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list := s.security.List(sev, pageLimit)
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"findings": s.redactFindingsForAPI(list),
+		"findings": redactFindingsForAPI(list, keys),
 		"total":    s.security.Count(),
 	})
 }
@@ -70,8 +78,7 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 // redactFindingsForAPI masks known upstream credentials in free-text finding
 // fields before JSON encode (§2.4). ScanText already redacts on write; this
 // is the read-path backstop for legacy plaintext Detail rows.
-func (s *Server) redactFindingsForAPI(list []security.Finding) []security.Finding {
-	keys := s.knownUpstreamRedactKeys()
+func redactFindingsForAPI(list []security.Finding, keys []string) []security.Finding {
 	if len(keys) == 0 || len(list) == 0 {
 		return list
 	}
@@ -80,26 +87,6 @@ func (s *Server) redactFindingsForAPI(list []security.Finding) []security.Findin
 		out[i] = security.RedactFindingForRead(f, keys)
 	}
 	return out
-}
-
-// knownUpstreamRedactKeys returns decrypted upstream API keys for RedactSecrets.
-// Empty / missing store → nil (caller leaves text unchanged).
-func (s *Server) knownUpstreamRedactKeys() []string {
-	if s == nil || s.st == nil {
-		return nil
-	}
-	ups, err := s.st.ListUpstreams()
-	if err != nil || len(ups) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(ups))
-	for _, u := range ups {
-		if u == nil || u.APIKey == "" {
-			continue
-		}
-		keys = append(keys, u.APIKey)
-	}
-	return keys
 }
 
 // maxFindingClientField caps free-text client strings written onto findings

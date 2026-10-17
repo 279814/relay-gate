@@ -91,7 +91,7 @@ func (s *Server) testClientProfile(w http.ResponseWriter, r *http.Request) {
 		s.writeRecipeErr(w, err)
 		return
 	}
-	writeJSON(w, 200, redactExecutionDetail(execution, s.knownUpstreamRedactKeys()))
+	s.writeExecutionDetail(w, r, execution)
 }
 func (s *Server) disableClientProfile(w http.ResponseWriter, r *http.Request) {
 	if !s.probeAdminReady(w) {
