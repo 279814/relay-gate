@@ -557,7 +557,7 @@ function app() {
     },
 
     async delUp(u) {
-      const warn = '\n\n该站的所有路由会一并删除；有历史依赖时会拒绝删除。';
+      const warn = '\n\n有路由引用或历史时禁止硬删除，请改为停用；历史不会随删除清理。';
       if (!confirm(`删除上游「${u.name}」？${warn}`)) return;
       const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id + '?expected_revision=' + u.revision), '已删除');
       if (ok) await this.loadAll();
@@ -592,7 +592,7 @@ function app() {
     },
 
     async delMn(m) {
-      const warn = '\n\n该模型的所有路由会一并删除；有历史依赖时会拒绝删除。';
+      const warn = '\n\n有路由引用或历史时禁止硬删除，请改为停用；历史不会随删除清理。';
       if (!confirm(`删除模型「${m.name}」？${warn}`)) return;
       const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id + '?expected_revision=' + m.revision), '已删除');
       if (ok) await this.loadAll();
