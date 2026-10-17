@@ -13,6 +13,7 @@ import (
 type Store interface {
 	ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error)
 	GetUpstream(id int64) (*model.Upstream, error)
+	GetUpstreamByName(context.Context, string) (*model.Upstream, error)
 	CreateUpstreamWithEndpoints(context.Context, *model.Upstream, []*model.UpstreamEndpoint) error
 	UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) error
 	DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error
@@ -24,6 +25,7 @@ type Store interface {
 	DeleteModelNameWithRevision(ctx context.Context, id, expectedRevision int64) error
 
 	ListRoutesPage(ctx context.Context, filter model.RouteFilter) (model.Page[*model.Route], error)
+	ListRouteMetadataPage(context.Context, model.RouteFilter) (model.Page[model.RouteMetadata], error)
 	GetRoute(id int64) (*model.Route, error)
 	CreateRoute(r *model.Route) error
 	UpdateRouteWithRevision(ctx context.Context, value *model.Route, expectedRevision int64) error
@@ -63,6 +65,18 @@ func (s *Service) GetUpstream(_ context.Context, id int64) (model.Upstream, erro
 		return model.Upstream{}, err
 	}
 	return *u, nil
+}
+
+func (s *Service) GetUpstreamByName(ctx context.Context, name string) (model.Upstream, error) {
+	u, err := s.store.GetUpstreamByName(ctx, name)
+	if err != nil {
+		return model.Upstream{}, err
+	}
+	return *u, nil
+}
+
+func (s *Service) ListRouteMetadata(ctx context.Context, f model.RouteFilter) (model.Page[model.RouteMetadata], error) {
+	return s.store.ListRouteMetadataPage(ctx, f)
 }
 
 type EndpointMutation struct {
