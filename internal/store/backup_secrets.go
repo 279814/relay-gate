@@ -175,6 +175,10 @@ func CipherFromBackupKeyring(databasePath, manifestPath string) (*Cipher, error)
 	if err != nil {
 		return nil, err
 	}
+	return cipherFromArchivedKeyring(values, m)
+}
+
+func cipherFromArchivedKeyring(values map[string][]byte, m *BackupManifest) (*Cipher, error) {
 	raw := values["keyring.json"]
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("%w: 备份不含已验证的 keyring.json", ErrRestoreRejected)
@@ -185,8 +189,9 @@ func CipherFromBackupKeyring(databasePath, manifestPath string) (*Cipher, error)
 		Active        string `json:"active"`
 		Pending       string `json:"pending"`
 		Phase         string `json:"phase"`
+		RotationID    string `json:"rotation_id"`
 	}
-	if err := json.Unmarshal(raw, &root); err != nil || root.FormatVersion != 1 || root.KeyID == "" || root.Active == "" || root.Pending != "" || (root.Phase != "" && root.Phase != "cleaned") {
+	if err := json.Unmarshal(raw, &root); err != nil || root.FormatVersion != 1 || root.KeyID == "" || root.Active == "" || root.Pending != "" || (root.Phase == "" && root.RotationID != "") || (root.Phase != "" && root.Phase != "cleaned") {
 		return nil, fmt.Errorf("%w: 归档 keyring 不是可恢复的稳定密钥根", ErrRestoreRejected)
 	}
 	c, err := NewCipher(root.Active)

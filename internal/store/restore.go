@@ -332,8 +332,17 @@ func validateBackupPaths(databasePath, manifestPath string) (absDB, absManifest,
 	if relDBErr != nil || strings.HasPrefix(relDB, "..") {
 		return "", "", "", nil, fmt.Errorf("%w: backup 数据库必须位于 backups/ 子树", ErrRestoreRejected)
 	}
-	if _, err := readBackupSecrets(filepath.Dir(absManifest), &m); err != nil {
+	values, err := readBackupSecrets(filepath.Dir(absManifest), &m)
+	if err != nil {
 		return "", "", "", nil, fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	}
+	// An archive that includes a keyring will replace the live credential root.
+	// Validate its stable active master even when the caller supplied a cipher;
+	// otherwise a decryptable DB could be installed with an unrelated keyring.
+	if _, present := values["keyring.json"]; present {
+		if _, err := cipherFromArchivedKeyring(values, &m); err != nil {
+			return "", "", "", nil, err
+		}
 	}
 	return absDB, absManifest, backupDB, &m, nil
 }
@@ -377,9 +386,6 @@ func validateBackupDatabase(ctx context.Context, path string, cipher *Cipher, ma
 	if manifest.SourceFingerprint != "" && state.Fingerprint != manifest.SourceFingerprint {
 		return fmt.Errorf("%w: backup fingerprint 与 manifest 不符", ErrRestoreRejected)
 	}
-	if err := validateLegacyUpstreamKeys(ctx, db, cipher); err != nil {
-		return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
-	}
 	if state.Version >= 8 {
 		validationCipher := cipher.cloneMasterCipher()
 		keys, err := readDataKeys(ctx, db, validationCipher)
@@ -390,8 +396,13 @@ func validateBackupDatabase(ctx context.Context, path string, cipher *Cipher, ma
 		if err := validateEncryptedState(ctx, db, validationCipher); err != nil {
 			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
 		}
-	} else if err := validateLegacySampleBodies(ctx, db, cipher, state.Version); err != nil {
-		return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+	} else {
+		if err := validateDirectSecrets(ctx, db, cipher); err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
+		if err := validateLegacySampleBodies(ctx, db, cipher, state.Version); err != nil {
+			return fmt.Errorf("%w: %v", ErrRestoreRejected, err)
+		}
 	}
 	return nil
 }
