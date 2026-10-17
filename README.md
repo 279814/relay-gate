@@ -80,7 +80,7 @@ http://<这台机器的IP>:18787/admin/
 查看（Compose）：
 
 ```bash
-docker compose logs --no-color 2>&1 | grep -E '^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)='
+docker compose logs --no-color --no-log-prefix 2>&1 | grep -E '^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)='
 ```
 
 之后重启**不会再打印**。若操作员已设置 `ENCRYPTION_KEY` / `RELAY_KEYS` / `ADMIN_PASSWORD`，环境变量优先，不会另造一套。凭据落在 `data/secrets/`（已 gitignore），不要提交进仓库。
@@ -125,7 +125,7 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
 | 存储 | 单副本 SQLite（`modernc.org/sqlite`，无 CGO），库权限 0600 |
 | 登录保护 | 失败退避（按来源 IP + 全局）；**无**登录 IP 白名单 |
 
-需求基线：[docs/01-需求与设计.md](docs/01-需求与设计.md)。阶段记录见 docs/04–09。
+需求基线：[docs/01-需求与设计.md](docs/01-需求与设计.md)。阶段记录见 docs/04–09；当前验收边界与交接步骤见 [维护与交接](docs/10-维护与交接.md)。
 
 ## 构建与开发
 
@@ -133,31 +133,43 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
 go build ./...
 go test ./...
 go vet ./...
-sh scripts/check-p0.sh
-sh scripts/check-p5.sh
+bash scripts/check-p0.sh
+bash scripts/check-p5.sh
 sh scripts/check-deploy.sh
 sh scripts/check-entrypoint.sh
+node internal/web/bindings.check.js
+node internal/web/app.contract.test.js
+node --test internal/web/modules.contract.test.mjs
+python scripts/deploy.contract.test.py
 ```
 
-Windows 本地不要用 `-race`（无 CGO）。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
+Go 版本以 `go.mod` 为准。检查脚本需要 Bash、Python 3、Node.js 和 PowerShell 7（`pwsh`）；它们只用于验证，运行服务不需要。Windows 无 CGO 时不要用 `-race`，竞态检测与容器冒烟由 Linux CI 执行。前端是单页 HTML + Alpine.js（`go:embed`），无 Node 构建链。
 
 ### 离线备份检查与恢复
+
+先停止容器或二进制进程，并备份完整 `data/`（SQLite、WAL/SHM 与 `secrets/` 一起保留）。确认备份 manifest 指定的配对 image/binary 可用，再执行只读检查；不要在服务运行时直接复制或覆盖数据库。
 
 ```bash
 relay-gate db check-backup --database /abs/path/data/relay.db \
   --manifest /abs/path/data/backups/<backup>/manifest.json
+```
 
+核对检查输出的 `ReaderContract` / `PairedBuildID` 与配对程序后，再显式接受数据替换：
+
+```bash
 relay-gate db restore --database /abs/path/data/relay.db \
   --manifest /abs/path/data/backups/<backup>/manifest.json \
   --execute --accept-data-replacement \
   --accept-reader-contract '<exact-ReaderContract-from-check>'
 ```
 
+使用输出要求的配对 image/binary 启动并检查 `/healthz`；恢复会保留原数据库的隔离目录，不要在验证前删除。schema 3→2 需要 manifest 指定的 P0 compatible reader；恢复 schema 1 到 pre-P0 程序会放弃该备份之后的新配置。完整限制见需求基线中的恢复章节。
+
 ## 安全
 
-- 上游 key 在库中 AES-GCM 加密；样本凭据脱敏
+- 上游 key 和样本正文使用 AES-GCM 加密；路径、脱敏请求头等元数据并非整库加密，管理 API 经授权仍能读出对话原文
 - `.env`、`data/`、`scripts/upstreams.tsv`、`docs/02-上游能力矩阵.md` 已 gitignore
-- 备份单位是整个 `data/`（含 Keyring）
+- 备份单位是整个 `data/`（含 Keyring）；Master Key 通过管理界面的轮换流程更新，不能直接替换环境变量
 
 发现安全问题请看 [SECURITY.md](SECURITY.md)。
 

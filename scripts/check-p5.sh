@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P5 release validation gate（离线）：schema 6 终态、Keyring、备份拒绝门、
+# P5 release validation gate（离线）：schema 7 终态、Keyring、备份拒绝门、
 # 安全扫描不改字节、Transform 未绑定透传、RecoveryGate single-flight、
 # IP 证书续期可观测（fake RenewWatch；不冒充真实公网签发）。
 set -euo pipefail
@@ -26,10 +26,10 @@ echo "== secrets / private assets stay untracked =="
 python - <<'PY'
 from pathlib import Path
 import subprocess
-tracked = subprocess.check_output(['git', 'ls-files'], text=True, encoding='utf-8')
+tracked = subprocess.check_output(['git', 'ls-files', '-z']).decode('utf-8').split('\0')
 forbidden = ['.env', 'upstreams.tsv', 'docs/02-上游能力矩阵.md']
 for name in forbidden:
-    for line in tracked.splitlines():
+    for line in tracked:
         if line == name or line.endswith('/' + name) or line.endswith('\\' + name):
             raise SystemExit(f'tracked forbidden path: {line}')
 print('ok')

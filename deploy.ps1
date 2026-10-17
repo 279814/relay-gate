@@ -20,15 +20,27 @@ if ($LASTEXITCODE -ne 0) {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $root "data") | Out-Null
 
-$port = 18787
-if (Test-Path .env) {
-  $line = Get-Content .env | Where-Object { $_ -match '^\s*RELAY_PORT\s*=' } | Select-Object -First 1
-  if ($line -match '=\s*(.+)$') { $port = [int]($Matches[1].Trim()) }
-}
-
-Write-Host "Building and starting relay-gate (http://0.0.0.0:$port)..."
+Write-Host "Building and starting relay-gate..."
 docker compose up -d --build
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Use Compose's resolved binding rather than reimplementing .env precedence.
+# Querying only the port also avoids printing resolved credential values.
+$bindings = @(docker compose port relay-gate 18787)
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "Could not resolve relay-gate's published port." -ForegroundColor Red
+  exit 1
+}
+$binding = [string]($bindings | Select-Object -First 1)
+if ($binding -notmatch '^(\[[^\]]+\]|[^:\s]+):([0-9]{1,5})$') {
+  Write-Host "No valid published port for relay-gate:18787." -ForegroundColor Red
+  exit 1
+}
+$port = [int]$Matches[2]
+if ($port -lt 1 -or $port -gt 65535) {
+  Write-Host "Published relay-gate port must be between 1 and 65535." -ForegroundColor Red
+  exit 1
+}
 
 Write-Host ""
 Write-Host "Waiting for healthz..."
@@ -49,5 +61,5 @@ if (-not $ok) {
 Write-Host ""
 Write-Host "Open http://<this-host-IP>:$port/admin/"
 Write-Host "On first start, three secrets are printed once in the container log:"
-Write-Host '  docker compose logs --no-color 2>&1 | Select-String -Pattern "^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)="'
+Write-Host '  docker compose logs --no-color --no-log-prefix 2>&1 | Select-String -Pattern "^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)="'
 Write-Host "Later restarts do not reprint them. Env still wins if set."

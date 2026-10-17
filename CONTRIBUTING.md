@@ -2,7 +2,7 @@
 
 欢迎 issue 与 PR。这是个人维护的项目，回应速度取决于我的空闲时间。
 
-改 v1.0.0 之前先读两份文档，不要只看 README：`docs/01-需求与设计.md` 是需求基线，`docs/04-P0-探活基础门禁实施计划.md` 文首是当前做到哪一步。README 描述今天已经能部署的行为（HTTP `IP:port` 一行安装）。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`。
+改 v1.0.0 之前先读需求基线 `docs/01-需求与设计.md` 与当前交接记录 `docs/10-维护与交接.md`；历史阶段记录见 docs/04–09。README 描述今天已经能部署的行为（HTTP `IP:port` 一行安装）。生产探活经 ProbeExecutor + SyntheticCoordinator；RunState 走 `runstate.Controller`。
 
 ## 提 issue
 
@@ -19,7 +19,7 @@
 
 ## 开发环境
 
-需要 Go 1.26+。不需要 CGO（SQLite 驱动是纯 Go 的）。
+需要 `go.mod` 指定的 Go 版本（当前 1.26.9）。不需要 CGO（SQLite 驱动是纯 Go 的）；Linux CI 的竞态检测需要 CGO。
 
 ```bash
 go build ./...
@@ -41,9 +41,15 @@ go vet ./...                            # 静态检查
 go test -race -count=1 ./...            # 竞态
 node internal/web/bindings.check.js     # 前端绑定（查 x-model 写向不存在的属性）
 node internal/web/app.contract.test.js  # 前端契约
+node --test internal/web/modules.contract.test.mjs  # 前端业务模块契约
+python scripts/deploy.contract.test.py  # 安装脚本行为（假 Docker，临时目录）
+bash scripts/check-p0.sh                # 探活离线门禁
+bash scripts/check-p5.sh                # 发布与私有文件门禁
 sh scripts/check-entrypoint.sh          # entrypoint 静态不变量
 sh scripts/check-deploy.sh              # 部署清单静态不变量
 ```
+
+部署行为测试需要 Bash、Python 3 与 PowerShell 7（`pwsh`）；Linux 与 Windows CI 都会运行。Windows 未启用 CGO 时用 `go test -count=1 ./...`，将 `-race` 留给 Linux CI。
 
 改动涉及容器/部署时，`scripts/smoke-m7.ps1` 会在 CI 的 `container` job 里跑。
 它需要 Docker 引擎，本地没有也没关系——推上来看 CI 结果。
@@ -51,8 +57,8 @@ sh scripts/check-deploy.sh              # 部署清单静态不变量
 ## 这个项目的一些约定
 
 读代码时会注意到，注释里写的多是**为什么**而不是**做什么**。这不是风格偏好，
-而是因为这个项目里很多决定看起来是反直觉的（比如刻意不写 `USER`、
-端口刻意只绑 loopback、空白名单刻意全拒），不写下理由的话下一个人会"顺手优化掉"。
+而是因为这个项目里很多决定需要保留背景（比如 Dockerfile 刻意不写 `USER`，
+由 entrypoint 修正数据目录权限后降权；默认发布所有接口以支持 HTTP `IP:port`），不写下理由的话下一个人会"顺手优化掉"。
 如果你的 PR 做了一个非显然的选择，请在注释里留下理由。
 
 ### 新增检查器请做变异验证
@@ -73,8 +79,9 @@ chown 循环因变量未赋值而变成空操作。如果你发现一处，即�
 
 ### 保守默认
 
-错误代价不对称时选保守的那一侧：空白名单→全拒、端口→仅 loopback、
-库文件→owner-only、缺凭据→拒绝启动。改动这些默认值请说明理由。
+错误代价不对称时选保守的那一侧：库文件→owner-only、无法读取凭据→拒绝启动、
+观察不完整→不声称 supported。当前安装默认监听所有接口且没有登录 IP 白名单；
+修改这些已文档化的默认行为时，请同时更新部署说明与验证。
 
 ## 提交信息
 
