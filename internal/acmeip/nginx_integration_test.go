@@ -58,8 +58,15 @@ func (r *realNginxCommands) Run(ctx context.Context, name string, args ...string
 
 func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	requireEdgeContainer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	streamDuration := 250 * time.Millisecond
+	if mode := os.Getenv("RELAY_PUBLIC_LONG_STREAM_TEST"); mode == "1" {
+		streamDuration = 2105 * time.Second
+	} else if mode != "" {
+		t.Fatal("RELAY_PUBLIC_LONG_STREAM_TEST must be unset or 1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), streamDuration+45*time.Second)
 	defer cancel()
+	beats := int((streamDuration + 5*time.Second - 1) / (5 * time.Second))
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Forwarded") != "" || r.Header.Get("X-Forwarded-Proto") != "https" || r.Header.Get("X-Forwarded-For") != "127.0.0.1" {
 			http.Error(w, "spoofed edge identity", 400)
@@ -68,7 +75,20 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: first\n\n")
 		w.(http.Flusher).Flush()
-		time.Sleep(250 * time.Millisecond)
+		started := time.Now()
+		for i := 1; i <= beats; i++ {
+			timer := time.NewTimer(time.Until(started.Add(time.Duration(i) * streamDuration / time.Duration(beats))))
+			select {
+			case <-r.Context().Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
 		_, _ = io.WriteString(w, "data: second\n\n")
 		w.(http.Flusher).Flush()
 	}))
@@ -136,7 +156,7 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, network, "127.0.0.1:443")
 	}}
 	defer transport.CloseIdleConnections()
-	client := http.Client{Transport: transport, Timeout: 4 * time.Second}
+	client := http.Client{Transport: transport, Timeout: streamDuration + 4*time.Second}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://8.8.8.8/sse", nil)
 	request.Header.Set("Forwarded", "for=6.6.6.6;proto=http")
 	request.Header.Set("X-Forwarded-For", "6.6.6.6")
@@ -146,6 +166,7 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer response.Body.Close()
 	if response.StatusCode != 200 {
 		response.Body.Close()
 		t.Fatalf("HTTPS proxy status %d", response.StatusCode)
@@ -157,9 +178,12 @@ func TestPublicRealNginxLocalCAIntegration(t *testing.T) {
 	}
 	rest, err := io.ReadAll(reader)
 	response.Body.Close()
-	if err != nil || !strings.Contains(string(rest), "data: second") {
+	wantRest := "\n" + strings.Repeat(": ping\n\n", beats) + "data: second\n\n"
+	if err != nil || string(rest) != wantRest || time.Since(started) < streamDuration {
 		t.Fatalf("SSE stream truncated: %q, %v", rest, err)
 	}
+	t.Logf("real Nginx SSE: elapsed=%s requested=%s heartbeats=%d exact_wire=true long_duration_gate=%t",
+		time.Since(started), streamDuration, beats, streamDuration > 35*time.Minute)
 	redirect, err := plain.Get("http://127.0.0.1/admin/")
 	if err != nil {
 		t.Fatal(err)
