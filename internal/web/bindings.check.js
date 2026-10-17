@@ -51,6 +51,7 @@ async function main() {
     'Number', 'Array', 'confirm', 'window', 'console',
     'r', 'u', 'm', 's', 't', 'rc', 'uc', 'c', 'e', 'i', 'v', 'n', 'x', 'p', 'k', 'd',
     'g', 'l', 'row', 'ep', 'ex', 'run', 'cand', 'idx', 'a', 'ev', 'f', 'b',
+    'filterField', 'choice',
   ]);
 
   const exprs = [];

@@ -156,6 +156,46 @@ await check('probe feature lists + filter reset + load more + bad cursor', async
   }
 });
 
+await check('Probe list filters expose the typed HTTP fields and reset cursors', async () => {
+  const expected = {
+    endpoints: ['upstream_id', 'endpoint', 'needs_review'], secrets: ['name_prefix'],
+    executions: ['upstream_id', 'route_id', 'endpoint', 'error_class', 'trigger', 'capability_state'],
+    capabilities: ['upstream_id', 'route_id', 'endpoint', 'state', 'expired'],
+    reachability: ['upstream_id', 'state', 'current'], calibrations: ['route_id', 'endpoint', 'state'],
+    probeCostDaily: ['day_from', 'day_to', 'trigger', 'origin', 'endpoint', 'route_id', 'upstream_id'],
+  };
+  const paths = { endpoints: '/upstream-endpoints', secrets: '/probe-secrets', executions: '/probe-executions', capabilities: '/capabilities', reachability: '/reachability', calibrations: '/calibrations', probeCostDaily: '/probe-costs' };
+  const seen = [];
+  const shell = { err: '' };
+  createProbeFeature(shell, { get: async url => { seen.push(new URL(url, 'http://fixture')); return { items: [], next_cursor: '' }; } });
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  for (const [list, keys] of Object.entries(expected)) {
+    assert.deepEqual(Object.keys(shell[list].filter), keys, list + ' typed fields');
+    assert.deepEqual(shell.probeFilterFields[list].map(field => field.key), keys, list + ' controls');
+    assert.ok(html.includes('probeFilterFields.' + list), list + ' visible filters');
+    shell[list].next_cursor = 'old-filter-cursor';
+    shell[list].items = [{ id: 'old-filter-row' }];
+    shell[list].filter[keys[0]] = 'fixture-selected';
+    shell.onProbeFilterChange(list);
+    assert.equal(shell[list].next_cursor, '');
+    assert.deepEqual(shell[list].items, []);
+    await shell.loadPaged(list, paths[list], true);
+    const request = seen.at(-1);
+    assert.equal(request.searchParams.get(keys[0]), 'fixture-selected');
+    assert.equal(request.searchParams.has('cursor'), false);
+  }
+});
+
+await check('Probe cost rows preserve the complete SQL identity across origins and endpoints', () => {
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  const expression = html.match(/x-for="c in probeCostDaily.items" :key="([^"]+)"/)[1];
+  const key = new Function('c', 'f', 'return ' + expression);
+  const first = { DayUTC: '2099-01-01', Trigger: 'manual', Origin: 'manual', Endpoint: 'messages', RouteID: 1, UpstreamID: 1 };
+  for (const changed of [{ Origin: 'learned' }, { Endpoint: 'count_tokens' }, { UpstreamID: 2 }]) {
+    assert.notEqual(key(first, field), key({ ...first, ...changed }, field));
+  }
+});
+
 await check('capabilityBadge expired is derived stale', () => {
   const shell = {};
   createProbeFeature(shell, createApiClient());
