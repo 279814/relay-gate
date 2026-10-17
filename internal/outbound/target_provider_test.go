@@ -150,9 +150,10 @@ func TestValues_ResolvesURLPlaceholders(t *testing.T) {
 		UpstreamAPIKey:     []byte("sk-up-test-key"),
 		CredentialRevision: 5,
 		Secrets: fakeSecrets{byName: map[string]probetemplate.ResolvedSecret{
-			"site-token": {ID: 1, Plain: []byte("tok"), Revision: 9},
+			"site-token": {ID: 1, Plain: []byte("temporary-site-secret"), Revision: 9},
 		}},
 	}
+	values = values.WithBindings([]model.SecretRevision{{ID: 1, Name: "site-token", Revision: 9, Resolved: true}})
 
 	key, err := values.ResolveValue(context.Background(), "UPSTREAM_API_KEY")
 	if err != nil {
@@ -166,7 +167,7 @@ func TestValues_ResolvesURLPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(secret.Plain) != "tok" || secret.Revision != 9 {
+	if string(secret.Plain) != "temporary-site-secret" || secret.Revision != 9 {
 		t.Errorf("secret 应带自己的 revision，得到 %q@%d", secret.Plain, secret.Revision)
 	}
 }
@@ -191,7 +192,7 @@ func TestValues_FailsWhenKeyOrSourceMissing(t *testing.T) {
 	if !errors.Is(err, ErrUpstreamAPIKeyEmpty) || !errors.Is(err, ErrAuthConfig) {
 		t.Errorf("空 api_key 应是 ErrUpstreamAPIKeyEmpty / ErrAuthConfig，得到 %v", err)
 	}
-	_, err = (Values{}).ResolveValue(context.Background(), "SECRET:x")
+	_, err = (Values{}).WithBindings([]model.SecretRevision{{ID: 1, Name: "x", Revision: 1, Resolved: true}}).ResolveValue(context.Background(), "SECRET:x")
 	if err == nil {
 		t.Error("没有 Secret 源时应报错")
 	}

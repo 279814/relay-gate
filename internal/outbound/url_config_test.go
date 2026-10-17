@@ -57,6 +57,7 @@ func (failingSecrets) ResolveProbeSecret(context.Context, string) (probetemplate
 func TestResolve_NonURLConfigErrorsAreNotMarked(t *testing.T) {
 	endpoint := canonicalEndpoint(model.EndpointMessages)
 	endpoint.FixedQueryTemplate = "key={{SECRET:site-token}}"
+	endpoint.BoundSecrets = []model.SecretRevision{{ID: 1, Name: "site-token", Revision: 1, Resolved: true}}
 	err := resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint,
 		Values: Values{Secrets: failingSecrets{}}})
 	if errors.Is(err, ErrURLConfig) {
@@ -88,6 +89,7 @@ func (absentSecrets) ResolveProbeSecret(context.Context, string) (probetemplate.
 func TestSecretNotFound_IsRouteConfigButReadFailureIsNot(t *testing.T) {
 	endpoint := canonicalEndpoint(model.EndpointMessages)
 	endpoint.FixedQueryTemplate = "key={{SECRET:site-token}}"
+	endpoint.BoundSecrets = []model.SecretRevision{{ID: 1, Name: "site-token", Revision: 1, Resolved: true}}
 	err := resolveErr(t, ResolveInput{Upstream: testUpstream(), Endpoint: endpoint,
 		Values: Values{Secrets: absentSecrets{}}})
 	if !errors.Is(err, ErrURLConfig) {
@@ -98,7 +100,7 @@ func TestSecretNotFound_IsRouteConfigButReadFailureIsNot(t *testing.T) {
 		ManualHeaders: []model.HeaderTemplate{{Name: "X-Site-Token", Values: []string{"{{SECRET:site-token}}"}}}}
 	apply := func(secrets SecretSource) error {
 		return ApplyAuth(context.Background(), make(http.Header), AuthInput{
-			Profile: profile, Values: Values{UpstreamAPIKey: []byte("sk-up-test-key"), Secrets: secrets},
+			Profile: profile, Values: (Values{UpstreamAPIKey: []byte("sk-up-test-key"), Secrets: secrets}).WithBindings(endpoint.BoundSecrets),
 			Use: ResolveRealForward})
 	}
 	if err := apply(absentSecrets{}); !errors.Is(err, ErrAuthConfig) {
