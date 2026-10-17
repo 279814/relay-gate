@@ -402,6 +402,7 @@ func runServer() error {
 		WithSecurityCenter(secCenter).
 		WithAlertMailer(mailer).
 		WithTransformRegistry(xform).
+		WithPublicHTTPSStatusFile(cfg.PublicHTTPSStatusFile).
 		WithCredentials(credSvc, kr).
 		WithMasterKeyEnvironmentOverride(strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")) != "")
 	if hash, err := credential.LoadAdminHash(dataDir); err == nil {
@@ -431,9 +432,13 @@ func runServer() error {
 		fmt.Fprintf(w, `{"status":"ok","state":%q,"version":%q}`, state, version)
 	})
 
+	handler := http.Handler(mux)
+	if cfg.TrustedEdge != nil {
+		handler = cfg.TrustedEdge.Wrap(handler)
+	}
 	srv := &http.Server{
 		Addr:    cfg.Addr,
-		Handler: mux,
+		Handler: handler,
 		// 不设 WriteTimeout：真实请求的首 Token 可达 20 分钟（§4.2），
 		// 一个粗粒度的写超时会把正常的长思考直接掐断。
 		// 超时控制在转发层按三段独立实现，不靠 Server 级的钝刀。
