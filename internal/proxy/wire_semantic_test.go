@@ -226,7 +226,7 @@ func TestForward_TTFTStampsOnSemanticNotMessageStart(t *testing.T) {
 	defer up.Close()
 
 	f := testForwarder(t, Timeouts{
-		Connect: 2 * time.Second, FirstToken: 2 * time.Second,
+		Connect: 2 * time.Second, FirstSemantic: 2 * time.Second,
 		Idle: 2 * time.Second, Total: 5 * time.Second,
 	})
 	rec := httptest.NewRecorder()

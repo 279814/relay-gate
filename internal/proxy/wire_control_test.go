@@ -45,7 +45,7 @@ func TestPeekPendingReadCancellationAndDiscardCloseExactlyOnce(t *testing.T) {
 			body := &pendingReadFixture{started: make(chan struct{}), exited: make(chan struct{}), closed: make(chan struct{})}
 			to := RealTimeouts(model.DefaultSettings())
 			to.PeekWait = time.Millisecond
-			to.FirstToken = time.Second
+			to.FirstSemantic = time.Second
 			to.Total = time.Second
 			f := &Forwarder{Transport: wireRoundTripper(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, nil
@@ -86,7 +86,7 @@ func TestActualBodyTimeoutInsidePeekWindowRemains504WithoutReplay(t *testing.T) 
 	}))
 	defer up.Close()
 	client := &http.Client{Timeout: 40 * time.Millisecond}
-	f := testForwarder(t, Timeouts{FirstToken: time.Second, PeekWait: time.Second, CommitOnPeekTimeout: true, Total: 2 * time.Second})
+	f := testForwarder(t, Timeouts{FirstSemantic: time.Second, PeekWait: time.Second, CommitOnPeekTimeout: true, Total: 2 * time.Second})
 	f.Transport = wireRoundTripper(client.Do)
 	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, nil)
 	_ = at.Peek()
@@ -115,7 +115,7 @@ func TestPeekShortWindowCommitsHeadersWithoutClosingPendingRead(t *testing.T) {
 	}))
 	defer up.Close()
 	to := RealTimeouts(model.DefaultSettings())
-	to.FirstToken, to.PeekWait, to.Total = 300*time.Millisecond, 25*time.Millisecond, time.Second
+	to.FirstSemantic, to.PeekWait, to.Total = 300*time.Millisecond, 25*time.Millisecond, time.Second
 	f := testForwarder(t, to)
 	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, nil)
 	_ = at.Peek()
@@ -145,7 +145,7 @@ func TestPeekWindowActuallyFlushesHeadersBeforeFirstBodyByte(t *testing.T) {
 	defer up.Close()
 	to := RealTimeouts(model.DefaultSettings())
 	to.PeekWait = 20 * time.Millisecond
-	to.FirstToken = time.Second
+	to.FirstSemantic = time.Second
 	to.Total = 2 * time.Second
 	f := testForwarder(t, to)
 	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -233,7 +233,7 @@ func TestPeekWindowWithResponseTransformsFlushesDecidableHeaders(t *testing.T) {
 			}
 			to := RealTimeouts(model.DefaultSettings())
 			to.PeekWait = 20 * time.Millisecond
-			to.FirstToken = time.Second
+			to.FirstSemantic = time.Second
 			to.Total = 2 * time.Second
 			f := testForwarder(t, to)
 			gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -350,7 +350,7 @@ func TestForwardRawKeepaliveAfterSemanticResetsIdle(t *testing.T) {
 		}
 	}))
 	defer up.Close()
-	f := testForwarder(t, Timeouts{FirstToken: time.Second, Idle: 60 * time.Millisecond, Total: time.Second})
+	f := testForwarder(t, Timeouts{FirstSemantic: time.Second, Idle: 60 * time.Millisecond, Total: time.Second})
 	res := f.Forward(context.Background(), httptest.NewRecorder(), "POST", up.URL, http.Header{}, nil)
 	if res.Err != nil || !res.SemanticSeen {
 		t.Fatalf("original keepalives after semantic must keep the stream active: %v", res.Err)
@@ -382,7 +382,7 @@ func TestTransformOutputCannotSatisfyRawFirstSemanticTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := testForwarder(t, Timeouts{FirstToken: 80 * time.Millisecond, Idle: time.Second, Total: time.Second})
+	f := testForwarder(t, Timeouts{FirstSemantic: 80 * time.Millisecond, Idle: time.Second, Total: time.Second})
 	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, nil)
 	if at.Failed() {
 		at.Discard()

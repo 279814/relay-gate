@@ -115,9 +115,8 @@ func discardLog() *slog.Logger {
 
 // testSettings 用短超时，避免测试挂在生产的 300s 下限上。
 //
-// SaveSettings 卡 real_first_semantic_sec；TimeoutsFrom 在 Total ≥ 300s 时还会
-// 把投影后的 FirstToken 抬到同一下限。这里把 RealTotalSec 也压到 5s，使
-// CapTotal/Total 低于下限，转发层才不会把测试用的短 FirstToken 抬回去。
+// 这里显式配置独立阶段，Total 也压到 5s，避免测试用的短 semantic 阶段
+// 被原生长思考的 300s 下限抬高。
 func testSettings() model.Settings {
 	s := model.DefaultSettings()
 	s.RealConnectSec = 2

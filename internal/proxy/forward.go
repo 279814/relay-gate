@@ -17,62 +17,27 @@ import (
 	"github.com/279814/relay-gate/internal/outbound"
 )
 
-// Timeouts 是转发路径用到的四段超时。
-//
-// 它是 outbound.Budget 的投影，只取 forward.go 实际用得到的那几段：
-// Connect 由连接池承载（不在这里用），Total 是最外层硬上限，FirstToken 管
-// 「响应头 / 首字节 / 首事件 / 首语义」投影成的单一截止（§7.4），Idle 在
-// §8.8 首语义证据出现之后才启用（流内静默）。
-//
-// 为什么不直接用 outbound.Budget：Budget 的四个观察点（response_header /
-// first_byte / first_event / first_semantic）要到阶段计时器拆开之后才分得开
-// —— 现阶段用 SemanticSeen 决定何时结束 FirstToken、何时启用 Idle，
-// 而不另起一套计时器。TimeoutsFrom 是投影入口。
+// Timeouts keeps each real-request stage independent. PeekWait is the separate
+// bounded retry-inspection window; it never extends a response stage or Total.
 type Timeouts struct {
-	Connect    time.Duration
-	FirstToken time.Duration
-	// PeekWait is the pre-commit first-body-byte window (§11.5).
-	// Safe/Balanced use a short bound (2s); Aggressive uses real_first_byte_sec.
-	// Zero means fall back to FirstToken.
-	PeekWait time.Duration
-	// Safe/Balanced commit an undecided response when the short peek window
-	// expires. Aggressive may instead treat its expanded window as a failure.
+	Connect             time.Duration
+	ResponseHead        time.Duration
+	FirstByte           time.Duration
+	FirstSemantic       time.Duration
+	PeekWait            time.Duration
 	CommitOnPeekTimeout bool
-	Idle                time.Duration // 首语义之后，原始语义事件之间的静默上限
+	Idle                time.Duration
 	Total               time.Duration
 }
 
-// TimeoutsFrom 把 outbound.Budget 投影成转发路径用的四段。
-//
-// 各阶段上限取**最小的那个**：Budget 的四个观察点都从 SentAt 起算，而
-// forward.go 现在只有一个「首字节前」的计时器，能表达的只有其中最紧的那条。
-// 取最大值会让配得更紧的那个阶段静默失效。
-//
-// 投影后再抬到 MinRealFirstSemanticSec：配置层只卡 real_first_semantic_sec，
-// 但这里 FirstToken 兼管响应头 / 首字节 / 首语义，任一阶段配短都会经 min
-// 把长思考砍到五分钟以下（与探活侧 PR #93 同类）。Total 已被 CapTotal 夹到
-// 低于该下限时不抬，否则会越过一次客户端请求共享的总预算。
 func TimeoutsFrom(budget outbound.Budget) Timeouts {
-	firstToken := budget.Total
-	for _, stage := range []time.Duration{
-		budget.ResponseHead, budget.FirstByte, budget.FirstEvent, budget.FirstSemantic,
-	} {
-		if stage > 0 && stage < firstToken {
-			firstToken = stage
-		}
-	}
+	semantic := budget.FirstSemantic
 	floor := time.Duration(model.MinRealFirstSemanticSec) * time.Second
-	if firstToken > 0 && firstToken < floor && (budget.Total <= 0 || budget.Total >= floor) {
-		firstToken = floor
+	if semantic > 0 && semantic < floor && (budget.Total <= 0 || budget.Total >= floor) {
+		semantic = floor
 	}
-	return Timeouts{
-		Connect:             budget.Connect,
-		FirstToken:          firstToken,
-		PeekWait:            2 * time.Second, // §11.5 Safe/Balanced default bound
-		CommitOnPeekTimeout: true,
-		Idle:                budget.IdleTimeout(),
-		Total:               budget.Total,
-	}
+	return Timeouts{Connect: budget.Connect, ResponseHead: budget.ResponseHead, FirstByte: budget.FirstByte, FirstSemantic: semantic,
+		PeekWait: 2 * time.Second, CommitOnPeekTimeout: true, Idle: budget.IdleTimeout(), Total: budget.Total}
 }
 
 // WithAggressivePeek expands the pre-commit first-byte wait to real_first_byte_sec (§11.5).
@@ -84,14 +49,17 @@ func (to Timeouts) WithAggressivePeek(realFirstByte time.Duration) Timeouts {
 	return to
 }
 
-func (to Timeouts) peekWaitOrFirstToken() time.Duration {
+func (to Timeouts) peekWait() time.Duration {
 	if to.PeekWait > 0 {
 		return to.PeekWait
 	}
-	return to.FirstToken
+	if to.FirstByte > 0 {
+		return to.FirstByte
+	}
+	return to.Total
 }
 
-// RealTimeouts 是真实请求的四段超时。
+// RealTimeouts 是真实请求的独立阶段与总预算。
 func RealTimeouts(s model.Settings) Timeouts {
 	return TimeoutsFrom(outbound.RealBudget(s))
 }
@@ -263,8 +231,7 @@ func (f *Forwarder) Send(ctx context.Context, method, outURL string,
 	//
 	// cancel 不在这里 defer：它要活到 Commit/Discard —— 提交之后响应体
 	// 还在读，提前取消会把一个正常的流掐断。
-	ctx, cancel := context.WithTimeout(ctx, f.Timeouts.Total)
-	at := &Attempt{f: f, res: res, cancel: cancel, ctx: ctx, clientCtx: clientCtx}
+	at := &Attempt{f: f, res: res, cancel: func() {}, ctx: ctx, clientCtx: clientCtx}
 
 	// bytes.NewReader 而不是 strings.NewReader(string(body))：
 	// 后者会把整个 body 复制一遍，而 body 可能有几百 KB 到 MB。
@@ -286,33 +253,36 @@ func (f *Forwarder) Send(ctx context.Context, method, outURL string,
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 
-	// 响应头阶段单独设一个时限。
-	//
-	// 没有它的话，一个卡在「收下请求但不回响应头」的站只能等 Total 兜底
-	// （默认 30 分钟），而首 Token 超时形同虚设 —— 它只在读 body 时才起作用。
-	// 这种站在公益站里并不罕见：连接建立、请求收下，然后就没有然后了。
-	//
-	// 用 timer 而不是给请求套一个更短的 context：请求的 context 一旦到期，
-	// 连带取消的是**整个响应体的读取** —— 长思考流会在首 Token 那一刻
-	// 被拦腰砍断，而那正是 5 分钟下限要保护的场景。timer 在拿到响应头后
-	// 立刻 Stop，之后的时限交给 streamBody 自己的 timer。
-	var headerTimedOut atomic.Bool
-	headerTimer := time.AfterFunc(f.Timeouts.FirstToken, func() {
-		headerTimedOut.Store(true)
-		cancel()
-	})
-	defer headerTimer.Stop()
-
 	res.SentAt = time.Now()
-	// 直接用 Transport.RoundTrip 而不是 http.Client。除了「不要自动跟随
-	// 重定向」之外还有一条不显然的理由：Client.Do 会把错误包成 *url.Error，
-	// 而它的 Error() 带上**完整 URL** —— FixedQueryTemplate / legacy_exact
-	// 可能把 key 放在 query 里（§7.1），那就等于把上游 key 拼进错误文本。
-	// writeForwardError 已对此做了脱敏兜底，两层都在。
+	ctx, cancel := context.WithDeadline(clientCtx, res.SentAt.Add(f.Timeouts.Total))
+	at.ctx, at.cancel = ctx, cancel
+	req = req.WithContext(ctx)
+	deadline, kind := f.Timeouts.pendingDeadline(res.SentAt, false, time.Time{}, time.Time{}, time.Time{}, false, 0)
+	var timedOut atomic.Int32
+	headerDone := make(chan struct{})
+	headerTimer := time.AfterFunc(time.Until(deadline), func() { defer close(headerDone); timedOut.Store(kind); cancel() })
+	defer headerTimer.Stop()
 	resp, err := f.Transport.RoundTrip(req)
-	headerTimer.Stop()
-	if err != nil {
-		res.Err = classifyTransportErr(err, clientCtx, headerTimedOut.Load(), f.Timeouts.FirstToken)
+	if !headerTimer.Stop() {
+		<-headerDone
+	}
+	if !time.Now().Before(deadline) {
+		timedOut.CompareAndSwap(0, kind)
+	}
+	if err != nil || timedOut.Load() != 0 {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		switch {
+		case clientCtx.Err() != nil:
+			res.Err = classifyTransportErr(err, clientCtx)
+		case timedOut.Load() != 0:
+			res.Err = responseStageError(timedOut.Load())
+		case ctx.Err() != nil:
+			res.Err = ErrTotalTimeout
+		default:
+			res.Err = classifyTransportErr(err, clientCtx)
+		}
 		res.DoneAt = time.Now()
 		return at
 	}
@@ -358,9 +328,11 @@ func (at *Attempt) Peek() []byte {
 		return at.peeked
 	}
 	at.peekDone = true
+	stop := at.watchResponse()
+	defer stop()
 	res, f := at.res, at.f
 
-	peekWait := f.Timeouts.peekWaitOrFirstToken()
+	peekWait := f.Timeouts.peekWait()
 	timer := time.NewTimer(peekWait)
 	defer timer.Stop()
 	// One bounded read replaces the old cancellation watcher. If Safe/Balanced
@@ -378,6 +350,11 @@ func (at *Attempt) Peek() []byte {
 	select {
 	case read = <-ready:
 	case <-timer.C:
+		if at.clientCtx.Err() != nil || at.ctx.Err() != nil || at.stageTimeout.Load() != 0 {
+			_ = body.Close()
+			read.err = context.Canceled
+			break
+		}
 		if f.Timeouts.CommitOnPeekTimeout {
 			at.resp.Body = &pendingPeekBody{ReadCloser: body, ready: ready, ctx: at.ctx}
 			return nil
@@ -394,6 +371,18 @@ func (at *Attempt) Peek() []byte {
 		at.peeked = read.body
 		// 只记首字节时刻；TTFT / OnFirstByte 等 §8.8 语义证据（streamBody）。
 		res.FirstByteAt = read.at
+		at.wire.firstByte.CompareAndSwap(0, read.at.UnixNano())
+		at.wire.lastByte.Store(read.at.UnixNano())
+		at.wire.notify()
+	}
+	if n > 0 && f.Timeouts.FirstByte > 0 && !read.at.Before(res.SentAt.Add(f.Timeouts.FirstByte)) {
+		at.stageTimeout.CompareAndSwap(0, responseByteTimeout)
+	}
+	if at.clientCtx.Err() != nil || at.ctx.Err() != nil || at.stageTimeout.Load() != 0 {
+		at.peekBroke = true
+		res.DoneAt = time.Now()
+		res.Err = at.readFailure(read.err, 0)
+		return nil
 	}
 
 	// n > 0 时一律算拿到了内容，即使同时带回 EOF —— 那是「短响应一次读完」
@@ -418,9 +407,15 @@ func (at *Attempt) Peek() []byte {
 	var bodyTimeout net.Error
 	switch {
 	case at.clientCtx.Err() != nil:
-		res.Err = fmt.Errorf("%w: %v", ErrCanceled, err)
+		if errors.Is(context.Cause(at.clientCtx), ErrTotalTimeout) {
+			res.Err = ErrTotalTimeout
+		} else {
+			res.Err = fmt.Errorf("%w: %v", ErrCanceled, err)
+		}
+	case at.stageTimeout.Load() != 0:
+		res.Err = responseStageError(at.stageTimeout.Load())
 	case timedOut:
-		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.peekWaitOrFirstToken())
+		res.Err = fmt.Errorf("%w: 首 Token 超过 %v", ErrFirstTokenTimeout, f.Timeouts.peekWait())
 	case at.ctx.Err() != nil:
 		res.Err = fmt.Errorf("%w: 超过总时限 %v", ErrTotalTimeout, f.Timeouts.Total)
 	case errors.As(err, &bodyTimeout) && bodyTimeout.Timeout():
@@ -547,6 +542,8 @@ func (at *Attempt) Discard() {
 	if at.resp == nil {
 		return // Send 就失败了，没有 body 可关
 	}
+	stop := at.watchResponse()
+	defer stop()
 	if _, pending := at.resp.Body.(*pendingPeekBody); pending {
 		// An undecided window has no reusable complete response yet. Do not
 		// wait for another byte while discarding its still-owned first read.
@@ -569,7 +566,7 @@ const discardDrainLimit = 4 << 10
 
 // captureDrain reuses only the existing bounded connection-reuse drain.
 func (at *Attempt) captureDrain() {
-	var body io.Reader = at.resp.Body
+	var body io.Reader = observedUpstreamBody{ReadCloser: at.resp.Body, wire: at.wire, readError: &at.res.upstreamReadErr}
 	if tee := at.respTee(); tee != nil {
 		body = io.TeeReader(body, lenientWriter{tee})
 	}
@@ -608,6 +605,9 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
+			if at.clientCtx.Err() != nil || at.ctx.Err() != nil || at.stageTimeout.Load() != 0 {
+				return total, at.readFailure(err, total)
+			}
 			if res.FirstByteAt.IsZero() {
 				res.FirstByteAt = time.Now()
 			}
@@ -673,16 +673,15 @@ func IsUpstreamFault(err error) bool {
 // 失败次数，永远不会被标 dead，正好废掉这个项目的核心价值。
 //
 // clientCtx 是加超时之前的 ctx（客户端的）。
-func classifyTransportErr(err error, clientCtx context.Context,
-	headerTimedOut bool, firstToken time.Duration) error {
+func classifyTransportErr(err error, clientCtx context.Context) error {
 
 	// 只有**客户端**取消才是非上游故障。这个判断必须在最前面：
 	// 客户端断开会连带取消内层 context，先判内层会误伤。
 	if clientCtx.Err() != nil {
+		if errors.Is(context.Cause(clientCtx), ErrTotalTimeout) {
+			return ErrTotalTimeout
+		}
 		return fmt.Errorf("%w: %v", ErrCanceled, err)
-	}
-	if headerTimedOut {
-		return fmt.Errorf("%w: 响应头超过 %v 未返回", ErrFirstTokenTimeout, firstToken)
 	}
 	// GotConn 已到：请求可能已写出。不得再标成 ErrConnect，否则 Balanced
 	// 会按 Safe 建连失败换站并可能双写 POST（§11.2）。

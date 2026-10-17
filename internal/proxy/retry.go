@@ -152,6 +152,11 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		tried:         map[int64]bool{},
 		maxLocalSkips: countCandidateRoutes(pre.snapshot, pre.inModel, proto),
 	}
+	// Every preparation/send shares this existing plan's absolute limit. A
+	// later Attempt cannot renew time consumed while resolving its target.
+	requestCtx, stopTotal := context.WithDeadlineCause(r.Context(), plan.deadline, ErrTotalTimeout)
+	defer stopTotal()
+	r = r.WithContext(requestCtx)
 	if plan.maxAttempts < 1 {
 		// Validate 已保证 ≥ 1。这里兜的是「旧库升级后该字段是零值」——
 		// 那种情况下 0 不是「关闭重试」而是「一次都不发」，等于关闭转发。
