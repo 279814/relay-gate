@@ -59,9 +59,9 @@ type CalibrationPlanOptions struct {
 
 // CalibrationCrashPoint 是测试可注入的崩溃点（§P0-11 第 16 条）。
 //
-// 生产路径 crashAt 恒为空。未实现「socket 写出后但 execution 插入前」——
-// 那一点在 Executor RoundTrip 与 recorder 之间，需要 Executor 级 hook；
-// 见 calibration.go 文末 DeferredCrashPoints。
+// 生产路径 crashAt 恒为空。socket 写出后、execution 插入前的边界由
+// TestCalibration_SocketWriteCrashDoesNotReplay 使用真实 HTTP 与子进程 kill
+// 覆盖，复用 TransportManager 接缝，不在 Executor 主链增加测试 hook。
 type CalibrationCrashPoint string
 
 const (
@@ -69,11 +69,6 @@ const (
 	CrashAfterSendStarted     CalibrationCrashPoint = "after_send_started"
 	CrashAfterExecutionCommit CalibrationCrashPoint = "after_execution_commit"
 )
-
-// DeferredCrashPoints 说明本轮未实现的崩溃注入点。
-var DeferredCrashPoints = []string{
-	"after_socket_before_execution_insert: 需要 ProbeExecutor 在 RoundTrip 返回后、Record 前暴露 hook；P0-11 未改 Executor 发送主链到那种粒度，避免与 P0-09/P0-10 的单次发送不变量纠缠。重启语义由 send_started 无 execution → interrupted 覆盖「可能已出网」的保守分支。",
-}
 
 // CalibrationService 见文件头。
 type CalibrationService struct {

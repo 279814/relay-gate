@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,65 @@ import (
 )
 
 var retentionNow = time.Date(2026, 10, 18, 15, 40, 0, 0, time.UTC)
+
+// Bulk fixtures restore every nonunique secondary index, using its original
+// SQL, before the subject runs. This keeps the real 50k/200k policies and all
+// constraints/FKs while avoiding per-row index construction under -race.
+func retentionBulkFixture(t *testing.T, st *Store, load func(*sql.Tx) error) {
+	t.Helper()
+	started := time.Now()
+	before, err := inspectSchemaState(context.Background(), st.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT name,sql FROM sqlite_schema WHERE type='index' AND tbl_name='probe_execution'
+		AND sql IS NOT NULL ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var indexes []struct{ name, sql string }
+	for rows.Next() {
+		var index struct{ name, sql string }
+		if err := rows.Scan(&index.name, &index.sql); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(strings.ToUpper(index.sql), "CREATE INDEX ") {
+			indexes = append(indexes, index)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range indexes {
+		if _, err := tx.Exec(`DROP INDEX "` + strings.ReplaceAll(index.name, `"`, `""`) + `"`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := load(tx); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range indexes {
+		if _, err := tx.Exec(index.sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := inspectSchemaState(context.Background(), tx)
+	if err != nil || after.Fingerprint != before.Fingerprint {
+		t.Fatalf("bulk fixture changed physical catalog: %+v %v", after, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bulk execution fixture setup (original indexes restored): %s", time.Since(started))
+}
 
 func retentionExecution(t *testing.T, st *Store, up *model.Upstream, id string, trigger model.ProbeTrigger, age time.Duration) model.ProbeExecution {
 	t.Helper()
@@ -124,33 +185,52 @@ func TestPruneProbeExecutionsEnforcesEachProductionRowCap(t *testing.T) {
 			if tc.trigger == model.TriggerRealTraffic {
 				binding, reason = "real_traffic_context", "unsupported_shape"
 			}
-			_, err := st.db.Exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+			retentionBulkFixture(t, st, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
 				INSERT INTO probe_execution(id,trigger,upstream_id,upstream_network_revision,upstream_credential_revision,
 				endpoint,recipe_binding_use,recipe_storage,recipe_origin,template_id,recipe_identity_revision,evidence_hash,
 				error_class,capability_state,observation_scope,observation_order,reachability_disposition,capability_disposition,
 				real_request_shape_unavailable_reason,created_at,done_at_ms)
-				SELECT printf('cap-%07d',x),?,?,1,1,'models',?,'embedded','basic_protocol','builtin:models',1,'hash',
-				'none','unknown','upstream_reachability',x,'not_applicable','not_applicable',?,?+x,?+x FROM n`,
-				tc.cap+3, tc.trigger, up.ID, binding, reason, retentionNow.Add(-time.Hour).UnixMilli(), retentionNow.Add(-time.Hour).UnixMilli())
-			if err != nil {
-				t.Fatal(err)
+				SELECT printf('cap-%07d',x),CASE WHEN ?='scheduled' AND x%2=0 THEN 'recovery' ELSE ? END,?,1,1,'models',?,'embedded','basic_protocol','builtin:models',1,'hash',
+				'none','unknown','upstream_reachability',x,'not_applicable','not_applicable',?,?+(x/2),?+(x/2) FROM n`,
+					tc.cap+3, tc.trigger, tc.trigger, up.ID, binding, reason, retentionNow.Add(-time.Hour).UnixMilli(), retentionNow.Add(-time.Hour).UnixMilli())
+				return err
+			})
+			for i := 0; i < 4; i++ {
+				id := fmt.Sprintf("protected-%d", i)
+				retentionExecution(t, st, up, id, tc.trigger, 100*24*time.Hour)
+				if _, err := st.db.Exec(`INSERT INTO probe_recipe(upstream_id,endpoint,status,last_test_execution_id,created_at,updated_at)
+					VALUES (?,'models','archived',?,1,1)`, up.ID, id); err != nil {
+					t.Fatal(err)
+				}
 			}
-			n, err := st.PruneProbeExecutions(context.Background(), retentionNow, 2)
+			started := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			n, err := st.PruneProbeExecutions(ctx, retentionNow, 2)
+			cancel()
+			t.Logf("%s production cap: first bounded prune=%s", tc.trigger, time.Since(started))
 			if err != nil || n != 2 {
 				t.Fatalf("pruned=%d err=%v", n, err)
 			}
-			n, err = st.PruneProbeExecutions(context.Background(), retentionNow, 500)
+			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+			n, err = st.PruneProbeExecutions(ctx, retentionNow, 500)
+			cancel()
 			if err != nil || n != 1 {
 				t.Fatalf("remaining excess=%d err=%v", n, err)
 			}
-			if got := retentionCount(t, st, "probe_execution"); got != tc.cap {
-				t.Fatalf("kept=%d cap=%d", got, tc.cap)
+			if got := retentionCount(t, st, "probe_execution"); got != tc.cap+4 {
+				t.Fatalf("kept=%d cap=%d plus four protected records", got, tc.cap)
 			}
 			if _, err := st.GetProbeExecution(context.Background(), "cap-0000001"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("oldest survived: %v", err)
 			}
 			if _, err := st.GetProbeExecution(context.Background(), fmt.Sprintf("cap-%07d", tc.cap+3)); err != nil {
 				t.Fatal(err)
+			}
+			for i := 0; i < 4; i++ {
+				if _, err := st.GetProbeExecution(context.Background(), fmt.Sprintf("protected-%d", i)); err != nil {
+					t.Fatal(err)
+				}
 			}
 		})
 	}
@@ -494,15 +574,15 @@ func TestPruneCalibrationWithUnrelatedExecutionVolumeFitsJanitorDeadline(t *test
 	if err := st.CreateRoute(route); err != nil {
 		t.Fatal(err)
 	}
-	_, err := st.db.Exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200000)
+	retentionBulkFixture(t, st, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200000)
 		INSERT INTO probe_execution(id,trigger,upstream_id,upstream_network_revision,upstream_credential_revision,
 		endpoint,recipe_binding_use,recipe_storage,recipe_origin,template_id,recipe_identity_revision,evidence_hash,
 		error_class,capability_state,observation_scope,observation_order,reachability_disposition,capability_disposition,created_at)
 		SELECT printf('volume-%07d',x),'scheduled',?,1,1,'models','resolved','embedded','basic_protocol','builtin:models',1,
 		'hash','none','unknown','upstream_reachability',x,'not_applicable','not_applicable',? FROM n`, up.ID, retentionNow.UnixMilli())
-	if err != nil {
-		t.Fatal(err)
-	}
+		return err
+	})
 	for i := 0; i < 100; i++ {
 		if _, err := st.db.Exec(`INSERT INTO calibration_run(id,route_id,endpoint,state,created_at,finished_at)
 			VALUES (?,?,'models','failed',1,1)`, fmt.Sprintf("empty-failed-%03d", i), route.ID); err != nil {

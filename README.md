@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/279814/relay-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/279814/relay-gate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
 
 面向多个异构 LLM 中转站的**主动探活 + 优先级路由**透传网关。
 
@@ -125,7 +125,7 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
 | 存储 | 单副本 SQLite（`modernc.org/sqlite`，无 CGO），库权限 0600 |
 | 登录保护 | 失败退避（按来源 IP + 全局）；**无**登录 IP 白名单 |
 
-需求基线：[docs/01-需求与设计.md](docs/01-需求与设计.md)。阶段记录见 docs/04–09；当前验收边界与交接步骤见 [维护与交接](docs/10-维护与交接.md)。
+需求基线：[docs/01-需求与设计.md](docs/01-需求与设计.md)。阶段记录见 docs/04–09；当前验收边界与交接步骤见 [维护与交接](docs/10-维护与交接.md)、[完成矩阵](docs/11-最终完成矩阵.md)与[P0实现索引](docs/18-P0-实现与验收索引.md)。Recipe与ClientProfile操作见[管理说明](docs/16-Recipe与ClientProfile管理.md)。
 
 ## 构建与开发
 

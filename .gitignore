@@ -54,3 +54,5 @@ mock-*.log
 .vs/
 .playwright-cli/
 output/playwright/
+__pycache__/
+*.pyc

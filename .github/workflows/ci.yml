@@ -11,11 +11,11 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -32,12 +32,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: Stream cancellation race regression
+        run: go test -race -run='^TestNativeStreamStopsReadingAfterFirstSemanticVerdict$' -count=100 ./internal/probe
+
       # -race 只能在这里跑：竞态检测要 cgo，开发机（Windows，无 cgo）
       # 起不来。而这个项目的核心恰恰是并发 —— 在途计数、样本队列、
       # livecfg 的快照替换、SSE 流的三个超时看门狗，全是多协程共享状态。
       # 功能断言只能证明「这次对了」，证不了「没有数据竞争」。
       - name: go test -race
-        run: go test -race -count=1 ./...
+        # 保留真实 50k/200k 保留上限及清理本身的 2s 断言。
+        # pure-Go SQLite 在 -race 下构造这些数据会超过默认的包级 10m。
+        run: go test -race -timeout=20m -count=1 ./...
 
       # 第二轮不开 -race：竞态检测会把调度拉慢一个数量级，掩盖
       # 时序敏感的偶发失败（超时、TTFT、后台 writer 的进度）。
@@ -73,7 +78,7 @@ jobs:
           node --test internal/web/recipe_admin.contract.test.mjs
 
       - name: 前端模块契约测试
-        run: node --test internal/web/modules.contract.test.mjs internal/web/recipe_admin.contract.test.mjs
+        run: node --test internal/web/modules.contract.test.mjs
 
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
@@ -99,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # smoke-m7.ps1 是 PowerShell 的。ubuntu-latest 自带 pwsh，
       # 不需要额外安装步骤。
@@ -114,8 +119,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
       - name: 安装脚本离线行为回归
@@ -130,11 +135,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
       - name: Real binary, disposable database and loopback upstream
@@ -147,8 +152,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Exercise actual bounded fuzzing beyond the seed corpus
@@ -164,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Verify pinned Gitleaks and scan committed history
@@ -180,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify pinned Trivy
         env:
           GH_TOKEN: ${{ github.token }}
@@ -199,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate independent public Compose definition
         env:
           RELAY_PUBLIC_IP: 8.8.8.8
@@ -211,3 +216,5 @@ jobs:
       - name: Local CA, real Nginx, streaming and Certbot capability integration
         # No published host ports, public ACME requests or production data.
         run: docker run --rm relay-public-edge-test -test.v -test.count=1 -test.timeout=3m
+      - name: Repeat real Nginx configuration transitions
+        run: docker run --rm relay-public-edge-test -test.run='^TestPublicRealNginxLocalCAIntegration$' -test.count=5 -test.timeout=3m

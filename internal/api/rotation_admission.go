@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/279814/relay-gate/internal/httpbody"
 	"github.com/279814/relay-gate/internal/runstate"
 )
 
@@ -70,11 +71,13 @@ func (s *Server) guardMutations(next http.Handler) http.Handler {
 			return
 		}
 		if s.runState != nil && s.runState.InMaintenance() {
+			httpbody.DiscardRejected(w, r)
 			writeJSON(w, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "maintenance 期间禁止管理写入"})
 			return
 		}
 		leave, admitted := s.mutations.enter()
 		if !admitted {
+			httpbody.DiscardRejected(w, r)
 			writeJSON(w, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "管理写入正在等待安全轮换"})
 			return
 		}

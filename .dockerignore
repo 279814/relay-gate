@@ -33,6 +33,8 @@ docs/02-上游能力矩阵.md
 .vs/
 .playwright-cli/
 output/playwright/
+**/__pycache__
+**/*.pyc
 
 # 冒烟脚本的运行产物
 *-gate.log

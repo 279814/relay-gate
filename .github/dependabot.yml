@@ -1,5 +1,9 @@
 version: 2
 updates:
+  - package-ecosystem: pip
+    directory: /deploy
+    schedule:
+      interval: weekly
   - package-ecosystem: gomod
     directory: /
     schedule:
