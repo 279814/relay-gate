@@ -53,7 +53,7 @@ func (store *Store) ListProbeCostDaily(ctx context.Context, filter model.ProbeCo
 	if err != nil {
 		return model.Page[*model.ProbeCostDaily]{}, err
 	}
-	conditions := []string{"1=1"}
+	conditions := []string{`day_utc>(SELECT closed_through_day_utc FROM probe_cost_retention_watermark WHERE singleton=1)`}
 	args := make([]any, 0, 14)
 	if filter.DayFrom != "" {
 		conditions = append(conditions, "day_utc>=?")
