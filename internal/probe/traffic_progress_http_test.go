@@ -39,22 +39,34 @@ func forwardWithTrafficProgress(t *testing.T, h *trafficHTTPHarness, to proxy.Ti
 	return res, rec.Body.Bytes()
 }
 
-func TestTrafficProgressHTTP_CompressedKeepaliveCannotExtendSemanticIdle(t *testing.T) {
-	for _, encoding := range []string{"gzip", "br"} {
+type progressEncoder interface {
+	io.WriteCloser
+	Flush() error
+}
+
+type plainProgressEncoder struct{ io.Writer }
+
+func (plainProgressEncoder) Flush() error { return nil }
+func (plainProgressEncoder) Close() error { return nil }
+
+func newProgressEncoder(w io.Writer, encoding string) progressEncoder {
+	switch encoding {
+	case "gzip":
+		return gzip.NewWriter(w)
+	case "br":
+		return brotli.NewWriter(w)
+	default:
+		return plainProgressEncoder{w}
+	}
+}
+
+func TestTrafficProgressHTTP_RawKeepaliveAfterSemanticResetsIdle(t *testing.T) {
+	for _, encoding := range []string{"identity", "gzip", "br"} {
 		t.Run(encoding, func(t *testing.T) {
 			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("Content-Encoding", encoding)
-				var encoder interface {
-					io.Writer
-					Flush() error
-					Close() error
-				}
-				if encoding == "gzip" {
-					encoder = gzip.NewWriter(w)
-				} else {
-					encoder = brotli.NewWriter(w)
-				}
+				encoder := newProgressEncoder(w, encoding)
 				defer encoder.Close()
 				_, _ = io.WriteString(encoder, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"raw\"}}\n\n")
 				_ = encoder.Flush()
@@ -72,17 +84,43 @@ func TestTrafficProgressHTTP_CompressedKeepaliveCannotExtendSemanticIdle(t *test
 					case <-r.Context().Done():
 						return
 					case <-end.C:
+						_, _ = io.WriteString(encoder, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 						return
 					}
 				}
 			})
 			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 200 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
-			if !errors.Is(res.Err, proxy.ErrStreamStalled) || !res.SemanticSeen || res.FirstSemanticAt.IsZero() {
-				t.Fatalf("compressed raw progress did not control Idle: %+v", res)
+			if res.Err != nil || !res.SemanticSeen || res.FirstSemanticAt.IsZero() {
+				t.Fatalf("raw keepalives after genuine semantic must keep the stream active: %+v", res)
+			}
+			exec := h.execution(t)
+			if !exec.Success || exec.Partial || !exec.NormalEndSeen {
+				t.Fatalf("complete stream with keepalives must retain complete semantic evidence: %+v", exec)
+			}
+		})
+	}
+}
+
+func TestTrafficProgressHTTP_RealSilenceAfterSemanticStillExpiresIdle(t *testing.T) {
+	for _, encoding := range []string{"identity", "gzip", "br"} {
+		t.Run(encoding, func(t *testing.T) {
+			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Content-Encoding", encoding)
+				encoder := newProgressEncoder(w, encoding)
+				defer encoder.Close()
+				_, _ = io.WriteString(encoder, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"raw\"}}\n\n")
+				_ = encoder.Flush()
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			})
+			res, _ := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 300 * time.Millisecond, Idle: 90 * time.Millisecond, Total: time.Second})
+			if !errors.Is(res.Err, proxy.ErrStreamStalled) || !res.SemanticSeen {
+				t.Fatalf("genuinely silent upstream must expire Idle: %+v", res)
 			}
 			exec := h.execution(t)
 			if exec.Success || !exec.Partial {
-				t.Fatalf("truncated compressed stream must stay partial: %+v", exec)
+				t.Fatalf("silent partial stream was promoted: %+v", exec)
 			}
 		})
 	}

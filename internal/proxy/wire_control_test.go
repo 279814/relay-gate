@@ -328,7 +328,7 @@ func TestTransformOutputCannotManufactureForwardSemanticEvidence(t *testing.T) {
 	}
 }
 
-func TestForwardKeepaliveDoesNotRefreshSemanticIdle(t *testing.T) {
+func TestForwardRawKeepaliveAfterSemanticResetsIdle(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
@@ -352,15 +352,14 @@ func TestForwardKeepaliveDoesNotRefreshSemanticIdle(t *testing.T) {
 	defer up.Close()
 	f := testForwarder(t, Timeouts{FirstToken: time.Second, Idle: 60 * time.Millisecond, Total: time.Second})
 	res := f.Forward(context.Background(), httptest.NewRecorder(), "POST", up.URL, http.Header{}, nil)
-	if !errors.Is(res.Err, ErrStreamStalled) {
-		t.Fatalf("heartbeats must not extend semantic idle: %v", res.Err)
+	if res.Err != nil || !res.SemanticSeen {
+		t.Fatalf("original keepalives after semantic must keep the stream active: %v", res.Err)
 	}
 }
 
-func TestTransformKeepaliveCannotRefreshRawSemanticIdle(t *testing.T) {
+func TestTransformOutputCannotSatisfyRawFirstSemanticTimeout(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"raw\"}}\n\n")
 		w.(http.Flusher).Flush()
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
@@ -383,7 +382,7 @@ func TestTransformKeepaliveCannotRefreshRawSemanticIdle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := testForwarder(t, Timeouts{FirstToken: time.Second, Idle: 80 * time.Millisecond, Total: time.Second})
+	f := testForwarder(t, Timeouts{FirstToken: 80 * time.Millisecond, Idle: time.Second, Total: time.Second})
 	at := f.Send(context.Background(), "POST", up.URL, http.Header{}, nil)
 	if at.Failed() {
 		at.Discard()
@@ -394,7 +393,7 @@ func TestTransformKeepaliveCannotRefreshRawSemanticIdle(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "injected") {
 		t.Fatalf("fixture did not rewrite ping: %q", rec.Body.String())
 	}
-	if !errors.Is(res.Err, ErrStreamStalled) {
-		t.Fatalf("transformed heartbeat changed raw Idle: %v", res.Err)
+	if !errors.Is(res.Err, ErrFirstTokenTimeout) || res.SemanticSeen {
+		t.Fatalf("transformed heartbeat must not satisfy the original semantic gate: %+v", res)
 	}
 }

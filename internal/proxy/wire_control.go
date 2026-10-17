@@ -152,9 +152,10 @@ func (at *Attempt) projectWire() {
 	}
 }
 
-// One existing cancellation watcher also owns the stage timer. Only genuine
-// raw semantic events refresh Idle. Capacity/codec failures fall back to the
-// outer total deadline after first byte, rather than killing a healthy stream.
+// One existing cancellation watcher also owns the stage timer. First semantic
+// enables Idle; subsequent original upstream activity resets it, including
+// keepalives. Transformed output cannot refresh it. Capacity/codec failures fall
+// back to the outer total deadline after first byte.
 func (at *Attempt) watchResponse() func() {
 	if at.wire == nil {
 		at.wire = newWireEvidence(at.f.Protocol, at.res.RespHeaders, at.f.RespObserver)
@@ -180,7 +181,7 @@ func (at *Attempt) watchResponse() func() {
 					deadline = time.Unix(0, lastByte).Add(at.f.Timeouts.Idle)
 					kind = 2
 				} else if !s.LastSemanticAt.IsZero() {
-					deadline = s.LastSemanticAt.Add(at.f.Timeouts.Idle)
+					deadline = time.Unix(0, lastByte).Add(at.f.Timeouts.Idle)
 					kind = 2
 				}
 			}
@@ -213,7 +214,7 @@ func (at *Attempt) watchResponse() func() {
 				// A progress notification can race the timer; recompute before
 				// closing when reliable new evidence has extended the deadline.
 				now := at.wire.snapshot()
-				if at.wire.lastByte.Load() != 0 && (now.Incomplete != "" || now.LastSemanticAt.After(s.LastSemanticAt) || (status >= 400 && at.wire.lastByte.Load() > lastByte)) {
+				if at.wire.lastByte.Load() != 0 && (now.Incomplete != "" || now.LastSemanticAt.After(s.LastSemanticAt) || ((status >= 400 || !now.LastSemanticAt.IsZero()) && at.wire.lastByte.Load() > lastByte)) {
 					continue
 				}
 				at.stageTimeout.Store(kind)
