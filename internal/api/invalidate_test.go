@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +19,15 @@ type recordingInvalidator struct {
 	routes     []int64
 	upstreams  []int64
 	modelNames []int64
+	scheduled  []probe.ScheduleKey
+	reasons    []probe.ScheduleReason
+}
+
+func (r *recordingInvalidator) Trigger(key probe.ScheduleKey, reason probe.ScheduleReason) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scheduled = append(r.scheduled, key)
+	r.reasons = append(r.reasons, reason)
 }
 
 func (r *recordingInvalidator) InvalidateRoute(id int64) {
@@ -399,6 +407,9 @@ func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T)
 			}
 			return []int64{101, 102}
 		},
+		RouteScheduleKey: func(routeID int64) (probe.ScheduleKey, bool) {
+			return probe.ScheduleKey{UpstreamID: 9, ScopeType: model.RecipeScopeRoute, ScopeID: routeID, Endpoint: model.EndpointMessages}, true
+		},
 	}
 	wrap.InvalidateModelName(5)
 	if len(sem.modelNames) != 1 || sem.modelNames[0] != 5 {
@@ -408,9 +419,13 @@ func TestSemanticConfigInvalidator_ModelNameClearsChildRouteHealth(t *testing.T)
 		sem.modelNameRoutes[0][0] != 101 || sem.modelNameRoutes[0][1] != 102 {
 		t.Fatalf("semantic routeIDs=%v", sem.modelNameRoutes)
 	}
-	_, _, mns := inner.counts()
-	if mns != 1 {
-		t.Fatalf("inner InvalidateModelName count=%d", mns)
+	if len(inner.modelNames) != 0 || len(inner.scheduled) != 2 {
+		t.Fatalf("expected per-route L2 Trigger keys, got legacy calls=%v keys=%v", inner.modelNames, inner.scheduled)
+	}
+	for index, key := range inner.scheduled {
+		if key.UpstreamID != 9 || key.ScopeType != model.RecipeScopeRoute || key.ScopeID != int64(101+index) || key.Endpoint != model.EndpointMessages || inner.reasons[index] != probe.ScheduleConfig {
+			t.Fatalf("wrong child L2 schedule key/reason: %+v %s", key, inner.reasons[index])
+		}
 	}
 }
 
@@ -913,16 +928,16 @@ func forceTableDeleteFail(t *testing.T, s *Server, table string) {
 	}
 }
 
-// reachForgetInner clears UpstreamGate on InvalidateUpstream (production Inner
-// is probe.Scheduler, which Forget-s reachability).
+// reachForgetInner clears the same committed Reachability evidence used by the
+// production Scheduler. Failed SQL deletion must never invoke this invalidator.
 type reachForgetInner struct {
 	*recordingInvalidator
-	gate *health.UpstreamGate
+	reach *health.ReachabilityTracker
 }
 
 func (r *reachForgetInner) InvalidateUpstream(id int64) {
-	if r.gate != nil {
-		r.gate.Forget(id)
+	if r.reach != nil {
+		r.reach.Invalidate(id)
 	}
 	r.recordingInvalidator.InvalidateUpstream(id)
 }
@@ -935,10 +950,10 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	fs.s.FailThreshold = 1
 	tr := health.NewTracker(fs)
 	recGate := health.NewRecoveryGate()
-	upGate := health.NewUpstreamGate()
+	reach := health.NewReachabilityTracker(fs)
 	caps := &recordingCaps{}
 	sem := health.NewSemanticInvalidator(tr, recGate, caps, nil, nil)
-	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, gate: upGate}
+	inner := &reachForgetInner{recordingInvalidator: &recordingInvalidator{}, reach: reach}
 	h := s.WithInvalidator(&SemanticConfigInvalidator{
 		Semantic: sem,
 		Inner:    inner,
@@ -1007,10 +1022,18 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 	}
 	seedDead(rtA)
 	seedDead(rtB)
-	upGate.Report(upA, 0, false, errors.New("forced probe fail"))
-	upGate.Report(upB, 0, false, errors.New("forced probe fail"))
-	if st := upGate.Status(upA); !st.Probed || st.OK {
-		t.Fatalf("setup upstream A reachability probed=%v ok=%v", st.Probed, st.OK)
+	upstreamA, err := s.st.GetUpstream(upA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamB, err := s.st.GetUpstream(upB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAPIReachability(t, reach, fs.s, upA, upstreamA.NetworkRevision, model.ReachabilityUnreachable, 1)
+	applyAPIReachability(t, reach, fs.s, upB, upstreamB.NetworkRevision, model.ReachabilityUnreachable, 1)
+	if st := reach.Effective(upA, upstreamA.NetworkRevision); st != model.ReachabilityUnreachable {
+		t.Fatalf("setup upstream A reachability=%s", st)
 	}
 	// createRoute triggers InvalidateRoute (counts + capability clears); only
 	// assert no further invalidate after the failed deletes below.
@@ -1033,8 +1056,12 @@ func TestInvalidate_FailedDeleteKeepsLiveHealth(t *testing.T) {
 			if caps.hasUpstream(upstreamID) {
 				t.Fatalf("%s: upstream Capability must not clear on failed delete", label)
 			}
-			if st := upGate.Status(upstreamID); !st.Probed || st.OK {
-				t.Fatalf("%s: Reachability probed=%v ok=%v want probed+not-ok", label, st.Probed, st.OK)
+			upstream, err := s.st.GetUpstream(upstreamID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := reach.Effective(upstreamID, upstream.NetworkRevision); st != model.ReachabilityUnreachable {
+				t.Fatalf("%s: Reachability=%s want unreachable", label, st)
 			}
 		}
 	}

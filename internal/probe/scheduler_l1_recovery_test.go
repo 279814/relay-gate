@@ -115,8 +115,7 @@ func newL1RecoveryHarness(t *testing.T) *l1RecoveryHarness {
 	})
 	settings := model.DefaultSettings()
 	h.reach = health.NewReachabilityTracker(nil)
-	h.gate = health.NewUpstreamGate().WithTracker(h.reach)
-	h.sched.gate = h.gate
+	h.sched.reach = h.reach
 	h.recorder = &reachReducingRecorder{t: t, reach: h.reach,
 		reducer: health.NewObservationReducer(nil), settings: settings}
 	executor := NewExecutor(testTargets(), nil, builtinOnlyResolver(),
@@ -150,7 +149,7 @@ func TestScheduler_L1BlipBelowThresholdDoesNotTriggerRecovery(t *testing.T) {
 	if got := h.reach.Effective(10, 0); got == model.ReachabilityUnreachable {
 		t.Fatalf("前置条件：一次失败低于阈值，站不应 unreachable，得到 %s", got)
 	}
-	if !h.gate.OKAt(10, 0) {
+	if !h.reach.OK(10, 0) {
 		t.Fatal("前置条件：低于阈值时模型探测不应被短路")
 	}
 	h.l1(t, 0)
@@ -165,7 +164,7 @@ func TestScheduler_L1NotFoundIsNotRecovery(t *testing.T) {
 
 	h.l1(t, 0)
 	h.l1(t, 2)
-	if !h.gate.OKAt(10, 0) {
+	if !h.reach.OK(10, 0) {
 		t.Fatal("/models 404 不得短路模型探测")
 	}
 	h.l1(t, 0)
@@ -181,7 +180,7 @@ func TestScheduler_L1ReturnFromUnreachableTriggersDeadRoutes(t *testing.T) {
 	h.l1(t, 0)
 	h.l1(t, 1)
 	h.l1(t, 1)
-	if h.gate.OKAt(10, 0) {
+	if h.reach.OK(10, 0) {
 		t.Fatal("前置条件：连续两次失败后站应 unreachable 并短路模型探测")
 	}
 	h.l1(t, 0)
@@ -198,7 +197,7 @@ func TestScheduler_L1RecoveryFollowsCommittedReachability(t *testing.T) {
 
 	h.l1(t, 0)
 	h.recorder.seed(10, model.ReachabilityUnreachable, 2)
-	if h.gate.OKAt(10, 0) {
+	if h.reach.OK(10, 0) {
 		t.Fatal("前置条件：站应 unreachable")
 	}
 	h.l1(t, 0)

@@ -1,227 +1,167 @@
 package probe
 
-// 这些测试保护的是**旧兼容路径**（sse.go 的 scanStream），不是 P0-07 的
-// Decoder。新协议语义的测试在 stream_test.go 与 stream_fixture_test.go。
-//
-// 为什么还留着：Prober.L2 仍在调 scanStream，而它的 errPayload 原文契约
-// 是 ClassifyHTTP 现在依赖的东西。P0-09 迁走生产路径、P0-17 删除本文件时，
-// 这里仍有效的 case 一并迁到 stream_test.go。
-//
-// 注意本文件里的断言与新 Decoder 有意不同（空 delta、zero usage 的处理），
-// 那是旧实现的既有行为，不要照它去改 stream.go。
-
+// Wire regressions exercise production Executor/Decoder/Classifier, not a
+// second scanner or an error-message keyword parser.
 import (
+	"context"
+	"github.com/279814/relay-gate/internal/model"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
 
-func contains(s, sub string) bool { return strings.Contains(s, sub) }
-
-// 三种协议的存活标志都要认。漏一种的后果是那个协议下的所有站
-// 都被判成假活 —— 整批好站被踢出池子。
-func TestScanStream_DetectsLifeAcrossProtocols(t *testing.T) {
-	tests := []struct {
-		name string
-		sse  string
-	}{
-		{
-			"Anthropic text_delta",
-			"event: content_block_delta\n" +
-				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"2"}}` + "\n\n",
-		},
-		{
-			"Anthropic thinking_delta（长思考先吐思考过程）",
-			"event: content_block_delta\n" +
-				`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"嗯"}}` + "\n\n",
-		},
-		{
-			"OpenAI Chat delta.content",
-			`data: {"choices":[{"delta":{"content":"2"}}]}` + "\n\n",
-		},
-		{
-			"OpenAI Chat reasoning_content",
-			`data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}` + "\n\n",
-		},
-		{
-			"OpenAI Responses output_text.delta",
-			"event: response.output_text.delta\n" +
-				`data: {"type":"response.output_text.delta","delta":"2"}` + "\n\n",
-		},
-		{
-			"工具调用也算生成",
-			`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}` + "\n\n",
-		},
-		{
-			// max_tokens=1 时个别站不单发 delta，直接在收尾事件里给 usage。
-			// 只认 delta 会把这类可用站误判成假活。
-			"只有 usage 也算活着",
-			"event: message_delta\n" +
-				`data: {"type":"message_delta","usage":{"output_tokens":1}}` + "\n\n",
-		},
+func executeStreamFixture(t *testing.T, proto model.Protocol, reader io.Reader) ExecutionResult {
+	t.Helper()
+	transport := &countingRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(reader)}, nil
+	}}
+	harness := testProbeExecutor()
+	harness.Transport = transport
+	harness.L2(context.Background(), upstreamFor("http://fixture.invalid"), modelNameFor(proto), &model.Route{ID: 1}, fastSettings())
+	if transport.count() != 1 {
+		t.Fatalf("stream fixture performed %d RoundTrips", transport.count())
 	}
+	return harness.Last
+}
 
-	for _, tc := range tests {
+func TestNativeStreamSemanticEvidenceAcrossProtocols(t *testing.T) {
+	cases := []struct {
+		name  string
+		proto model.Protocol
+		wire  string
+	}{
+		{"Anthropic text", model.ProtoAnthropic, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"},
+		{"Anthropic thinking", model.ProtoAnthropic, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\n"},
+		{"Chat content", model.ProtoOpenAIChat, "data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\n"},
+		{"Chat reasoning", model.ProtoOpenAIChat, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"reason\"}}]}\n\n"},
+		{"Responses text", model.ProtoOpenAIResponses, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"},
+		{"tool invocation", model.ProtoOpenAIChat, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"ping\",\"arguments\":\"{}\"}}]}}]}\n\n"},
+		{"positive output usage", model.ProtoAnthropic, "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n"},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res := scanStream(strings.NewReader(tc.sse), nil)
-			if !res.alive {
-				t.Errorf("应判为存活，得到 alive=false errPayload=%q", res.errPayload)
+			result := executeStreamFixture(t, tc.proto, strings.NewReader(tc.wire))
+			if !result.Execution.Success || !result.Execution.SemanticSeen || !result.ExpectedCancel {
+				t.Fatalf("semantic probe must succeed and cancel intentionally: %+v", result.Execution)
 			}
 		})
 	}
 }
 
-// 假活形态一：200 + SSE 但没有任何内容增量。
-// 只看状态码会把它当成好站，而它完全不可用（§4.3）。
-func TestScanStream_FakeAliveWithNoDelta(t *testing.T) {
-	sse := "event: message_start\n" +
-		`data: {"type":"message_start","message":{"id":"x","content":[]}}` + "\n\n" +
-		"event: message_stop\n" +
-		`data: {"type":"message_stop"}` + "\n\n"
-
-	res := scanStream(strings.NewReader(sse), nil)
-	if res.alive {
-		t.Error("无任何内容增量应判为假活")
-	}
-	if len(res.errPayload) > 0 {
-		t.Errorf("没有 error 事件，errPayload 应为空，得到 %q", res.errPayload)
-	}
-	if res.bytesRead == 0 {
-		t.Error("应记录已读字节数，用于区分「空响应」与「有内容但无效」")
+func TestNativeStreamMetadataAndEmptyToolScaffoldingAreNotLife(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proto model.Protocol
+		wire  string
+	}{
+		{"Anthropic metadata/end", model.ProtoAnthropic, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"x\",\"content\":[]}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"},
+		{"empty tool index", model.ProtoOpenAIChat, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := executeStreamFixture(t, tc.proto, strings.NewReader(tc.wire))
+			if result.Execution.Success || result.Execution.SemanticSeen || result.Execution.ErrorClass != model.ErrorFakeAlive || result.Execution.ResponseBytes == 0 {
+				t.Fatalf("metadata falsely proved life: %+v", result.Execution)
+			}
+		})
 	}
 }
 
-// 假活形态二：200 + 流内 error 事件。
-func TestScanStream_CapturesErrorEvent(t *testing.T) {
-	sse := "event: error\n" +
-		`data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}` + "\n\n"
-
-	res := scanStream(strings.NewReader(sse), nil)
-	if res.alive {
-		t.Error("error 事件不该判为存活")
-	}
-	if !contains(string(res.errPayload), "overloaded_error") {
-		t.Errorf("应捕获错误原文供后续分类，得到 %q", res.errPayload)
-	}
-}
-
-// 不带 event 行、只在 data 里表达错误的形态也要认。
-// New API / One API 流中途出错时经常这样，只认 event 头会丢掉错误原因。
-func TestScanStream_CapturesBareErrorPayload(t *testing.T) {
-	sse := `data: {"error":{"message":"upstream load balancer error","code":"no_available_channel"}}` + "\n\n"
-
-	res := scanStream(strings.NewReader(sse), nil)
-	if res.alive {
-		t.Error("裸 error payload 不该判为存活")
-	}
-	if !contains(string(res.errPayload), "no_available_channel") {
-		t.Errorf("应捕获错误原文，得到 %q", res.errPayload)
+func TestNativeStreamStructuredErrorEventsKeepSafeClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, wire string
+		want       model.ErrorClass
+		detail     string
+	}{
+		{"named error", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"private upstream body\"}}\n\n", model.ErrorRateLimited, "overloaded_error"},
+		{"bare error", "data: {\"error\":{\"message\":\"private upstream body\",\"code\":\"no_available_channel\"}}\n\n", model.ErrorTransient, "no_available_channel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader(tc.wire))
+			if result.Execution.Success || result.Execution.ErrorClass != tc.want || !strings.Contains(result.Execution.RedactedDetail, tc.detail) || strings.Contains(result.Execution.RedactedDetail, "private upstream body") {
+				t.Fatalf("wrong structured/private evidence: %+v", result.Execution)
+			}
+		})
 	}
 }
 
-// 完全空的响应体（连 SSE 框架都没有）。
-func TestScanStream_EmptyBody(t *testing.T) {
-	res := scanStream(strings.NewReader(""), nil)
-	if res.alive {
-		t.Error("空响应体不该判为存活")
-	}
-	if res.bytesRead != 0 {
-		t.Errorf("空响应体应读到 0 字节，得到 %d", res.bytesRead)
+func TestNativeStreamEmptyBodyHasNoResponseBytes(t *testing.T) {
+	result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader(""))
+	if result.Execution.Success || result.Execution.ResponseBytes != 0 || result.Execution.ErrorClass != model.ErrorTransient || result.Execution.FirstByteAtMS != 0 {
+		t.Fatalf("empty stream falsely succeeded: %+v", result.Execution)
 	}
 }
 
-// 判定一出就立即返回，不把流读完 —— 这是 §4.1「主动断流不再消耗
-// 上游 token」的前提。读完才判的话，探活成本等于一次完整生成。
-func TestScanStream_StopsAtFirstVerdict(t *testing.T) {
-	head := "event: content_block_delta\n" +
-		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"2"}}` + "\n\n"
-	tail := strings.Repeat("event: content_block_delta\ndata: {\"x\":1}\n\n", 5000)
-
-	r := strings.NewReader(head + tail)
-	res := scanStream(r, nil)
-
-	if !res.alive {
-		t.Fatal("应判为存活")
-	}
-	if res.bytesRead >= int64(len(head)+len(tail)) {
-		t.Errorf("判定出结果后就该停止读取，却读了 %d 字节（总长 %d）",
-			res.bytesRead, len(head)+len(tail))
-	}
-	if r.Len() == 0 {
-		t.Error("流应仍有剩余未读 —— 否则说明读到了 EOF，白耗了上游 token")
+func TestNativeStreamStopsReadingAfterFirstSemanticVerdict(t *testing.T) {
+	head := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"
+	tail := strings.Repeat("event: ping\ndata: {}\n\n", 5000)
+	reader := strings.NewReader(head + tail)
+	result := executeStreamFixture(t, model.ProtoAnthropic, reader)
+	if !result.Execution.Success || !result.ExpectedCancel || reader.Len() == 0 || result.Execution.ResponseBytes >= int64(len(head)+len(tail)) {
+		t.Fatalf("semantic verdict consumed remaining generation: %+v unread=%d", result.Execution, reader.Len())
 	}
 }
 
-// 一个不断吐心跳却永不出内容的站，不能让探活一直读到超时。
-func TestScanStream_BailsOutOnEndlessNoise(t *testing.T) {
-	noise := strings.Repeat("event: ping\ndata: {}\n\n", 200000)
-	res := scanStream(strings.NewReader(noise), nil)
-
-	if res.alive {
-		t.Error("只有心跳不该判为存活")
-	}
-	if res.bytesRead > maxStreamScan*2 {
-		t.Errorf("应在扫描上限附近停下，却读了 %d 字节", res.bytesRead)
+func TestNativeStreamEndlessNoiseIsBounded(t *testing.T) {
+	noise := strings.Repeat("event: ping\ndata: {}\n\n", 500000)
+	result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader(noise))
+	if result.Execution.Success || result.Execution.ResponseBytes > defaultMaxTotalBytes+readChunk {
+		t.Fatalf("unbounded noise scan: bytes=%d error=%s", result.Execution.ResponseBytes, result.Execution.ErrorClass)
 	}
 }
 
-// TTFT 只在收到第一个非空行时回调一次。
-func TestScanStream_FirstByteCallbackFiresOnce(t *testing.T) {
-	sse := "event: message_start\ndata: {}\n\n" +
-		"event: content_block_delta\n" +
-		`data: {"delta":{"type":"text_delta","text":"2"}}` + "\n\n"
-
-	var calls int
-	scanStream(strings.NewReader(sse), func() { calls++ })
-	if calls != 1 {
-		t.Errorf("首字节回调应只触发一次，得到 %d 次", calls)
+func TestNativeStreamFirstByteTimestampSurvivesLaterEvents(t *testing.T) {
+	result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"+aliveSSE))
+	execution := result.Execution
+	if !execution.Success || execution.FirstByteAtMS == 0 || execution.FirstByteAtMS > execution.FirstEventAtMS || execution.FirstEventAtMS > execution.FirstSemanticAtMS {
+		t.Fatalf("first-byte/event/semantic timeline inconsistent: %+v", execution)
 	}
 }
 
-// 单个 SSE 事件可以很长（message_start 里嵌完整的 message 结构）。
-// 行缓冲不够大会让扫描直接失败，把好站判成假活。
-func TestScanStream_HandlesVeryLongLines(t *testing.T) {
+func TestNativeStreamAcceptsLongMetadataWithinEventBudget(t *testing.T) {
 	padding := strings.Repeat("a", 200<<10)
-	sse := "event: message_start\n" +
-		`data: {"type":"message_start","message":{"id":"` + padding + `"}}` + "\n\n" +
-		"event: content_block_delta\n" +
-		`data: {"delta":{"type":"text_delta","text":"2"}}` + "\n\n"
-
-	res := scanStream(strings.NewReader(sse), nil)
-	if !res.alive {
-		t.Error("超长事件行不该导致扫描失败（会把好站误判成假活）")
+	wire := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"" + padding + "\"}}\n\n" + aliveSSE
+	if result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader(wire)); !result.Execution.Success {
+		t.Fatalf("long valid metadata broke decoding: %+v", result.Execution)
 	}
 }
 
-// event 名的作用域到空行为止。不重置的话，一个 error 事件之后的
-// 所有 data 行都会被当成 error 内容。
-func TestScanStream_EventNameScopeEndsAtBlankLine(t *testing.T) {
-	sse := "event: ping\n\n" +
-		`data: {"delta":{"type":"text_delta","text":"2"}}` + "\n\n"
-
-	res := scanStream(strings.NewReader(sse), nil)
-	if !res.alive {
-		t.Error("空行后 event 名应已重置，该 data 应正常参与存活判定")
+func TestNativeStreamEventNameEndsAtBlankLine(t *testing.T) {
+	wire := "event: error\n\n" + "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"
+	if result := executeStreamFixture(t, model.ProtoAnthropic, strings.NewReader(wire)); !result.Execution.Success {
+		t.Fatalf("empty event leaked its name: %+v", result.Execution)
 	}
 }
 
-func TestStreamErrStatus(t *testing.T) {
-	tests := []struct {
-		name    string
-		payload string
-		want    int
+func TestNativeStreamStructuredStatusRemainsEventEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+		want          int
 	}{
-		// 上游自报状态码时用它，能让流内的 401 也走到 Fatal 分支
-		{"error.code", `{"error":{"code":401,"message":"bad key"}}`, 401},
+		{"error.code", `{"error":{"code":401,"message":"private"}}`, 0},
 		{"error.status", `{"error":{"status":429}}`, 429},
-		{"无状态码时用 500 占位", `{"error":{"message":"boom"}}`, 500},
-		{"非 JSON", `boom`, 500},
-		{"越界的 code 忽略", `{"error":{"code":99}}`, 500},
-	}
-	for _, tc := range tests {
+		{"no numeric status", `{"error":{"message":"private"}}`, 0},
+		{"out-of-range code", `{"error":{"code":99}}`, 0},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := streamErrStatus([]byte(tc.payload)); got != tc.want {
-				t.Errorf("payload %q：期望 %d，得到 %d", tc.payload, tc.want, got)
+			decoder, err := NewDecoder(DecoderSpec{Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, WireSSE, 1<<20, 8<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := decoder.Feed([]byte("event: error\ndata: " + tc.payload + "\n\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 1 || events[0].Kind != EventRemoteError || events[0].ErrorStatus != tc.want {
+				t.Fatalf("numeric error evidence invented/lost: %+v", events)
 			}
 		})
+	}
+	decoder, err := NewDecoder(DecoderSpec{Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, WireSSE, 1<<20, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.Feed([]byte("data: boom\n\n")); err == nil {
+		t.Fatal("malformed text became fabricated HTTP 500")
 	}
 }

@@ -2,16 +2,13 @@ package probe
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
 // 「读流出错」与「假活」必须能区分开。
@@ -43,7 +40,8 @@ func TestL2_FirstTokenTimeoutIsNotReportedAsFakeAlive(t *testing.T) {
 	s.L2FirstTokenSec = 1
 	s.L2TotalSec = 10
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	executor := testProbeExecutor()
+	out := executor.L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, s)
 
 	if out.Verdict != health.VerdictUnavailable {
@@ -52,11 +50,8 @@ func TestL2_FirstTokenTimeoutIsNotReportedAsFakeAlive(t *testing.T) {
 	if out.Err == nil {
 		t.Fatal("应带上失败原因")
 	}
-	if !errors.Is(out.Err, proxy.ErrFirstTokenTimeout) {
-		t.Errorf("应归为首 Token 超时，实际错误是 %q", out.Err)
-	}
-	if strings.Contains(out.Err.Error(), "假活") {
-		t.Errorf("超时不是假活，错误信息不该这么说：%q", out.Err)
+	if executor.Last.Execution.ErrorClass != model.ErrorTransient || executor.Last.Execution.RedactedDetail != "semantic_timeout" || executor.Last.Execution.ResponseHeaderAtMS == 0 || executor.Last.Execution.FirstSemanticAtMS != 0 {
+		t.Fatalf("own semantic timeout lost timing/classification: %+v", executor.Last.Execution)
 	}
 }
 
@@ -81,7 +76,8 @@ func TestL2_MidStreamBreakIsNotReportedAsFakeAlive(t *testing.T) {
 	s.L2FirstTokenSec = 5
 	s.L2TotalSec = 10
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	executor := testProbeExecutor()
+	out := executor.L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, s)
 
 	if out.Verdict != health.VerdictUnavailable {
@@ -90,11 +86,8 @@ func TestL2_MidStreamBreakIsNotReportedAsFakeAlive(t *testing.T) {
 	if out.Err == nil {
 		t.Fatal("应带上失败原因")
 	}
-	if !errors.Is(out.Err, proxy.ErrStreamBroke) {
-		t.Errorf("应归为中途断流，实际错误是 %q", out.Err)
-	}
-	if strings.Contains(out.Err.Error(), "假活") {
-		t.Errorf("断流不是假活，错误信息不该这么说：%q", out.Err)
+	if executor.Last.Execution.ErrorClass != model.ErrorTransient || executor.Last.Execution.RedactedDetail != "read_failure" || executor.Last.Execution.FirstByteAtMS == 0 {
+		t.Fatalf("broken response must retain read failure evidence: %+v", executor.Last.Execution)
 	}
 }
 
@@ -111,13 +104,14 @@ func TestL2_GenuineFakeAliveStillReported(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out := testProber().L2(context.Background(), upstreamFor(srv.URL),
+	executor := testProbeExecutor()
+	out := executor.L2(context.Background(), upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Verdict != health.VerdictUnavailable {
 		t.Fatalf("假活应判不可用，得到 %s", out.Verdict)
 	}
-	if out.Err == nil || !strings.Contains(out.Err.Error(), "假活") {
+	if out.Err == nil || executor.Last.Execution.ErrorClass != model.ErrorFakeAlive || executor.Last.Execution.RedactedDetail != "no_semantic_evidence" {
 		t.Errorf("应明确报假活，实际错误是 %v", out.Err)
 	}
 }
@@ -127,7 +121,7 @@ func TestL2_GenuineFakeAliveStillReported(t *testing.T) {
 // 这个 bug 曾经存在：rateLimitMarkers 含 "quota"，而关键词分支排在 401/403
 // 之前，于是「余额耗尽」的 401 被判成限流 —— 冷却 60 秒后再试，永远不判死。
 // 而余额耗尽只能靠人去充值或换 key，等它自愈是等不到的。
-func TestClassifyHTTP_AuthErrorIsFatalEvenWithQuotaWording(t *testing.T) {
+func TestNativeClassifier_AuthErrorIsFatalEvenWithQuotaWording(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
@@ -139,10 +133,10 @@ func TestClassifyHTTP_AuthErrorIsFatalEvenWithQuotaWording(t *testing.T) {
 	}
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		for _, c := range cases {
-			out := ClassifyHTTP(status, nil, []byte(c.body))
-			if out.Verdict != health.VerdictFatal {
+			out := classifyNativeFixture(t, status, nil, c.body)
+			if out.ErrorClass != model.ErrorAuthRejected {
 				t.Errorf("HTTP %d + %s：应判致命（鉴权/配置错误），得到 %s",
-					status, c.name, out.Verdict)
+					status, c.name, out.ErrorClass)
 			}
 		}
 	}
@@ -176,7 +170,8 @@ func TestL2_CanceledDuringBodyReadDoesNotCountAsUpstreamFailure(t *testing.T) {
 		cancel()
 	}()
 
-	out := testProber().L2(ctx, upstreamFor(srv.URL),
+	executor := testProbeExecutor()
+	out := executor.L2(ctx, upstreamFor(srv.URL),
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Verdict != health.VerdictIgnore {
@@ -184,26 +179,25 @@ func TestL2_CanceledDuringBodyReadDoesNotCountAsUpstreamFailure(t *testing.T) {
 	}
 }
 
-// 但 429 与 5xx 里的限流关键词仍然要判限流，不能被上一条改坏。
-func TestClassifyHTTP_RateLimitStillDetectedOutsideAuthErrors(t *testing.T) {
+// HTTP status takes precedence; arbitrary message words never become protocol evidence.
+func TestNativeClassifier_RateLimitStillDetectedOutsideAuthErrors(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
 		body   string
-		want   health.Verdict
+		want   model.ErrorClass
 	}{
-		{"429", 429, `{"error":{"message":"too many requests"}}`, health.VerdictRateLimited},
-		{"529 overloaded", 529, `{"type":"error","error":{"type":"overloaded_error"}}`,
-			health.VerdictRateLimited},
-		{"400 quota", 400, `{"error":{"message":"quota exceeded"}}`, health.VerdictRateLimited},
-		{"500 普通故障", 500, `{"error":"internal"}`, health.VerdictUnavailable},
+		{"429", 429, `{"error":{"message":"too many requests"}}`, model.ErrorRateLimited},
+		{"529 overloaded", 529, `{"type":"error","error":{"type":"overloaded_error"}}`, model.ErrorTransient},
+		{"400 quota words are not protocol evidence", 400, `{"error":{"message":"quota exceeded"}}`, model.ErrorTransient},
+		{"500 普通故障", 500, `{"error":"internal"}`, model.ErrorTransient},
 		{"400 model not found", 400, `{"error":{"message":"model not found"}}`,
-			health.VerdictFatal},
+			model.ErrorTransient},
 	}
 	for _, c := range cases {
-		out := ClassifyHTTP(c.status, nil, []byte(c.body))
-		if out.Verdict != c.want {
-			t.Errorf("%s：期望 %s，得到 %s", c.name, c.want, out.Verdict)
+		out := classifyNativeFixture(t, c.status, nil, c.body)
+		if out.ErrorClass != c.want {
+			t.Errorf("%s：期望 %s，得到 %s", c.name, c.want, out.ErrorClass)
 		}
 	}
 }

@@ -57,6 +57,10 @@ func (recorder *ResultRecorder) Record(ctx context.Context,
 		return model.ProbeApplyResult{}, model.WrapValidation("probe observation 不能为空")
 	}
 	var expectedGeneration *uint64
+	var expectedReachCreatedAt int64
+	if value.ReachabilityExpectation != nil {
+		expectedReachCreatedAt = value.ReachabilityExpectation.Revision.CreatedAt
+	}
 	if recorder.caps != nil && recorder.caps.routeGen != nil && value.Execution.RouteID > 0 {
 		generation := recorder.caps.routeGen.GenerationOf(value.Execution.RouteID)
 		expectedGeneration = &generation
@@ -68,6 +72,9 @@ func (recorder *ResultRecorder) Record(ctx context.Context,
 	}
 
 	if result.Reachability == model.ApplyCurrent && result.CommittedReachability != nil && recorder.reach != nil {
+		committed := *result.CommittedReachability
+		committed.ObservedCreatedAt = expectedReachCreatedAt
+		result.CommittedReachability = &committed
 		if recorder.reach.ApplyCommitted(result.CommittedReachability) && recorder.onReachabilityRecovered != nil {
 			recorder.onReachabilityRecovered(value.Execution)
 		}

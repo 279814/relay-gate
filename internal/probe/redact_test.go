@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
 // 上游把 key 回显在错误消息里时，判定结论里**不能**出现明文 key。
@@ -38,7 +36,8 @@ func TestL1_UpstreamKeyNotLeakedIntoVerdict(t *testing.T) {
 	up := upstreamFor(srv.URL)
 	up.APIKey = upKey
 
-	out := testProber().L1(context.Background(), up, fastSettings())
+	executor := testProbeExecutor()
+	out := executor.L1(context.Background(), up, fastSettings())
 
 	if out.Err == nil {
 		t.Fatal("401 应带上失败原因")
@@ -48,7 +47,7 @@ func TestL1_UpstreamKeyNotLeakedIntoVerdict(t *testing.T) {
 	}
 	// 脱敏不能把诊断信息一起吞掉：状态码必须还在，否则用户看到一句
 	// 「鉴权错误」却不知道是哪一步出的问题。
-	if !strings.Contains(out.Err.Error(), "401") {
+	if executor.Last.Execution.StatusCode != 401 || executor.Last.Execution.ErrorClass != model.ErrorAuthRejected {
 		t.Errorf("应保留状态码以便排查：%q", out.Err)
 	}
 }
@@ -76,7 +75,7 @@ data: {"error":{"type":"authentication_error","message":"bad key ` + upKey + `"}
 	up := upstreamFor(srv.URL)
 	up.APIKey = upKey
 
-	out := testProber().L2(context.Background(), up,
+	out := testProbeExecutor().L2(context.Background(), up,
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Err == nil {
@@ -101,7 +100,7 @@ func TestL2_UpstreamKeyNotLeakedFromHTTPError(t *testing.T) {
 	up := upstreamFor(srv.URL)
 	up.APIKey = upKey
 
-	out := testProber().L2(context.Background(), up,
+	out := testProbeExecutor().L2(context.Background(), up,
 		modelNameFor(model.ProtoAnthropic), &model.Route{ID: 1}, fastSettings())
 
 	if out.Err == nil {
@@ -112,12 +111,12 @@ func TestL2_UpstreamKeyNotLeakedFromHTTPError(t *testing.T) {
 	}
 }
 
-// 上游原文里**没有** key 时，错误信息必须一字不改。
+// User body text is private even when it contains no recognized credential.
 //
 // 这是配对的反面用例：脱敏只该动 key，不该顺手改写别的内容。
 // 上游给的原文是排查的主要依据（「400: model xxx not found」直接告诉
 // 用户该改哪里），被脱敏逻辑意外改动的话，那个价值就打了折扣。
-func TestL1_ErrorTextUnchangedWhenNoKeyPresent(t *testing.T) {
+func TestL1_ErrorMessageNeverEchoedEvenWhenNoKnownKeyPresent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":{"message":"model claude-opus-9 not found"}}`))
@@ -127,14 +126,15 @@ func TestL1_ErrorTextUnchangedWhenNoKeyPresent(t *testing.T) {
 	up := upstreamFor(srv.URL)
 	up.APIKey = "sk-live-upstream-abcdef123456"
 
-	out := testProber().L1(context.Background(), up, fastSettings())
+	executor := testProbeExecutor()
+	out := executor.L1(context.Background(), up, fastSettings())
 
 	if out.Err == nil {
 		t.Fatal("400 应带上失败原因")
 	}
-	// 原文里的诊断信息必须完整保留
-	if !strings.Contains(out.Err.Error(), "model claude-opus-9 not found") {
-		t.Errorf("不含 key 的原文被改动了：%q", out.Err)
+	// Status remains diagnostic evidence; arbitrary upstream text is not persisted.
+	if strings.Contains(out.Err.Error(), "claude-opus-9") || strings.Contains(executor.Last.Execution.RedactedDetail, "claude-opus-9") || executor.Last.Execution.StatusCode != 400 {
+		t.Errorf("原始正文泄漏或状态证据丢失：%q", out.Err)
 	}
 }
 
@@ -147,11 +147,11 @@ func (rt blockingURLErrorTransport) RoundTrip(req *http.Request) (*http.Response
 
 // 探测 ctx 到期时 RoundTrip 返回的 *url.Error 同样带完整 URL（含 query Secret），
 // ctxOutcome 分支不得把它带进 Outcome.Err（Scheduler 日志与 last_error）。
-func TestProber_CtxExpiredRoundTrip_OmitsRequestURL(t *testing.T) {
+func TestExecutor_CtxExpiredRoundTrip_OmitsRequestURL(t *testing.T) {
 	const secret = "sk-fixture-ctx-query-secret"
 	leakURL := "https://leak.example.test/v1/models?api_key=" + secret
 	up := upstreamFor("https://leak.example.test")
-	prober := &Prober{Transport: blockingURLErrorTransport{leakURL: leakURL}, Targets: testTargets()}
+	prober := &executorProbeHarness{Transport: blockingURLErrorTransport{leakURL: leakURL}, Targets: testTargets(), Recipes: builtinOnlyResolver()}
 
 	run := map[string]func(ctx context.Context) Outcome{
 		"L1": func(ctx context.Context) Outcome { return prober.L1(ctx, up, fastSettings()) },
@@ -164,13 +164,16 @@ func TestProber_CtxExpiredRoundTrip_OmitsRequestURL(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 			out := probe(ctx)
-			if out.Verdict != health.VerdictUnavailable {
-				t.Fatalf("Verdict=%s, want unavailable", out.Verdict)
+			if out.Verdict != health.VerdictIgnore {
+				t.Fatalf("Verdict=%s, want ignored caller deadline", out.Verdict)
 			}
-			if !errors.Is(out.Err, proxy.ErrConnect) {
-				t.Fatal("ctx 到期的传输失败应返回通用 ErrConnect")
+			if prober.Last.Execution.ErrorClass != model.ErrorIgnored {
+				t.Fatalf("caller cancellation counted as upstream failure: %+v", prober.Last.Execution)
 			}
-			got := out.Err.Error()
+			got := prober.Last.Execution.RedactedDetail
+			if out.Err != nil {
+				got += out.Err.Error()
+			}
 			if strings.Contains(got, secret) || strings.Contains(got, "leak.example.test") {
 				t.Fatal("Outcome.Err 携带了请求 URL 或 query Secret")
 			}

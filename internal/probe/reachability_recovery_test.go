@@ -206,7 +206,7 @@ func TestScheduler_L1RecoveryThroughResultRecorderFiresOnce(t *testing.T) {
 	h.l1(t, 0)
 	h.l1(t, 1)
 	h.l1(t, 1)
-	if h.gate.OKAt(10, 0) {
+	if h.reach.OK(10, 0) {
 		t.Fatal("前置条件：连续两次失败后站应 unreachable")
 	}
 	h.l1(t, 0)
@@ -223,7 +223,7 @@ func TestScheduler_ManualCommitLeavingUnreachableTriggersBeforeL1(t *testing.T) 
 	h.l1(t, 0)
 	h.l1(t, 1)
 	h.l1(t, 1)
-	if h.gate.OKAt(10, 0) {
+	if h.reach.OK(10, 0) {
 		t.Fatal("前置条件：连续两次失败后站应 unreachable")
 	}
 	exec := l2Execution(model.TriggerManual)
@@ -231,7 +231,7 @@ func TestScheduler_ManualCommitLeavingUnreachableTriggersBeforeL1(t *testing.T) 
 	if _, err := recorder.Record(context.Background(), &model.ProbeObservation{Execution: exec}); err != nil {
 		t.Fatal(err)
 	}
-	if !h.gate.OKAt(10, 0) {
+	if !h.reach.OK(10, 0) {
 		t.Fatal("前置条件：手动测试拿到响应后站应离开 unreachable")
 	}
 	_, _, _, triggered, _ := h.track.snapshot()

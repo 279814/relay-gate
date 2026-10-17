@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 
@@ -47,14 +48,15 @@ func TestScheduler_CoalescesL1PerUpstream_RaceDeterministic(t *testing.T) {
 	track := newRecordingTracker()
 	// 挡住 L2：本测试只关心 L1 收敛，L2 会让计数 transport 多计几次。
 	track.l2Allowed = map[int64]bool{}
-	gate := health.NewUpstreamGate()
+	reach := health.NewReachabilityTracker(nil)
 
 	ct := &countingErrTransport{}
 	cfg := &fakeCfg{
-		snap:  router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
-		state: store.StateRunning,
+		snap:     router.BuildSnapshot([]*model.ModelName{mn}, []*model.Upstream{up}, routes),
+		state:    store.StateRunning,
+		settings: fastSettings(),
 	}
-	sched := NewScheduler(cfg, ct, track, gate, discardLogger()).WithTargets(testTargets(), nil)
+	sched := newSchedulerFixture(t, cfg, ct, track, reach, discardLogger())
 
 	// 模拟一个 tick 内串行处理 5 条 Route，且每次 after-probe 都等到
 	// goroutine 跑完 —— 正是「第一个 L1 在 tick 遍历完成前结束」的竞态。
@@ -77,7 +79,7 @@ type countingErrTransport struct {
 	n  int
 }
 
-func (c *countingErrTransport) TransportFor(*model.Upstream, outbound.Budget) (*outbound.Transport, error) {
+func (c *countingErrTransport) RoundTripper(outbound.NetworkConfig) (http.RoundTripper, error) {
 	c.mu.Lock()
 	c.n++
 	c.mu.Unlock()

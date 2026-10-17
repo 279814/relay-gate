@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/sample"
 )
 
@@ -20,6 +21,14 @@ type ConfigInvalidator interface {
 	InvalidateModelName(modelNameID int64)
 }
 
+// ConfigScheduler receives neutral scope keys and retains its existing pending
+// coalescing; it does not expose a ModelName-specific compatibility method.
+type ConfigScheduler interface {
+	InvalidateRoute(int64)
+	InvalidateUpstream(int64)
+	Trigger(probe.ScheduleKey, probe.ScheduleReason)
+}
+
 // SemanticConfigInvalidator clears §9.2 runtime state then delegates schedule invalidation.
 type SemanticConfigInvalidator struct {
 	Semantic interface {
@@ -27,9 +36,10 @@ type SemanticConfigInvalidator struct {
 		InvalidateUpstream(upstreamID int64, routeIDs []int64)
 		InvalidateModelName(modelNameID int64, routeIDs []int64)
 	}
-	Inner             ConfigInvalidator
+	Inner             ConfigScheduler
 	RoutesOfUpstream  func(upstreamID int64) []int64
 	RoutesOfModelName func(modelNameID int64) []int64
+	RouteScheduleKey  func(routeID int64) (probe.ScheduleKey, bool)
 	// DropUpstreamTransports drops outbound connection pools for a deleted
 	// Upstream (close idle + remove map entries). Optional: nil in tests that
 	// do not wire outbound.Manager.
@@ -75,8 +85,12 @@ func (s *SemanticConfigInvalidator) InvalidateModelName(modelNameID int64) {
 	if s.Semantic != nil {
 		s.Semantic.InvalidateModelName(modelNameID, routeIDs)
 	}
-	if s.Inner != nil {
-		s.Inner.InvalidateModelName(modelNameID)
+	if s.Inner != nil && s.RouteScheduleKey != nil {
+		for _, id := range routeIDs {
+			if key, ok := s.RouteScheduleKey(id); ok {
+				s.Inner.Trigger(key, probe.ScheduleConfig)
+			}
+		}
 	}
 }
 
@@ -169,9 +183,6 @@ func (s *SemanticConfigInvalidator) InvalidateModelNameDeleted(modelNameID int64
 	}
 	if s.Semantic != nil {
 		s.Semantic.InvalidateModelName(modelNameID, routeIDs)
-	}
-	if s.Inner != nil {
-		s.Inner.InvalidateModelName(modelNameID)
 	}
 }
 

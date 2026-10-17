@@ -14,6 +14,7 @@ import (
 	"github.com/279814/relay-gate/internal/credential"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/store"
@@ -47,8 +48,8 @@ type Server struct {
 	// 探活链路。同样可以为 nil —— 探活未启用时相关端点回 503，
 	// 而不是让整个管理接口不可用（管理端点必须始终可用，§4.8）。
 	healthView      HealthView
-	gate            GateView
-	prober          Prober
+	manualRunner    ManualProbeRunner
+	reachability    ReachabilityView
 	countTokensView CountTokensView
 
 	// cost 是探活成本计数器（§5.2d）。为 nil 时对应端点回 503。
@@ -148,6 +149,9 @@ func conflictClientMessage(err error) string {
 // 吞掉它们会让配置出错时只剩一个无信息的 400。
 func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, probe.ErrSyntheticClosed):
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"合成探活已暂停或维护中"})
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, credential.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errBody{"not found"})
 	case errors.Is(err, credential.ErrRevealUnavailable):

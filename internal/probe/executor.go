@@ -403,16 +403,6 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 
 	classifier := NewResponseClassifier(req.Mode, req.Endpoint, resp.StatusCode, resp.Header, headerAt)
 
-	// 连接层探测（空 l1_path）：拿到任何响应头即算通，不必读流（§4.1）。
-	if prepared.connectionOnly {
-		timing.doneAtMS = e.clock.Now().UnixMilli()
-		decision := classifier.Finish(nil, nil)
-		// connectionOnly 覆盖 models 的「必须是模型列表」判据：这里只探连接。
-		decision.Success = decision.Reachable
-		return e.finishSuccessPath(ctx, req, prepared, decision, timing,
-			requestBytes, 0, estInputTokens, false, sentAt)
-	}
-
 	protocol := model.Protocol("")
 	if req.ModelName != nil {
 		protocol = req.ModelName.Protocol

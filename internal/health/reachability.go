@@ -21,6 +21,10 @@ type ReachabilityTracker struct {
 	settings SettingsSource
 }
 
+type reachabilityRevisionSource interface {
+	CurrentReachabilityRevision(int64, model.EvidencePolicySelector) (model.ReachabilityRevision, bool)
+}
+
 // NewReachabilityTracker 构造空 Tracker。settings 用于 effective 读侧失效。
 func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 	return &ReachabilityTracker{
@@ -49,11 +53,16 @@ func (tracker *ReachabilityTracker) ApplyCommitted(row *model.UpstreamReachabili
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
+	if _, ok := tracker.settings.(reachabilityRevisionSource); ok {
+		if !tracker.rowCurrentLocked(row, row.ObservedNetworkRevision) {
+			return false
+		}
+	}
 	current := tracker.rows[row.UpstreamID]
 	if current != nil && current.ObservationToken != "" && row.ObservationToken == "" {
 		return false
 	}
-	if current != nil && current.ObservationToken == row.ObservationToken &&
+	if current != nil && current.ObservedCreatedAt == row.ObservedCreatedAt && current.ObservationToken == row.ObservationToken &&
 		current.LastObservationOrder >= row.LastObservationOrder {
 		return false
 	}
@@ -151,6 +160,10 @@ func (tracker *ReachabilityTracker) InvalidateStale(networkByUpstream map[int64]
 func (tracker *ReachabilityTracker) rowCurrentLocked(row *model.UpstreamReachability, networkRevision int64) bool {
 	if row.ObservedNetworkRevision != networkRevision {
 		return false
+	}
+	if source, ok := tracker.settings.(reachabilityRevisionSource); ok {
+		revision, ready := source.CurrentReachabilityRevision(row.UpstreamID, row.PolicySelector)
+		return ready && revision.CreatedAt == row.ObservedCreatedAt && revision.NetworkRevision == row.ObservedNetworkRevision && revision.SettingsFingerprint == row.SettingsFingerprint && revisioncodec.NewReachabilityToken(revision) == row.ObservationToken
 	}
 	settings := model.DefaultSettings()
 	if tracker.settings != nil {

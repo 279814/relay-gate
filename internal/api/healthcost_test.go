@@ -24,7 +24,7 @@ func (stubHealth) Status(id int64) health.Status {
 // withHealthView 给测试服务器接上健康视图，否则 /health 回 503。
 func withHealthView(t *testing.T, s *Server) http.Handler {
 	t.Helper()
-	return s.WithHealth(stubHealth{}, nil, nil).Routes(testAdminPW)
+	return s.WithHealth(stubHealth{}, nil).Routes(testAdminPW)
 }
 
 // TestGetHealth_QueryCostUnderAutoRefresh 量化健康看板的数据库读开销。

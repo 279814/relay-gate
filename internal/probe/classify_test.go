@@ -1,182 +1,176 @@
 package probe
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"github.com/279814/relay-gate/internal/model"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/279814/relay-gate/internal/health"
-	"github.com/279814/relay-gate/internal/proxy"
 )
 
-func TestClassifyHTTP(t *testing.T) {
-	tests := []struct {
+// Thin test driver: all wire interpretation and decisions belong to the
+// production Decoder/Classifier. No keyword heuristic or synthetic HTTP status.
+func classifyNativeFixture(t *testing.T, status int, header http.Header, body string) Decision {
+	t.Helper()
+	classifier := NewResponseClassifier(ObserveProbe, model.EndpointMessages, status, header, time.Unix(1700000000, 0))
+	decoder, err := NewDecoder(DecoderSpec{Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, WireJSON, 1<<20, 8<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, readErr := decoder.Feed([]byte(body))
+	for _, event := range events {
+		if decision, done := classifier.Observe(event); done {
+			return decision
+		}
+	}
+	if readErr == nil {
+		events, readErr = decoder.Finish()
+		for _, event := range events {
+			if decision, done := classifier.Observe(event); done {
+				return decision
+			}
+		}
+	}
+	return classifier.Finish(readErr, nil)
+}
+
+func TestNativeHTTPClassificationUsesStructuredEvidence(t *testing.T) {
+	for _, tc := range []struct {
 		name    string
 		status  int
 		body    string
-		want    health.Verdict
-		wantErr string // 期望错误信息里含这段原文
+		want    model.ErrorClass
+		success bool
 	}{
-		{"200 正常", 200, `{"ok":true}`, health.VerdictOK, ""},
-
-		// 致命类：改配置才能好，重试无意义
-		{"401 鉴权失败", 401, `{"error":"invalid api key"}`, health.VerdictFatal, "invalid api key"},
-		{"403 禁止", 403, `forbidden`, health.VerdictFatal, ""},
-		{"400 模型不存在", 400, `{"error":{"message":"model_not_found"}}`, health.VerdictFatal, ""},
-		{"404 模型不存在", 404, `{"error":"no such model: opus-9"}`, health.VerdictFatal, ""},
-		{"400 invalid model", 400, `{"error":"invalid model specified"}`, health.VerdictFatal, ""},
-
-		// 限流类：站是好的，只是这会儿满了
-		{"429", 429, `{"error":"slow down"}`, health.VerdictRateLimited, ""},
-		{"529 overloaded 走限流而非 5xx", 529, `{"type":"overloaded_error"}`, health.VerdictRateLimited, ""},
-		{"503 里含 rate limit", 503, `{"error":"rate limit exceeded"}`, health.VerdictRateLimited, ""},
-		{"400 里含 quota", 400, `{"error":"quota exhausted"}`, health.VerdictRateLimited, ""},
-
-		// 不可用类：等它恢复
-		{"500", 500, `internal error`, health.VerdictUnavailable, ""},
-		{"502", 502, `bad gateway`, health.VerdictUnavailable, ""},
-		{"503", 503, `unavailable`, health.VerdictUnavailable, ""},
-		// 未预料到的 4xx 保守归到累计类：探活请求是我们构造的，
-		// 一个意外的 400 更可能是「这站参数要求特殊」而非「站坏了」
-		{"意外的 400", 400, `{"error":"missing field foo"}`, health.VerdictUnavailable, "missing field foo"},
-
-		// 3xx：Transport 不跟随；成功只认 2xx，不得 VerdictOK
-		{"302 不得算成功", 302, `{"redirect":true}`, health.VerdictUnavailable, ""},
-		{"301 不得算成功", 301, ``, health.VerdictUnavailable, ""},
-		{"307 不得算成功", 307, ``, health.VerdictUnavailable, ""},
-		{"308 不得算成功", 308, ``, health.VerdictUnavailable, ""},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			out := ClassifyHTTP(tc.status, nil, []byte(tc.body))
-			if out.Verdict != tc.want {
-				t.Errorf("status %d body %q：期望 %s，得到 %s（err=%v）",
-					tc.status, tc.body, tc.want, out.Verdict, out.Err)
-			}
-			if out.Status != tc.status {
-				t.Errorf("Status 应原样带出，期望 %d 得到 %d", tc.status, out.Status)
-			}
-			if tc.wantErr != "" {
-				if out.Err == nil || !contains(out.Err.Error(), tc.wantErr) {
-					t.Errorf("错误信息应含上游原文 %q，得到 %v", tc.wantErr, out.Err)
-				}
-			}
-		})
-	}
-}
-
-// 限流判定必须在 5xx 之前。529 overloaded 是 5xx 但属于限流 ——
-// 判错的后果是把一个「太受欢迎」的可用站累计判死。
-func TestClassifyHTTP_RateLimitTakesPrecedenceOverServerError(t *testing.T) {
-	out := ClassifyHTTP(500, nil, []byte(`{"error":{"type":"overloaded_error"}}`))
-	if out.Verdict != health.VerdictRateLimited {
-		t.Errorf("5xx 里的限流特征应判为限流，得到 %s", out.Verdict)
-	}
-}
-
-// 模型不存在要在通用 4xx 之前判：同为 400，但一个要改配置、一个等恢复。
-func TestClassifyHTTP_ModelNotFoundTakesPrecedenceOverGeneric4xx(t *testing.T) {
-	out := ClassifyHTTP(400, nil, []byte(`{"error":{"type":"invalid_request_error","message":"model not found"}}`))
-	if out.Verdict != health.VerdictFatal {
-		t.Errorf("模型不存在应立即判死（UI 标「配置错误」），得到 %s", out.Verdict)
-	}
-}
-
-func TestParseRetryAfter(t *testing.T) {
-	tests := []struct {
-		name string
-		val  string
-		want time.Duration
-	}{
-		{"秒数", "120", 120 * time.Second},
-		{"缺失", "", 0},
-		{"零", "0", 0},
-		{"负数", "-5", 0},
-		{"非数字（HTTP 日期形式不支持，回落到默认冷却）", "Wed, 21 Oct 2026 07:28:00 GMT", 0},
-		// 上限保护：上游误填毫秒会把站冷藏几小时，而它早就恢复了
-		{"超大值被截到上限", "999999", maxRetryAfter},
-		// 乘法前先按秒数截断：否则 Duration 溢出会把荒谬大值 wrap 成负数
-		{"溢出秒数被截到上限", "999999999999", maxRetryAfter},
-		{"int64最大秒数被截到上限", "9223372036854775807", maxRetryAfter},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			h := http.Header{}
-			if tc.val != "" {
-				h.Set("Retry-After", tc.val)
-			}
-			if got := parseRetryAfter(h); got != tc.want {
-				t.Errorf("Retry-After %q：期望 %v，得到 %v", tc.val, tc.want, got)
-			}
-		})
-	}
-}
-
-func TestClassifyHTTP_PassesRetryAfterThrough(t *testing.T) {
-	h := http.Header{}
-	h.Set("Retry-After", "300")
-	out := ClassifyHTTP(429, h, []byte(`{}`))
-	if out.RetryAfter != 300*time.Second {
-		t.Errorf("429 应带出 Retry-After，得到 %v", out.RetryAfter)
-	}
-}
-
-// 客户端断开绝不能算上游故障。这条不成立的话，用户频繁取消
-// 就能把所有好站判死。
-func TestClassifyTransportErr(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want health.Verdict
-	}{
-		{"nil", nil, health.VerdictOK},
-		{"客户端断开", proxy.ErrClientGone, health.VerdictIgnore},
-		{"请求被取消", proxy.ErrCanceled, health.VerdictIgnore},
-		{"连接失败", proxy.ErrConnect, health.VerdictUnavailable},
-		{"首 Token 超时", proxy.ErrFirstTokenTimeout, health.VerdictUnavailable},
-		{"流内静默", proxy.ErrStreamStalled, health.VerdictUnavailable},
-		{"总超时", proxy.ErrTotalTimeout, health.VerdictUnavailable},
-		{"上游未返回数据", proxy.ErrUpstreamBroke, health.VerdictUnavailable},
-		{"包装过的客户端断开", errors.New("x: " + proxy.ErrClientGone.Error()), health.VerdictUnavailable},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := ClassifyTransportErr(tc.err).Verdict; got != tc.want {
-				t.Errorf("%v：期望 %s，得到 %s", tc.err, tc.want, got)
-			}
-		})
-	}
-}
-
-// 我们自己设的超时**必须**算上游的账。不算的话一个真死的站
-// 永远攒不够失败次数，主动探活就完全失去意义。
-func TestClassifyTransportErr_OwnTimeoutsCountAgainstUpstream(t *testing.T) {
-	for _, err := range []error{
-		proxy.ErrFirstTokenTimeout, proxy.ErrStreamStalled, proxy.ErrTotalTimeout,
+		{"200 semantic body", 200, `{"content":[{"type":"text","text":"2"}]}`, model.ErrorNone, true},
+		{"200 arbitrary object", 200, `{"ok":true}`, model.ErrorFakeAlive, false},
+		{"401 auth", 401, `{"error":"invalid api key"}`, model.ErrorAuthRejected, false},
+		{"403 auth", 403, `forbidden`, model.ErrorAuthRejected, false},
+		{"400 model word only", 400, `{"error":{"message":"model_not_found"}}`, model.ErrorTransient, false},
+		{"404 model words", 404, `{"error":"no such model: opus-9"}`, model.ErrorUnsupported, false},
+		{"400 invalid model words", 400, `{"error":"invalid model specified"}`, model.ErrorTransient, false},
+		{"400 explicit model code", 400, `{"error":{"code":"model_not_found"}}`, model.ErrorModelNotFound, false},
+		{"429", 429, `{"error":"slow down"}`, model.ErrorRateLimited, false},
+		{"529 explicit HTTP wins", 529, `{"type":"overloaded_error"}`, model.ErrorTransient, false},
+		{"503 rate words", 503, `{"error":"rate limit exceeded"}`, model.ErrorTransient, false},
+		{"400 quota words", 400, `{"error":"quota exhausted"}`, model.ErrorTransient, false},
+		{"500", 500, `internal error`, model.ErrorTransient, false},
+		{"502", 502, `bad gateway`, model.ErrorTransient, false},
+		{"503", 503, `unavailable`, model.ErrorTransient, false},
+		{"unexpected400", 400, `{"error":"missing field foo"}`, model.ErrorTransient, false},
+		{"302", 302, `{"redirect":true}`, model.ErrorTransient, false},
+		{"301", 301, ``, model.ErrorTransient, false},
+		{"307", 307, ``, model.ErrorTransient, false},
+		{"308", 308, ``, model.ErrorTransient, false},
 	} {
-		if got := ClassifyTransportErr(err).Verdict; got != health.VerdictUnavailable {
-			t.Errorf("%v 应计入上游失败（否则死站永远不会被判死），得到 %s", err, got)
+		t.Run(tc.name, func(t *testing.T) {
+			decision := classifyNativeFixture(t, tc.status, nil, tc.body)
+			if decision.ErrorClass != tc.want || decision.Success != tc.success || decision.StatusCode != tc.status || !decision.Reachable {
+				t.Fatalf("wrong HTTP evidence: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestNativeHTTPAndStreamErrorPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   model.ErrorClass
+	}{
+		{"500 overload remains HTTP transient", 500, `{"error":{"type":"overloaded_error"}}`, model.ErrorTransient},
+		{"200 overload is protocol rate-limit", 200, `{"error":{"type":"overloaded_error"}}`, model.ErrorRateLimited},
+		{"200 numeric401 is not HTTP status", 200, `{"error":{"code":401}}`, model.ErrorTransient},
+		{"200 authentication type", 200, `{"error":{"type":"authentication_error"}}`, model.ErrorAuthRejected},
+		{"400 shape with model words", 400, `{"error":{"type":"invalid_request_error","message":"model not found"}}`, model.ErrorShapeRejected},
+		{"400 explicit model code", 400, `{"error":{"type":"invalid_request_error","code":"model_not_found"}}`, model.ErrorModelNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if decision := classifyNativeFixture(t, tc.status, nil, tc.body); decision.ErrorClass != tc.want {
+				t.Fatalf("wrong structured precedence: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestNativeClassifierRetryAfterUsesInjectedHeaderTime(t *testing.T) {
+	now := time.Date(2026, 10, 18, 1, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, value string
+		want        int64
+	}{
+		{"seconds", "120", now.Add(120 * time.Second).UnixMilli()},
+		{"missing", "", 0}, {"zero", "0", now.UnixMilli()}, {"negative", "-5", 0},
+		{"future HTTP date", now.Add(5 * time.Minute).Format(http.TimeFormat), now.Add(5 * time.Minute).UnixMilli()},
+		{"past date", now.Add(-time.Hour).Format(http.TimeFormat), now.UnixMilli()},
+		{"oversized ignored", "999999", 0}, {"overflow ignored", "999999999999", 0}, {"int64 max ignored", "9223372036854775807", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			header := http.Header{"Retry-After": []string{tc.value}}
+			decision := NewResponseClassifier(ObserveProbe, model.EndpointMessages, 429, header, now).Finish(nil, nil)
+			if decision.RetryAfterUntilMS != tc.want {
+				t.Fatalf("Retry-After=%q got %d want %d", tc.value, decision.RetryAfterUntilMS, tc.want)
+			}
+		})
+	}
+}
+
+func TestNativeClassifierCarriesRetryAfterThrough(t *testing.T) {
+	header := http.Header{"Retry-After": []string{"300"}}
+	now := time.Unix(1700000000, 0)
+	decision := NewResponseClassifier(ObserveProbe, model.EndpointMessages, 429, header, now).Finish(nil, nil)
+	if decision.ErrorClass != model.ErrorRateLimited || decision.RetryAfterUntilMS != now.Add(300*time.Second).UnixMilli() {
+		t.Fatalf("rate-limit retry time lost: %+v", decision)
+	}
+}
+
+func TestNativeClassifierTransportAndCancellationStayDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		status         int
+		readErr, cause error
+		want           model.ErrorClass
+	}{
+		{"no response is not proof of life", 0, nil, nil, model.ErrorUnreachable},
+		{"client canceled", 0, context.Canceled, ErrClientCanceled, model.ErrorIgnored},
+		{"service paused", 200, context.Canceled, ErrServicePaused, model.ErrorIgnored},
+		{"shutdown", 200, context.Canceled, ErrServiceShutdown, model.ErrorIgnored},
+		{"connect failed", 0, ErrProbeTransportFailed, nil, model.ErrorUnreachable},
+		{"semantic timeout", 200, ErrProbeSemanticTimeout, nil, model.ErrorTransient},
+		{"idle/total read timeout", 200, context.DeadlineExceeded, nil, model.ErrorTransient},
+		{"unexpected EOF", 200, io.ErrUnexpectedEOF, nil, model.ErrorTransient},
+		{"canceled words are not cause", 200, errors.New("client canceled the request"), nil, model.ErrorTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decision := NewResponseClassifier(ObserveProbe, model.EndpointMessages, tc.status, nil, time.Now()).Finish(tc.readErr, tc.cause)
+			if decision.ErrorClass != tc.want || decision.Reachable != (tc.status > 0) {
+				t.Fatalf("wrong cancellation/transport scope: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestNativeProbeTimeoutsCannotBecomeIgnoredOrFakeAlive(t *testing.T) {
+	for _, failure := range []error{ErrProbeSemanticTimeout, context.DeadlineExceeded, io.ErrUnexpectedEOF} {
+		decision := NewResponseClassifier(ObserveProbe, model.EndpointMessages, 200, nil, time.Now()).Finish(failure, nil)
+		if decision.Success || decision.ErrorClass != model.ErrorTransient {
+			t.Fatalf("upstream timeout/break was ignored or labeled fake-alive: %+v", decision)
 		}
 	}
 }
 
-func TestErrFromBody_CollapsesWhitespaceAndTruncates(t *testing.T) {
-	err := errFromBody(500, []byte("line one\n\n   line   two\n"))
-	if got := err.Error(); got != "HTTP 500: line one line two" {
-		t.Errorf("多行应压成单行便于日志，得到 %q", got)
+func TestNativeStructuredDiagnosticsAreBoundedAndNeverEchoMessage(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "api_error", "code": strings.Repeat("x", maxRedactedDetail*2), "message": "line one\n\n   private body line two"}})
+	decision := classifyNativeFixture(t, 200, nil, string(payload))
+	if len(decision.RedactedDetail) > maxRedactedDetail || strings.Contains(decision.RedactedDetail, "private body") || strings.ContainsAny(decision.RedactedDetail, "\r\n") {
+		t.Fatalf("unbounded/raw private diagnostic: %q", decision.RedactedDetail)
 	}
-
-	long := make([]byte, maxErrExcerpt*2)
-	for i := range long {
-		long[i] = 'x'
-	}
-	if got := errFromBody(500, long); len(got.Error()) > maxErrExcerpt+40 {
-		t.Errorf("过长的响应体应被截断，得到 %d 字节", len(got.Error()))
-	}
-
-	if got := errFromBody(503, nil).Error(); got != "HTTP 503" {
-		t.Errorf("空 body 应只报状态码，得到 %q", got)
+	if empty := classifyNativeFixture(t, 503, nil, ""); empty.StatusCode != 503 || empty.ErrorClass != model.ErrorTransient || strings.Contains(empty.RedactedDetail, "line one") {
+		t.Fatalf("empty error body lost status: %+v", empty)
 	}
 }

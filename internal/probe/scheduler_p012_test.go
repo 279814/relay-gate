@@ -84,8 +84,7 @@ func TestP012_ResumeStaggersFirstProbesWithJitter(t *testing.T) {
 		state:    store.StateRunning,
 	}
 	track := health.NewTracker(cfg)
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil).
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	sched.tick(context.Background())
@@ -178,8 +177,7 @@ func TestP012_ResumeDoesNotRepeatL1BeforeFirstL2(t *testing.T) {
 		state:    store.StateRunning,
 	}
 	track := health.NewTracker(cfg)
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil).
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	sched.tick(context.Background())
@@ -295,8 +293,8 @@ func TestP012_ScheduleKeyPendingCoalesces(t *testing.T) {
 }
 
 func TestP012_JitterRangeReproducible(t *testing.T) {
-	sched := NewScheduler(&fakeCfg{state: store.StateRunning}, newFakeTransport(),
-		newRecordingTracker(), health.NewUpstreamGate(), discardLogger()).
+	sched := newSchedulerFixture(t, &fakeCfg{state: store.StateRunning}, newFakeTransport(),
+		newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(42)))
 	a := make([]float64, 20)
 	for i := range a {
@@ -305,8 +303,8 @@ func TestP012_JitterRangeReproducible(t *testing.T) {
 			t.Fatalf("jitter %v 超出 [0.9,1.1]", a[i])
 		}
 	}
-	sched2 := NewScheduler(&fakeCfg{state: store.StateRunning}, newFakeTransport(),
-		newRecordingTracker(), health.NewUpstreamGate(), discardLogger()).
+	sched2 := newSchedulerFixture(t, &fakeCfg{state: store.StateRunning}, newFakeTransport(),
+		newRecordingTracker(), health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(42)))
 	for i := range a {
 		if got := sched2.jitterFactor(); got != a[i] {
@@ -324,8 +322,8 @@ func TestP012_ResumePrepareBeforeRunningVisible(t *testing.T) {
 	defer ctrl.Close()
 	coord := NewSyntheticCoordinator(model.RunStatePaused)
 	track := newRecordingTracker()
-	sched := NewScheduler(&fakeCfg{state: store.StatePaused}, newFakeTransport(),
-		track, health.NewUpstreamGate(), discardLogger())
+	sched := newSchedulerFixture(t, &fakeCfg{state: store.StatePaused}, newFakeTransport(),
+		track, health.NewReachabilityTracker(nil), discardLogger())
 	watch := &resumeGateWatch{Scheduler: sched, ctrl: ctrl, saw: &atomic.Bool{}}
 	if err := coord.BindResumeTarget(watch); err != nil {
 		t.Fatal(err)

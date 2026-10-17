@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"errors"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -51,8 +50,7 @@ func TestScheduler_L1CompletionRearmsFoldedSiblings(t *testing.T) {
 		// 冷却挡住合成 L2，本用例只看 L1。
 		track.Report(health.Report{RouteID: rt.ID, Verdict: health.VerdictRateLimited, RetryAfter: time.Hour})
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger()).
-		WithTargets(testTargets(), nil).
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	start := time.Now()
@@ -93,17 +91,16 @@ func TestScheduler_UnknownRouteOnUnreachableStationWaitsStationCycle(t *testing.
 		t.Fatalf("setup: FailThreshold=%d, need >=2 so one L1 failure leaves the Route unknown", cfg.settings.FailThreshold)
 	}
 	track := health.NewTracker(cfg)
-	gate := health.NewUpstreamGate()
-	gate.Report(10, gate.EnsureGeneration(10), false, errors.New("connection refused"))
-	sched := NewScheduler(cfg, newFakeTransport(), track, gate, discardLogger()).
-		WithTargets(testTargets(), nil).
+	reach := health.NewReachabilityTracker(cfg)
+	seedFixtureReach(reach, 10, model.ReachabilityUnreachable, cfg.settings)
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, reach, discardLogger()).
 		WithRNG(rand.New(rand.NewSource(7)))
 
 	start := time.Now()
 	sched.tick(context.Background())
 	sched.wg.Wait()
 
-	if gate.OKAt(10, ups[0].NetworkRevision) {
+	if reach.OK(10, ups[0].NetworkRevision) {
 		t.Fatal("setup: connection refused must leave the station unreachable")
 	}
 	st := track.Status(100)
@@ -133,7 +130,7 @@ func TestScheduler_RefusedL2DoesNotBurstAfterCompletion(t *testing.T) {
 	for _, id := range []int64{100, 101} {
 		track.Report(health.Report{RouteID: id, Verdict: health.VerdictFatal})
 	}
-	sched := NewScheduler(cfg, newFakeTransport(), track, health.NewUpstreamGate(), discardLogger())
+	sched := newSchedulerFixture(t, cfg, newFakeTransport(), track, health.NewReachabilityTracker(nil), discardLogger())
 
 	hold, ok := sched.beginL2(10, 100)
 	if !ok {

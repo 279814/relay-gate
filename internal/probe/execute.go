@@ -40,15 +40,6 @@ type preparedProbe struct {
 	resolvedURLHash string
 	requestURLHash  string
 
-	// connectionOnly 表示这次 L1 只探连接层，任何响应都算通（§4.1）。
-	//
-	// 在这里定而不是让 L1 去看请求方法：那个判据会被一份 method=HEAD 的
-	// models 配方冒充。两者本来就会分开 —— 迁移在 l1_path 为空时物化了一份
-	// HEAD 配方（store/migrate_backfill.go 的 backfillLegacyModelsRecipe），
-	// 而用户之后把 l1_path 改回 /v1/models 时只有 url_override 被重译，
-	// 那份不可变的配方仍是 HEAD。于是「看方法」会让这个站的 L1 对 500 判通，
-	// 站级门禁放行、L2 继续往一个已死的站上烧 token，而界面显示健康。
-	connectionOnly   bool
 	outputTokenLimit int
 }
 
@@ -163,10 +154,6 @@ func (p *requestPreparer) finishPrepare(ctx context.Context, up *model.Upstream,
 	}
 
 	method := rendered.Method
-	connectionOnly := endpoint == model.EndpointModels && strings.TrimSpace(up.L1Path) == ""
-	if connectionOnly {
-		method = http.MethodHead
-	}
 
 	var bodyReader *strings.Reader
 	if len(rendered.Body) > 0 {
@@ -190,7 +177,6 @@ func (p *requestPreparer) finishPrepare(ctx context.Context, up *model.Upstream,
 		request:          request,
 		resolvedURLHash:  target.ResolvedURLHash,
 		requestURLHash:   target.RequestURLHash,
-		connectionOnly:   connectionOnly,
 		outputTokenLimit: ProbeRequestOutputTokenLimit(rendered.Body),
 	}, resolved, nil
 }

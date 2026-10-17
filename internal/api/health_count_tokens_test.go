@@ -59,7 +59,7 @@ func TestGetHealth_CountTokensPerRoute(t *testing.T) {
 		scopes: map[model.RecipeScope]int{},
 		eps:    map[model.EndpointKind]int{},
 	}
-	h := s.WithHealth(stubHealth{}, nil, nil).WithCountTokensView(view).Routes(testAdminPW)
+	h := s.WithHealth(stubHealth{}, nil).WithCountTokensView(view).Routes(testAdminPW)
 
 	rows := healthRowsByRoute(t, h)
 	for _, rt := range routes {

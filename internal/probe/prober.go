@@ -124,11 +124,6 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	// 判据是 prepared.connectionOnly 而不是「请求方法是 HEAD」：一份
 	// method=HEAD 的已发布 models 配方会冒充这个语义，而那种配方是迁移产物
 	// （见 preparedProbe.connectionOnly 的说明）。看方法的话，那个站的 L1
-	// 会对 500 判通，于是整站门禁放行而界面显示健康。
-	if prepared.connectionOnly {
-		return Outcome{Verdict: health.VerdictOK, TTFT: ttft, Status: resp.StatusCode}
-	}
-
 	// 404/405 视为通过 —— 站不提供这个端点不等于站挂了。
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 		return Outcome{Verdict: health.VerdictOK, TTFT: ttft, Status: resp.StatusCode}

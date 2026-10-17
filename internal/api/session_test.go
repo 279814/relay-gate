@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/probe"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -676,16 +675,11 @@ func TestProbeHeaders_EndpointReturnsDefaults(t *testing.T) {
 	}
 }
 
-func TestOutcomeJSON_ZeroVerdictWouldReportOK(t *testing.T) {
-	// 这条测试记录一个陷阱，它是 probeRoute 里那段显式判断的全部理由：
-	// health.Verdict 的零值是 VerdictOK（iota 的第一个），所以一个
-	// **从未执行**的 Outcome 序列化出来是 `"verdict": "ok"`。
-	//
-	// 端到端跑的时候真的撞上了：L1 连不上的站，界面显示「L1 失败、L2 成功」。
-	// 用户完全无法据此判断这个 Route 能不能用。
-	m := outcomeJSON(probe.Outcome{})
-	if m["verdict"] != "ok" {
-		t.Skipf("Verdict 零值语义已变（现在是 %v），probeRoute 里的显式判断可以简化", m["verdict"])
+func TestManualProbeWithoutRunnerNeverReportsUnexecutedSuccess(t *testing.T) {
+	_, h := newTestServer(t)
+	response := do(t, h, "POST", "/admin/api/routes/1/probe", "", true)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexecuted probe must not report zero-value success: %d %s", response.Code, response.Body.String())
 	}
 }
 

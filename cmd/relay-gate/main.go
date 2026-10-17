@@ -163,7 +163,7 @@ func runServer() error {
 	cfgSrc := livecfg.New(st, log)
 	tracker := health.NewTracker(cfgSrc)
 	reachTracker := health.NewReachabilityTracker(cfgSrc)
-	gate := health.NewUpstreamGate().WithTracker(reachTracker)
+
 	capRegistry := probe.NewCapabilityRegistry(cfgSrc).WithRouteGeneration(tracker)
 	obsReducer := health.NewObservationReducer(nil)
 
@@ -230,7 +230,6 @@ func runServer() error {
 		WithRelayKeyValidator(credSvc).
 		WithTargets(targets, st).
 		WithTransports(transports).
-		WithHealthReporter(probe.NewReporter(tracker).WithCapabilityRegistry(capRegistry)).
 		WithLogSink(logRecorder).
 		WithCountTokensCapability(capRegistry).
 		WithRecoveryGate(sharedRecovery).
@@ -268,6 +267,11 @@ func runServer() error {
 	if _, err := capRegistry.RestoreRealSuccesses(context.Background(), st, cfgSrc, recipes); err != nil {
 		return fmt.Errorf("恢复真实成功探活证据: %w", err)
 	}
+	if n, err := reachTracker.RestoreNegatives(context.Background(), st); err != nil {
+		return fmt.Errorf("恢复站级不可达状态: %w", err)
+	} else if n > 0 {
+		log.Info("已恢复站级不可达状态", "rows", n)
+	}
 
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
@@ -283,8 +287,7 @@ func runServer() error {
 		resultRecorder, coordinator,
 		probe.WallClock(), log)
 
-	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
-		WithTargets(targets, st).
+	sched := probe.NewScheduler(cfgSrc, tracker, reachTracker, log).
 		WithRecipes(recipes).
 		WithExecutor(executor).
 		WithRunState(runCtrl).
@@ -364,6 +367,21 @@ func runServer() error {
 			}
 			return ids
 		},
+		RouteScheduleKey: func(routeID int64) (probe.ScheduleKey, bool) {
+			route, err := st.GetRoute(routeID)
+			if err != nil {
+				return probe.ScheduleKey{}, false
+			}
+			name, err := st.GetModelName(route.ModelNameID)
+			if err != nil {
+				return probe.ScheduleKey{}, false
+			}
+			endpoint, ok := name.Protocol.Endpoint()
+			if !ok {
+				return probe.ScheduleKey{}, false
+			}
+			return probe.ScheduleKey{ScopeType: model.RecipeScopeRoute, ScopeID: routeID, UpstreamID: route.UpstreamID, Endpoint: endpoint}, true
+		},
 		// 删站后没有下一次 Transport() 去换池键，必须主动丢掉该站全部池。
 		DropUpstreamTransports: transports.Invalidate,
 	}
@@ -392,7 +410,7 @@ func runServer() error {
 	// routing 快照，使新请求看到新 enabled/路由，不等 livecfg 的 2s TTL。
 	adminAPI := api.New(st, log).
 		WithRuntime(tracker, recorder, logRecorder).
-		WithHealth(tracker, gate, sched).
+		WithHealth(tracker, reachTracker).
 		WithCountTokensView(capRegistry).
 		WithCost(cost).
 		WithInvalidator(inv).

@@ -21,7 +21,7 @@ func TestL1_ShortAPIKeyConfigErrorNoSend(t *testing.T) {
 	up := upstreamFor("https://short-key.example")
 	up.APIKey = strings.Repeat("x", model.MinRedactableKeyLen-1)
 
-	p := proberFor(up)
+	p := executorFor(up)
 	p.Transport = rt
 
 	out := p.L1(context.Background(), up, fastSettings())

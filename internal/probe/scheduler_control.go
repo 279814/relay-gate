@@ -114,10 +114,8 @@ func (s *Scheduler) PrepareResume() {
 	} else {
 		s.track.ResetAll()
 	}
-	if s.gate != nil && s.gate.Tracker() != nil {
-		s.gate.Tracker().DemotePositive()
-	} else if s.gate != nil {
-		s.gate.Reset()
+	if s.reach != nil {
+		s.reach.DemotePositive()
 	}
 	if s.ensureP012().capReg != nil {
 		s.ensureP012().capReg.DemotePositive()
@@ -281,8 +279,8 @@ func (s *Scheduler) Trigger(key ScheduleKey, reason ScheduleReason) {
 
 // InvalidateUpstream 使该站尽快被调度。
 func (s *Scheduler) InvalidateUpstream(upstreamID int64) {
-	if s.gate != nil {
-		s.gate.Forget(upstreamID)
+	if s.reach != nil {
+		s.reach.Invalidate(upstreamID)
 	}
 	s.Trigger(ScheduleKey{
 		UpstreamID: upstreamID, ScopeType: model.RecipeScopeUpstream, Endpoint: model.EndpointModels,
