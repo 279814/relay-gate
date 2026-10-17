@@ -94,7 +94,7 @@ func TestSecretNotFound_IsRouteConfigButReadFailureIsNot(t *testing.T) {
 		t.Errorf("missing Secret in URL must be ErrURLConfig, got %v", err)
 	}
 
-	profile := model.EndpointAuthProfile{Mode: model.AuthModeManualHeaders,
+	profile := model.EndpointAuthProfile{Mode: model.AuthModeManualHeaders, SecretRef: "upstream_api_key",
 		ManualHeaders: []model.HeaderTemplate{{Name: "X-Site-Token", Values: []string{"{{SECRET:site-token}}"}}}}
 	apply := func(secrets SecretSource) error {
 		return ApplyAuth(context.Background(), make(http.Header), AuthInput{
