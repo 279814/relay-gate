@@ -193,7 +193,7 @@ func newRecoveryL1Harness(t *testing.T) (*l1RecoveryHarness, *ResultRecorder) {
 	recorder := NewResultRecorder(committer, health.NewObservationReducer(nil), h.reach, nil).
 		WithReachabilityRecovered(h.sched.OnReachabilityRecovered)
 	h.recorder = committer.inner
-	h.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+	h.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: outbound.NewManager()},
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 	return h, recorder

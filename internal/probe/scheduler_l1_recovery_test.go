@@ -119,7 +119,7 @@ func newL1RecoveryHarness(t *testing.T) *l1RecoveryHarness {
 	h.sched.gate = h.gate
 	h.recorder = &reachReducingRecorder{t: t, reach: h.reach,
 		reducer: health.NewObservationReducer(nil), settings: settings}
-	executor := NewExecutor(testTargets(), nil, nil,
+	executor := NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: outbound.NewManager()},
 		h.recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
 	h.sched.WithExecutor(executor)

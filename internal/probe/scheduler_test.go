@@ -980,7 +980,7 @@ func TestScheduler_ProbeNowUsesExecutor(t *testing.T) {
 	})
 
 	recorder := &captureRecorder{}
-	executor := NewExecutor(testTargets(), nil, nil,
+	executor := NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: outbound.NewManager()},
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
 	hs.sched.WithExecutor(executor)
@@ -1019,7 +1019,7 @@ func TestScheduler_ProbeNowSkipsMemoryCostWhenNotCharged(t *testing.T) {
 	hs.sched.WithCost(cost)
 
 	recorder := &captureRecorder{} // CostCharged stays false: insert failed/skipped
-	executor := NewExecutor(testTargets(), nil, nil,
+	executor := NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: outbound.NewManager()},
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger())
 	hs.sched.WithExecutor(executor)

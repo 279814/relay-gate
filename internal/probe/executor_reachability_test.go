@@ -123,7 +123,7 @@ func TestExecutor_PreSendConfigErrorLeavesReachabilityUnchanged(t *testing.T) {
 	t.Cleanup(manager.CloseIdleConnections)
 	badProxyExec := NewExecutor(
 		outbound.NewProvider(testEndpoints{upstream: &badProxy}, nil, outbound.NewResolver(testHasher{})),
-		nil, nil, ManagerTransports{Manager: manager}, recorder, AlwaysOpenAdmission(), WallClock(), nil)
+		nil, builtinOnlyResolver(), ManagerTransports{Manager: manager}, recorder, AlwaysOpenAdmission(), WallClock(), nil)
 	for name, target := range map[string]*model.Upstream{
 		"bad_base_url": &badURL, "empty_key": &emptyKey, "bad_proxy_url": &badProxy,
 	} {

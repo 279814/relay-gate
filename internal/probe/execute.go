@@ -52,6 +52,18 @@ type preparedProbe struct {
 	outputTokenLimit int
 }
 
+// requestPreparer only resolves and renders a fixed request. It has no network
+// transport, parser or health writer; Executor owns the single send lifecycle.
+type requestPreparer struct {
+	Targets TargetResolver
+	Secrets outbound.SecretSource
+	Recipes *RecipeResolver
+}
+
+func (p *requestPreparer) values(up *model.Upstream) outbound.Values {
+	return outbound.Values{UpstreamAPIKey: []byte(up.APIKey), CredentialRevision: up.CredentialRevision, Secrets: p.Secrets}
+}
+
 // prepare 解析并渲染出一次探活请求。
 //
 // mn 与 rt 可以为 nil（L1 打的是站级 /v1/models，没有模型上下文）。那种情况下
@@ -63,7 +75,7 @@ type preparedProbe struct {
 // Executor 靠它把 recipe origin/storage/version 落进 config_error 的 execution 行 ——
 // 否则 §5.2d 的成本证据（CostEvidenceFromExecution 要求 RecipeOrigin.Valid()）
 // 建不起来，整行写库失败。解析本身失败时回零值 ResolvedRecipe（identity 未定）。
-func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
+func (p *requestPreparer) prepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
 	rt *model.Route, endpoint model.EndpointKind) (*preparedProbe, ResolvedRecipe, error) {
 
 	// 没有出站解析器就地失败，**不自己拼一个地址**：探活打的地址必须与真实
@@ -76,12 +88,15 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 	if p.Targets == nil {
 		return nil, ResolvedRecipe{}, errors.New("探活未装配出站目标解析器")
 	}
+	if p.Recipes == nil {
+		return nil, ResolvedRecipe{}, errors.New("探活未装配 Recipe 来源")
+	}
 
 	var routeID int64
 	if rt != nil {
 		routeID = rt.ID
 	}
-	resolved, err := p.recipes().Resolve(ctx, RecipeQuery{
+	resolved, err := p.Recipes.Resolve(ctx, RecipeQuery{
 		UpstreamID: up.ID, RouteID: routeID, Endpoint: endpoint,
 	})
 	if err != nil {
@@ -91,15 +106,19 @@ func (p *Prober) prepare(ctx context.Context, up *model.Upstream, mn *model.Mode
 }
 
 // prepareExplicit 使用校准物化的 Recipe 与候选 AuthProfile（§P0-11）。
-func (p *Prober) prepareExplicit(ctx context.Context, req ExecutionRequest) (*preparedProbe, ResolvedRecipe, error) {
+func (p *requestPreparer) prepareExplicit(ctx context.Context, req ExecutionRequest) (*preparedProbe, ResolvedRecipe, error) {
 	if p.Targets == nil {
 		return nil, ResolvedRecipe{}, errors.New("探活未装配出站目标解析器")
 	}
 	if req.ExplicitRecipe == nil || req.Upstream == nil {
 		return nil, ResolvedRecipe{}, errors.New("explicit prepare 缺少 recipe/upstream")
 	}
-	if req.ExplicitRecipe.Identity.Storage != model.RecipeStorageDB || req.ExplicitRecipe.Identity.DBVersionID < 1 {
-		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 StorageDB+DBVersionID")
+	identity := req.ExplicitRecipe.Identity
+	if err := identity.Validate(); err != nil {
+		return nil, ResolvedRecipe{}, err
+	}
+	if identity.Storage != model.RecipeStorageDB && (identity.Storage != model.RecipeStorageProfile || req.ExplicitRecipe.Facts.Use != model.BindingExplicitProfileTest) {
+		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 DB 版本或明确绑定的 Profile 测试")
 	}
 	facts := req.ExplicitRecipe.Facts
 	if facts.Use == "" {
@@ -110,7 +129,7 @@ func (p *Prober) prepareExplicit(ctx context.Context, req ExecutionRequest) (*pr
 		*req.ExplicitRecipe, req.AuthOverride)
 }
 
-func (p *Prober) finishPrepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
+func (p *requestPreparer) finishPrepare(ctx context.Context, up *model.Upstream, mn *model.ModelName,
 	rt *model.Route, endpoint model.EndpointKind, resolved ResolvedRecipe,
 	authOverride *model.EndpointAuthProfile) (*preparedProbe, ResolvedRecipe, error) {
 
@@ -242,27 +261,10 @@ func newProbeRequest(ctx context.Context, method, url string, body *strings.Read
 	return http.NewRequestWithContext(ctx, method, url, body)
 }
 
-// recipes 返回本次探活用的解析器。
-//
-// 未装配时退化成「只有内置模板」的解析器，而不是报错：内置 manifest 是
-// embed 的，零配置可用，所以这个退化仍然发得出一个正确的请求。它服务两类
-// 调用方 —— 只关心传输行为的测试，以及 P0-14 之前（用户还无法创建 Recipe）
-// 的运行时。
-//
-// 生产装配仍要显式传（main.go）：漏传的后果是用户已发布的 Recipe 被忽略，
-// 而那不会报错。端到端测试
-// （internal/outbound/recipe_resolution_test.go）盯的正是这条。
-func (p *Prober) recipes() *RecipeResolver {
-	if p.Recipes != nil {
-		return p.Recipes
-	}
-	return builtinOnlyResolver()
-}
-
 // templateValues 装配六个内置占位符（§8.5）。
 //
 // 每次探活现造一个：Secret 与 key 的明文不该常驻在任何长生命周期对象里。
-func (p *Prober) templateValues(ctx context.Context, up *model.Upstream, mn *model.ModelName,
+func (p *requestPreparer) templateValues(ctx context.Context, up *model.Upstream, mn *model.ModelName,
 	rt *model.Route, resolved ResolvedRecipe) (TemplateValues, error) {
 
 	values := TemplateValues{
@@ -297,7 +299,7 @@ func (p *Prober) templateValues(ctx context.Context, up *model.Upstream, mn *mod
 // 按**编译结果**要的名字去解析，再交给 BindSecrets 与 ref 快照对齐。反过来
 // （按 ref 清单解析）会漏掉「模板引用了但 ref 里没有」这种不同源的情况 ——
 // 而那正是 BindSecrets 的「多余」分支要报的。
-func (p *Prober) resolveSecrets(ctx context.Context,
+func (p *requestPreparer) resolveSecrets(ctx context.Context,
 	resolved ResolvedRecipe) (map[string]probetemplate.ResolvedValue, error) {
 
 	required := resolved.Compiled.RequiredSecrets()
@@ -326,7 +328,7 @@ func (p *Prober) resolveSecrets(ctx context.Context,
 // 顺序是不变量：覆盖先、认证后。反过来的话，probe_headers 里的一个
 // Authorization 会盖掉 ApplyAuth 刚写的那个 —— 而 probe_headers 是明文 JSON，
 // 等于给这个站开了第二个不受加密保护的 key 来源。
-func (p *Prober) applyProbeHeaders(ctx context.Context, header http.Header, up *model.Upstream,
+func (p *requestPreparer) applyProbeHeaders(ctx context.Context, header http.Header, up *model.Upstream,
 	target outbound.ResolvedTarget) error {
 
 	applyUpstreamHeaderOverrides(header, up)

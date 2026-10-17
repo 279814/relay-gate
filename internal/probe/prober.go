@@ -36,19 +36,6 @@ type Prober struct {
 	Recipes *RecipeResolver
 }
 
-// values 组装 URL 与认证要的占位符（UPSTREAM_API_KEY 与 SECRET:）。
-//
-// 与 TemplateValues 的分工：这个只服务 URL 与认证头（outbound 侧），
-// 而 Recipe 的 header/query/body 用 TemplateValues —— 后者还要提供模型名、
-// prompt 这些属于 body 模板的值。见 outbound.Values 的说明。
-func (p *Prober) values(up *model.Upstream) outbound.Values {
-	return outbound.Values{
-		UpstreamAPIKey:     []byte(up.APIKey),
-		CredentialRevision: up.CredentialRevision,
-		Secrets:            p.Secrets,
-	}
-}
-
 // probeConfigOutcome 把「还没发出去就失败了」翻译成 Outcome。
 //
 // Err 原样保留：legacy 待审核（去审核）与普通配置错误（去改配置）的动作不同，
@@ -106,7 +93,11 @@ func (p *Prober) L1(ctx context.Context, up *model.Upstream, s model.Settings) (
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.L1TotalSec)*time.Second)
 	defer cancel()
 
-	prepared, _, err := p.prepare(ctx, up, nil, nil, model.EndpointModels)
+	preparer := &requestPreparer{Targets: p.Targets, Secrets: p.Secrets, Recipes: p.Recipes}
+	if preparer.Recipes == nil {
+		preparer.Recipes = builtinOnlyResolver()
+	}
+	prepared, _, err := preparer.prepare(ctx, up, nil, nil, model.EndpointModels)
 	if err != nil {
 		return probeConfigOutcome(err)
 	}
@@ -172,7 +163,11 @@ func (p *Prober) L2(ctx context.Context, up *model.Upstream, mn *model.ModelName
 		return Outcome{Verdict: health.VerdictUnavailable,
 			Err: fmt.Errorf("协议 %q 没有对应的 Endpoint", mn.Protocol)}
 	}
-	prepared, _, err := p.prepare(ctx, up, mn, rt, kind)
+	preparer := &requestPreparer{Targets: p.Targets, Secrets: p.Secrets, Recipes: p.Recipes}
+	if preparer.Recipes == nil {
+		preparer.Recipes = builtinOnlyResolver()
+	}
+	prepared, _, err := preparer.prepare(ctx, up, mn, rt, kind)
 	if err != nil {
 		return probeConfigOutcome(err)
 	}

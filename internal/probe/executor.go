@@ -199,9 +199,8 @@ func (e *Executor) Execute(ctx context.Context, req ExecutionRequest) (Execution
 	}
 
 	// 准备阶段：解析 → 渲染 → 认证。任何一步失败都是 route-local 的
-	// config_error，**不出网**（§8.6）。这里刻意不传 Transport 构造 Prober ——
-	// 它只借用 prepare，不发送。
-	preparer := &Prober{Targets: e.resolver, Secrets: e.secrets, Recipes: e.recipes}
+	// config_error，**不出网**（§8.6）。准备器没有网络发送能力。
+	preparer := &requestPreparer{Targets: e.resolver, Secrets: e.secrets, Recipes: e.recipes}
 	var prepared *preparedProbe
 	var resolved ResolvedRecipe
 	var err error

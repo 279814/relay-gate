@@ -57,7 +57,7 @@ func TestScheduler_L2URLConfigErrorLeavesRouteHealth(t *testing.T) {
 			hs := newSchedHarness(t, 2, aliveL2Handler)
 			recorder := &captureRecorder{}
 			if withExecutor {
-				hs.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+				hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 					ManagerTransports{Manager: outbound.NewManager()},
 					recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 			}
@@ -118,7 +118,7 @@ func TestScheduler_L2ProxyPoolConfigErrorLeavesRouteHealth(t *testing.T) {
 	recorder := &captureRecorder{}
 	manager := outbound.NewManager()
 	t.Cleanup(manager.CloseIdleConnections)
-	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, nil,
+	hs.sched.WithExecutor(NewExecutor(testTargets(), nil, builtinOnlyResolver(),
 		ManagerTransports{Manager: manager},
 		recorder, AlwaysOpenAdmission(), WallClock(), discardLogger()))
 
