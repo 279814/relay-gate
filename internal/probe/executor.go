@@ -388,6 +388,11 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 
 	// RoundTrip 已返回：建连观测点此刻定稿，读它是 happens-after（经 rtCh）。
 	timing.applyTrace(trace)
+	if ctx.Err() != nil {
+		// Both the response/deadline and external cancellation can already be
+		// ready. Never turn the caller's cancellation into an upstream failure.
+		rtErr = ctx.Err()
+	}
 
 	// 传输层失败：连响应头都没拿到，status=0 → unreachable（§8.9）。
 	if rtErr != nil {
@@ -420,8 +425,11 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 			estInputTokens, timing, sentAt)
 	}
 
-	readResult := e.readStream(sendCtx, cancel, resp.Body, resp.Header.Get("Content-Encoding"), decoder, classifier, req, budget, sentAt, &timing, stageTimer)
-	if readResult.setupErr != nil {
+	readResult := e.readStream(sendCtx, ctx, cancel, resp.Body, resp.Header.Get("Content-Encoding"), decoder, classifier, req, budget, sentAt, &timing, stageTimer)
+	if ctx.Err() != nil && !readResult.expectedCancel {
+		readResult.cancelCause = ErrServicePaused
+	}
+	if readResult.setupErr != nil && readResult.cancelCause == nil {
 		return e.finishObserverIncomplete(ctx, req, prepared, resp.StatusCode,
 			model.ObserverDecodeFailure, "observer_content_encoding", requestBytes,
 			estInputTokens, timing, sentAt)
@@ -449,7 +457,7 @@ func (read executorReaderFunc) Read(p []byte) (int, error) { return read(p) }
 
 // readStream shares the SentAt-anchored deadline with RoundTrip. Probe mode
 // still cancels immediately after the first semantic verdict.
-func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, rawBody io.Reader, encoding string,
+func (e *Executor) readStream(ctx, callerCtx context.Context, cancel context.CancelFunc, rawBody io.Reader, encoding string,
 	decoder Decoder, classifier *ResponseClassifier, req ExecutionRequest, budget outbound.Budget,
 	sentAt time.Time, timing *sendTiming, timer Timer) streamResultExec {
 	var result streamResultExec
@@ -500,7 +508,19 @@ func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, ra
 			}
 		}
 	}()
+	callerCanceled := func() bool {
+		// ctx also carries our stage/semantic cancellation; only the original
+		// caller may suppress an upstream verdict as an ignored observation.
+		if callerCtx.Err() != nil {
+			result.cancelCause = ErrServicePaused
+			return true
+		}
+		return false
+	}
 	expired := func(now time.Time) bool {
+		if callerCanceled() {
+			return true
+		}
 		deadline, cause := nextExecutionDeadline(budget, sentAt, timing, lastActivity)
 		if !now.Before(deadline) {
 			result.readErr = cause
@@ -535,6 +555,9 @@ func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, ra
 		return false
 	}
 	for {
+		if callerCanceled() {
+			return result
+		}
 		deadline, cause := nextExecutionDeadline(budget, sentAt, timing, lastActivity)
 		timer = resetExecutionTimer(timer, e.clock, deadline)
 		select {
@@ -579,6 +602,9 @@ func (e *Executor) readStream(ctx context.Context, cancel context.CancelFunc, ra
 				return result
 			}
 		case <-timer.C():
+			if callerCanceled() {
+				return result
+			}
 			result.readErr = cause
 			cancel()
 			return result
