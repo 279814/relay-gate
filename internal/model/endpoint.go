@@ -217,10 +217,13 @@ type UpstreamEndpoint struct {
 	URLOverride           string              `json:"url_override,omitempty"`
 	FixedQueryTemplate    string              `json:"fixed_query_template,omitempty"`
 	AuthProfile           EndpointAuthProfile `json:"auth_profile"`
-	Revision              int64               `json:"revision"`
-	NeedsReview           bool                `json:"needs_review"`
-	CreatedAt             int64               `json:"created_at"`
-	UpdatedAt             int64               `json:"updated_at"`
+	// BoundSecrets belongs to the same captured database generation as this
+	// Endpoint. It contains identity/revision metadata only, never plaintext.
+	BoundSecrets []SecretRevision `json:"-"`
+	Revision     int64            `json:"revision"`
+	NeedsReview  bool             `json:"needs_review"`
+	CreatedAt    int64            `json:"created_at"`
+	UpdatedAt    int64            `json:"updated_at"`
 }
 
 type LegacyFullURL struct {
