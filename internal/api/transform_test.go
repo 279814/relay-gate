@@ -263,7 +263,14 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	}
 
 	// Failed delete (missing id) must keep bindings for the live route.
-	rec = do(t, h, "DELETE", "/admin/api/routes/999999", "", true)
+	stale := do(t, h, "DELETE", "/admin/api/routes/"+itoa(routeID)+"?expected_revision=9", "", true)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale delete=%d %s", stale.Code, stale.Body.String())
+	}
+	if compiled, _, err := reg.PublishedCompiled(routeID, endpointID); err != nil || compiled == nil {
+		t.Fatalf("stale delete failed to restore transform binding: %v", err)
+	}
+	rec = do(t, h, "DELETE", "/admin/api/routes/999999"+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("missing route must reject delete")
 	}
@@ -272,7 +279,7 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("failed delete must keep target binding: c=%v err=%v", c != nil, err)
 	}
 
-	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(routeID), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(routeID)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete route: %d %s", rec.Code, rec.Body.String())
 	}
@@ -287,7 +294,7 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 
 	// Empty the route table so AUTOINCREMENT can reuse the deleted id after
 	// sqlite_sequence reset (a surviving higher id would force max+1).
-	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(siblingID), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/routes/"+itoa(siblingID)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete sibling: %d %s", rec.Code, rec.Body.String())
 	}
@@ -383,7 +390,7 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("failed delete must keep target binding: c=%v err=%v", c != nil, err)
 	}
 
-	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), `{"enabled":false}`, true)
+	rec = do(t, h, "PUT", "/admin/api/upstreams/"+itoa(upID), withExpectedRevision(t, `{"enabled":false}`, 1), true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable upstream: %d %s", rec.Code, rec.Body.String())
 	}

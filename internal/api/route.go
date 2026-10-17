@@ -2,23 +2,32 @@ package api
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/279814/relay-gate/internal/model"
 )
 
 func (s *Server) listRoutes(w http.ResponseWriter, r *http.Request) {
-	// ?model_name_id=N 过滤，便于 UI 在 ModelName 详情页只取相关 Route
-	var mnID int64
-	if v := r.URL.Query().Get("model_name_id"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n <= 0 {
-			s.writeErr(w, model.WrapValidation("model_name_id 不合法"))
-			return
-		}
-		mnID = n
+	page, err := configPage(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
 	}
-	list, err := s.st.ListRoutes(mnID)
+	enabled, err := configEnabled(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	mnID, err := configIDFilter(r, "model_name_id")
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	upID, err := configIDFilter(r, "upstream_id")
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	list, err := s.configAdmin.ListRoutes(r.Context(), model.RouteFilter{PageRequest: page, Enabled: enabled, ModelNameID: mnID, UpstreamID: upID})
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -32,7 +41,7 @@ func (s *Server) getRoute(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	rt, err := s.st.GetRoute(id)
+	rt, err := s.configAdmin.GetRoute(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -48,18 +57,19 @@ func (s *Server) createRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rt.ID = 0
-	if err := s.st.CreateRoute(&rt); err != nil {
+	created, err := s.configAdmin.CreateRoute(r.Context(), rt)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	rt = created
 	s.log.Info("新增 route", "id", rt.ID, "model_name_id", rt.ModelNameID,
 		"upstream_id", rt.UpstreamID, "priority", rt.Priority)
 	// §4.5：新建的 Route 立刻探一次。这是最该探的时刻 —— 用户刚配好，
 	// 想知道的正是「这个映射到底通不通」。不探的话它会以 unknown 状态
 	// 直接参与选路（乐观策略），真实请求撞上去才发现配错了。
 	s.invalidateRoute(rt.ID)
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, rt.ID, rt.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, rt)
@@ -71,21 +81,32 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	cur, err := s.st.GetRoute(id)
+	current, err := s.configAdmin.GetRoute(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	cur := &current
 	before := *cur
-	if err := decodeJSON(r, cur); err != nil {
+	in := struct {
+		*model.Route
+		ExpectedRevision int64 `json:"expected_revision"`
+	}{Route: cur}
+	if err := decodeJSON(r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := requireRevision(in.ExpectedRevision); err != nil {
 		s.writeErr(w, err)
 		return
 	}
 	cur.ID = id
-	if err := s.st.UpdateRoute(cur); err != nil {
+	updated, err := s.configAdmin.UpdateRoute(r.Context(), id, in.ExpectedRevision, *cur)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	*cur = updated
 	s.log.Info("更新 route", "id", id, "priority", cur.Priority)
 	// §4.5：只有改了模型映射或指向的站才需要重探 —— 那两项决定探活
 	// 打的是哪个模型、哪个站。改 priority / weight 只影响选路的偏好，
@@ -100,14 +121,18 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 		before.ModelNameID != cur.ModelNameID {
 		s.invalidateRoute(id)
 	}
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, cur.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusOK, cur)
 }
 
 func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
+	revision, err := deleteRevision(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
@@ -119,10 +144,10 @@ func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	var delErr error
 	if s.transforms != nil {
 		delErr = s.transforms.DetachRouteBindingsAround([]int64{id}, func() error {
-			return s.st.DeleteRoute(id)
+			return s.configAdmin.DeleteRoute(r.Context(), id, revision)
 		})
 	} else {
-		delErr = s.st.DeleteRoute(id)
+		delErr = s.configAdmin.DeleteRoute(r.Context(), id, revision)
 	}
 	if delErr != nil {
 		s.writeErr(w, delErr)
@@ -135,8 +160,7 @@ func (s *Server) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	// Capability 仍按 id 索引；若不 Forget，调度器 RetainOnly 之前（或 id
 	// 被复用时）新行会继承 StateDead / 旧 capability。
 	s.invalidateRoute(id)
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, revision) {
 		return
 	}
 	s.log.Info("删除 route", "id", id)

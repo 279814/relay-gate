@@ -75,9 +75,8 @@ func TestWriteErrConflictBodyOmitsWrappedDriverText(t *testing.T) {
 // 时不能启用」这条门禁在 API 层呈现为 409，而不是 500。
 func TestEnableIncompleteUpstreamReturns409(t *testing.T) {
 	server, handler := newTestServer(t)
-	created := do(t, handler, http.MethodPost, "/admin/api/upstreams",
-		`{"name":"incomplete","base_url":"https://incomplete.example.com",
-		  "api_key":"sk-incomplete-secret","auth_style":"x-api-key","enabled":false}`, true)
+	created := do(t, handler, http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"incomplete","base_url":"https://incomplete.example.com",
+		  "api_key":"sk-incomplete-secret","auth_style":"x-api-key","enabled":false}`), true)
 	if created.Code != http.StatusOK && created.Code != http.StatusCreated {
 		t.Fatalf("建 Upstream = %d: %s", created.Code, created.Body.String())
 	}
@@ -103,9 +102,8 @@ func TestEnableIncompleteUpstreamReturns409(t *testing.T) {
 		t.Fatalf("删 Endpoint: %v", err)
 	}
 
-	enabled := do(t, handler, http.MethodPut, "/admin/api/upstreams/"+itoa(upstreams[0].ID),
-		`{"name":"incomplete","base_url":"https://incomplete.example.com",
-		  "auth_style":"x-api-key","enabled":true}`, true)
+	enabled := do(t, handler, http.MethodPut, "/admin/api/upstreams/"+itoa(upstreams[0].ID), withExpectedRevision(t, `{"name":"incomplete","base_url":"https://incomplete.example.com",
+		  "auth_style":"x-api-key","enabled":true}`, 1), true)
 	if enabled.Code != http.StatusConflict {
 		t.Errorf("缺 Endpoint 时启用 = %d: %s, want 409", enabled.Code, enabled.Body.String())
 	}

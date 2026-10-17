@@ -235,6 +235,19 @@
           <div>
             <div class="bar">
               <strong>上游站点</strong>
+              <select x-model="configPages.upstreams.enabled" @change="pageConfig('upstreams','reset')">
+        <option value="">全部状态</option>
+        <option value="true">启用</option>
+        <option value="false">停用</option>
+        </select>
+              <select x-model="configPages.upstreams.probe_mode" @change="pageConfig('upstreams','reset')">
+        <option value="">全部探活模式</option>
+        <option value="active">主动探活</option>
+        <option value="lazy">懒探活</option>
+        </select>
+              <button :disabled="busy || !configPages.upstreams.history.length" @click="pageConfig('upstreams','prev')">上一页</button>
+              <button :disabled="busy || !configPages.upstreams.next" @click="pageConfig('upstreams','next')">下一页</button>
+        <button @click="pageConfig('upstreams','reset')">刷新</button>
               <span class="dim">全局配一次，通过「路由」绑到多个模型</span>
               <span class="grow"></span>
               <button class="primary" @click="editUp(null)">新增上游</button>
@@ -289,6 +302,20 @@
           <div>
             <div class="bar">
               <strong>逻辑模型</strong>
+              <select x-model="configPages['model-names'].enabled" @change="pageConfig('model-names','reset')">
+        <option value="">全部状态</option>
+        <option value="true">启用</option>
+        <option value="false">停用</option>
+        </select>
+              <select x-model="configPages['model-names'].protocol" @change="pageConfig('model-names','reset')">
+        <option value="">全部协议</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="openai-responses">Responses</option>
+        <option value="openai-chat">Chat Completions</option>
+        </select>
+              <button :disabled="busy || !configPages['model-names'].history.length" @click="pageConfig('model-names','prev')">上一页</button>
+              <button :disabled="busy || !configPages['model-names'].next" @click="pageConfig('model-names','next')">下一页</button>
+        <button @click="pageConfig('model-names','reset')">刷新</button>
               <span class="dim">客户端请求里写的那个 model 值</span>
               <span class="grow"></span>
               <button class="primary" @click="editMn(null)">新增模型</button>
@@ -330,6 +357,16 @@
           <div>
             <div class="bar">
               <strong>路由</strong>
+              <select x-model="configPages.routes.enabled" @change="pageConfig('routes','reset')">
+        <option value="">全部状态</option>
+        <option value="true">启用</option>
+        <option value="false">停用</option>
+        </select>
+              <input type="number" min="1" x-model="configPages.routes.upstream_id" placeholder="上游 ID" style="width:7rem">
+              <input type="number" min="1" x-model="configPages.routes.model_name_id" placeholder="模型 ID" style="width:7rem">
+        <button @click="pageConfig('routes','reset')">筛选</button>
+              <button :disabled="busy || !configPages.routes.history.length" @click="pageConfig('routes','prev')">上一页</button>
+              <button :disabled="busy || !configPages.routes.next" @click="pageConfig('routes','next')">下一页</button>
               <span class="dim">模型 × 上游的绑定，探活与健康状态的最小单位</span>
               <span class="grow"></span>
               <button class="primary" @click="editRt(null)"
@@ -1597,6 +1634,10 @@
         <div class="mask" @click.self="upForm = null">
           <div class="modal">
             <h3 x-text="upForm.id ? '编辑上游' : '新增上游'"></h3>
+            <button x-show="upForm.id" @click="refreshConfigForm('upstreams','upForm')">读取最新配置以比较</button>
+            <pre class="mono" x-show="upForm._latest" x-text="JSON.stringify(upForm._latest,null,2)">
+            </pre>
+            <button x-show="upForm._latest" @click="acceptConfigRevision('upForm')">保留当前编辑，使用最新版本重试</button>
             <div class="field">
               <label>名称</label>
               <input x-model="upForm.name" placeholder="例如 站点A">
@@ -1606,8 +1647,7 @@
               <input x-model="upForm.base_url" class="mono" placeholder="https://api.example.com">
               <!-- 带 /v1 是配置时最容易犯的错，症状是 404 且很难看出根因 -->
               <div class="note">
-                填根地址，<strong>不要带 /v1</strong> —— 出站路径由入站请求决定。
-                带了会拼成 /v1/v1/messages。确实用非标准路径的站请开下面的 full_url_mode。
+                填写站点基础地址，具体请求路径由 Endpoint 配置决定；非标准路径可逐项填写完整 URL 覆盖。
               </div>
             </div>
             <div class="field">
@@ -1621,8 +1661,8 @@
             </div>
             <div class="row">
               <div class="field">
-                <label>鉴权方式</label>
-                <select x-model="upForm.auth_style">
+                <label>旧版全局鉴权方式（修改会覆盖全部 Endpoint）</label>
+                <select x-model="upForm.auth_style" :disabled="!upForm.id">
                   <option value="auto">auto（两个头都发）</option>
                   <option value="x-api-key">x-api-key</option>
                   <option value="bearer">bearer</option>
@@ -1669,7 +1709,41 @@
             </div>
             <div class="row">
               <label class="check"><input type="checkbox" x-model="upForm.enabled"> 启用</label>
-              <label class="check"><input type="checkbox" x-model="upForm.full_url_mode"> full_url_mode（base_url 即完整端点）</label>
+              <label class="check" x-show="upForm.id"><input type="checkbox" x-model="upForm.full_url_mode"> full_url_mode（兼容旧完整地址；新端点请逐项配置 URL）</label>
+        <template x-if="!upForm.id">
+        <section>
+          <h4>五类初始端点</h4>
+          <p class="dim">留空 URL 使用基础地址加规范路径。逐项确认鉴权；这些配置将与站点一起创建。</p>
+          <template x-for="ep in upForm.initial_endpoints" :key="ep.endpoint">
+          <fieldset>
+            <legend x-text="ep.endpoint">
+            </legend>
+            <label>完整 URL 覆盖<input x-model="ep.url_override" class="mono" placeholder="留空使用规范路径">
+            </label>
+            <label>固定 query 模板<input x-model="ep.fixed_query_template" class="mono" placeholder="可选；凭据用占位符">
+            </label>
+            <label>认证模式<select x-model="ep.auth_profile.mode">
+            <option value="header_bearer">Bearer</option>
+            <option value="x_api_key">X-Api-Key</option>
+            <option value="api_key">Api-Key</option>
+            <option value="auto_calibrated">显式校准</option>
+            <option value="fixed_query_secret">固定 query 凭据</option>
+            <option value="manual_headers">认证头模板</option>
+            </select>
+            </label>
+            <label>凭据来源<input x-model="ep.auth_profile.secret_ref" class="mono">
+            </label>
+            <label x-show="ep.auth_profile.mode === 'api_key'">认证头名<input x-model="ep.auth_profile.header_name" placeholder="Api-Key">
+            </label>
+            <label x-show="ep.auth_profile.mode === 'fixed_query_secret'">query 参数名<input x-model="ep.auth_profile.query_name">
+            </label>
+            <label x-show="ep.auth_profile.mode === 'manual_headers'">认证头模板 JSON 数组<textarea x-model="ep.manual_headers_raw" class="mono" placeholder='[{"name":"Authorization","values":["Bearer {{UPSTREAM_API_KEY}}"]}]'>
+            </textarea>
+            </label>
+          </fieldset>
+          </template>
+        </section>
+        </template>
             </div>
             <footer>
               <button @click="upForm = null">取消</button>
@@ -1684,6 +1758,10 @@
         <div class="mask" @click.self="mnForm = null">
           <div class="modal">
             <h3 x-text="mnForm.id ? '编辑模型' : '新增模型'"></h3>
+            <button x-show="mnForm.id" @click="refreshConfigForm('model-names','mnForm')">读取最新配置以比较</button>
+            <pre class="mono" x-show="mnForm._latest" x-text="JSON.stringify(mnForm._latest,null,2)">
+            </pre>
+            <button x-show="mnForm._latest" @click="acceptConfigRevision('mnForm')">保留当前编辑，使用最新版本重试</button>
             <div class="field">
               <label>模型名</label>
               <input x-model="mnForm.name" class="mono" placeholder="claude-opus-4-8">
@@ -1735,11 +1813,15 @@
         <div class="mask" @click.self="rtForm = null">
           <div class="modal">
             <h3 x-text="rtForm.id ? '编辑路由' : '新增路由'"></h3>
+            <button x-show="rtForm.id" @click="refreshConfigForm('routes','rtForm')">读取最新配置以比较</button>
+            <pre class="mono" x-show="rtForm._latest" x-text="JSON.stringify(rtForm._latest,null,2)">
+            </pre>
+            <button x-show="rtForm._latest" @click="acceptConfigRevision('rtForm')">保留当前编辑，使用最新版本重试</button>
             <div class="row">
               <div class="field">
                 <label>模型</label>
                 <select x-model.number="rtForm.model_name_id">
-                  <template x-for="m in modelNames" :key="m.id">
+                  <template x-for="m in configOptions('model-names',rtForm.model_name_id)" :key="m.id">
                     <option :value="m.id" x-text="m.name"></option>
                   </template>
                 </select>
@@ -1747,7 +1829,7 @@
               <div class="field">
                 <label>上游</label>
                 <select x-model.number="rtForm.upstream_id">
-                  <template x-for="u in upstreams" :key="u.id">
+                  <template x-for="u in configOptions('upstreams',rtForm.upstream_id)" :key="u.id">
                     <option :value="u.id" x-text="u.name"></option>
                   </template>
                 </select>
@@ -1780,6 +1862,14 @@
             </div>
             <div class="row">
               <label class="check"><input type="checkbox" x-model="rtForm.enabled"> 启用</label>
+        <div class="bar">
+        <span>模型选项页</span>
+              <button :disabled="!configPages['model-names'].history.length" @click="pageConfig('model-names','prev')">上一页</button>
+              <button :disabled="!configPages['model-names'].next" @click="pageConfig('model-names','next')">下一页</button>
+        <span>上游选项页</span>
+              <button :disabled="!configPages.upstreams.history.length" @click="pageConfig('upstreams','prev')">上一页</button>
+              <button :disabled="!configPages.upstreams.next" @click="pageConfig('upstreams','next')">下一页</button>
+        </div>
             </div>
             <footer>
               <button @click="rtForm = null">取消</button>

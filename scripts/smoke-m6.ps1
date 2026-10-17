@@ -144,11 +144,16 @@ try {
     $mn = Admin POST '/admin/api/model-names' @{
         name = 'claude-opus-5'; protocol = 'anthropic'; match_mode = 'exact'; enabled = $true
     }
+    $initialEndpoints = foreach ($kind in @('models','messages','responses','chat_completions','count_tokens')) {
+        @{ endpoint = $kind; auth_profile = @{ mode = 'x_api_key'; secret_ref = 'upstream_api_key' } }
+    }
     $upBad = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-bad'; base_url = "http://127.0.0.1:$MOCK_BAD"
         api_key = $KEY_BAD; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
     $upOK = Admin POST '/admin/api/upstreams' @{
+        initial_endpoints = $initialEndpoints
         name = 'mock-ok'; base_url = "http://127.0.0.1:$MOCK_OK"
         api_key = $KEY_OK; auth_style = 'auto'; enabled = $true; l1_path = '/v1/models'
     }
@@ -190,10 +195,11 @@ try {
 
     Say '不需要重试时不留痕迹'
     # 停掉坏站的 Route，让请求一次就成功
-    Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+    $rtBad = Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+        expected_revision = $rtBad.revision
         model_name_id = $mn.id; upstream_id = $upBad.id
         priority = 1; weight = 100; enabled = $false
-    } | Out-Null
+    }
     Start-Sleep -Seconds 3  # 等 livecfg 的 2s TTL 过期
 
     $r2 = Relay '{"model":"claude-opus-5","max_tokens":16}'
@@ -203,10 +209,11 @@ try {
         "得到 '$($r2.Headers['X-Relay-Attempts'])' —— 正常响应必须与 M5 逐字节相同"
 
     # 恢复坏站 Route，后面的检查要用到那条重试记录
-    Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+    $rtBad = Admin PUT "/admin/api/routes/$($rtBad.id)" @{
+        expected_revision = $rtBad.revision
         model_name_id = $mn.id; upstream_id = $upBad.id
         priority = 1; weight = 100; enabled = $true
-    } | Out-Null
+    }
 
     # ── 最危险的一条：出站头必须每次重建 ──────────────────────
     Say 'A 站的 key 绝不能出现在发往 B 站的请求里'

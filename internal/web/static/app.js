@@ -37,6 +37,12 @@ function app() {
     upstreams: [],
     modelNames: [],
     routes: [],
+  configPages: {
+    upstreams: {cursor: '', next: '', history: [], limit: 25, enabled: '', probe_mode: ''},
+    'model-names': {cursor: '', next: '', history: [], limit: 25, enabled: '', protocol: ''},
+    routes: {cursor: '', next: '', history: [], limit: 25, enabled: '', upstream_id: '', model_name_id: ''},
+  },
+  configNames: {upstreams: {}, 'model-names': {}},
     samples: [],
     samplesTotal: 0,
     sampleFilter: { outcome: '' },
@@ -127,6 +133,7 @@ function app() {
         // 探活未启用时几个端点回 503，那是「功能没接」不是「出错了」——
         // 按中文子串匹配来区分的话，后端改一次文案前端就误报。
         e.status = r.status;
+    e.data = data;
         throw e;
       }
       return data;
@@ -197,6 +204,8 @@ function app() {
       this.upstreams = [];
       this.modelNames = [];
       this.routes = [];
+    for (const page of Object.values(this.configPages)) { page.cursor = ''; page.next = ''; page.history = []; page.request = (page.request || 0) + 1; }
+    this.configNames = {upstreams: {}, 'model-names': {}};
       this.samples = [];
       this.samplesTotal = 0;
       // 请求日志同样要清。它含 model 名、站名、失败原因 —— 那是运营信息，
@@ -223,19 +232,73 @@ function app() {
     async loadAll() {
       await this.run(async () => {
         // 并发拉取。串行的话首屏要等 6 个往返。
-        const [st, ups, mns, rts] = await Promise.all([
+        const [st] = await Promise.all([
           this.api('GET', '/state'),
-          this.api('GET', '/upstreams'),
-          this.api('GET', '/model-names'),
-          this.api('GET', '/routes'),
+          this.loadConfigPage('upstreams', 'reset'),
+          this.loadConfigPage('model-names', 'reset'),
+          this.loadConfigPage('routes', 'reset'),
         ]);
         this.running = st.state === 'running';
-        this.upstreams = ups || [];
-        this.modelNames = mns || [];
-        this.routes = rts || [];
       });
       await this.loadHealth();
       await this.loadSettings();
+    },
+
+    async loadConfigPage(resource, direction) {
+      const page = this.configPages[resource];
+    const request = (page.request || 0) + 1;
+    page.request = request;
+      let cursor = page.cursor, history = [...page.history];
+      if (direction === 'reset') { cursor = ''; history = []; }
+      else if (direction === 'next') { if (!page.next) return; history.push(cursor); cursor = page.next; }
+      else if (direction === 'prev') { if (!history.length) return; cursor = history.pop(); }
+      const query = new URLSearchParams({limit: String(page.limit)});
+      if (cursor) query.set('cursor', cursor);
+      for (const key of ['enabled', 'probe_mode', 'protocol', 'upstream_id', 'model_name_id']) {
+        if (page[key] !== undefined && page[key] !== '') query.set(key, String(page[key]));
+      }
+      const result = await this.api('GET', '/' + resource + '?' + query);
+    if (request !== page.request) return;
+      const field = {'upstreams': 'upstreams', 'model-names': 'modelNames', 'routes': 'routes'}[resource];
+      this[field] = result.items;
+      page.cursor = cursor; page.history = history; page.next = result.next_cursor || '';
+      if (resource !== 'routes') for (const row of result.items) this.configNames[resource][row.id] = row;
+      else {
+        const missing = [];
+        for (const [kind, key] of [['upstreams', 'upstream_id'], ['model-names', 'model_name_id']]) {
+          for (const id of new Set(result.items.map(row => row[key]))) if (!this.configNames[kind][id]) {
+            missing.push(this.api('GET', '/' + kind + '/' + id).then(row => { this.configNames[kind][id] = row; }));
+          }
+        }
+        await Promise.all(missing);
+      }
+    },
+
+    async pageConfig(resource, direction) { await this.run(() => this.loadConfigPage(resource, direction)); },
+
+    configOptions(resource, selected) {
+      const rows = resource === 'upstreams' ? this.upstreams : this.modelNames;
+      const retained = this.configNames[resource][selected];
+      return retained && !rows.some(row => row.id === selected) ? [retained, ...rows] : rows;
+    },
+
+    async refreshConfigForm(resource, field) {
+      const form = this[field];
+      await this.run(async () => { form._latest = await this.api('GET', '/' + resource + '/' + form.id); });
+    },
+
+    acceptConfigRevision(field) {
+      const form = this[field];
+      if (form._latest) { form.revision = form._latest.revision; delete form._latest; }
+    },
+
+    async saveConfigRequest(resource, form, body) {
+      if (form.id) body.expected_revision = form.revision;
+      try { return await this.api(form.id ? 'PUT' : 'POST', '/' + resource + (form.id ? '/' + form.id : ''), body); }
+      catch (error) {
+        if (error.status === 409 || error.data?.persisted) error.message += '。编辑内容已保留，请读取最新配置，比较后选择版本再重试';
+        throw error;
+      }
     },
 
     async loadHealth() {
@@ -410,6 +473,8 @@ function app() {
       if (tab === 'reqlogs' && !this.reqLogs.length) this.loadReqLogs();
       if (tab === 'cost') this.loadCost();
       if (tab === 'health') this.loadHealth();
+    const resource = {upstreams: 'upstreams', models: 'model-names', routes: 'routes'}[tab];
+    if (resource) this.pageConfig(resource);
     },
 
     // ── 总闸（§4.8）───────────────────────────────────
@@ -436,6 +501,8 @@ function app() {
           name: '', base_url: '', api_key: '', auth_style: 'auto',
           l1_path: '/v1/models', proxy_url: '', enabled: true,
           full_url_mode: false, probe_headers_raw: '',
+      probe_mode: 'active', host_override: '', tls_server_name: '',
+      initial_endpoints: ['models', 'messages', 'responses', 'chat_completions', 'count_tokens'].map(endpoint => ({endpoint, url_override: '', fixed_query_template: '', auth_profile: {mode: endpoint === 'messages' || endpoint === 'count_tokens' ? 'x_api_key' : 'header_bearer', secret_ref: 'upstream_api_key'}})),
         };
         return;
       }
@@ -471,7 +538,17 @@ function app() {
         name: f.name, base_url: f.base_url, auth_style: f.auth_style,
         l1_path: f.l1_path, proxy_url: f.proxy_url, enabled: f.enabled,
         full_url_mode: f.full_url_mode, probe_headers: headers,
+    probe_mode: f.probe_mode, host_override: f.host_override || '', tls_server_name: f.tls_server_name || '',
       };
+    if (!f.id) {
+      try {
+        body.initial_endpoints = f.initial_endpoints.map(ep => {
+          const auth = {...ep.auth_profile};
+          if (auth.mode === 'manual_headers') auth.manual_headers = ep.manual_headers_raw?.trim() ? JSON.parse(ep.manual_headers_raw) : [];
+          return {endpoint: ep.endpoint, url_override: ep.url_override, fixed_query_template: ep.fixed_query_template, auth_profile: auth};
+        });
+      } catch { this.err = '初始端点认证头必须是合法 JSON 数组'; return; }
+    }
       // 只在真的填了新 key 时才带上这个字段（后端：留空 = 不改）。
       if (f.api_key) body.api_key = f.api_key;
 
@@ -481,9 +558,8 @@ function app() {
       // 网络抖动）就会变成一个未捕获的 promise rejection —— 界面静默不动，
       // 用户以为保存没生效，而其实存进去了。
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/upstreams/' + f.id, body)
-             : await this.api('POST', '/upstreams', body);
-        this.upstreams = await this.api('GET', '/upstreams') || [];
+    await this.saveConfigRequest('upstreams', f, body);
+    await this.loadConfigPage('upstreams');
       }, f.id ? '已保存。改了 key 或地址会立即重新探活' : '已新增');
 
       if (ok) {
@@ -493,10 +569,9 @@ function app() {
     },
 
     async delUp(u) {
-      const n = this.routes.filter(r => r.upstream_id === u.id).length;
-      const warn = n ? `\n\n它下面的 ${n} 条路由会一并删除。` : '';
+      const warn = '\n\n该站的所有路由会一并删除；有历史依赖时会拒绝删除。';
       if (!confirm(`删除上游「${u.name}」？${warn}`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/upstreams/' + u.id + '?expected_revision=' + u.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
@@ -518,9 +593,8 @@ function app() {
         probe_max_tokens: f.probe_max_tokens, enabled: f.enabled,
       };
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/model-names/' + f.id, body)
-             : await this.api('POST', '/model-names', body);
-        this.modelNames = await this.api('GET', '/model-names') || [];
+    await this.saveConfigRequest('model-names', f, body);
+    await this.loadConfigPage('model-names');
       }, f.id ? '已保存' : '已新增');
 
       if (ok) {
@@ -530,10 +604,9 @@ function app() {
     },
 
     async delMn(m) {
-      const n = this.routes.filter(r => r.model_name_id === m.id).length;
-      const warn = n ? `\n\n它的 ${n} 条路由会一并删除。` : '';
+      const warn = '\n\n该模型的所有路由会一并删除；有历史依赖时会拒绝删除。';
       if (!confirm(`删除模型「${m.name}」？${warn}`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/model-names/' + m.id + '?expected_revision=' + m.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
@@ -557,9 +630,8 @@ function app() {
         enabled: f.enabled,
       };
       const { ok } = await this.run(async () => {
-        f.id ? await this.api('PUT', '/routes/' + f.id, body)
-             : await this.api('POST', '/routes', body);
-        this.routes = await this.api('GET', '/routes') || [];
+    await this.saveConfigRequest('routes', f, body);
+    await this.loadConfigPage('routes');
       }, f.id ? '已保存' : '已新增，正在探活');
 
       if (ok) {
@@ -570,7 +642,7 @@ function app() {
 
     async delRt(r) {
       if (!confirm(`删除路由「${this.mnName(r.model_name_id)} × ${this.upName(r.upstream_id)}」？`)) return;
-      const { ok } = await this.run(() => this.api('DELETE', '/routes/' + r.id), '已删除');
+      const { ok } = await this.run(() => this.api('DELETE', '/routes/' + r.id + '?expected_revision=' + r.revision), '已删除');
       if (ok) await this.loadAll();
     },
 
@@ -669,8 +741,8 @@ function app() {
 
     // ── 显示辅助 ─────────────────────────────────────
 
-    upName(id) { return this.upstreams.find(u => u.id === id)?.name || (id ? `#${id}` : '—'); },
-    mnName(id) { return this.modelNames.find(m => m.id === id)?.name || (id ? `#${id}` : '—'); },
+    upName(id) { return this.upstreams.find(u => u.id === id)?.name || this.configNames.upstreams[id]?.name || (id ? `#${id}` : '—'); },
+    mnName(id) { return this.modelNames.find(m => m.id === id)?.name || this.configNames['model-names'][id]?.name || (id ? `#${id}` : '—'); },
 
     routeLabel(id) {
       const r = this.routes.find(x => x.id === id);

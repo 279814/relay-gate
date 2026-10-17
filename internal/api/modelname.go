@@ -7,7 +7,17 @@ import (
 )
 
 func (s *Server) listModelNames(w http.ResponseWriter, r *http.Request) {
-	list, err := s.st.ListModelNames()
+	page, err := configPage(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	enabled, err := configEnabled(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	list, err := s.configAdmin.ListModelNames(r.Context(), model.ModelNameFilter{PageRequest: page, Enabled: enabled, Protocol: model.Protocol(r.URL.Query().Get("protocol"))})
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -21,7 +31,7 @@ func (s *Server) getModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	m, err := s.st.GetModelName(id)
+	m, err := s.configAdmin.GetModelName(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -37,13 +47,14 @@ func (s *Server) createModelName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.ID = 0
-	if err := s.st.CreateModelName(&m); err != nil {
+	created, err := s.configAdmin.CreateModelName(r.Context(), m)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	m = created
 	s.log.Info("新增 model_name", "id", m.ID, "name", m.Name, "protocol", m.Protocol)
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, m.ID, m.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, m)
@@ -55,39 +66,57 @@ func (s *Server) updateModelName(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	cur, err := s.st.GetModelName(id)
+	current, err := s.configAdmin.GetModelName(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	cur := &current
 	before := *cur
-	if err := decodeJSON(r, cur); err != nil {
+	in := struct {
+		*model.ModelName
+		ExpectedRevision int64 `json:"expected_revision"`
+	}{ModelName: cur}
+	if err := decodeJSON(r, &in); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := requireRevision(in.ExpectedRevision); err != nil {
 		s.writeErr(w, err)
 		return
 	}
 	cur.ID = id
-	if err := s.st.UpdateModelName(cur); err != nil {
+	updated, err := s.configAdmin.UpdateModelName(r.Context(), id, in.ExpectedRevision, *cur)
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	*cur = updated
 	s.log.Info("更新 model_name", "id", id, "name", cur.Name)
 	// §4.5：只有改了探活请求的内容才重探。protocol 也算 —— 它决定
 	// 探活打哪个端点、body 用哪种参数名（§3.3.1）。
 	if before.ProbePrompt != cur.ProbePrompt ||
 		before.ProbeMaxTokens != cur.ProbeMaxTokens ||
 		before.Protocol != cur.Protocol ||
-		before.Name != cur.Name || // 不映射时 Name 就是发给上游的模型名
-		(!before.Enabled && cur.Enabled) {
+		before.Name != cur.Name {
 		s.invalidateModelName(id)
+	} else if !before.Enabled && cur.Enabled {
+		for _, routeID := range s.routeIDsOfModelName(id) {
+			s.forgetHealthOnReEnableRoute(routeID)
+		}
 	}
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, cur.Revision) {
 		return
 	}
 	writeJSON(w, http.StatusOK, cur)
 }
 
 func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
+	revision, err := deleteRevision(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	id, err := pathID(r)
 	if err != nil {
 		s.writeErr(w, err)
@@ -103,10 +132,10 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 	var delErr error
 	if s.transforms != nil {
 		delErr = s.transforms.DetachRouteBindingsAround(childRoutes, func() error {
-			return s.st.DeleteModelName(id)
+			return s.configAdmin.DeleteModelName(r.Context(), id, revision)
 		})
 	} else {
-		delErr = s.st.DeleteModelName(id)
+		delErr = s.configAdmin.DeleteModelName(r.Context(), id, revision)
 	}
 	if delErr != nil {
 		s.writeErr(w, delErr)
@@ -114,8 +143,7 @@ func (s *Server) deleteModelName(w http.ResponseWriter, r *http.Request) {
 	}
 	s.forgetRoutesSchedulerHolds(childRoutes)
 	s.invalidateModelNameDeleted(id, childRoutes)
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, revision) {
 		return
 	}
 	// route 表对 model_name 是 ON DELETE CASCADE；transform_binding 已在事务内卸绑。

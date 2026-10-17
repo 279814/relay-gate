@@ -166,7 +166,7 @@ func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 
 	// ── delete one route: sibling must remain selectable within TTL ──
 	beforeInv, beforeRef := pub.counts()
-	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtSibling), "", true)
+	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtSibling)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete route %d：%s", rec.Code, rec.Body.String())
 	}
@@ -189,7 +189,7 @@ func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 
 	// ── delete upstream: cascaded child routes must vanish; unrelated stay ──
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upDrop), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/upstreams/"+itoa(upDrop)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete upstream %d：%s", rec.Code, rec.Body.String())
 	}
@@ -214,7 +214,7 @@ func TestDelete_PublishesSnapshotBeforeHandlerReturns(t *testing.T) {
 
 	// ── delete model_name: its routes cascade out; other models stay ──
 	beforeInv, beforeRef = pub.counts()
-	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnDrop), "", true)
+	rec = do(t, h, "DELETE", "/admin/api/model-names/"+itoa(mnDrop)+"?expected_revision=1", "", true)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete model_name %d：%s", rec.Code, rec.Body.String())
 	}
@@ -250,7 +250,7 @@ func TestDelete_FailedStoreDoesNotPublish(t *testing.T) {
 
 	beforeInv, beforeRef := pub.counts()
 	forceTableDeleteFail(t, s, "route")
-	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID), "", true)
+	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtID)+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("expected delete failure, got 204")
 	}
@@ -303,12 +303,12 @@ func TestDelete_RefreshFailureDoesNotReturnSuccessWithStaleSnapshot(t *testing.T
 	pub.mu.Unlock()
 
 	beforeInv, beforeRef := pub.counts()
-	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtDrop), "", true)
+	rec := do(t, h, "DELETE", "/admin/api/routes/"+itoa(rtDrop)+"?expected_revision=1", "", true)
 	if rec.Code == http.StatusNoContent {
 		t.Fatal("Refresh failure must not return 204 while routing may be stale")
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want persisted 503 on Refresh failure, got %d: %s", rec.Code, rec.Body.String())
 	}
 	afterInv, afterRef := pub.counts()
 	// Invalidate + failed Refresh + re-Invalidate to keep TTL forced open.
