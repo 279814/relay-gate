@@ -408,7 +408,25 @@ func runServer() error {
 		WithTransformRegistry(xform).
 		WithPublicHTTPSStatusFile(cfg.PublicHTTPSStatusFile).
 		WithCredentials(credSvc, kr).
-		WithMasterKeyEnvironmentOverride(strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")) != "")
+		WithMasterKeyEnvironmentOverride(strings.TrimSpace(os.Getenv("ENCRYPTION_KEY")) != "").
+		WithRotationQuiescer(func(ctx context.Context) (func(), error) {
+			// EnterMaintenance already requests synthetic cancellation. Require
+			// its actual drain here as well; a timeout cannot authorize rewrap.
+			if err := coordinator.CancelSynthetic(ctx, context.Canceled); err != nil {
+				return nil, err
+			}
+			release, err := fwd.Quiesce(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for _, flush := range []func(context.Context) error{traffic.Flush, recorder.Flush, logRecorder.Flush, secObs.Flush} {
+				if err := flush(ctx); err != nil {
+					release()
+					return nil, err
+				}
+			}
+			return release, nil
+		})
 	if hash, err := credential.LoadAdminHash(dataDir); err == nil {
 		adminAPI = adminAPI.WithAdminHash(hash, dataDir)
 	}

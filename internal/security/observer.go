@@ -1,6 +1,7 @@
 package security
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -30,11 +31,18 @@ type ObserveJob struct {
 // Queue full → drop (never block forwarding).
 type Observer struct {
 	sink    FindingSink
-	queue   chan ObserveJob
+	queue   chan observeWrite
+	stop    chan struct{}
+	done    chan struct{}
 	dropped atomic.Uint64
 	log     *slog.Logger
 	wg      sync.WaitGroup
 	once    sync.Once
+}
+
+type observeWrite struct {
+	job     ObserveJob
+	barrier chan struct{}
 }
 
 // NewObserver starts workers. queueSize defaults to 64.
@@ -47,7 +55,9 @@ func NewObserver(sink FindingSink, queueSize int, log *slog.Logger) *Observer {
 	}
 	o := &Observer{
 		sink:  sink,
-		queue: make(chan ObserveJob, queueSize),
+		queue: make(chan observeWrite, queueSize),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
 		log:   log,
 	}
 	o.wg.Add(1)
@@ -60,15 +70,44 @@ func (o *Observer) Enqueue(job ObserveJob) {
 	if o == nil {
 		return
 	}
+	select {
+	case <-o.stop:
+		return
+	default:
+	}
 	if len(job.Body) > MaxScanBytes {
 		job.Body = append([]byte(nil), job.Body[:MaxScanBytes]...)
 	} else if job.Body != nil {
 		job.Body = append([]byte(nil), job.Body...)
 	}
 	select {
-	case o.queue <- job:
+	case o.queue <- observeWrite{job: job}:
 	default:
 		o.dropped.Add(1)
+	}
+}
+
+// Flush follows producer drain. The FIFO barrier waits for all earlier scans
+// and their synchronous evidence writes without blocking normal Enqueue calls.
+func (o *Observer) Flush(ctx context.Context) error {
+	if o == nil {
+		return nil
+	}
+	barrier := make(chan struct{})
+	select {
+	case <-o.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case o.queue <- observeWrite{barrier: barrier}:
+	}
+	select {
+	case <-barrier:
+		return nil
+	case <-o.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -86,15 +125,35 @@ func (o *Observer) Close() {
 		return
 	}
 	o.once.Do(func() {
-		close(o.queue)
+		close(o.stop)
 		o.wg.Wait()
 	})
 }
 
 func (o *Observer) loop() {
 	defer o.wg.Done()
-	for job := range o.queue {
-		o.scan(job)
+	defer close(o.done)
+	consume := func(value observeWrite) {
+		if value.barrier != nil {
+			close(value.barrier)
+			return
+		}
+		o.scan(value.job)
+	}
+	for {
+		select {
+		case value := <-o.queue:
+			consume(value)
+		case <-o.stop:
+			for {
+				select {
+				case value := <-o.queue:
+					consume(value)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 
