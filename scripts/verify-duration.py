@@ -102,6 +102,8 @@ def run(args):
             future = pool.submit(runtime.request, "POST", "/v1/messages", body, True, True) if args.mode == "long" else None
             while time.monotonic() - started < args.seconds or (future and not future.done()):
                 now = time.monotonic()
+                if now - started > args.seconds + 60:
+                    raise AssertionError("response did not finish within the duration plus shutdown allowance")
                 if args.mode == "soak":
                     status, raw, _ = runtime.request("POST", "/v1/messages", body, proxy=True)
                     report["requests"] += 1
@@ -134,6 +136,9 @@ def run(args):
             assert elapsed >= args.seconds, "wall-clock duration was shortened"
             report["elapsed_seconds"] = round(elapsed, 3)
             report["resources"] = resource_bounds(report["samples"], args.seconds)
+            gaps = [later["elapsed_seconds"] - earlier["elapsed_seconds"] for earlier, later in zip(report["samples"], report["samples"][1:])]
+            report["resources"]["max_sample_gap_seconds"] = round(max(gaps, default=0), 3)
+            assert report["resources"]["max_sample_gap_seconds"] <= 120, "sampling gap prevents proving continuous runtime"
             assert report["resources"]["rss_peak_bytes"] <= 512 << 20, "RSS exceeded the acceptance ceiling"
             if args.mode == "soak" and args.seconds >= 172800:
                 assert report["resources"]["rss_slope_bytes_per_hour"] <= 2 << 20, "sustained RSS growth exceeded the acceptance bound"
