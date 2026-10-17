@@ -40,7 +40,7 @@ func recipeTestExecution(t *testing.T, store *Store, upstream *model.Upstream, r
 	}
 	endpoint := page.Items[0]
 	order := nextTestObservationOrder(t, store)
-	return model.ProbeExecution{
+	execution := model.ProbeExecution{
 		ID: id, Trigger: model.TriggerManual, UpstreamID: upstream.ID,
 		UpstreamNetworkRevision:    upstream.NetworkRevision,
 		UpstreamCredentialRevision: upstream.CredentialRevision,
@@ -58,6 +58,8 @@ func recipeTestExecution(t *testing.T, store *Store, upstream *model.Upstream, r
 		Reachable:    true, Final: true, Success: true,
 		ObservationOrder: order, SentAtMS: order, DoneAtMS: order + 1,
 	}
+	completeExplicitTestEvidence(t, store, &execution)
+	return execution
 }
 
 func TestPublishRecipeVersionRequiresMatchingExplicitTest(t *testing.T) {

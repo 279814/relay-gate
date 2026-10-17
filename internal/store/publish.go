@@ -11,8 +11,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 // publishedBinding 把 loadPublishedBinding 的行拼成完整的 Recipe+Version。
@@ -90,8 +92,8 @@ func (store *Store) RecipeVersionSecretRefs(ctx context.Context, versionID int64
 // PublishRecipeVersion 把一个 draft version 设为该 scope+endpoint 的 published binding。
 //
 // testExecutionID 必须是一次针对 (recipeID, versionID) 的显式测试且成功。
-// force=true 只跳过「测试必须成功」这一条 —— 用于上游返回非 200 但用户确认
-// 该形状可用的情形；它不跳过身份一致性与 token 新鲜度检查，那些是安全边界。
+// force=true 仅接受确实发送并失败的当前测试；成功、取消与未发送都不能强制发布。
+// 身份一致性和 token 新鲜度在同一个发布事务里重验。
 func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutionID string, expectedRecipeRevision int64, force bool) (err error) {
 	if recipeID < 1 || versionID < 1 || testExecutionID == "" || expectedRecipeRevision < 1 {
 		return model.WrapValidation("publish 参数无效")
@@ -111,6 +113,9 @@ func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutio
 	if err != nil {
 		return err
 	}
+	if recipe.Revision != expectedRecipeRevision {
+		return ErrRevisionConflict
+	}
 	switch recipe.Status {
 	case model.RecipeArchived:
 		return model.WrapValidation("archived recipe 不能发布")
@@ -119,8 +124,10 @@ func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutio
 	}
 	// version 必须属于本 recipe。跨 recipe 发布会让 binding 指向别人的内容。
 	var versionRecipeID int64
-	if err = tx.QueryRowContext(ctx, `SELECT recipe_id FROM probe_recipe_version WHERE id=?`,
-		versionID).Scan(&versionRecipeID); errors.Is(err, sql.ErrNoRows) {
+	var versionOrigin model.RecipeSource
+	var versionTimeout model.ProbeTimeoutProfile
+	if err = tx.QueryRowContext(ctx, `SELECT recipe_id,origin,timeout_profile FROM probe_recipe_version WHERE id=?`,
+		versionID).Scan(&versionRecipeID, &versionOrigin, &versionTimeout); errors.Is(err, sql.ErrNoRows) {
 		return model.WrapValidation("recipe version %d 不存在", versionID)
 	} else if err != nil {
 		return err
@@ -129,6 +136,31 @@ func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutio
 		return model.WrapValidation("version %d 不属于 recipe %d", versionID, recipeID)
 	}
 	if err = requireRecipeTestExecution(ctx, tx, recipe, versionID, testExecutionID, force); err != nil {
+		return err
+	}
+	execution, err := scanProbeExecution(tx.QueryRowContext(ctx, `SELECT `+probeExecutionCols+` FROM probe_execution WHERE id=?`, testExecutionID))
+	if err != nil {
+		return err
+	}
+	facts := model.RecipeBindingFacts{Use: model.BindingExplicitTest, ExplicitRecipeID: recipe.ID, ExplicitVersionID: versionID, ExplicitRecipeRowRevision: recipe.Revision}
+	if recipe.ScopeType == model.RecipeScopeRoute {
+		facts.ResolvedLayer = model.ResolvedRoute
+		facts.RouteRecipeID, facts.RoutePublishedVersionID, facts.RouteBindingRevision = recipe.ID, versionID, recipe.ActiveBindingRevision
+	} else {
+		facts.ResolvedLayer = model.ResolvedUpstream
+		facts.UpstreamRecipeID, facts.UpstreamPublishedVersionID, facts.UpstreamBindingRevision = recipe.ID, versionID, recipe.ActiveBindingRevision
+	}
+	if execution.RecipeBindingFacts != facts {
+		return ErrRevisionConflict
+	}
+	if execution.RecipeBindingRevision != recipe.ActiveBindingRevision {
+		return ErrRevisionConflict
+	}
+	modelEndpoint := recipe.Endpoint != model.EndpointModels && recipe.Endpoint != model.EndpointCountTokens
+	if execution.RecipeOrigin != versionOrigin || modelEndpoint && execution.CapabilityPolicySelector.TimeoutProfile != versionTimeout {
+		return ErrRevisionConflict
+	}
+	if err = requireExplicitTestTargetCurrent(ctx, tx, execution); err != nil {
 		return err
 	}
 	now := nowMS()
@@ -227,12 +259,14 @@ func replaceRecipeSecretRefs(ctx context.Context, tx *sql.Tx, recipeID, versionI
 func requireRecipeTestExecution(ctx context.Context, tx *sql.Tx, recipe *model.ProbeRecipe, versionID int64, executionID string, force bool) error {
 	var upstreamID, routeID, execRecipeID, execVersionID int64
 	var endpoint, storage, bindingUse, reachDisposition, capDisposition string
-	var success bool
+	var success, final, expectedCancel bool
+	var sentAt, doneAt int64
+	var errorClass model.ErrorClass
 	if err := tx.QueryRowContext(ctx, `SELECT upstream_id,COALESCE(route_id,0),COALESCE(recipe_id,0),
 		COALESCE(recipe_version_id,0),endpoint,recipe_storage,recipe_binding_use,success,
-		reachability_disposition,capability_disposition FROM probe_execution WHERE id=?`,
+		reachability_disposition,capability_disposition,final,sent_at_ms,done_at_ms,expected_cancel,error_class FROM probe_execution WHERE id=?`,
 		executionID).Scan(&upstreamID, &routeID, &execRecipeID, &execVersionID, &endpoint,
-		&storage, &bindingUse, &success, &reachDisposition, &capDisposition); errors.Is(err, sql.ErrNoRows) {
+		&storage, &bindingUse, &success, &reachDisposition, &capDisposition, &final, &sentAt, &doneAt, &expectedCancel, &errorClass); errors.Is(err, sql.ErrNoRows) {
 		return model.WrapValidation("测试用的 execution %q 不存在", executionID)
 	} else if err != nil {
 		return err
@@ -247,7 +281,8 @@ func requireRecipeTestExecution(ctx context.Context, tx *sql.Tx, recipe *model.P
 	if endpoint != string(recipe.Endpoint) {
 		return model.WrapValidation("execution %q 的 endpoint 与 recipe 不一致", executionID)
 	}
-	// scope 也要对得上：upstream 作用域的 recipe 不能拿某条 Route 的测试来发布。
+	// Scope owner must match. An upstream model-endpoint test can additionally
+	// carry its selected Route; publication also rechecks that Route and Model.
 	if recipe.ScopeType == model.RecipeScopeRoute {
 		if routeID != recipe.ScopeID {
 			return model.WrapValidation("execution %q 测的 Route 与 recipe scope 不一致", executionID)
@@ -255,16 +290,145 @@ func requireRecipeTestExecution(ctx context.Context, tx *sql.Tx, recipe *model.P
 	} else if upstreamID != recipe.ScopeID {
 		return model.WrapValidation("execution %q 测的 Upstream 与 recipe scope 不一致", executionID)
 	}
-	// 显式测试的 Capability 固定 not_applicable（它不改在服务的能力状态），
-	// 所以只能查 Reachability 侧有没有 config_stale/superseded。
+	// Explicit tests do not update live capability. Reject known stale evidence
+	// first; PublishRecipeVersion additionally rechecks the current full token.
 	if reachDisposition == string(model.ApplyConfigStale) || capDisposition == string(model.ApplyConfigStale) {
-		return model.WrapValidation("execution %q 测试时的配置已过期，请重测", executionID)
+		return ErrRevisionConflict
 	}
 	if reachDisposition == string(model.ApplySuperseded) || capDisposition == string(model.ApplySuperseded) {
-		return model.WrapValidation("execution %q 已被更新的观察结果取代，请重测", executionID)
+		return ErrRevisionConflict
 	}
 	if !success && !force {
 		return model.WrapValidation("execution %q 未成功；确认该形状可用可以用 force 发布", executionID)
 	}
+	if !final || sentAt <= 0 || doneAt < sentAt || errorClass == model.ErrorIgnored || (!success && expectedCancel) {
+		return model.WrapValidation("execution %q 不是已发送且完成的测试，请重测", executionID)
+	}
+	if force && (success || errorClass == model.ErrorNone) {
+		return model.WrapValidation("force 只允许已发送且确实失败的测试")
+	}
 	return nil
+}
+
+// Explicit tests deliberately do not update live capability state. Their stored
+// disposition therefore cannot prove freshness at publication time: rebuild the
+// same semantic token from database-current rows in this write transaction.
+func requireExplicitTestTargetCurrent(ctx context.Context, tx *sql.Tx, execution *model.ProbeExecution) error {
+	if !execution.Final || !execution.Success && execution.ExpectedCancel || execution.ErrorClass == model.ErrorIgnored || execution.SentAtMS <= 0 || execution.DoneAtMS < execution.SentAtMS {
+		return model.WrapValidation("测试尚未完成发送或已取消，请重测")
+	}
+	if execution.ReachabilityDisposition == model.ApplyConfigStale || execution.ReachabilityDisposition == model.ApplySuperseded || execution.CapabilityDisposition == model.ApplyConfigStale || execution.CapabilityDisposition == model.ApplySuperseded {
+		return ErrRevisionConflict
+	}
+	selector := execution.CapabilityPolicySelector
+	if selector.Validate() != nil || selector.Kind == model.EvidenceRealTraffic || execution.CapabilityToken == "" {
+		return ErrRevisionConflict
+	}
+	identity := model.RecipeIdentity{Storage: execution.RecipeStorage, Origin: execution.RecipeOrigin, DBVersionID: execution.RecipeVersionID, ClientProfileID: execution.ClientProfileID, TemplateID: execution.TemplateID, Revision: execution.RecipeIdentityRevision}
+	if identity.Validate() != nil {
+		return ErrRevisionConflict
+	}
+	var enabled bool
+	if err := tx.QueryRowContext(ctx, `SELECT enabled FROM upstream WHERE id=?`, execution.UpstreamID).Scan(&enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrRevisionConflict
+		}
+		return err
+	}
+	if !enabled {
+		return ErrRevisionConflict
+	}
+	target := model.SemanticTarget{Scope: model.RecipeScopeUpstream, UpstreamID: execution.UpstreamID, Endpoint: execution.Endpoint}
+	if execution.RouteID > 0 {
+		var routeEnabled, modelEnabled bool
+		if err := tx.QueryRowContext(ctx, `SELECT r.enabled,m.enabled FROM route r JOIN model_name m ON m.id=r.model_name_id WHERE r.id=? AND r.upstream_id=?`, execution.RouteID, execution.UpstreamID).Scan(&routeEnabled, &modelEnabled); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrRevisionConflict
+			}
+			return err
+		}
+		if !routeEnabled || !modelEnabled {
+			return ErrRevisionConflict
+		}
+		target.Scope, target.RouteID = model.RecipeScopeRoute, execution.RouteID
+	}
+	secrets, err := explicitTestSecretRevisions(ctx, tx, execution)
+	if err != nil {
+		return err
+	}
+	if revisioncodec.SecretRevisionSetHash(secrets) != execution.ProbeSecretRevisionsHash {
+		return ErrRevisionConflict
+	}
+	revision := model.SemanticRevision{
+		UpstreamNetwork: execution.UpstreamNetworkRevision, UpstreamCredential: execution.UpstreamCredentialRevision,
+		EndpointID: execution.EndpointID, EndpointRevision: execution.EndpointRevision, AuthProfile: execution.AuthProfileRevision,
+		RouteCapability: execution.RouteCapabilityRevision, ModelCapability: execution.ModelCapabilityRevision,
+		RecipeIdentity: identity, RecipeBindingRevision: execution.RecipeBindingRevision,
+		ProbeSettingsFingerprint: execution.ProbeSettingsFingerprint, ProbeSecrets: secrets, RequestTransform: execution.RequestTransformBindingRevision,
+	}
+	if revisioncodec.NewObservationToken(revision) != execution.CapabilityToken {
+		return ErrRevisionConflict
+	}
+	current, err := currentSemanticRevision(ctx, tx, &model.SemanticExpectation{Target: target, PolicySelector: selector, Revision: revision})
+	if errors.Is(err, ErrNotFound) || errors.Is(err, sql.ErrNoRows) {
+		return ErrRevisionConflict
+	}
+	if err != nil {
+		return err
+	}
+	if revisioncodec.NewObservationToken(current) != execution.CapabilityToken {
+		return ErrRevisionConflict
+	}
+	return nil
+}
+
+func explicitTestSecretRevisions(ctx context.Context, tx *sql.Tx, execution *model.ProbeExecution) ([]model.SecretRevision, error) {
+	query := `SELECT name,secret_id FROM endpoint_active_secret_ref WHERE endpoint_id=?`
+	args := []any{execution.EndpointID}
+	if execution.RecipeStorage == model.RecipeStorageDB {
+		query += ` UNION ALL SELECT name,bound_secret_id_snapshot FROM recipe_version_required_secret WHERE recipe_version_id=?`
+		args = append(args, execution.RecipeVersionID)
+	} else {
+		query += ` UNION ALL SELECT name,bound_secret_id_snapshot FROM client_profile_required_secret WHERE client_profile_id=?`
+		args = append(args, execution.ClientProfileID)
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]int64{}
+	for rows.Next() {
+		var name string
+		var id int64
+		if err := rows.Scan(&name, &id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if previous, exists := refs[name]; id < 1 || exists && previous != id {
+			rows.Close()
+			return nil, ErrRevisionConflict
+		}
+		refs[name] = id
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	secrets := make([]model.SecretRevision, 0, len(refs))
+	for name, boundID := range refs {
+		value := model.SecretRevision{Name: name, Resolved: true}
+		if err := tx.QueryRowContext(ctx, `SELECT id,revision FROM probe_secret WHERE name=?`, name).Scan(&value.ID, &value.Revision); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrRevisionConflict
+			}
+			return nil, err
+		}
+		if value.ID != boundID {
+			return nil, ErrRevisionConflict
+		}
+		secrets = append(secrets, value)
+	}
+	sort.Slice(secrets, func(i, j int) bool { return secrets[i].Name < secrets[j].Name })
+	return secrets, nil
 }

@@ -53,6 +53,13 @@ func (store *Store) TestedClientProfile(ctx context.Context, upstreamID int64, e
 		upstreamID, endpoint))
 }
 
+func (store *Store) GetClientProfile(ctx context.Context, id int64) (*model.ClientProbeProfile, error) {
+	if id < 1 {
+		return nil, model.WrapValidation("client profile id 无效")
+	}
+	return scanClientProfile(store.db.QueryRowContext(ctx, `SELECT `+clientProfileCols+` FROM client_probe_profile WHERE id=?`, id))
+}
+
 func (store *Store) ListClientProfilesPage(ctx context.Context, filter model.ClientProfileFilter) (model.Page[*model.ClientProbeProfile], error) {
 	limit, err := normalizePageLimit(filter.Limit)
 	if err != nil {
@@ -290,8 +297,11 @@ func (store *Store) MarkClientProfileTested(ctx context.Context, id int64, execu
 	if err != nil {
 		return err
 	}
-	if profile.Status == model.ProfileDisabled {
-		return model.WrapValidation("disabled profile 不能直接发布，请先建新候选")
+	if profile.Revision != expectedRevision {
+		return ErrRevisionConflict
+	}
+	if profile.Status != model.ProfileCandidate {
+		return model.WrapValidation("只有 candidate profile 可以通过显式测试启用")
 	}
 	if err = requireProfileTestExecution(ctx, tx, profile, executionID); err != nil {
 		return err
@@ -371,10 +381,17 @@ func requireProfileTestExecution(ctx context.Context, tx *sql.Tx, profile *model
 		return model.WrapValidation("execution %q 测的不是本 profile", executionID)
 	}
 	if identityRevision != profile.Revision {
-		return model.WrapValidation("profile 在测试后已被修改（测试时 revision %d，现为 %d），请重测",
-			identityRevision, profile.Revision)
+		return ErrRevisionConflict
 	}
-	return nil
+	execution, err := scanProbeExecution(tx.QueryRowContext(ctx, `SELECT `+probeExecutionCols+` FROM probe_execution WHERE id=?`, executionID))
+	if err != nil {
+		return err
+	}
+	facts := model.RecipeBindingFacts{Use: model.BindingExplicitProfileTest, ExplicitProfileID: profile.ID, ExplicitProfileRevision: profile.Revision, ExplicitProfileStatus: profile.Status}
+	if execution.RecipeBindingFacts != facts || execution.RecipeBindingRevision != profile.Revision {
+		return ErrRevisionConflict
+	}
+	return requireExplicitTestTargetCurrent(ctx, tx, execution)
 }
 
 // DisableClientProfile 停用一个 profile。不硬删：历史 execution 用 RESTRICT
