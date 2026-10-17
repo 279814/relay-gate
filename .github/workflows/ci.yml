@@ -83,6 +83,9 @@ jobs:
       - name: Settings and service-state revision contracts
         run: node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs
 
+      - name: Endpoint editor mutation contract
+        run: node --test internal/web/endpoint.contract.test.mjs
+
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 

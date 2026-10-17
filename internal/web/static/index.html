@@ -1272,7 +1272,7 @@
               <strong>Upstream Endpoints</strong>
               <span class="dim">legacy NeedsReview：确认后转为 canonical（须显式 URL）</span>
               <span class="grow"></span>
-              <button class="primary" @click="endpointForm = { upstream_id: '', endpoint: 'messages', url_mode: 'canonical', url_override: '', fixed_query_template: '', auth_profile: {} }">新增 Endpoint</button>
+              <button class="primary" @click="editEndpoint()">新增 Endpoint</button>
               <button @click="loadEndpoints(true)">刷新</button>
             </div>
             <table>
@@ -1290,7 +1290,12 @@
                       <button class="sm" x-show="f(ep,'needs_review','NeedsReview')"
                               @click="confirmEndpointReview(ep)">确认审核</button>
                     </td>
-                    <td><button class="sm" @click="endpointForm = { id: f(ep,'id','ID'), upstream_id: f(ep,'upstream_id','UpstreamID'), endpoint: f(ep,'endpoint','Endpoint'), url_mode: f(ep,'url_mode','URLMode') || 'canonical', url_override: f(ep,'url_override','URLOverride') || '', fixed_query_template: f(ep,'fixed_query_template','FixedQueryTemplate') || '', auth_profile: f(ep,'auth_profile','AuthProfile') || {}, revision: f(ep,'revision','Revision') || 0 }">编辑</button></td>
+                    <td>
+                      <button class="sm" @click="editEndpoint(ep)" :disabled="!endpointEditable(ep) || !!ep.delete_pending || !!ep.delete_conflict">编辑</button>
+                      <button class="sm danger" @click="deleteEndpoint(ep)" :disabled="busy || !endpointEditable(ep) || !!ep.deleting || !!ep.delete_pending || !!ep.delete_conflict" title="仅停用 Upstream 且没有 Route 或历史记录时可删除">删除</button>
+                      <span class="dim" x-show="!endpointEditable(ep)">请审核 URL 或校准认证</span>
+                      <span class="tag warn" x-show="ep.delete_pending">已删除，待激活；请刷新列表</span>
+                    </td>
                   </tr>
                 </template>
                 <tr x-show="!endpoints.items.length"><td colspan="6" class="empty">暂无 Endpoint</td></tr>
@@ -1655,7 +1660,7 @@
             <div class="row">
               <div class="field">
                 <label>Upstream ID</label>
-                <input type="number" x-model.number="endpointForm.upstream_id">
+                <input type="number" x-model.number="endpointForm.upstream_id" :disabled="!!endpointForm.id">
               </div>
               <div class="field">
                 <label>端点</label>
@@ -1670,10 +1675,6 @@
             </div>
             <div class="row">
               <div class="field">
-                <label>URL 模式</label>
-                <input x-model="endpointForm.url_mode" class="mono" placeholder="canonical">
-              </div>
-              <div class="field">
                 <label>URL Override</label>
                 <input x-model="endpointForm.url_override" class="mono" placeholder="可选">
               </div>
@@ -1682,9 +1683,27 @@
               <label>Fixed Query Template</label>
               <input x-model="endpointForm.fixed_query_template" class="mono">
             </div>
+            <div class="row">
+              <div class="field">
+                <label>认证方式</label>
+                <select x-model="endpointForm.auth_profile.mode">
+                  <option value="header_bearer">Authorization: Bearer</option>
+                  <option value="x_api_key">X-Api-Key</option>
+                  <option value="api_key">自定义 API Key 头</option>
+                  <option value="fixed_query_secret">固定 Query 凭据</option>
+                  <option value="manual_headers">认证头模板</option>
+                  <option value="auto_calibrated">自动（须显式校准）</option>
+                </select>
+              </div>
+              <div class="field"><label>凭据来源</label><input x-model="endpointForm.auth_profile.secret_ref" class="mono" placeholder="upstream_api_key 或 probe:name"></div>
+            </div>
+            <div class="field" x-show="endpointForm.auth_profile.mode === 'api_key'"><label>认证头名</label><input x-model="endpointForm.auth_profile.header_name" class="mono" placeholder="Api-Key"></div>
+            <div class="field" x-show="endpointForm.auth_profile.mode === 'fixed_query_secret'"><label>Query 参数名</label><input x-model="endpointForm.auth_profile.query_name" class="mono"></div>
+            <div class="field" x-show="endpointForm.auth_profile.mode === 'manual_headers'"><label>认证头模板 JSON 数组</label><textarea x-model="endpointForm.manual_headers_raw" class="mono" placeholder='[{"name":"Authorization","values":["Bearer {{UPSTREAM_API_KEY}}"]}]'></textarea></div>
             <footer>
               <button @click="endpointForm = null">取消</button>
-              <button class="primary" @click="saveEndpoint()" :disabled="busy">保存</button>
+              <button x-show="endpointForm.id || endpointForm.persisted_id" @click="reloadEndpoint()" :disabled="busy || !!endpointForm.saving">重新读取已保存版本</button>
+              <button class="primary" @click="saveEndpoint()" :disabled="busy || !!endpointForm.saving || !!endpointForm.conflict || !!endpointForm.pending">保存</button>
             </footer>
           </div>
         </div>

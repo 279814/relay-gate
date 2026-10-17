@@ -429,7 +429,7 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("reset endpoint sequence: %v", err)
 	}
 
-	body := `{"upstream_id":` + itoa(upID) + `,"endpoint":"models","url_mode":"canonical","auth_profile":{"mode":"x_api_key","header_name":"x-api-key","secret_ref":"upstream_api_key"}}`
+	body := `{"upstream_id":` + itoa(upID) + `,"endpoint":"models","auth_profile":{"mode":"x_api_key","header_name":"x-api-key","secret_ref":"upstream_api_key"}}`
 	rec = do(t, h, "POST", "/admin/api/upstream-endpoints", body, true)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("recreate endpoint: %d %s", rec.Code, rec.Body.String())

@@ -20,8 +20,9 @@ type ProbeAdmin interface {
 	ManualProbeRunner
 	ListEndpoints(ctx context.Context, f model.EndpointFilter) (model.Page[model.UpstreamEndpoint], error)
 	GetEndpoint(ctx context.Context, id int64) (model.UpstreamEndpoint, error)
-	CreateEndpoint(ctx context.Context, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error)
-	UpdateEndpoint(ctx context.Context, id, expectedRevision int64, in model.UpstreamEndpoint) (model.UpstreamEndpoint, error)
+	CreateEndpoint(ctx context.Context, in probe.EndpointMutation) (model.UpstreamEndpoint, error)
+	UpdateEndpoint(ctx context.Context, id, expectedRevision int64, in probe.EndpointMutation) (model.UpstreamEndpoint, error)
+	ConfirmEndpointReview(ctx context.Context, id, expectedRevision int64, urlOverride string) (model.UpstreamEndpoint, error)
 	DeleteEndpoint(ctx context.Context, id, expectedRevision int64) error
 
 	ListSecrets(ctx context.Context, f model.ProbeSecretFilter) (model.Page[model.ProbeSecret], error)
@@ -125,13 +126,9 @@ func (s *Server) createUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	var in model.UpstreamEndpoint
+	var in probe.EndpointMutation
 	if err := decodeJSON(r, &in); err != nil {
 		s.writeErr(w, err)
-		return
-	}
-	if in.NeedsReview || in.URLMode == model.EndpointURLLegacyExact {
-		s.writeErr(w, model.WrapValidation("不能新增待审核 Endpoint：未审核状态禁止新增 URL 绑定（§19.2）"))
 		return
 	}
 	ep, err := s.probeAdmin.CreateEndpoint(r.Context(), in)
@@ -145,7 +142,7 @@ func (s *Server) createUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	// livecfg Probe 快照含 Endpoint：url_override / path 影响下一次出站 URL
 	// （outbound 读同代 Bundle），须 Invalidate+Refresh，不能等 2s TTL。
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+		s.writeRecipeErr(w, &probe.ActivationPendingError{Resource: "endpoint", ID: ep.ID, Revision: ep.Revision})
 		return
 	}
 	writeJSON(w, http.StatusCreated, ep)
@@ -168,26 +165,20 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	body := struct {
-		model.UpstreamEndpoint
+		probe.EndpointMutation
 		ExpectedRevision int64 `json:"expected_revision"`
-	}{UpstreamEndpoint: cur}
+	}{EndpointMutation: probe.EndpointMutationFrom(cur)}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	// URL 路径上的 id / 库中的 upstream_id 不可被 body 改写：否则会校验到别的站、
-	// 或把 Invalidate 打到错误 Upstream（store UPDATE 本身不写 upstream_id 列）。
-	body.ID = id
-	body.UpstreamID = cur.UpstreamID
-	// §19.2 第 4 条：未审核 Endpoint 的 URL 绑定只能经 confirm-review 改写，
-	// 否则通用 PUT 可以绕过「每个 Endpoint 须用户确认」。
-	if cur.NeedsReview && endpointBindingChanged(cur, body.UpstreamEndpoint) {
-		s.writeErr(w, model.WrapValidation("Endpoint 待审核：URL 绑定须经 confirm-review 确认后才能修改"))
-		return
-	}
-	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, body.UpstreamEndpoint)
+	ep, err := s.probeAdmin.UpdateEndpoint(r.Context(), id, body.ExpectedRevision, body.EndpointMutation)
 	if err != nil {
 		s.writeErr(w, err)
+		return
+	}
+	if ep.Revision == body.ExpectedRevision {
+		writeJSON(w, http.StatusOK, ep)
 		return
 	}
 	// §9.2: Endpoint 来源/URL and Auth Profile must Forget RouteHealth immediately
@@ -195,7 +186,7 @@ func (s *Server) updateUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	s.invalidateUpstream(ep.UpstreamID)
 	// url_override / path 变更必须立刻进入 livecfg Probe 快照（同代 Bundle）。
 	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+		s.writeRecipeErr(w, &probe.ActivationPendingError{Resource: "endpoint", ID: ep.ID, Revision: ep.Revision})
 		return
 	}
 	writeJSON(w, http.StatusOK, ep)
@@ -211,7 +202,11 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 		s.writeErr(w, err)
 		return
 	}
-	expected, _ := strconv.ParseInt(r.URL.Query().Get("expected_revision"), 10, 64)
+	expected, err := deleteRevision(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	// Read UpstreamID before DELETE so §9.2 Forget still targets the right station.
 	cur, getErr := s.probeAdmin.GetEndpoint(r.Context(), id)
 	// §15: durable transform_binding rows are dropped inside DeleteEndpoint's
@@ -234,8 +229,7 @@ func (s *Server) deleteUpstreamEndpoint(w http.ResponseWriter, r *http.Request) 
 	}
 	// Deleted Endpoint must leave the livecfg Probe snapshot immediately;
 	// otherwise outbound/probe keep the pre-delete URL/path for the 2s TTL.
-	if err := s.publishAfterSuccessfulWrite(); err != nil {
-		s.writeErr(w, err)
+	if !s.publishConfigResource(w, id, expected) {
 		return
 	}
 	writeJSON(w, http.StatusNoContent, nil)

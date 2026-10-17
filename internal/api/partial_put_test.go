@@ -171,7 +171,7 @@ func TestPartialPUT_EndpointOmitsKeepStoredFields(t *testing.T) {
 
 // Body id / upstream_id must not retarget the write: URL path id is the row,
 // and the stored upstream ownership stays put (validation + response + invalidate).
-func TestPartialPUT_EndpointIgnoresBodyIDAndUpstreamID(t *testing.T) {
+func TestPartialPUT_EndpointRejectsForgedIdentityAndPreservesPartialEdits(t *testing.T) {
 	s, _ := newTestServer(t)
 	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).Routes(testAdminPW)
 
@@ -203,8 +203,17 @@ func TestPartialPUT_EndpointIgnoresBodyIDAndUpstreamID(t *testing.T) {
 		`{"id":`+itoa(otherOnA.ID)+`,"upstream_id":`+itoa(upB)+
 			`,"url_override":`+mustJSON(t, override)+
 			`,"expected_revision":`+itoa(target.Revision)+`}`, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("forged identity must be rejected: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, "GET", "/admin/api/upstream-endpoints/"+itoa(target.ID), "", true)
+	rejected := decodeBody[model.UpstreamEndpoint](t, rec)
+	if rejected.Revision != target.Revision || rejected.URLOverride != target.URLOverride || rejected.UpstreamID != upA {
+		t.Fatalf("rejected identity mutation changed target: %+v", rejected)
+	}
+	rec = do(t, h, "PUT", "/admin/api/upstream-endpoints/"+itoa(target.ID), `{"url_override":`+mustJSON(t, override)+`,"expected_revision":`+itoa(target.Revision)+`}`, true)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT with forged id/upstream_id: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("valid partial URL edit: %d %s", rec.Code, rec.Body.String())
 	}
 	got := decodeBody[model.UpstreamEndpoint](t, rec)
 	if got.ID != target.ID {

@@ -175,6 +175,19 @@ func TestAuthBindingStartupRepairRunsOnceAndNeverRebindsMissingMetadata(t *testi
 	if err := second.UpdateEndpoint(unbound, unbound.Revision); err != nil {
 		t.Fatal(err)
 	}
+	if len(unbound.BoundSecrets) != 0 {
+		t.Fatal("an empty update silently rebound a recreated Secret")
+	}
+	// Rebinding requires an explicit configuration change, rather than treating
+	// an empty update as a new declaration of the same-name Secret identity.
+	unbound.AuthProfile.SecretRef = "upstream_api_key"
+	if err := second.UpdateEndpoint(unbound, unbound.Revision); err != nil {
+		t.Fatal(err)
+	}
+	unbound.AuthProfile.SecretRef = "probe:" + recreated.Name
+	if err := second.UpdateEndpoint(unbound, unbound.Revision); err != nil {
+		t.Fatal(err)
+	}
 	rebound, err := second.GetEndpoint(ep.ID)
 	if err != nil {
 		t.Fatal(err)

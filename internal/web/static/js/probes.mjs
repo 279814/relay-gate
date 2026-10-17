@@ -276,29 +276,141 @@ export function createProbeFeature(shell, api) {
       if (ok) await this.loadSecrets(true);
     },
 
+    endpointEditable(endpoint) {
+      const auth = field(endpoint, 'auth_profile', 'AuthProfile') || {};
+      const mode = field(endpoint, 'url_mode', 'URLMode');
+      return (!mode || mode === 'canonical') &&
+        !field(endpoint, 'needs_review', 'NeedsReview') &&
+        !field(endpoint, 'legacy_compat_real_only', 'LegacyCompatRealOnly') &&
+        !field(endpoint, 'legacy_full_url_id', 'LegacyFullURLID') &&
+        !field(endpoint, 'legacy_full_url_revision', 'LegacyFullURLRevision') &&
+        field(auth, 'mode', 'Mode') !== 'legacy_auto_real_only';
+    },
+
+    editEndpoint(endpoint) {
+      if (endpoint && !this.endpointEditable(endpoint)) {
+        this.err = '旧兼容端点请使用 URL 审核或认证校准';
+        return;
+      }
+      const auth = endpoint ? field(endpoint, 'auth_profile', 'AuthProfile') || {} : { mode: 'x_api_key', secret_ref: 'upstream_api_key' };
+      const headers = field(auth, 'manual_headers', 'ManualHeaders') || [];
+      this.endpointForm = {
+        saving: false,
+        conflict: false,
+        pending: false,
+        id: field(endpoint, 'id', 'ID'),
+        upstream_id: field(endpoint, 'upstream_id', 'UpstreamID') || '',
+        endpoint: field(endpoint, 'endpoint', 'Endpoint', 'Kind') || 'messages',
+        url_override: field(endpoint, 'url_override', 'URLOverride') || '',
+        fixed_query_template: field(endpoint, 'fixed_query_template', 'FixedQueryTemplate') || '',
+        revision: field(endpoint, 'revision', 'Revision') || 0,
+        auth_profile: {
+          mode: field(auth, 'mode', 'Mode') || '',
+          secret_ref: field(auth, 'secret_ref', 'SecretRef') || '',
+          header_name: field(auth, 'header_name', 'HeaderName') || '',
+          query_name: field(auth, 'query_name', 'QueryName') || '',
+          manual_headers: JSON.parse(JSON.stringify(headers)),
+        },
+        manual_headers_raw: JSON.stringify(headers, null, 2),
+      };
+    },
+
     async saveEndpoint() {
       const f = this.endpointForm;
-      if (!f) return;
+      if (!f || f.saving || f.conflict || f.pending || this.authed !== true) return;
+      if (!this.endpointEditable(f)) { this.err = '旧兼容端点请使用 URL 审核或认证校准'; return; }
       const id = field(f, 'id', 'ID');
+      const revision = Number(field(f, 'revision', 'Revision')) || 0;
+      if (id && revision < 1) { this.err = '请重新读取 Endpoint 版本后再编辑'; return; }
+      const profile = field(f, 'auth_profile', 'AuthProfile') || {};
+      const auth = {};
+      for (const key of ['mode', 'header_name', 'query_name', 'secret_ref', 'manual_headers']) {
+        if (profile[key] !== undefined) auth[key] = profile[key];
+      }
+      if (f.manual_headers_raw !== undefined) {
+        try { auth.manual_headers = JSON.parse(f.manual_headers_raw); }
+        catch { this.err = '认证头模板须为合法 JSON 数组'; return; }
+        if (!Array.isArray(auth.manual_headers)) { this.err = '认证头模板须为 JSON 数组'; return; }
+      }
       const body = {
         upstream_id: Number(field(f, 'upstream_id', 'UpstreamID')) || 0,
         endpoint: field(f, 'endpoint', 'Endpoint', 'Kind') || 'messages',
-        url_mode: field(f, 'url_mode', 'URLMode') || 'canonical',
         url_override: field(f, 'url_override', 'URLOverride') || '',
         fixed_query_template: field(f, 'fixed_query_template', 'FixedQueryTemplate') || '',
-        auth_profile: field(f, 'auth_profile', 'AuthProfile') || {},
-        expected_revision: Number(field(f, 'revision', 'Revision')) || 0,
+        auth_profile: auth,
       };
-      const { ok } = await this.run(async () => {
-        if (id) {
-          await api.put('/upstream-endpoints/' + id, body);
-        } else {
-          await api.post('/upstream-endpoints', body);
-        }
-      }, id ? '已更新 Endpoint' : '已创建 Endpoint');
-      if (ok) {
+      if (id) body.expected_revision = revision;
+      f.saving = true;
+      this.err = ''; this.msg = '';
+      try {
+        if (id) await api.put('/upstream-endpoints/' + id, body);
+        else await api.post('/upstream-endpoints', body);
+        if (this.endpointForm !== f || this.authed !== true) return;
         this.endpointForm = null;
+        this.msg = id ? '已更新 Endpoint' : '已创建 Endpoint';
         await this.loadEndpoints(true);
+      } catch (error) {
+        if (this.endpointForm !== f || this.authed !== true) return;
+        if (error.status === 409) {
+          f.conflict = true;
+          this.err = 'Endpoint 版本已变化，草稿已保留；请重新读取后确认';
+        } else if (error.status === 503 && error.data?.code === 'config_activation_pending' && error.data.persisted === true) {
+          f.pending = true;
+          f.persisted_id = error.data.id;
+          f.persisted_revision = error.data.new_revision;
+          this.err = 'Endpoint 已保存，激活待确认；草稿已保留，请重新读取已保存版本后确认';
+        } else {
+          this.err = error.message || 'Endpoint 保存失败';
+        }
+      } finally {
+        f.saving = false;
+      }
+    },
+
+    async deleteEndpoint(endpoint) {
+      const list = this.endpoints;
+      if (this.authed !== true || !endpoint || endpoint.deleting || endpoint.delete_pending || endpoint.delete_conflict) return;
+      if (!this.endpointEditable(endpoint)) { this.err = '旧兼容端点不能通过普通管理入口删除'; return; }
+      const id = Number(field(endpoint, 'id', 'ID'));
+      const revision = Number(field(endpoint, 'revision', 'Revision'));
+      if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(revision) || revision < 1) { this.err = '请重新加载 Endpoint 版本'; return; }
+      if (!globalThis.confirm('仅停用 Upstream 且没有 Route 或历史记录时允许删除 Endpoint。确认删除？')) return;
+      endpoint.deleting = true;
+      this.err = ''; this.msg = '';
+      try {
+        await api.del('/upstream-endpoints/' + id + '?expected_revision=' + revision);
+        if (this.authed !== true || this.endpoints !== list || !list.items.includes(endpoint)) return;
+        list.items = list.items.filter(row => Number(field(row, 'id', 'ID')) !== id);
+        this.msg = 'Endpoint #' + id + ' 已删除';
+      } catch (error) {
+        if (this.authed !== true || this.endpoints !== list || !list.items.includes(endpoint)) return;
+        if (error.status === 503 && error.data?.code === 'config_activation_pending' && error.data.persisted === true) {
+          endpoint.delete_pending = true;
+          this.msg = 'Endpoint #' + id + ' 已删除，待激活；请重新加载列表确认';
+        } else if (error.status === 409 || error.status === 404) {
+          endpoint.delete_conflict = true;
+          this.err = 'Endpoint 版本已变化或记录已不存在；请重新加载列表确认';
+        } else { this.err = error.message || 'Endpoint 删除失败'; }
+      } finally { endpoint.deleting = false; }
+    },
+
+    async reloadEndpoint() {
+      const f = this.endpointForm;
+      if (!f || f.saving || this.authed !== true) return;
+      const id = f.id || f.persisted_id;
+      if (!id || !globalThis.confirm('重新读取会替换当前草稿。确认已复制需要保留的修改？')) return;
+      f.saving = true;
+      try {
+        const endpoint = await api.get('/upstream-endpoints/' + id);
+        if (this.endpointForm !== f || this.authed !== true) return;
+        this.editEndpoint(endpoint);
+        this.err = '';
+        this.msg = '已重新读取 Endpoint 保存版本，请确认配置后继续';
+      } catch (error) {
+        if (this.endpointForm !== f || this.authed !== true) return;
+        this.err = error.message || 'Endpoint 重新读取失败';
+      } finally {
+        f.saving = false;
       }
     },
 
