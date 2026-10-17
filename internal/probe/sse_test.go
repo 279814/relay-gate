@@ -4,11 +4,13 @@ package probe
 // second scanner or an error-message keyword parser.
 import (
 	"context"
-	"github.com/279814/relay-gate/internal/model"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 func executeStreamFixture(t *testing.T, proto model.Protocol, reader io.Reader) ExecutionResult {
@@ -92,13 +94,27 @@ func TestNativeStreamEmptyBodyHasNoResponseBytes(t *testing.T) {
 	}
 }
 
+// The Executor can have one read in flight when semantic cancellation returns.
+// Only that goroutine owns Reader; assertions observe the atomic byte count.
+type streamFixtureReadCounter struct {
+	io.Reader
+	bytes atomic.Int64
+}
+
+func (r *streamFixtureReadCounter) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytes.Add(int64(n))
+	return n, err
+}
+
 func TestNativeStreamStopsReadingAfterFirstSemanticVerdict(t *testing.T) {
 	head := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"
 	tail := strings.Repeat("event: ping\ndata: {}\n\n", 5000)
-	reader := strings.NewReader(head + tail)
+	reader := &streamFixtureReadCounter{Reader: strings.NewReader(head + tail)}
 	result := executeStreamFixture(t, model.ProtoAnthropic, reader)
-	if !result.Execution.Success || !result.ExpectedCancel || reader.Len() == 0 || result.Execution.ResponseBytes >= int64(len(head)+len(tail)) {
-		t.Fatalf("semantic verdict consumed remaining generation: %+v unread=%d", result.Execution, reader.Len())
+	unread := int64(len(head)+len(tail)) - reader.bytes.Load()
+	if !result.Execution.Success || !result.ExpectedCancel || unread <= 0 || result.Execution.ResponseBytes >= int64(len(head)+len(tail)) {
+		t.Fatalf("semantic verdict consumed remaining generation: %+v unread=%d", result.Execution, unread)
 	}
 }
 
