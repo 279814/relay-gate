@@ -77,6 +77,10 @@ func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func runServer() error {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	readerBuildID, err := store.CurrentReaderBuildID(version)
+	if err != nil {
+		return err
+	}
 
 	// Resolve data dir before Load so first-start can materialize the three
 	// secrets (admin / relay / ENCRYPTION_KEY) via crash-safe bootstrap.
@@ -142,7 +146,7 @@ func runServer() error {
 	if err := credSvc.RestorePersistedGrace(dataDir); err != nil {
 		return fmt.Errorf("恢复 Relay grace: %w", err)
 	}
-	st, err := store.OpenLocked(cfg.DBPath, cipher, instanceLock.db)
+	st, err := store.OpenLockedWithReaderBuildID(cfg.DBPath, cipher, instanceLock.db, readerBuildID)
 	if err != nil {
 		return err
 	}
