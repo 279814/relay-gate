@@ -7,9 +7,9 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 )
 
-// §9.2: Enabled false→true must clear Capability. Enabled is not part of the
-// Observation Token, so a stored config_error row would otherwise be put back by
-// RestoreConfigErrors on restart and kept by the §8.13 sticky reducer.
+// §9.2: Enabled false→true clears Capability and advances its existing semantic
+// revision in the same transaction. The Boolean itself is not encoded into the
+// Observation Token; the revision rejects observations from the old lifecycle.
 
 func insertScopedCapability(t *testing.T, st *Store, scope model.RecipeScope, scopeID, endpointID int64,
 	endpoint model.EndpointKind, state model.CapabilityState) {
@@ -169,5 +169,61 @@ func TestUpstreamReEnableDeletesStoredConfigError(t *testing.T) {
 	}
 	if got[capKey{model.RecipeScopeRoute, routeB.ID, model.EndpointMessages}] != model.CapabilityConfigError {
 		t.Error("sibling upstream child route config_error must survive")
+	}
+}
+
+func TestReEnableAdvancesSemanticLifecycleRevisions(t *testing.T) {
+	st := testStore(t)
+	up := mkUpstream(t, st, "lifecycle-upstream")
+	route := &model.Route{ModelNameID: mkModelName(t, st, "lifecycle-model", model.ProtoAnthropic).ID, UpstreamID: up.ID, Enabled: true}
+	if err := st.CreateRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	setRouteEnabled(t, st, route.ID, false)
+	current, err := st.GetRoute(route.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.CapabilityRevision != 1 {
+		t.Fatalf("disable changed route semantics: %d", current.CapabilityRevision)
+	}
+	setRouteEnabled(t, st, route.ID, true)
+	current, err = st.GetRoute(route.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.CapabilityRevision != 2 {
+		t.Fatalf("re-enable capability revision=%d want 2", current.CapabilityRevision)
+	}
+	current.Priority++
+	current.Weight++
+	if err := st.UpdateRouteWithRevision(context.Background(), current, current.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if current.CapabilityRevision != 2 {
+		t.Fatalf("priority/weight changed semantics: %d", current.CapabilityRevision)
+	}
+	setUpstreamEnabled(t, st, up.ID, false)
+	up, err = st.GetUpstream(up.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.NetworkRevision != 1 {
+		t.Fatalf("disable changed upstream semantics: %d", up.NetworkRevision)
+	}
+	setUpstreamEnabled(t, st, up.ID, true)
+	up, err = st.GetUpstream(up.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.NetworkRevision != 2 || up.CredentialRevision != 1 {
+		t.Fatalf("re-enable revisions network=%d credential=%d", up.NetworkRevision, up.CredentialRevision)
+	}
+	up.Name = "lifecycle display name"
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if up.NetworkRevision != 2 || up.CredentialRevision != 1 {
+		t.Fatalf("display edit changed semantic revisions: %+v", up)
 	}
 }

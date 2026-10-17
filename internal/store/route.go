@@ -218,7 +218,9 @@ func (s *Store) UpdateRouteWithRevision(ctx context.Context, value *model.Route,
 	}
 	value.Revision = current.Revision + 1
 	value.CapabilityRevision = current.CapabilityRevision
-	if semanticChanged {
+	// §9.2: re-enable starts a new health lifecycle even when its routing
+	// fields are unchanged; old in-flight observations must fail the SQL CAS.
+	if semanticChanged || (!current.Enabled && value.Enabled) {
 		value.CapabilityRevision++
 	}
 	value.CreatedAt = current.CreatedAt
