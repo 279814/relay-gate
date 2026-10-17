@@ -35,9 +35,10 @@ if (typeof base !== 'function') {
     });
 
     // 业务网络改走 api.mjs；保留原 api(method,path,body) 形状。
-    shell.api = async function apiCompat(method, path, body) {
+    const apiCompat = async function apiCompat(method, path, body) {
       return api.request(method, path, body);
     };
+    shell.api = apiCompat;
 
     try {
       createProbeFeature(shell, api);
@@ -63,7 +64,26 @@ if (typeof base !== 'function') {
     const originalReset = shell.reset;
     shell.reset = function resetPendingRequests() {
       api.invalidatePendingRequests();
+      this.api = apiCompat;
+      this.busy = false;
+      this.probing = 0;
       return originalReset?.call(this);
+    };
+
+    // The classic runner owns global busy/messages. Its completion belongs to
+    // the login that started it, just like the individual feature requests.
+    shell.run = async function run(fn, okMsg) {
+      const current = api.captureLifecycle();
+      this.busy = true; this.err = ''; this.msg = '';
+      try {
+        const data = await fn();
+        if (!current()) return { ok:false };
+        if (okMsg) this.msg = okMsg;
+        return { ok:true, data };
+      } catch (error) {
+        if (current()) this.err = error.message;
+        return { ok:false };
+      } finally { if (current()) this.busy = false; }
     };
 
     // Alpine 把 shell 包成响应式代理后才调用这些方法：原方法必须以调用方的
@@ -82,8 +102,12 @@ if (typeof base !== 'function') {
     const origLoadAll = shell.loadAll;
     if (origLoadAll) {
       shell.loadAll = async function loadAll() {
+        if (this.authed === false) return;
+        const current = api.captureLifecycle();
         await origLoadAll.call(this);
+        if (!current() || this.authed === false) return;
         if (this.probeModuleReady) await this.refreshHealthSide();
+        if (!current()) return;
         if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };
     }
@@ -91,8 +115,12 @@ if (typeof base !== 'function') {
     const origLoadHealth = shell.loadHealth;
     if (origLoadHealth) {
       shell.loadHealth = async function loadHealth() {
+        if (this.authed === false) return;
+        const current = api.captureLifecycle();
         await origLoadHealth.call(this);
+        if (!current() || this.authed === false) return;
         if (this.probeModuleReady) await this.refreshHealthSide();
+        if (!current()) return;
         if (typeof this.refreshRecentErrors === 'function') await this.refreshRecentErrors();
       };
     }
@@ -149,60 +177,27 @@ if (typeof base !== 'function') {
       };
     }
 
-    const origSaveUp = shell.saveUp;
-    if (origSaveUp) {
-      shell.saveUp = async function saveUp() {
-        const f = this.upForm;
-        if (!f) return;
-        try {
-          // 先用带 position 提示的解析器校验；通过后写回紧凑 JSON 再走原逻辑。
-          const headers = this.parseHeadersOrThrow
-            ? this.parseHeadersOrThrow(f.probe_headers_raw)
-            : (f.probe_headers_raw || '').trim() ? JSON.parse(f.probe_headers_raw) : {};
-          const prev = f.probe_headers_raw;
-          f.probe_headers_raw = JSON.stringify(headers);
-          // 劫持一次 api PUT/POST 以附加新字段
-          const innerApi = this.api.bind(this);
-          this.api = async (method, path, body) => {
-            if ((method === 'PUT' || method === 'POST') && String(path).startsWith('/upstreams')) {
-              body = Object.assign({}, body, {
-                probe_mode: f.probe_mode || 'active',
-                host_override: f.host_override || '',
-                tls_server_name: f.tls_server_name || '',
-              });
-            }
-            return innerApi(method, path, body);
-          };
-          try {
-            return await origSaveUp.call(this);
-          } finally {
-            this.api = innerApi;
-            f.probe_headers_raw = prev;
-          }
-        } catch (e) {
-          this.err = e.message;
-        }
-      };
-    }
 
     // 手动探活：优先展示 execution_id。
     const origProbe = shell.probe && shell.probe.bind(shell);
     if (origProbe) {
       shell.probe = async function probe(routeId) {
+        const current = api.captureLifecycle();
         this.probing = routeId;
         this.err = '';
         this.probeResult = null;
         try {
           const data = await api.post('/routes/' + routeId + '/probe');
+          if (!current()) return;
           this.probeResult = data;
           if (data && data.execution_id) {
             this.msg = '手动探活完成，execution_id=' + data.execution_id;
           }
           this.loadHealth();
         } catch (e) {
-          this.err = e.message;
+          if (current()) this.err = e.message;
         } finally {
-          this.probing = 0;
+          if (current()) this.probing = 0;
         }
       };
     }

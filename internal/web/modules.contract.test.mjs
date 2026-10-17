@@ -242,9 +242,17 @@ await check('boot wraps window.app without requiring committed app.js edits', ()
 
 await check('boot wrappers call originals with the reactive this, not bind(shell)', () => {
   const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
-  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp', 'saveUp']) {
+  for (const name of ['boot', 'loadAll', 'loadHealth', 'go', 'editUp']) {
     assert.ok(!new RegExp(`shell\\.${name}\\.bind\\(shell\\)`).test(boot), name + ' bound to raw shell');
   }
+});
+
+await check('Upstream save uses the explicit classic DTO without intercepting API calls', () => {
+  const boot = fs.readFileSync(path.join(jsDir, 'boot.mjs'), 'utf8');
+  const classic = fs.readFileSync(path.join(staticDir, 'app.js'), 'utf8');
+  assert.ok(!boot.includes('origSaveUp'));
+  assert.ok(!boot.includes('shell.saveUp ='));
+  for (const field of ['probe_mode: f.probe_mode', 'host_override: f.host_override', 'tls_server_name: f.tls_server_name', 'body.initial_endpoints']) assert.ok(classic.includes(field), field);
 });
 
 await check('Secret clear sends empty value', async () => {

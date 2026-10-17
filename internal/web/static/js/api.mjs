@@ -12,6 +12,19 @@ export function createApiClient(hooks = {}) {
   let owner = {};
 
   function invalidatePendingRequests() { owner = {}; }
+  function captureLifecycle() { const captured = owner; return () => captured === owner; }
+
+  async function readCurrent(promise, requestOwner) {
+    try {
+      const value = await promise;
+      if (requestOwner === owner) return value;
+    } catch (error) {
+      if (requestOwner === owner) throw error;
+    }
+    const error = new Error('请求已失效');
+    error.stale = true;
+    throw error;
+  }
 
   async function request(method, path, body) {
     const requestOwner = owner;
@@ -20,7 +33,7 @@ export function createApiClient(hooks = {}) {
       opt.headers['Content-Type'] = 'application/json';
       opt.body = JSON.stringify(body);
     }
-    const r = await fetch('/admin/api' + path, opt);
+    const r = await readCurrent(fetch('/admin/api' + path, opt), requestOwner);
     if (r.status === 401) {
       // A response authenticated before logout must not clear a newer login.
       // Invalidate the cohort before invoking the hook, so concurrent 401s
@@ -34,7 +47,7 @@ export function createApiClient(hooks = {}) {
       throw e;
     }
     if (r.status === 204) return null;
-    const text = await r.text();
+    const text = await readCurrent(r.text(), requestOwner);
     let data = null;
     if (text) {
       try {
@@ -54,6 +67,7 @@ export function createApiClient(hooks = {}) {
 
   return {
     invalidatePendingRequests,
+    captureLifecycle,
     request,
     get: (path) => request('GET', path),
     post: (path, body) => request('POST', path, body),

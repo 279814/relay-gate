@@ -10,6 +10,7 @@ export function createSettingsFeature(shell, api) {
   };
 
   shell.loadSettings = async function loadSettings({ discard = false } = {}) {
+    if (this.authed === false) return false;
     const state = this.settingsState;
     if (state.busy || state.loading || (!discard && (state.conflict || state.pending || this.settingsDirty()))) return false;
     state.loading = true;

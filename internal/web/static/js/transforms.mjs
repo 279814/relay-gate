@@ -2,30 +2,33 @@
  * Pure text (x-text). Does not modify dirty app.js.
  */
 
+const initialState = () => ({
+  sets: [],
+  bindings: [],
+  executions: [],
+  selectedId: 0,
+  selected: null,
+  newName: '',
+  draftRulesJSON: '[]',
+  reqFailPolicy: 'fail_closed',
+  resFailPolicy: 'fail_open',
+  note: '',
+  routeId: '',
+  endpointId: '',
+  previewPhase: 'request',
+  previewBody: '',
+  previewResult: '',
+  loading: false,
+  budgetRequestMs: 50,
+  budgetSSEMs: 10,
+  budgetAudit: [],
+});
+
 export function createTransformsFeature(shell, api) {
-  shell.transforms = {
-    sets: [],
-    bindings: [],
-    executions: [],
-    selectedId: 0,
-    selected: null,
-    newName: '',
-    draftRulesJSON: '[]',
-    reqFailPolicy: 'fail_closed',
-    resFailPolicy: 'fail_open',
-    note: '',
-    routeId: '',
-    endpointId: '',
-    previewPhase: 'request',
-    previewBody: '',
-    previewResult: '',
-    loading: false,
-    budgetRequestMs: 50,
-    budgetSSEMs: 10,
-    budgetAudit: [],
-  };
+  shell.transforms = initialState();
 
   shell.loadTransforms = async function loadTransforms() {
+    const state = this.transforms;
     try {
       this.transforms.loading = true;
       const [sets, bindings, executions, budgets] = await Promise.all([
@@ -34,6 +37,7 @@ export function createTransformsFeature(shell, api) {
         api.get('/transform-executions?limit=50'),
         api.get('/transforms/budgets'),
       ]);
+      if (this.transforms !== state) return;
       this.transforms.sets = sets.sets || [];
       this.transforms.bindings = bindings.bindings || [];
       this.transforms.executions = executions.executions || [];
@@ -51,9 +55,10 @@ export function createTransformsFeature(shell, api) {
         }
       }
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     } finally {
-      this.transforms.loading = false;
+      state.loading = false;
     }
   };
 
@@ -68,6 +73,7 @@ export function createTransformsFeature(shell, api) {
   };
 
   shell.createTransformSet = async function createTransformSet() {
+    const state = this.transforms;
     try {
       const name = (this.transforms.newName || '').trim();
       if (!name) {
@@ -75,16 +81,20 @@ export function createTransformsFeature(shell, api) {
         return;
       }
       const set = await api.post('/transforms', { name });
+      if (this.transforms !== state) return;
       this.transforms.newName = '';
       this.msg = '已创建转换集 #' + set.id;
       await this.loadTransforms();
+      if (this.transforms !== state) return;
       this.selectTransformSet(set);
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
   };
 
   shell.saveTransformDraft = async function saveTransformDraft() {
+    const state = this.transforms;
     try {
       let rules;
       try {
@@ -103,14 +113,17 @@ export function createTransformsFeature(shell, api) {
         res_fail_policy: this.transforms.resFailPolicy,
         note: this.transforms.note,
       });
+      if (this.transforms !== state) return;
       this.msg = '草稿已保存（revision ' + (set.draft && set.draft.revision) + '）';
       await this.loadTransforms();
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
   };
 
   shell.previewTransform = async function previewTransform() {
+    const state = this.transforms;
     try {
       const data = await api.post('/transforms/' + this.transforms.selectedId + '/preview', {
         phase: this.transforms.previewPhase || 'request',
@@ -118,13 +131,16 @@ export function createTransformsFeature(shell, api) {
         resp_body: this.transforms.previewBody || '',
         status: 200,
       });
+      if (this.transforms !== state) return;
       this.transforms.previewResult = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
   };
 
   shell.publishTransform = async function publishTransform() {
+    const state = this.transforms;
     try {
       const routeId = Number(this.transforms.routeId);
       const endpointId = Number(this.transforms.endpointId);
@@ -136,14 +152,17 @@ export function createTransformsFeature(shell, api) {
         route_id: routeId,
         endpoint_id: endpointId,
       });
+      if (this.transforms !== state) return;
       this.msg = '已发布 version=' + (data.version && data.version.id);
       await this.loadTransforms();
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
   };
 
   shell.shadowTransform = async function shadowTransform() {
+    const state = this.transforms;
     try {
       const routeId = Number(this.transforms.routeId);
       const endpointId = Number(this.transforms.endpointId);
@@ -155,14 +174,17 @@ export function createTransformsFeature(shell, api) {
         route_id: routeId,
         endpoint_id: endpointId,
       });
+      if (this.transforms !== state) return;
       this.msg = '已 shadow version=' + (data.version && data.version.id);
       await this.loadTransforms();
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
   };
 
   shell.saveTransformBudgets = async function saveTransformBudgets() {
+    const state = this.transforms;
     try {
       const requestMs = Number(this.transforms.budgetRequestMs);
       const sseMs = Number(this.transforms.budgetSSEMs);
@@ -175,8 +197,10 @@ export function createTransformsFeature(shell, api) {
         const b = (cur && cur.budgets) || {};
         raising = requestMs > Number(b.request_ms) || sseMs > Number(b.sse_event_ms);
       } catch (_) {
+        if (this.transforms !== state) return;
         raising = requestMs > curReq || sseMs > curSSE;
       }
+      if (this.transforms !== state) return;
       let confirmRaise = false;
       if (raising) {
         confirmRaise = window.confirm(
@@ -196,13 +220,20 @@ export function createTransformsFeature(shell, api) {
         sse_event_ms: sseMs,
         confirm_raise: confirmRaise,
       });
+      if (this.transforms !== state) return;
       this.transforms.budgetRequestMs = data.budgets.request_ms;
       this.transforms.budgetSSEMs = data.budgets.sse_event_ms;
       this.transforms.budgetAudit = data.audit || [];
       this.msg = raising ? '已提高执行预算并记录审计' : '已更新执行预算';
     } catch (e) {
+      if (this.transforms !== state) return;
       this.err = e && e.message ? e.message : String(e);
     }
+  };
+  const originalReset = shell.reset;
+  shell.reset = function resetTransforms() {
+    this.transforms = initialState();
+    return originalReset?.call(this);
   };
 }
 

@@ -56,17 +56,8 @@ function emptyList(extraFilter) {
   };
 }
 
-/**
- * @param {object} shell Alpine 组件实例
- * @param {ReturnType<import('./api.mjs').createApiClient>} api
- */
-export function createProbeFeature(shell, api) {
-  Object.assign(shell, {
-    probeModuleReady: false,
-    probeModuleError: '',
-    stateRevision: 0,
-
-    probeFilterFields: FILTER_FIELDS,
+function initialData() {
+  return {
     endpoints: emptyList(emptyFilter('endpoints')),
     secrets: emptyList(emptyFilter('secrets')),
     recipes: emptyList(emptyFilter('recipes')),
@@ -87,6 +78,21 @@ export function createProbeFeature(shell, api) {
     capByRouteEndpoint: {},
     _modalUnlock: null,
     _escUnbind: null,
+  };
+}
+
+/**
+ * @param {object} shell Alpine 组件实例
+ * @param {ReturnType<import('./api.mjs').createApiClient>} api
+ */
+export function createProbeFeature(shell, api) {
+  Object.assign(shell, {
+    probeModuleReady: false,
+    probeModuleError: '',
+    stateRevision: 0,
+
+    probeFilterFields: FILTER_FIELDS,
+    ...initialData(),
 
     f: field,
 
@@ -133,8 +139,10 @@ export function createProbeFeature(shell, api) {
     },
 
     async loadPaged(listKey, path, reset) {
+      if (this.authed === false) return false;
       const list = this[listKey];
       if (!list) return;
+      const request = list.request = (list.request || 0) + 1;
       if (reset) {
         list.items = [];
         list.next_cursor = '';
@@ -150,10 +158,12 @@ export function createProbeFeature(shell, api) {
           }
         }
         const page = await api.get(`${path}?${q}`);
+        if (this[listKey] !== list || list.request !== request) return false;
         const items = field(page, 'Items', 'items') || [];
         list.items = reset ? items : list.items.concat(items);
         list.next_cursor = field(page, 'NextCursor', 'next_cursor') || '';
       } catch (e) {
+        if (this[listKey] !== list || list.request !== request) return false;
         if (e.status === 400) {
           this.err = (e.message || '分页游标无效') + '。已清空筛选，请从首屏重载。';
           list.items = [];
@@ -162,13 +172,15 @@ export function createProbeFeature(shell, api) {
           this.err = e.message;
         }
       } finally {
-        list.loading = false;
+        if (list.request === request) list.loading = false;
       }
     },
 
     onProbeFilterChange(listKey) {
       const list = this[listKey];
       if (!list) return;
+      list.request = (list.request || 0) + 1;
+      list.loading = false;
       list.next_cursor = '';
       list.items = [];
     },
@@ -210,9 +222,13 @@ export function createProbeFeature(shell, api) {
     },
 
     async loadProbeRuntime() {
+      const owner = this.endpoints;
       try {
-        this.probeRuntime = await api.get('/probe-runtime');
+        const data = await api.get('/probe-runtime');
+        if (this.endpoints !== owner) return;
+        this.probeRuntime = data;
       } catch (e) {
+        if (this.endpoints !== owner) return;
         if (e.status !== 503) this.err = e.message;
       }
     },
@@ -229,11 +245,15 @@ export function createProbeFeature(shell, api) {
     },
 
     async openExecution(id) {
+      const owner = this.endpoints;
       try {
-        this.executionDrawer = await api.get('/probe-executions/' + encodeURIComponent(id));
+        const data = await api.get('/probe-executions/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.executionDrawer = data;
         this._lockModal(() => this.closeExecution());
         this.$nextTick(() => focusFirst(this.$refs && this.$refs.execDrawer));
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
@@ -243,19 +263,27 @@ export function createProbeFeature(shell, api) {
     },
 
     async openRecipe(id) {
+      const owner = this.endpoints;
       try {
-        this.recipeDetail = await api.get('/probe-recipes/' + encodeURIComponent(id));
+        const data = await api.get('/probe-recipes/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.recipeDetail = data;
         this._lockModal(() => { this.recipeDetail = null; this._unlockModal(); });
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
 
     async openCalibration(id) {
+      const owner = this.endpoints;
       try {
-        this.calibrationDetail = await api.get('/calibrations/' + encodeURIComponent(id));
+        const data = await api.get('/calibrations/' + encodeURIComponent(id));
+        if (this.endpoints !== owner) return;
+        this.calibrationDetail = data;
         this._lockModal(() => { this.calibrationDetail = null; this._unlockModal(); });
       } catch (e) {
+        if (this.endpoints !== owner) return;
         this.err = e.message;
       }
     },
@@ -376,6 +404,13 @@ export function createProbeFeature(shell, api) {
       return (b - a) + 'ms';
     },
   });
+
+  const originalReset = shell.reset;
+  shell.reset = function resetProbes() {
+    this._unlockModal();
+    Object.assign(this, initialData());
+    return originalReset?.call(this);
+  };
 
   return shell;
 }
