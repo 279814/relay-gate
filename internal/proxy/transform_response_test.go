@@ -530,6 +530,20 @@ func TestResponseTransform_BodyAtMaxBufferSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test isolates the byte cap. Under -race an 8 MiB replacement may
+	// legitimately exceed the production 50 ms wall-clock budget; budget
+	// exhaustion and rollback have separate deterministic transform tests.
+	defaults := reg.Budgets()
+	if defaults.RequestMs != 50 {
+		t.Fatalf("production request budget changed: %d", defaults.RequestMs)
+	}
+	if _, err := reg.SetBudgets(5000, defaults.SSEEventMs, true); err != nil {
+		t.Fatal(err)
+	}
+	audits := reg.BudgetAudits(1)
+	if len(audits) != 1 || !audits[0].Confirmed || audits[0].Action != "raise_budget" {
+		t.Fatal("test-only byte-boundary budget must use the confirmed, audited path")
+	}
 	rules := []transform.Rule{
 		{Kind: transform.KindReplaceBytes, From: marker, To: replaced},
 	}
