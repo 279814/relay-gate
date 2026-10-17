@@ -4,7 +4,6 @@ import (
 	"context"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/probe"
-	"github.com/279814/relay-gate/internal/sample"
 )
 
 // ConfigInvalidator 在配置变更后立即触发相关 Route 的探活（§4.5 表格第 3 行）。
@@ -234,7 +233,7 @@ func (s *Server) publishAfterSuccessfulWrite() error {
 		s.publisher.Invalidate()
 		if s.log != nil {
 			// §2.4：Refresh 失败文案可能包装出站凭据；属性先过 RedactDiagnosticText。
-			safeErr := sample.RedactDiagnosticText(err.Error(), s.knownUpstreamRedactKeys())
+			safeErr := s.diagnosticError(err)
 			s.log.Error("写入后刷新配置快照失败", "err", safeErr)
 		}
 		return err

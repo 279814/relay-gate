@@ -257,7 +257,7 @@ func (s *Server) testRecipeVersion(w http.ResponseWriter, r *http.Request) {
 		s.writeRecipeErr(w, err)
 		return
 	}
-	writeJSON(w, 200, redactExecutionDetail(execution, s.knownUpstreamRedactKeys()))
+	s.writeExecutionDetail(w, r, execution)
 }
 
 func (s *Server) publishRecipeVersion(w http.ResponseWriter, r *http.Request) {
