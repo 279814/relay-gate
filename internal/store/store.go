@@ -15,10 +15,11 @@ import (
 )
 
 type Store struct {
-	db     *sql.DB
-	cipher *Cipher
-	lock   *instanceLock
-	path   string
+	db            *sql.DB
+	cipher        *Cipher
+	lock          *instanceLock
+	path          string
+	readerBuildID string
 }
 
 // connPragmas 是必须写在 DSN 里的**连接级** pragma。

@@ -246,6 +246,14 @@ func fileEvidence(path string) (int64, string, error) {
 // CreateRotationBackup returns one consistent SQLite snapshot paired with the
 // current on-disk credential root. The API closes mutation admission first.
 func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult, error) {
+	buildID := s.readerBuildID
+	if buildID == "" {
+		var err error
+		buildID, err = CurrentReaderBuildID("dev")
+		if err != nil {
+			return MigrationBackupResult{}, err
+		}
+	}
 	state, err := inspectSchemaState(ctx, s.db)
 	if err != nil {
 		return MigrationBackupResult{}, err
@@ -258,7 +266,7 @@ func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult
 		return MigrationBackupResult{}, err
 	}
 	defer conn.Close()
-	return createMigrationBackup(ctx, conn, s.path, MigrationBackupSpec{SourceSchema: 8, TargetSchema: 8, SourceFingerprint: state.Fingerprint, LegacyCipherID: s.cipher.KeyID(), SourceValidator: "schema-8-data-key-v2", PairedBuildID: "relay-gate-schema-8-data-key-v2", ReaderContract: "schema-8-data-key-v2-reader"})
+	return createMigrationBackup(ctx, conn, s.path, MigrationBackupSpec{SourceSchema: 8, TargetSchema: 8, SourceFingerprint: state.Fingerprint, LegacyCipherID: s.cipher.KeyID(), SourceValidator: "schema-8-data-key-v2", PairedBuildID: buildID, ReaderContract: "schema-8-data-key-v2-reader"})
 }
 
 func syncDirectory(path string) error {

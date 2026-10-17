@@ -9,6 +9,7 @@ import argparse
 import concurrent.futures
 from contextlib import closing
 import gzip
+import hashlib
 import http.server
 import json
 import os
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -231,6 +233,15 @@ def verify(binary):
             assert not runtime.api("GET", "/state").get("maintenance"), "successful rotation left maintenance active"
             backups = list(runtime.root.glob("backups/*/manifest.json"))
             assert backups and all(path.with_name("secrets.json").is_file() for path in backups), "backup did not pair DB and secrets"
+            digest = hashlib.sha256()
+            with binary.open("rb") as executable:
+                for block in iter(lambda: executable.read(1024 * 1024), b""):
+                    digest.update(block)
+            version = json.loads(runtime.request("GET", "/healthz", auth=False)[1])["version"]
+            for path in backups:
+                paired = json.loads(path.read_text(encoding="utf-8"))["paired_build_id"]
+                assert paired.startswith("sha256:" + digest.hexdigest() + " "), "backup did not identify the actual reader artifact"
+                assert " version=" + urllib.parse.quote_plus(version) + " " in paired, "backup lost the actual build version label"
             state = runtime.api("GET", "/state")
             runtime.api("POST", "/state", {"state": "paused", "expected_revision": state["revision"]})
             runtime.stop()
