@@ -85,7 +85,7 @@ func setupSecretRoutes(t *testing.T, hs *harness, secrets *secretRouteStore, two
 	}, nil, outbound.NewResolver(testHasher{}))
 	hs.h = hs.h.WithTargets(provider, secrets)
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 	return caps
 }
 
@@ -120,11 +120,11 @@ func TestMissingSecret_SkipsRouteAndServesNext(t *testing.T) {
 	if q, _ := goodQuery.Load().(string); !strings.HasPrefix(q, "token="+presentSecretVal) {
 		t.Fatalf("existing Secret must still resolve, query = %q", q)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("missing-Secret Route capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("missing-Secret Route config error observations = %d, want 1", got)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 101, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("healthy Route capability = %s, want unknown", got)
+	if got := caps.configFailures(101); got != 0 {
+		t.Fatalf("healthy Route config error observations = %d, want 0", got)
 	}
 }
 
@@ -149,8 +149,8 @@ func TestMissingSecret_OnlyRouteReturnsNoRoute(t *testing.T) {
 			t.Fatalf("response leaks %q: header=%q body=%s", leak, reason, body)
 		}
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("config error observations = %d, want 1", got)
 	}
 }
 
@@ -172,8 +172,8 @@ func TestSecretStoreReadError_FailsRequestWithoutSkip(t *testing.T) {
 	if n := badHits.Load() + goodHits.Load(); n != 0 {
 		t.Fatalf("upstream hits = %d, want 0 (no skip to the next Route)", n)
 	}
-	if caps.marks != 0 {
-		t.Fatalf("config_error marks = %d, want 0 for a store read failure", caps.marks)
+	if caps.configFailures(0) != 0 {
+		t.Fatalf("config_error marks = %d, want 0 for a store read failure", caps.configFailures(0))
 	}
 	if strings.Contains(rec.Body.String(), missingSecretName) {
 		t.Fatalf("body leaks Secret name: %s", rec.Body.String())

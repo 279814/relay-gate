@@ -336,8 +336,8 @@ func NewManager() *Manager {
 
 // Transport 取（或建）这份网络配置对应的连接池。
 //
-// 返回 error 而不是静默回落到一个默认池：唯一的失败原因是 proxy_url 解析
-// 不了，而那时静默忽略代理意味着流量直接发往上游 —— 一个配了代理的用户
+// 连接池未装配或网络配置无效时返回 error，不静默回落到默认池。
+// 静默忽略代理意味着流量直接发往上游 —— 一个配了代理的用户
 // 会以为流量在走代理。
 //
 // 新建池时会丢掉该 Upstream 上网络身份已变的旧池（关空闲连接、从 map
@@ -346,6 +346,9 @@ func NewManager() *Manager {
 // 以 maxConnectTimeoutSiblings 为上限，避免改 *connect_sec 后每个历史值
 // 永久占一个池。在途 RoundTrip 仍持有旧 *Transport 引用，可读完。
 func (manager *Manager) Transport(network NetworkConfig) (*Transport, error) {
+	if manager == nil {
+		return nil, errors.New("未装配连接池管理器")
+	}
 	key := network.poolKey()
 
 	manager.mu.RLock()

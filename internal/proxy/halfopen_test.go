@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -209,7 +208,7 @@ func (g *gatingConfig) Snapshot() (*router.Snapshot, error) {
 func (g *gatingConfig) Settings() (model.Settings, error) { return g.inner.Settings() }
 func (g *gatingConfig) RunState() (store.RunState, error) { return g.inner.RunState() }
 
-// HalfOpen on ResultView / request_log must stay on the Route that claimed
+// HalfOpen on observer completion / request_log must stay on the Route that claimed
 // RecoveryGate. A sibling tried in the same client request (failover after
 // the claimed Route fails) must not inherit the request-scoped flag.
 func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
@@ -237,8 +236,8 @@ func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
 		t.Fatal("pre-hold RecoveryGate on recovering sibling")
 	}
 
-	rep := &halfOpenRouteReporter{}
-	hs.h.WithHealthReporter(rep)
+	rep := &attemptRecorder{}
+	hs.h.WithObservers(rep)
 
 	rec := hs.serve(hs.req())
 	if rec.Code != 200 {
@@ -271,34 +270,6 @@ func TestHandler_HalfOpenFlagOnlyOnClaimedRoute(t *testing.T) {
 	if !sawSibling {
 		t.Error("missing report for sibling Route 200")
 	}
-}
-
-type halfOpenRouteReporter struct {
-	mu  sync.Mutex
-	got []halfOpenReport
-}
-
-type halfOpenReport struct {
-	routeID  int64
-	halfOpen bool
-}
-
-func (r *halfOpenRouteReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ho := false
-	if res != nil {
-		ho = res.HalfOpen
-	}
-	r.got = append(r.got, halfOpenReport{routeID: routeID, halfOpen: ho})
-}
-
-func (r *halfOpenRouteReporter) TriggerProbe(int64) {}
-
-func (r *halfOpenRouteReporter) all() []halfOpenReport {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]halfOpenReport(nil), r.got...)
 }
 
 // Armed half-open must not RoundTrip after the Route is disabled between

@@ -890,15 +890,15 @@ func classifyOutcome(res *Result) model.Outcome {
 	return model.OutcomeOK
 }
 
-// credentialsOf 收齐这次请求涉及的全部凭据，供脱敏使用。
+// credentialsOf 收集入站 Relay Key 与上游基础凭据，供脱敏使用。
 //
 // 两处来源：出站的上游 key 与入站的 relay key。位置清单走
 // inboundCredentials（其内部读 model.AuthHeaders，是唯一来源）——
 // 各列一份的话，新增一个鉴权位置时必然漏掉其中之一，而漏掉的表现是
 // 明文 key 静默落库或进日志，不报错、不失败。
 //
-// 四个消费方共用它：样本落库（recordSample）、健康回写的 ErrBody
-// （viewOf）、count_tokens 的降级日志、被动安全扫描证据脱敏（ObserveJob.Keys）。
+// 各次尝试再补 target.ResolvedSecrets，供样本、响应头、降级日志和安全证据
+// 使用同一份实际凭据列表。
 func (h *Handler) credentialsOf(r *http.Request, cand *router.Candidate) []string {
 	keys := make([]string, 0, len(model.AuthHeaders)+1)
 	keys = append(keys, cand.Upstream.APIKey)

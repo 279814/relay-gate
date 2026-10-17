@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -679,68 +681,38 @@ func TestIsUpstreamFault(t *testing.T) {
 // 配置确实存进去了、API 也回显了新值，但出站流量还在绕过代理 —— 直到重启。
 // livecfg 每 2 秒刷新配置，这种「看起来生效了其实没有」最难排查。
 //
-// 池的分组规则本身由 outbound.TestManager_PoolIdentityCoversNetworkConfigOnly
-// 覆盖。这条钉的是**接线**：Handler.TransportFor 有没有把 Upstream 的网络
-// 字段真的传进 NetworkConfig —— 漏传一个字段，那个配置在 proxy 层就是死的，
-// 而 outbound 侧的测试看不到这段。
-func TestTransportFor_RebuildsWhenProxyChanges(t *testing.T) {
-	hs := newHarness(t, nil)
-	up := &model.Upstream{ID: 10, Name: "s", BaseURL: "https://x.com",
-		Enabled: true, NetworkRevision: 1}
-	budget := outbound.RealBudget(testSettings())
-
-	tr1, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 同一个 ID，但换了代理地址
-	up.ProxyURL = "http://127.0.0.1:9999"
-	tr2, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr2 == tr1 {
-		t.Error("改了 proxy_url 后应换池，否则流量永远绕过代理")
-	}
-
-	// 配置没变时必须复用 —— 每请求新建会丢掉连接复用，
-	// 对高延迟的公益站等于每次重新 TLS 握手
-	tr3, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr3 != tr2 {
-		t.Error("配置未变时应复用同一个池")
-	}
-
-	// connect 预算是池身份的一部分：真实请求与探活各传自己的值，
-	// 而 TransportFor 必须把它带进 NetworkConfig，否则 l*_connect_sec 是死的。
-	shorter := budget
-	shorter.Connect = 7 * time.Second
-	if tr4, _ := hs.h.TransportFor(up, shorter); tr4 == tr2 {
-		t.Error("改了 connect 预算后应换池")
-	}
-
-	// 其余网络字段同样必须传进去。漏传任何一个，那个配置在 proxy 层就是死的。
-	for _, testCase := range []struct {
-		name  string
-		apply func(*model.Upstream)
-	}{
-		{"tls_server_name", func(u *model.Upstream) { u.TLSServerName = "sni.x.com" }},
-		{"host_override", func(u *model.Upstream) { u.HostOverride = "real.x.com" }},
-		{"network_revision", func(u *model.Upstream) { u.NetworkRevision = 2 }},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			changed := *up
-			testCase.apply(&changed)
-			got, err := hs.h.TransportFor(&changed, budget)
-			if err != nil {
-				t.Fatal(err)
+// Both forwarders must honor a changed proxy through the shared Manager.
+func TestHandler_ProxyChangesAffectActualRequests(t *testing.T) {
+	for _, countTokens := range []bool{false, true} {
+		t.Run(fmt.Sprint(countTokens), func(t *testing.T) {
+			var first, second atomic.Int32
+			body := `{"id":"msg_1","type":"message"}`
+			if countTokens {
+				body = `{"input_tokens":13}`
 			}
-			if got == tr2 {
-				t.Errorf("改了 %s 应换池 —— 说明 TransportFor 没把它传进 NetworkConfig",
-					testCase.name)
+			makeProxy := func(hits *atomic.Int32) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(body))
+				}))
+			}
+			proxyA, proxyB := makeProxy(&first), makeProxy(&second)
+			defer proxyA.Close()
+			defer proxyB.Close()
+			hs := newHarness(t, nil)
+			for _, address := range []string{proxyA.URL, proxyB.URL} {
+				hs.cfg.snap.Upstreams[10].ProxyURL = address
+				request := hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`)
+				if countTokens {
+					request = hs.countTokensRequest(`{"model":"claude-opus-5","messages":[]}`)
+				}
+				if response := hs.serve(request); response.Code != 200 || response.Body.String() != body {
+					t.Fatalf("changed proxy was not used: %d %s", response.Code, response.Body.String())
+				}
+			}
+			if first.Load() != 1 || second.Load() != 1 {
+				t.Fatalf("proxy hits=%d/%d", first.Load(), second.Load())
 			}
 		})
 	}

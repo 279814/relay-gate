@@ -714,8 +714,8 @@ func TestSSETransform_OversizeEventFailOpenForwardsOriginal(t *testing.T) {
 func TestSSETransform_OversizeEventFailOpenNotUpstreamFault(t *testing.T) {
 	oversize := sseOversizeBody()
 	hs := newHarness(t, sseOversizeUpstream(oversize))
-	spy := &capturingReporter{}
-	hs.h.WithHealthReporter(spy)
+	observer := &countAttemptObserver{}
+	hs.h.WithObservers(observer)
 	reg := transform.NewRegistry(4)
 	set, _ := reg.CreateSet("sse-oversize-open-health")
 	rules := []transform.Rule{
@@ -733,12 +733,8 @@ func TestSSETransform_OversizeEventFailOpenNotUpstreamFault(t *testing.T) {
 	if rec.Code != 200 || !bytes.HasSuffix(rec.Body.Bytes(), oversize) {
 		t.Fatalf("fail_open must deliver the full stream: status=%d len=%d", rec.Code, rec.Body.Len())
 	}
-	got := spy.last()
-	if got == nil {
-		t.Fatal("no health report")
-	}
-	if got.Err != nil {
-		t.Fatalf("fail_open overflow reported to health as error %v (IsUpstreamFault=%v)", got.Err, IsUpstreamFault(got.Err))
+	if observer.finished != 1 || observer.finish.ReadErr != nil {
+		t.Fatalf("transform overflow became an upstream read error: %+v", observer.finish)
 	}
 	var failed bool
 	for _, ex := range reg.ListExecutions(0) {
@@ -768,8 +764,8 @@ func TestSSETransform_ApplyEventFailOpenRecordsFailure(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Write([]byte(tc.event))
 			})
-			spy := &capturingReporter{}
-			hs.h.WithHealthReporter(spy)
+			observer := &countAttemptObserver{}
+			hs.h.WithObservers(observer)
 			reg := transform.NewRegistry(4)
 			set, _ := reg.CreateSet("sse-apply-open-" + tc.name)
 			rules := []transform.Rule{
@@ -787,12 +783,8 @@ func TestSSETransform_ApplyEventFailOpenRecordsFailure(t *testing.T) {
 			if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`{"delta":"hi"}`)) || bytes.Contains(rec.Body.Bytes(), []byte("xxxx")) {
 				t.Fatalf("fail_open must forward the original event: status=%d body=%q", rec.Code, rec.Body.Bytes()[:min(rec.Body.Len(), 120)])
 			}
-			got := spy.last()
-			if got == nil {
-				t.Fatal("no health report")
-			}
-			if got.Err != nil {
-				t.Fatalf("fail_open apply error reported to health as %v", got.Err)
+			if observer.finished != 1 || observer.finish.ReadErr != nil {
+				t.Fatalf("transform apply failure became an upstream read error: %+v", observer.finish)
 			}
 			failed := 0
 			for _, ex := range reg.ListExecutions(0) {

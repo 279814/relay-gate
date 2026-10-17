@@ -11,11 +11,11 @@ import (
 	"github.com/279814/relay-gate/internal/router"
 )
 
-// routeConfigCaps records §6.5 route-local config_error marks per endpoint.
+// routeConfigCaps provides committed lookup fixtures and records observer boundaries.
 type routeConfigCaps struct {
+	attemptRecorder
 	mu     sync.Mutex
 	states map[int64]map[model.EndpointKind]model.CapabilityState
-	marks  int
 }
 
 func (c *routeConfigCaps) Effective(_ model.RecipeScope, scopeID int64,
@@ -28,21 +28,14 @@ func (c *routeConfigCaps) Effective(_ model.RecipeScope, scopeID int64,
 	return model.CapabilityUnknown
 }
 
-func (c *routeConfigCaps) MarkCountTokensUnsupported(int64, uint64, int) {}
-func (c *routeConfigCaps) MarkCountTokensConfigError(int64, uint64, int) {}
-func (c *routeConfigCaps) MarkCountTokensSupported(int64, uint64)        {}
-
-func (c *routeConfigCaps) MarkRouteConfigError(routeID int64, _ uint64, endpoint model.EndpointKind) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.states == nil {
-		c.states = map[int64]map[model.EndpointKind]model.CapabilityState{}
+func (c *routeConfigCaps) configFailures(routeID int64) int {
+	count := 0
+	for _, attempt := range c.all() {
+		if attempt.configError && (routeID == 0 || attempt.routeID == routeID) {
+			count++
+		}
 	}
-	if c.states[routeID] == nil {
-		c.states[routeID] = map[model.EndpointKind]model.CapabilityState{}
-	}
-	c.states[routeID][endpoint] = model.CapabilityConfigError
-	c.marks++
+	return count
 }
 
 const emptyKeyReqBody = `{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`
@@ -73,7 +66,7 @@ func TestEmptyUpstreamKey_SkipsRouteAndServesNext(t *testing.T) {
 			{ID: 101, ModelNameID: 1, UpstreamID: 11, Priority: 2, Weight: 100, Enabled: true},
 		})
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 
 	rec := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
 	if rec.Code != http.StatusOK {
@@ -85,24 +78,25 @@ func TestEmptyUpstreamKey_SkipsRouteAndServesNext(t *testing.T) {
 	if n := emptyHits.Load(); n != 0 {
 		t.Fatalf("empty-key Route must not reach the wire, hits = %d", n)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("empty-key Route messages capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("empty-key Route messages config error observations = %d, want 1", got)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 101, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("healthy Route capability = %s, want unknown", got)
+	if got := caps.configFailures(101); got != 0 {
+		t.Fatalf("healthy Route config error observations = %d, want 0", got)
 	}
 	_, open, _ := hs.health.stats()
 	if open != 0 {
 		t.Fatalf("concurrency slots leaked: open = %d", open)
 	}
 
-	// Next request excludes the config_error Route at selection.
+	// A committed registry update must exclude the Route at the next selection.
+	caps.states = map[int64]map[model.EndpointKind]model.CapabilityState{100: {model.EndpointMessages: model.CapabilityConfigError}}
 	rec2 := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("second status = %d, want 200", rec2.Code)
 	}
-	if caps.marks != 1 {
-		t.Fatalf("config_error marks = %d, want 1 (second request should skip at selection)", caps.marks)
+	if caps.configFailures(0) != 1 {
+		t.Fatalf("config_error marks = %d, want 1 (second request should skip at selection)", caps.configFailures(0))
 	}
 	if n := goodHits.Load(); n != 2 {
 		t.Fatalf("healthy upstream hits = %d, want 2", n)
@@ -120,7 +114,7 @@ func TestEmptyUpstreamKey_OnlyRouteReturnsNoRoute(t *testing.T) {
 	})
 	hs.cfg.snap.Upstreams[10].APIKey = ""
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 
 	rec := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -136,8 +130,8 @@ func TestEmptyUpstreamKey_OnlyRouteReturnsNoRoute(t *testing.T) {
 				leak, rec.Header().Get("X-Relay-Reason"), body)
 		}
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("config error observations = %d, want 1", got)
 	}
 }
 
@@ -170,7 +164,7 @@ func TestEmptyUpstreamKeyInFixedQuery_SkipsRouteAndServesNext(t *testing.T) {
 		})
 	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 
 	rec := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
 	if rec.Code != http.StatusOK {
@@ -182,11 +176,11 @@ func TestEmptyUpstreamKeyInFixedQuery_SkipsRouteAndServesNext(t *testing.T) {
 	if n := emptyHits.Load(); n != 0 {
 		t.Fatalf("empty-key Route must not reach the wire, hits = %d", n)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("empty-key Route messages capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("empty-key Route messages config error observations = %d, want 1", got)
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 101, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-		t.Fatalf("healthy Route capability = %s, want unknown", got)
+	if got := caps.configFailures(101); got != 0 {
+		t.Fatalf("healthy Route config error observations = %d, want 0", got)
 	}
 	_, open, _ := hs.health.stats()
 	if open != 0 {
@@ -206,7 +200,7 @@ func TestEmptyUpstreamKeyInFixedQuery_OnlyRouteReturnsNoRoute(t *testing.T) {
 	hs.cfg.snap.Upstreams[10].APIKey = ""
 	hs.h = hs.h.WithTargets(testTargetsWithQuery(hs.cfg, "key={{UPSTREAM_API_KEY}}"), nil)
 	caps := &routeConfigCaps{}
-	hs.h.WithCountTokensCapability(caps)
+	hs.h.WithCountTokensCapability(caps).WithObservers(caps)
 
 	rec := hs.serve(hs.anthropicRequest(emptyKeyReqBody))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -222,8 +216,8 @@ func TestEmptyUpstreamKeyInFixedQuery_OnlyRouteReturnsNoRoute(t *testing.T) {
 			t.Fatalf("response leaks template/auth text %q: header=%q body=%s", leak, reason, body)
 		}
 	}
-	if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-		t.Fatalf("capability = %s, want config_error", got)
+	if got := caps.configFailures(100); got != 1 {
+		t.Fatalf("config error observations = %d, want 1", got)
 	}
 }
 

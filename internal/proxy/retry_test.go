@@ -491,12 +491,12 @@ func TestRetry_GatewayErrorCarriesAttempts(t *testing.T) {
 // 漏掉的后果很隐蔽：站挂了，但因为重试成功兜住了，没人报告它失败 ——
 // 于是它一直显示 alive，直到下一个定时探活撞上去。而 §3.5 把真实请求的
 // 回写列为「最快的故障发现路径」，漏了它就等于放弃了这条路径。
-func TestRetry_ReportsHealthForEveryAttempt(t *testing.T) {
+func TestRetry_ObservesEveryAttempt(t *testing.T) {
 	hs := newMultiHarness(t,
 		respondStatus(502, `s0 down`),
 		respondOK(`{"id":"ok"}`))
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -528,8 +528,8 @@ func TestRetry_DiscardedAttemptCarriesErrBody(t *testing.T) {
 	hs := newMultiHarness(t,
 		respondStatus(502, `{"error":{"type":"overloaded_error","message":"rate limit"}}`),
 		respondOK(`{"id":"ok"}`))
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -551,8 +551,8 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 		respondStatus(200, `{"type":"error","error":{"type":"server_error","message":"boom"}}`),
 		respondOK(`{"id":"ok"}`))
 	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
+	spy := &attemptRecorder{}
+	hs.h.WithObservers(spy)
 
 	if rec := hs.serve(hs.req()); rec.Code != 200 {
 		t.Fatalf("应换站成功，得到 %d", rec.Code)
@@ -571,76 +571,7 @@ func TestRetry_Discarded200StructuredErrorCarriesErrBody(t *testing.T) {
 	}
 }
 
-// 每次尝试的 ErrBody 必须用**那一次自己的** key 脱敏。
-//
-// 用第一次的 key 去脱敏第二次的响应体,B 站回显的 key 就会明文流进
-// route_health.last_error 并显示在管理界面上（§3.6.3b 的要求是无条件的）。
-func TestRetry_RedactsEachAttemptWithItsOwnKey(t *testing.T) {
-	// 两个站都把自己收到的 key 回显在错误信息里（真实中转站的常见格式）
-	// 用 Balanced 点名的 502，以便换站并覆盖两次回写脱敏。
-	echoKey := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(502)
-		fmt.Fprintf(w, `{"error":"Invalid API key: %s"}`, r.Header.Get("X-Api-Key"))
-	}
-	hs := newMultiHarness(t, echoKey, echoKey)
-	hs.cfg.settings.RetryMaxAttempts = 2
-	hs.cfg.settings.RealTotalSec = 30
-	spy := &multiReporter{}
-	hs.h.WithHealthReporter(spy)
-
-	hs.serve(hs.req())
-
-	got := spy.all()
-	if len(got) != 2 {
-		t.Fatalf("应回写 2 次，得到 %d", len(got))
-	}
-	for i, rep := range got {
-		for _, st := range hs.stations {
-			if strings.Contains(string(rep.errBody), st.key) {
-				t.Errorf("第 %d 次回写的 ErrBody 里有明文 key %q —— 它会落进 "+
-					"route_health.last_error 并显示在管理界面上：%q",
-					i+1, st.key, rep.errBody)
-			}
-		}
-		// 脱敏不该毁掉错误信息本身
-		if !strings.Contains(string(rep.errBody), "Invalid API key") {
-			t.Errorf("第 %d 次回写丢掉了错误信息本身：%q", i+1, rep.errBody)
-		}
-	}
-}
-
-// multiReporter 按顺序记下每次回写。
-type multiReporter struct {
-	mu   sync.Mutex
-	got  []reportedView
-	prob []int64
-}
-
-type reportedView struct {
-	routeID int64
-	status  int
-	errBody []byte
-	err     error
-}
-
-func (m *multiReporter) ReportResult(routeID int64, _ uint64, res *ResultView) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.got = append(m.got, reportedView{routeID: routeID, status: res.Status,
-		errBody: res.ErrBody, err: res.Err})
-}
-
-func (m *multiReporter) TriggerProbe(routeID int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.prob = append(m.prob, routeID)
-}
-
-func (m *multiReporter) all() []reportedView {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]reportedView(nil), m.got...)
-}
+// Per-attempt key privacy is checked after durable observer commits in probe.
 
 // ── 并发额度：被丢弃的尝试必须立刻归还 ──────────────────────
 

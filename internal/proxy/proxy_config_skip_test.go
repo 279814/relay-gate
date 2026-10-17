@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 )
 
@@ -59,11 +58,11 @@ func TestProxyPoolConfigError_SkipsRouteAndServesNext(t *testing.T) {
 			if n := badHits.Load(); n != 0 {
 				t.Fatalf("bad-proxy Route must not reach the wire, hits = %d", n)
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-				t.Fatalf("bad-proxy Route capability = %s, want config_error", got)
+			if got := caps.configFailures(100); got != 1 {
+				t.Fatalf("bad-proxy Route config error observations = %d, want 1", got)
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 101, model.EndpointMessages, ""); got != model.CapabilityUnknown {
-				t.Fatalf("healthy Route capability = %s, want unknown", got)
+			if got := caps.configFailures(101); got != 0 {
+				t.Fatalf("healthy Route config error observations = %d, want 0", got)
 			}
 			if _, open, _ := hs.health.stats(); open != 0 {
 				t.Fatalf("concurrency slots leaked: open = %d", open)
@@ -96,8 +95,8 @@ func TestProxyPoolConfigError_OnlyRouteReturnsNoRoute(t *testing.T) {
 					t.Fatalf("response leaks proxy text %q: header=%q body=%s", leak, reason, body)
 				}
 			}
-			if got := caps.Effective(model.RecipeScopeRoute, 100, model.EndpointMessages, ""); got != model.CapabilityConfigError {
-				t.Fatalf("capability = %s, want config_error", got)
+			if got := caps.configFailures(100); got != 1 {
+				t.Fatalf("config error observations = %d, want 1", got)
 			}
 		})
 	}
@@ -133,8 +132,8 @@ func TestProxyPoolConfigError_RefusedProxyIsConnectError(t *testing.T) {
 	if n := goodHits.Load(); n != 0 {
 		t.Fatalf("healthy upstream hits = %d, want 0 (retry_max_attempts=1)", n)
 	}
-	if caps.marks != 0 {
-		t.Fatalf("config_error marks = %d, want 0 for a refused proxy", caps.marks)
+	if caps.configFailures(0) != 0 {
+		t.Fatalf("config_error marks = %d, want 0 for a refused proxy", caps.configFailures(0))
 	}
 }
 
@@ -153,7 +152,7 @@ func TestProxyPoolConfigError_MissingManagerIsNotRouteSkip(t *testing.T) {
 	if n := badHits.Load() + goodHits.Load(); n != 0 {
 		t.Fatalf("upstream hits = %d, want 0", n)
 	}
-	if caps.marks != 0 {
-		t.Fatalf("config_error marks = %d, want 0", caps.marks)
+	if caps.configFailures(0) != 0 {
+		t.Fatalf("config_error marks = %d, want 0", caps.configFailures(0))
 	}
 }

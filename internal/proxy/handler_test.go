@@ -1029,30 +1029,29 @@ func TestHandler_ConfigErrorIsServerError(t *testing.T) {
 // 连接池必须按网络身份复用：每请求新建会丢掉连接复用，
 // 对高延迟的公益站来说每次都要重新 TLS 握手。
 func TestHandler_ReusesTransportPerUpstream(t *testing.T) {
-	hs := newHarness(t, nil)
-	budget := outbound.RealBudget(testSettings())
-	up := hs.cfg.snap.Upstreams[10]
-
-	tr1, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
+	var remotes []string
+	var guard sync.Mutex
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		guard.Lock()
+		remotes = append(remotes, r.RemoteAddr)
+		guard.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message"}`))
+	})
+	send := func() {
+		t.Helper()
+		if response := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[]}`)); response.Code != 200 {
+			t.Fatalf("status=%d", response.Code)
+		}
 	}
-	tr2, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr1 != tr2 {
-		t.Error("同一 Upstream 应复用同一个 Transport")
-	}
-
-	// 配置变更（尤其 proxy_url）后必须丢弃旧的，否则改了代理不生效
-	hs.h.InvalidateTransport(up.ID)
-	tr3, err := hs.h.TransportFor(up, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tr3 == tr1 {
-		t.Error("InvalidateTransport 后应重建 Transport")
+	send()
+	send()
+	hs.h.InvalidateTransport(10)
+	send()
+	guard.Lock()
+	defer guard.Unlock()
+	if len(remotes) != 3 || remotes[0] != remotes[1] || remotes[1] == remotes[2] {
+		t.Fatalf("actual connections were not reused then invalidated: %v", remotes)
 	}
 }
 
