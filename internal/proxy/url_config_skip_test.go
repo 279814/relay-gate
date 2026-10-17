@@ -16,8 +16,9 @@ import (
 // perUpstreamEndpoints gives each Upstream its own FixedQueryTemplate so one
 // Route can carry a broken URL while its sibling stays healthy.
 type perUpstreamEndpoints struct {
-	base    testEndpoints
-	queries map[int64]string
+	base     testEndpoints
+	queries  map[int64]string
+	bindings map[int64][]model.SecretRevision
 }
 
 func (source perUpstreamEndpoints) Endpoint(ctx context.Context, upstreamID int64,
@@ -28,6 +29,7 @@ func (source perUpstreamEndpoints) Endpoint(ctx context.Context, upstreamID int6
 		return nil, err
 	}
 	endpoint.FixedQueryTemplate = source.queries[upstreamID]
+	endpoint.BoundSecrets = append([]model.SecretRevision(nil), source.bindings[upstreamID]...)
 	return endpoint, nil
 }
 

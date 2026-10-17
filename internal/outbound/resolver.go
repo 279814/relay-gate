@@ -113,6 +113,17 @@ type ResolvedTarget struct {
 	RequestURLHash   string
 	EndpointRevision int64
 	EndpointID       int64
+	CredentialValues ValueResolver `json:"-"`
+	credentialTrace  *credentialValueTrace
+}
+
+// ResolvedSecrets returns actual parsed credentials for this Attempt's existing
+// response/log/sample redaction. It never consults a SecretSource.
+func (target ResolvedTarget) ResolvedSecrets() []string {
+	if target.credentialTrace == nil {
+		return nil
+	}
+	return target.credentialTrace.resolvedSecrets()
 }
 
 // RequestURLHasher 对最终 URL 求带密钥的摘要。由 store.Cipher 实现。
@@ -170,10 +181,29 @@ func (resolver *Resolver) Resolve(ctx context.Context, in ResolveInput) (Resolve
 		return ResolvedTarget{}, urlConfig(err)
 	}
 
-	if in.Endpoint.URLMode == model.EndpointURLLegacyExact {
-		return resolver.resolveLegacy(ctx, in, base, requestHost)
+	switch values := in.Values.(type) {
+	case Values:
+		in.Values = values.WithBindings(in.Endpoint.BoundSecrets)
+	case *Values:
+		if values != nil {
+			in.Values = values.WithBindings(in.Endpoint.BoundSecrets)
+		} else {
+			in.Values = nil
+		}
 	}
-	return resolver.resolveCanonical(ctx, in, base, requestHost)
+	trace := newCredentialValueTrace(in.Values)
+	in.Values = trace
+	var target ResolvedTarget
+	if in.Endpoint.URLMode == model.EndpointURLLegacyExact {
+		target, err = resolver.resolveLegacy(ctx, in, base, requestHost)
+	} else {
+		target, err = resolver.resolveCanonical(ctx, in, base, requestHost)
+	}
+	if err != nil {
+		return ResolvedTarget{}, err
+	}
+	target.CredentialValues, target.credentialTrace = trace, trace
+	return target, nil
 }
 
 func (resolver *Resolver) resolveCanonical(ctx context.Context, in ResolveInput,

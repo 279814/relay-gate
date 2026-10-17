@@ -99,7 +99,26 @@ type Values struct {
 	UpstreamAPIKey     []byte
 	CredentialRevision int64
 	Secrets            SecretSource
+	bindings           map[string]model.SecretRevision
 }
+
+// WithBindings freezes permitted Secret identities for one captured Endpoint.
+// Missing metadata never authorizes a name-based lookup of the latest value.
+func (values Values) WithBindings(bindings []model.SecretRevision) Values {
+	values.bindings = make(map[string]model.SecretRevision, len(bindings))
+	for _, binding := range bindings {
+		if previous, exists := values.bindings[binding.Name]; exists && previous != binding {
+			binding.Resolved = false
+		}
+		values.bindings[binding.Name] = binding
+	}
+	return values
+}
+
+type secretSourceReadError struct{ cause error }
+
+func (e *secretSourceReadError) Error() string   { return "Probe Secret 读取失败" }
+func (e *secretSourceReadError) Unwrap() []error { return []error{ErrSecretSourceRead, e.cause} }
 
 func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedValue, error) {
 	if name == "UPSTREAM_API_KEY" {
@@ -116,18 +135,28 @@ func (values Values) ResolveValue(ctx context.Context, name string) (ResolvedVal
 	}
 	const prefix = "SECRET:"
 	if len(name) > len(prefix) && name[:len(prefix)] == prefix {
+		secretName := name[len(prefix):]
+		binding, ok := values.bindings[secretName]
+		if !ok || !binding.Resolved || binding.ID <= 0 || binding.Revision <= 0 {
+			return ResolvedValue{}, urlConfig(model.WrapValidation("Probe Secret 缺少有效的同代绑定，请重新保存 Endpoint"))
+		}
 		if values.Secrets == nil {
 			return ResolvedValue{}, urlConfig(model.WrapValidation("未配置 Probe Secret 源"))
 		}
-		secret, err := values.Secrets.ResolveProbeSecret(ctx, name[len(prefix):])
+		secret, err := values.Secrets.ResolveProbeSecret(ctx, secretName)
 		if err != nil {
 			// 错误里只带占位符名，不带值：这条错误会流进 last_error 并显示在
 			// 管理界面上（§4.3 的 config_error 路径）。
 			if errors.Is(err, ErrSecretNotFound) {
 				return ResolvedValue{}, urlConfig(model.WrapValidation("Probe Secret %q 不存在", name[len(prefix):]))
 			}
-			return ResolvedValue{}, fmt.Errorf("%w: Probe Secret %q 不可用: %w",
-				ErrSecretSourceRead, name[len(prefix):], err)
+			return ResolvedValue{}, &secretSourceReadError{cause: err}
+		}
+		if secret.ID != binding.ID || secret.Revision != binding.Revision {
+			return ResolvedValue{}, urlConfig(model.WrapValidation("Probe Secret 绑定已过期，请刷新配置后重试"))
+		}
+		if len(secret.Plain) < model.MinRedactableKeyLen {
+			return ResolvedValue{}, urlConfig(model.WrapValidation("Probe Secret 短于安全脱敏下限 %d，不能用于实际出站，请更新 Secret", model.MinRedactableKeyLen))
 		}
 		return ResolvedValue{Plain: secret.Plain, Revision: secret.Revision}, nil
 	}

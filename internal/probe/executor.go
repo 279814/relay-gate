@@ -673,7 +673,7 @@ func (e *Executor) finishSuccessPath(ctx context.Context, req ExecutionRequest, 
 	decision Decision, timing sendTiming, requestBytes, responseBytes, estInputTokens int64,
 	expectedCancel bool, sentAt time.Time) (ExecutionResult, error) {
 
-	decision = redactDecisionDetail(decision, req.Upstream)
+	decision = redactDecisionDetail(decision, req.Upstream, prepared.redactSecrets...)
 	outcome := e.decisionOutcome(req, decision)
 	outcome.Sent = true
 	outcome.Status = decision.StatusCode
@@ -1043,11 +1043,15 @@ func retryAfterDuration(decision Decision, now time.Time) time.Duration {
 // structuredIdentifier 的字符白名单只挡散文：key 本身就是 [A-Za-z0-9_.-]，
 // 上游把它整段回显进 error.type/code/param 时会原样进详情，继而进
 // probe_execution、能力/可达性行、健康视图和管理 API。
-func redactDecisionDetail(decision Decision, up *model.Upstream) Decision {
-	if up == nil || decision.RedactedDetail == "" {
+func redactDecisionDetail(decision Decision, up *model.Upstream, usedSecrets ...string) Decision {
+	if decision.RedactedDetail == "" {
 		return decision
 	}
-	decision.RedactedDetail = sample.RedactDiagnosticText(decision.RedactedDetail, []string{up.APIKey})
+	keys := append([]string(nil), usedSecrets...)
+	if up != nil {
+		keys = append(keys, up.APIKey)
+	}
+	decision.RedactedDetail = sample.RedactDiagnosticText(decision.RedactedDetail, keys)
 	return decision
 }
 

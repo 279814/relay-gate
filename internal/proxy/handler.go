@@ -300,9 +300,13 @@ func (h *Handler) outboundHeaders(r *http.Request, cand *router.Candidate,
 	target outbound.ResolvedTarget, proto model.Protocol) (http.Header, error) {
 
 	header := PrepareOutboundHeaders(r.Header, proto)
+	values := target.CredentialValues
+	if values == nil {
+		values = h.authValues(cand)
+	}
 	err := outbound.ApplyAuth(r.Context(), header, outbound.AuthInput{
 		Profile: target.AuthProfile,
-		Values:  h.authValues(cand),
+		Values:  values,
 		Use:     outbound.ResolveRealForward,
 	})
 	if err != nil {
