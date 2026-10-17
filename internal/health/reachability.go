@@ -37,9 +37,8 @@ func NewReachabilityTracker(settings SettingsSource) *ReachabilityTracker {
 // ApplyCommitted 仅在 CommitProbeObservation 返回 ApplyCurrent 后调用。
 //
 // CAS：同 token 时只接受更大（或相等时保留已有）order，回调返回顺序反转
-// 也不能让旧行盖住新行。token 不同表示新 incarnation（含 Mark* 等用
-// UnixMilli 占位 order 的旁路写入之后，sequencer 提交的新 token），即使
-// order 更低也必须替换，否则新行会输给上一 incarnation 留下的更高 order。
+// 也不能让旧行盖住新行。token 不同表示新的网络或策略身份，即使
+// order 更低也必须替换，否则新行会输给上一身份留下的更高 order。
 // 空 ObservationToken 的旁路占位不得覆盖已有非空 token；非空 token 仍可
 // 替换空占位。
 //

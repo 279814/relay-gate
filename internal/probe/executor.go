@@ -4,13 +4,9 @@ package probe
 //
 // 它把探活主链收敛成唯一一条路径：admission → 准备（解析/渲染/认证）→
 // 单次 RoundTrip → 按 Clock 分阶段读流 → 用 ResponseClassifier 归约成 Decision →
-// 展平进 ProbeExecution 并交给 recorder 落库。L1/L2/ProbeNow 与将来的真实流量
-// 旁路都走这一条，所以「探活到底发了什么、看到了什么」只有一个答案。
-//
-// 为什么不复用旧 Prober.L1/L2 的发送段：那两段各自拼请求、各自读流、各自
-// 把结果映射成 health.Verdict，而 §4.6 要的是一个带**作用范围**的 Decision。
-// 本执行器只产出 Decision（+ 一份供 P0-10 之前的 health.Tracker 消费的
-// 兼容 Outcome 映射），状态推进留给 P0-10 的 Registry。
+// 展平进 ProbeExecution 并交给 recorder 原子落库。定时、人工测试和校准
+// 共享这一执行单元；真实流量观察复用 Decoder、Classifier 与 ResultRecorder。
+// Decision 的作用范围与事务 disposition 决定 Registry/RouteHealth 更新。
 //
 // 时间只从注入的 Clock 取（§4.6/§7.4）：阶段超时、绝对时间戳、Retry-After
 // 的 headerAt 必须同一口径，否则「同一次响应」会在 execution 行里出现互相

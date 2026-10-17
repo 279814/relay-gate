@@ -36,7 +36,7 @@ func (s *retentionStoreSpy) PruneProbeCostHistory(ctx context.Context, now time.
 
 func TestRetentionJanitorBoundsEachCallAndStopsBeforeWorkOnShutdown(t *testing.T) {
 	spy := &retentionStoreSpy{}
-	j := NewRetentionJanitor(spy, discardLog())
+	j := NewRetentionJanitor(spy, discardLogger())
 	j.now = func() time.Time { return time.Date(2026, 10, 18, 8, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)) }
 	j.once(context.Background())
 	if len(spy.calls) != 3 {
@@ -68,7 +68,7 @@ func (s *blockingRetentionStore) PruneProbeExecutions(ctx context.Context, _ tim
 
 func TestRetentionJanitorShutdownCancelsActivePrune(t *testing.T) {
 	st := &blockingRetentionStore{started: make(chan struct{})}
-	j := NewRetentionJanitor(st, discardLog())
+	j := NewRetentionJanitor(st, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})

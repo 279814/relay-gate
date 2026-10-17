@@ -2,10 +2,7 @@ package probe
 
 // Recipe 解析结果真的被用来发请求（P0-05 第 11 条的后半）。
 //
-// 为什么这一组必须存在：四级解析在 P0-05 就交付了，但直到本轮之前
-// **没有任何生产调用方** —— Prober 仍在硬拼 body 与头。那种状态下 recipe
-// 的全部测试都是绿的，而用户配的配方对探活毫无影响。这里的断言全部落在
-// 「上游实际收到了什么」上，所以它证明的是那条链路接通了。
+// 断言落在上游实际收到的请求上，确保四级配方解析结果参与唯一的准备路径。
 
 import (
 	"bytes"
@@ -283,14 +280,7 @@ func TestL2_WithoutResolverFailsClosed(t *testing.T) {
 
 // 未装配出站目标解析器时，两级探活都以配置错误结束而**不是 panic**。
 //
-// Prober.Targets 的文档承诺「为 nil 时探活直接失败而不是自己拼一个」，理由是
-// 探活打的地址必须与真实请求完全一致。P0-06 之前这道检查在 Prober.resolve 里，
-// 随那个函数一起被删掉了 —— 于是承诺变成了一次空指针解引用。
-//
-// 为什么这条值得单独钉：探活跑在 Scheduler 起的 goroutine 里，那里没有
-// recover，一个 nil Targets 会**带崩整个网关进程**。而它是可达的 ——
-// probe.Prober 是导出类型，字段也是导出的（crosspath_test 就直接构造它），
-// 装配时漏一个 WithTargets 就是这个形态。
+// Scheduler goroutine中的依赖缺失必须返回配置错误，不能造成空指针崩溃。
 func TestProbeWithoutTargetsFailsAsConfigErrorNotPanic(t *testing.T) {
 	prober := &executorProbeHarness{Transport: http.DefaultTransport, Recipes: builtinOnlyResolver()}
 	upstream := upstreamFor("http://127.0.0.1:1")
