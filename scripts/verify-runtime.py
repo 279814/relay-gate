@@ -170,6 +170,13 @@ class Runtime:
         with closing(sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True, timeout=2)) as database:
             return database.execute(query, args).fetchall()
 
+    def seed(self, upstream_port):
+        upstream = self.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{upstream_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy"}, 201)
+        model = self.api("POST", "/model-names", {"name": "runtime-model", "protocol": "anthropic"}, 201)
+        self.api("POST", "/routes", {"upstream_id": upstream["id"], "model_name_id": model["id"], "priority": 1, "weight": 100}, 201)
+        body = {"model": "runtime-model", "messages": [{"role": "user", "content": PRIVATE}], "stream": True}
+        return upstream, body
+
 
 def verify(binary):
     with tempfile.TemporaryDirectory(prefix="relay-runtime-verify-") as directory:
@@ -182,10 +189,7 @@ def verify(binary):
             runtime.start()
             assert runtime.sql("SELECT version FROM schema_version") == [(8,)]
             assert runtime.request("GET", "/admin/api/upstreams", auth=False)[0] == 401
-            upstream = runtime.api("POST", "/upstreams", {"name": "runtime-fixture", "base_url": f"http://127.0.0.1:{remote.server_port}", "api_key": "fixture-upstream-credential", "probe_mode": "lazy"}, 201)
-            model = runtime.api("POST", "/model-names", {"name": "runtime-model", "protocol": "anthropic"}, 201)
-            runtime.api("POST", "/routes", {"upstream_id": upstream["id"], "model_name_id": model["id"], "priority": 1, "weight": 100}, 201)
-            body = {"model": "runtime-model", "messages": [{"role": "user", "content": PRIVATE}], "stream": True}
+            upstream, body = runtime.seed(remote.server_port)
             for mode, expected in (("complete", SEMANTIC + END), ("partial", SEMANTIC), ("gzip", gzip.compress(SEMANTIC + END, mtime=0))):
                 MockUpstream.mode = mode
                 status, wire, _ = runtime.request("POST", "/v1/messages", body, proxy=True)

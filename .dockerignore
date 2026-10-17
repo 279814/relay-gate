@@ -31,6 +31,8 @@ scripts/*.local.*
 docs/02-上游能力矩阵.md
 .local/p0/
 .vs/
+**/__pycache__
+**/*.pyc
 
 # 冒烟脚本的运行产物
 *-gate.log
