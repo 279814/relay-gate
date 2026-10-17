@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
@@ -592,6 +593,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			}
 		}
 	}
+	// Edge identity is local metadata even if a published transform tries to
+	// reintroduce it after the inbound blacklist was applied.
+	edge.StripForwardingHeaders(outHeader)
 	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)

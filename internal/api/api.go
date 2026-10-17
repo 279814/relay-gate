@@ -79,6 +79,7 @@ type Server struct {
 	mutations                    mutationAdmission
 	rotationQuiesce              func(context.Context) (func(), error)
 	masterKeyEnvironmentOverride bool
+	publicHTTPSStatusFile        string
 
 	// adminPW 由 Routes 装配时写入（环境变量明文，旧部署兼容）。
 	// adminHash 来自 data/secrets/ Argon2id（§12.5）；登录与 Bearer 两条路径共用。

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/credential"
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/runstate"
@@ -229,7 +230,7 @@ func (s *Server) postResetAdminPassword(w http.ResponseWriter, r *http.Request) 
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: edge.IsHTTPS(r),
 		MaxAge: int(sessionTTL.Seconds()),
 	})
 	w.Header().Set("Cache-Control", "no-store")

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/sample"
 )
@@ -21,10 +22,7 @@ var hopByHopHeaders = model.HopByHopHeaders
 //
 // 黑名单透传会把 Cookie 原样带给上游；会话令牌只属于本进程，绝不能
 // 离开网关。只剥这一颗，其它 Cookie 继续透传 —— 不做通用 Cookie 策略。
-const gatewaySessionCookie = "relay_session"
-
-// edgeMetadataHeaders 是 docs/01 点名的边缘内部元数据头，出站前一律剥离。
-var edgeMetadataHeaders = []string{"X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Proto"}
+const gatewaySessionCookie = edge.SessionCookieName
 
 // PrepareOutboundHeaders 构造出站请求头。
 //
@@ -78,15 +76,9 @@ func PrepareOutboundHeaders(in http.Header, proto model.Protocol) http.Header {
 	// 不放进 AuthHeaders：那份清单是 upstream API key 位置，ApplyAuth 会
 	// 按它重写；管理口令不是上游凭据，只删不写。
 	skip["X-Admin-Password"] = true
-	// 边缘 Nginx 写入的客户端地址 / 原始协议是内部元数据（§6.1、§12.2），
-	// 必须在出站前删除，不得泄露给上游。
-	for _, h := range edgeMetadataHeaders {
-		skip[h] = true
-	}
-
 	for k, vs := range in {
 		ck := http.CanonicalHeaderKey(k)
-		if skip[ck] || connTokens[ck] {
+		if skip[ck] || connTokens[ck] || edge.IsForwardingHeader(ck) {
 			continue
 		}
 		// 复制切片而不是共享底层数组：出站头若被后续修改，
