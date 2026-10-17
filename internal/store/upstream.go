@@ -332,11 +332,24 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 // re-home onto the internal holder in the same transaction as the delete so a
 // rollback cannot leave recipes detached from a still-living Upstream, and so a
 // later row that reuses the id cannot inherit the old published body.
-func (s *Store) DeleteUpstream(id int64) (err error) {
+func (s *Store) DeleteUpstream(id int64) error {
+	return s.deleteUpstream(context.Background(), id, 0)
+}
+
+// DeleteUpstreamWithRevision rejects a stale administrator view in the same
+// transaction as detaching references and deleting the row.
+func (s *Store) DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return model.WrapValidation("expected_revision 必须为正数")
+	}
+	return s.deleteUpstream(ctx, id, expectedRevision)
+}
+
+func (s *Store) deleteUpstream(ctx context.Context, id, expectedRevision int64) (err error) {
 	if id < 1 {
 		return ErrNotFound
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -346,12 +359,16 @@ func (s *Store) DeleteUpstream(id int64) (err error) {
 		}
 	}()
 
-	var exists int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM upstream WHERE id=?`, id).Scan(&exists); err != nil {
+	var revision int64
+	err = tx.QueryRowContext(ctx, `SELECT revision FROM upstream WHERE id=?`, id).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
-	if exists == 0 {
-		return ErrNotFound
+	if expectedRevision > 0 && revision != expectedRevision {
+		return ErrRevisionConflict
 	}
 
 	if err = ensureRecipeArchiveHolderTx(tx); err != nil {

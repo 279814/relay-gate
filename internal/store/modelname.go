@@ -213,8 +213,21 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 // way) would leave published rows keyed by the numeric route id for SQLite
 // reuse. Archive + re-home onto each Route's Upstream in the same transaction
 // as the delete; upstream-scoped recipes are untouched.
-func (s *Store) DeleteModelName(id int64) (err error) {
-	tx, err := s.db.Begin()
+func (s *Store) DeleteModelName(id int64) error {
+	return s.deleteModelName(context.Background(), id, 0)
+}
+
+// DeleteModelNameWithRevision rejects a stale administrator view in the same
+// transaction as detaching references and deleting the row.
+func (s *Store) DeleteModelNameWithRevision(ctx context.Context, id, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return model.WrapValidation("expected_revision 必须为正数")
+	}
+	return s.deleteModelName(ctx, id, expectedRevision)
+}
+
+func (s *Store) deleteModelName(ctx context.Context, id, expectedRevision int64) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -224,12 +237,16 @@ func (s *Store) DeleteModelName(id int64) (err error) {
 		}
 	}()
 
-	var exists int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM model_name WHERE id=?`, id).Scan(&exists); err != nil {
+	var revision int64
+	err = tx.QueryRowContext(ctx, `SELECT revision FROM model_name WHERE id=?`, id).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
-	if exists == 0 {
-		return ErrNotFound
+	if expectedRevision > 0 && revision != expectedRevision {
+		return ErrRevisionConflict
 	}
 
 	rows, err := tx.Query(`SELECT id, upstream_id FROM route WHERE model_name_id=?`, id)
