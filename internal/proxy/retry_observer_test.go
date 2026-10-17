@@ -41,6 +41,18 @@ func TestRetry_KeepAndPanicAdviceNeverReplaysStructured200(t *testing.T) {
 	}
 }
 
+func TestRetryMissingObservationNeverFallsBackToRetiredPayloadParser(t *testing.T) {
+	body := `{"error":{"type":"server_error","message":"keep original"}}`
+	hs := newMultiHarness(t, respondStatus(200, body), respondOK(`{"id":"must-not-replay"}`))
+	hs.cfg.settings.RetryPolicy = model.RetryPolicyAggressive
+	hs.h.observers = nil
+	response := hs.serve(hs.req())
+	if response.Body.String() != body {
+		t.Fatalf("missing observer replayed a structured 200: %s", response.Body.String())
+	}
+	hs.assertHits(t, 1, 0)
+}
+
 type targetRecordingFactory struct{ targets []health.AttemptTarget }
 
 func (factory *targetRecordingFactory) PrepareAttempt(_ context.Context, target health.AttemptTarget, _ health.AttemptRequestView) health.AttemptInstrumentation {

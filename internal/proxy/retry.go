@@ -714,19 +714,19 @@ func (h *Handler) nextCandidate(r *http.Request, pre *preambleResult,
 	return cand
 }
 
-// retryableAttempt 在旧 classifyPayload 之上叠加 P0-13 RetryDecider 与 P1 RetryPolicy。
+// retryableAttempt combines the shared RetryAdvice with transport/status policy.
 func (h *Handler) retryableAttempt(r *http.Request, la *liveAttempt, policy model.RetryPolicy) bool {
 	if la == nil || la.at == nil {
 		return false
 	}
-	// With observation installed, payload replay belongs solely to its bounded
-	// structured parser. A failed/no-op decider must not fall back to heuristics.
-	if res := la.at.Result(); h.observers != nil && res != nil && res.Err == nil && res.Status >= 200 && res.Status < 300 {
-		if policy.Normalize() != model.RetryPolicyAggressive || la.instr.Retry == nil {
-			return false
-		}
+	// Payload replay belongs solely to the bounded Decoder/Classifier advice.
+	// Missing observation, a failed or no-op decider must always keep the attempt.
+	if res := la.at.Result(); res != nil && res.Err == nil && res.Status >= 200 && res.Status < 300 {
 		prefix := la.at.Peek()
 		if res.Err == nil {
+			if policy.Normalize() != model.RetryPolicyAggressive || la.instr.Retry == nil {
+				return false
+			}
 			return safeRetryAdvice(la.instr.Retry, r.Context(), res.Status, res.RespHeaders, prefix).Disposition == health.RetryTryNextRoute
 		}
 	}
@@ -866,26 +866,8 @@ func retryable(at *Attempt) bool {
 		return false
 	}
 
-	// 2xx：要看载荷才知道（§3.5 的「200 但流内立刻 error」）。
-	// 判据必须保守，见 errorpayload.go 的开头：拿不准一律放行，因为误判的
-	// 代价是丢掉一个已经生成好的答案，而且它不报错、只表现为「偶尔慢一倍」。
-	ct := ""
-	if h := at.Result().RespHeaders; h != nil {
-		ct = h.Get("Content-Type")
-	}
-	verdict := classifyPayload(at.Peek(), ct)
-
-	// Peek **自己**可能失败：上游回了响应头却迟迟不吐 body（首 Token 超时），
-	// 或者吐了头就断开。那时 Err 是刚刚才填上的，所以必须在预读之后再读
-	// 一次 —— 只在函数开头读一次的话，这一整类故障永远等不到重试，
-	// 而「响应头回得很快、body 一个字节都不来」正是公益站最常见的挂法。
-	if err := at.Result().Err; err != nil {
-		if errors.Is(err, ErrUpstreamBroke) {
-			return false
-		}
-		return IsUpstreamFault(err)
-	}
-	return verdict == payloadError
+	// A 2xx payload is never classified by the proxy transport/status path.
+	return false
 }
 
 func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
