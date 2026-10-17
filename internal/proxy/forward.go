@@ -121,7 +121,6 @@ type Result struct {
 	// Raw transport failure remains distinguishable from a local transform error.
 	upstreamReadErr error
 
-	ProtocolError      bool
 	ObserverIncomplete model.ObserverIncompleteReason
 
 	// SemanticSeen and FirstSemanticAt come only from original upstream wire.

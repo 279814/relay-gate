@@ -187,6 +187,100 @@ func TestPeekWindowActuallyFlushesHeadersBeforeFirstBodyByte(t *testing.T) {
 	}
 }
 
+func TestPeekWindowWithResponseTransformsFlushesDecidableHeaders(t *testing.T) {
+	for _, mode := range []string{"json-header", "sse-header", "sse-rewrite", "gzip-header", "gzip-rewrite", "br-rewrite", "gzip-split-header"} {
+		t.Run(mode, func(t *testing.T) {
+			ct, body := "application/json", []byte(`{"content":[{"type":"text","text":"late"}]}`)
+			if mode != "json-header" {
+				ct = "text/event-stream"
+				body = []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n")
+			}
+			if strings.HasPrefix(mode, "gzip-") {
+				body = gzipBody(t, body)
+			}
+			if mode == "br-rewrite" {
+				body = brotliBody(body)
+			}
+			release := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", ct)
+				if strings.HasPrefix(mode, "gzip-") {
+					w.Header().Set("Content-Encoding", "gzip")
+				}
+				if mode == "br-rewrite" {
+					w.Header().Set("Content-Encoding", "br")
+				}
+				remaining := body
+				if mode == "gzip-split-header" {
+					_, _ = w.Write(body[:1])
+					remaining = body[1:]
+				}
+				w.(http.Flusher).Flush()
+				select {
+				case <-release:
+					_, _ = w.Write(remaining)
+				case <-r.Context().Done():
+				}
+			}))
+			defer up.Close()
+			rules := []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Transformed", Value: "1"}}
+			if strings.HasSuffix(mode, "rewrite") || mode == "gzip-split-header" {
+				rules = append(rules, transform.Rule{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "late", To: "late-rewritten"})
+			}
+			compiled, err := transform.Compile(transform.Version{Rules: rules})
+			if err != nil {
+				t.Fatal(err)
+			}
+			to := RealTimeouts(model.DefaultSettings())
+			to.PeekWait = 20 * time.Millisecond
+			to.FirstToken = time.Second
+			to.Total = 2 * time.Second
+			f := testForwarder(t, to)
+			gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				at := f.Send(r.Context(), "POST", up.URL, http.Header{"Accept-Encoding": {"identity"}}, nil)
+				_ = at.Peek()
+				at.CommitTransformed(w, compiled, nil)
+			}))
+			defer gate.Close()
+			got := make(chan *http.Response, 1)
+			failed := make(chan error, 1)
+			go func() {
+				req, _ := http.NewRequest("GET", gate.URL, nil)
+				req.Header.Set("Accept-Encoding", "identity")
+				res, err := http.DefaultClient.Do(req)
+				if err != nil {
+					failed <- err
+				} else {
+					got <- res
+				}
+			}()
+			var response *http.Response
+			select {
+			case response = <-got:
+			case err := <-failed:
+				close(release)
+				t.Fatal(err)
+			case <-time.After(300 * time.Millisecond):
+				close(release)
+				t.Fatal("response transform delayed decidable headers past the peek window")
+			}
+			close(release)
+			defer response.Body.Close()
+			output, err := io.ReadAll(response.Body)
+			if err != nil || response.Header.Get("X-Transformed") != "1" {
+				t.Fatalf("headers=%v err=%v", response.Header, err)
+			}
+			if mode == "gzip-header" {
+				if string(output) != string(body) {
+					t.Fatal("header-only transform changed compressed wire")
+				}
+			} else if !strings.Contains(string(output), "late") {
+				t.Fatalf("late body lost: %q", output)
+			}
+		})
+	}
+}
+
 func TestTransformOutputCannotManufactureForwardSemanticEvidence(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sse"}[stream], func(t *testing.T) {

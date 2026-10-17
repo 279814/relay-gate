@@ -14,6 +14,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/proxy"
+	"github.com/279814/relay-gate/internal/transform"
 	"github.com/andybalholm/brotli"
 )
 
@@ -180,5 +181,57 @@ func TestTrafficProgressHTTP_CapacityFallbackStillHonorsFirstByteLimit(t *testin
 	res, out := forwardWithTrafficProgress(t, h, proxy.Timeouts{FirstToken: 40 * time.Millisecond, Idle: 20 * time.Millisecond, Total: time.Second})
 	if !errors.Is(res.Err, proxy.ErrFirstTokenTimeout) || len(out) != 0 {
 		t.Fatalf("observer capacity disabled first-byte bound: %+v %x", res, out)
+	}
+}
+
+func TestTrafficProgressHTTP_BadGzipSSETransformStopsCommittedStream(t *testing.T) {
+	for _, policy := range []string{transform.FailOpen, transform.FailClosed} {
+		t.Run(policy, func(t *testing.T) {
+			h := newTrafficHTTPHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Content-Encoding", "gzip")
+				_, _ = io.WriteString(w, "invalid gzip upstream bytes")
+			})
+			endpoint, err := h.store.Endpoint(context.Background(), h.up.ID, model.EndpointMessages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reg := transform.NewRegistry(8)
+			set, err := reg.CreateSet("bad-gzip-sse")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = reg.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSSEMatch, Match: "content_block_delta", From: "raw", To: "rewritten"}}, transform.FailClosed, policy, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err = reg.PublishSnapshot(set.ID, h.route.ID, endpoint.ID); err != nil {
+				t.Fatal(err)
+			}
+			h.handler.WithTransforms(reg)
+			if body := h.request(t); len(body) != 0 {
+				t.Fatalf("postcommit decoder failure inserted local JSON or bad original bytes: %q", body)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err = h.manager.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			exec := h.execution(t)
+			if exec.Success || !exec.ObserverIncomplete {
+				t.Fatalf("malformed compressed input was promoted to success: %+v", exec)
+			}
+			if row := h.caps.Snapshot(model.RecipeScopeRoute, h.route.ID, model.EndpointMessages); row != nil && row.LastRealOKAt != 0 {
+				t.Fatal("bad compressed input created piggyback evidence")
+			}
+			failed := false
+			for _, execution := range reg.ListExecutions(0) {
+				if execution.Phase == "sse" && !execution.OK && execution.FailPolicyUsed == policy {
+					failed = true
+				}
+			}
+			if !failed {
+				t.Fatal("postcommit stream setup failure was not recorded under the selected policy")
+			}
+		})
 	}
 }
