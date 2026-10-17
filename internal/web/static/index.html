@@ -254,7 +254,7 @@
             </div>
             <table>
               <thead>
-                <tr><th>名称</th><th>地址</th><th>鉴权</th><th>Key</th><th>L1 路径</th>
+                <tr><th>名称</th><th>地址</th><th>Key</th>
                     <th title="各 Route 的 count_tokens Capability；Route 之间不一致时显示 mixed">count_tokens</th>
                     <th>状态</th><th></th></tr>
               </thead>
@@ -263,9 +263,7 @@
                   <tr>
                     <td x-text="u.name"></td>
                     <td class="wrap mono" x-text="u.base_url"></td>
-                    <td class="nowrap" x-text="u.auth_style"></td>
                     <td class="mono dim" x-text="u.api_key_is_set ? u.api_key : '未设置'"></td>
-                    <td class="mono dim" x-text="u.l1_path || '（仅握手）'"></td>
                     <td class="count-tokens-cell" :data-upstream-id="u.id">
                       <span class="tag" :class="countTokensClass(countTokensPosture(u.id).state)"
                             :data-ct-state="countTokensPosture(u.id).state"
@@ -290,7 +288,7 @@
                   </tr>
                 </template>
                 <tr x-show="!upstreams.length">
-                  <td colspan="8" class="empty">还没有上游站点。</td>
+                  <td colspan="6" class="empty">还没有上游站点。</td>
                 </tr>
               </tbody>
             </table>
@@ -1659,33 +1657,10 @@
                    x-text="`当前：${upForm.api_key_masked}。留空保存则保持不变`"></div>
               <div class="note">加密存储（AES-GCM），界面只回显脱敏值</div>
             </div>
-            <div class="row">
-              <div class="field">
-                <label>旧版全局鉴权方式（修改会覆盖全部 Endpoint）</label>
-                <select x-model="upForm.auth_style" :disabled="!upForm.id">
-                  <option value="auto">auto（两个头都发）</option>
-                  <option value="x-api-key">x-api-key</option>
-                  <option value="bearer">bearer</option>
-                </select>
-              </div>
-              <div class="field">
-                <label>L1 探活路径</label>
-                <input x-model="upForm.l1_path" class="mono" placeholder="/v1/models">
-                <div class="note">留空则只做 TCP/TLS 握手探测</div>
-              </div>
-            </div>
+            <p class="note" x-show="upForm.id">在「配方」页逐个编辑 Endpoint URL 与鉴权；探活请求形状通过 Recipe 编辑、测试和发布。</p>
             <div class="field">
               <label>代理地址（可选）</label>
               <input x-model="upForm.proxy_url" class="mono" placeholder="http://127.0.0.1:1080">
-            </div>
-            <div class="field">
-              <label>探活头覆盖（JSON，可选）</label>
-              <textarea x-model="upForm.probe_headers_raw" class="mono"
-                        placeholder='{"user-agent": "claude-cli/2.1.220"}'></textarea>
-              <div class="note">
-                空值表示删掉该头。不能放鉴权头 —— key 由上面的 api_key 统一注入。
-                改这个的正确方式是从「样本」页一键导入，手写等于猜。
-              </div>
             </div>
             <div class="row">
               <div class="field">
@@ -1709,7 +1684,6 @@
             </div>
             <div class="row">
               <label class="check"><input type="checkbox" x-model="upForm.enabled"> 启用</label>
-              <label class="check" x-show="upForm.id"><input type="checkbox" x-model="upForm.full_url_mode"> full_url_mode（兼容旧完整地址；新端点请逐项配置 URL）</label>
         <template x-if="!upForm.id">
         <section>
           <h4>五类初始端点</h4>

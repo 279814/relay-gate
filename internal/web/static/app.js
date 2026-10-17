@@ -498,9 +498,7 @@ function app() {
     editUp(u) {
       if (!u) {
         this.upForm = {
-          name: '', base_url: '', api_key: '', auth_style: 'auto',
-          l1_path: '/v1/models', proxy_url: '', enabled: true,
-          full_url_mode: false, probe_headers_raw: '',
+          name: '', base_url: '', api_key: '', proxy_url: '', enabled: true,
       probe_mode: 'active', host_override: '', tls_server_name: '',
       initial_endpoints: ['models', 'messages', 'responses', 'chat_completions', 'count_tokens'].map(endpoint => ({endpoint, url_override: '', fixed_query_template: '', auth_profile: {mode: endpoint === 'messages' || endpoint === 'count_tokens' ? 'x_api_key' : 'header_bearer', secret_ref: 'upstream_api_key'}})),
         };
@@ -512,32 +510,15 @@ function app() {
         ...u,
         api_key: '',
         api_key_masked: u.api_key,
-        probe_headers_raw: u.probe_headers ? JSON.stringify(u.probe_headers, null, 2) : '',
       };
     },
 
     async saveUp() {
       const f = this.upForm;
 
-      // probe_headers 在界面上是一段文本，存进去必须是对象。
-      // 解析失败要当场说清楚是哪儿错了 —— 让它带着一段坏 JSON 提交，
-      // 后端只会回一个笼统的「请求体不是合法 JSON」，指不到这个字段。
-      let headers;
-      try {
-        headers = f.probe_headers_raw.trim() ? JSON.parse(f.probe_headers_raw) : {};
-      } catch (e) {
-        this.err = '探活头不是合法 JSON：' + e.message;
-        return;
-      }
-      if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
-        this.err = '探活头必须是一个 JSON 对象，例如 {"user-agent": "claude-cli/2.1.220"}';
-        return;
-      }
-
       const body = {
-        name: f.name, base_url: f.base_url, auth_style: f.auth_style,
-        l1_path: f.l1_path, proxy_url: f.proxy_url, enabled: f.enabled,
-        full_url_mode: f.full_url_mode, probe_headers: headers,
+        name: f.name, base_url: f.base_url,
+        proxy_url: f.proxy_url, enabled: f.enabled,
     probe_mode: f.probe_mode, host_override: f.host_override || '', tls_server_name: f.tls_server_name || '',
       };
     if (!f.id) {
@@ -720,23 +701,15 @@ function app() {
       });
     },
 
-    /* applyHeaders 把导出的头填进对应上游的编辑表单。
-     *
-     * 不直接写库：这份头影响该站所有探活的成败，静默生效的话，
-     * 一次误导出就能让整站判死。让用户看一眼再按保存。
-     */
+    // 安全候选只进入手动配方草稿，测试和发布仍由用户明确操作。
     applyHeaders() {
-      const up = this.upstreams.find(u => u.id === this.hdrExport.upstream_id);
-      if (!up) {
-        this.err = '这条样本对应的上游已被删除，无法填入';
+      if (!this.hdrExport.candidate || typeof this.openSampleRecipeCandidate !== 'function') {
+        this.err = '安全配方候选编辑器尚未就绪，请刷新页面后重试';
         return;
       }
-      this.editUp(up);
-      this.upForm.probe_headers_raw = JSON.stringify(this.hdrExport.headers, null, 2);
+      this.openSampleRecipeCandidate(this.hdrExport.candidate);
       this.sample = null;
       this.hdrExport = null;
-      this.tab = 'upstreams';
-      this.msg = `已填入「${up.name}」的表单，确认后点保存`;
     },
 
     // ── 显示辅助 ─────────────────────────────────────

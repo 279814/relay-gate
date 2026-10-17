@@ -38,6 +38,7 @@ eval(fs.readFileSync(path.join(__dirname, 'static/app.js'), 'utf8'));
   await shell.saveUp();
   assert.equal(calls[0].body.initial_endpoints.length, 5);
   assert.ok(calls[0].body.initial_endpoints.every(ep => ep.auth_profile.mode && ep.auth_profile.secret_ref));
+	for (const field of ['auth_style','l1_path','full_url_mode','probe_headers']) assert.ok(!(field in calls[0].body), 'legacy global field was sent: '+field);
 
   let releaseOld;
   const oldResponse = new Promise(resolve => { releaseOld = resolve; });
