@@ -50,14 +50,16 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
-	if at.f.RespObserver != nil {
-		observer := observerTee{at.f.RespObserver}
-		if len(at.peeked) > 0 {
+	stop := at.watchResponse()
+	defer stop()
+	observer := observerTee{at.f.RespObserver}
+	if len(at.peeked) > 0 {
+		if at.f.RespObserver != nil {
 			_, _ = observer.Write(at.peeked)
 		}
-		at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, readError: &at.res.upstreamReadErr}
-		at.f.RespObserver = nil // transformed/fail-open writes must not duplicate input
+		at.wire.feed(at.peeked, time.Now())
 	}
+	at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, wire: at.wire, readError: &at.res.upstreamReadErr}
 
 	ct := at.resp.Header.Get("Content-Type")
 	if transform.IsSSEContentType(ct) {
@@ -214,13 +216,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
-	// flush 之后再判语义：body 已完整缓冲在 transform 路径，不额外读上游。
-	if res.Status >= 200 && res.Status < 400 &&
-		!IsStructuredErrorPayload(out.Body, out.Header.Get("Content-Type")) &&
-		HasSemanticEvidence(out.Body, out.Header.Get("Content-Type")) {
-		res.SemanticSeen = true
-		res.stampFirstSemantic(f)
-	}
+	at.projectWire()
 	now := time.Now()
 	if n > 0 && res.FirstByteAt.IsZero() {
 		res.FirstByteAt = now
@@ -274,7 +270,7 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 
 	// prefix already includes peeked bytes from readResponseBody; do not replay peeked.
 	src := io.MultiReader(bytes.NewReader(prefix), at.resp.Body)
-	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	n, werr := at.streamBody(w, src, true)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if werr != nil && res.Err == nil {
@@ -427,17 +423,6 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	flusher, canFlush := w.(http.Flusher)
 	var total int64
 	var hitAll []string
-	ct := ""
-	if res.RespHeaders != nil {
-		ct = res.RespHeaders.Get("Content-Type")
-	}
-	if ct == "" && at.resp != nil {
-		ct = at.resp.Header.Get("Content-Type")
-	}
-	var semSniffer *streamSemanticSniffer
-	if res.Status >= 200 && res.Status < 400 {
-		semSniffer = newStreamSemanticSniffer(ct)
-	}
 
 	writeEv := func(ev transform.SSEEvent) error {
 		if len(ev.Raw) == 0 {
@@ -452,13 +437,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		if f.RespTee != nil && wn > 0 {
 			_, _ = f.RespTee.Write(ev.Raw[:wn])
 		}
-		if semSniffer != nil && !semSniffer.Seen() && wn > 0 {
-			semSniffer.Feed(ev.Raw[:wn], ct)
-			if semSniffer.Seen() {
-				res.SemanticSeen = true
-				res.stampFirstSemantic(f)
-			}
-		}
+		at.projectWire()
 		if res.FirstByteAt.IsZero() && wn > 0 {
 			res.FirstByteAt = time.Now()
 		}
@@ -529,7 +508,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			break
 		}
 		if err != nil {
-			res.Err = err
+			res.Err = at.readFailure(err, total)
 			res.BytesWritten = total
 			return res
 		}
@@ -605,7 +584,7 @@ func (at *Attempt) commitSSEEncodedPassthrough(w http.ResponseWriter, compiled *
 	res.Status = hdrOut.Status
 	res.RespHeaders = hdrOut.Header.Clone()
 
-	n, werr := f.streamBody(at.ctx, at.clientCtx, w, src, at.resp.Body, res)
+	n, werr := at.streamBody(w, src, true)
 	res.BytesWritten = n
 	res.DoneAt = time.Now()
 	if werr != nil && res.Err == nil {
@@ -623,7 +602,7 @@ func (at *Attempt) readResponseBody(limit int) ([]byte, error) {
 	// Read limit+1 so ApplyResponse can detect overflow and apply fail policy.
 	_, err := io.Copy(&buf, io.LimitReader(src, int64(limit)+1))
 	if err != nil && err != io.EOF {
-		return buf.Bytes(), err
+		return buf.Bytes(), at.readFailure(err, int64(buf.Len()))
 	}
 	return buf.Bytes(), nil
 }

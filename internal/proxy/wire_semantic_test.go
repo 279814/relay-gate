@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"github.com/279814/relay-gate/internal/model"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,113 +10,113 @@ import (
 	"time"
 )
 
-func TestHasSemanticEvidence_TextDeltaAndHTML(t *testing.T) {
+func TestWireSemantic_TextDeltaAndHTML(t *testing.T) {
 	sseText := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"
-	if !HasSemanticEvidence([]byte(sseText), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(sseText), "text/event-stream") {
 		t.Fatal("non-empty text delta must be semantic evidence")
 	}
 
 	// 正文里拼写 error 的正常 delta 仍是语义证据，不得当失败。
 	sseErrorWord := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"fix spelling\"}}\n\n"
-	if !HasSemanticEvidence([]byte(sseErrorWord), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(sseErrorWord), "text/event-stream") {
 		t.Fatal("text containing the word error must still count as semantic")
 	}
 
 	html := []byte("<!DOCTYPE html><html><body>502 Bad Gateway</body></html>")
-	if HasSemanticEvidence(html, "text/html") {
+	if rawSemanticEvidence(model.ProtoAnthropic, html, "text/html") {
 		t.Fatal("HTML 200 must not count as semantic evidence")
 	}
 
 	chat := []byte(`{"choices":[{"message":{"content":"hello"}}]}`)
-	if !HasSemanticEvidence(chat, "application/json") {
+	if !rawSemanticEvidence(model.ProtoOpenAIChat, chat, "application/json") {
 		t.Fatal("non-stream non-empty model output must be semantic")
 	}
 
 	// 顶层结构化 error 即便带 content/choices/text 伴生字段，也不能当语义成功。
 	errWithContent := []byte(`{"error":{"message":"boom"},"content":[{"type":"text","text":"hi"}]}`)
-	if HasSemanticEvidence(errWithContent, "application/json") {
+	if rawSemanticEvidence(model.ProtoAnthropic, errWithContent, "application/json") {
 		t.Fatal("structured error with content text must not count as semantic")
 	}
 	errWithChoices := []byte(`{"error":{"message":"boom"},"choices":[{"message":{"content":"hi"}}]}`)
-	if HasSemanticEvidence(errWithChoices, "application/json") {
+	if rawSemanticEvidence(model.ProtoOpenAIChat, errWithChoices, "application/json") {
 		t.Fatal("structured error with choices text must not count as semantic")
 	}
 	sseErrWithContent := "data: {\"error\":{\"message\":\"boom\"},\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}\n\n"
-	if HasSemanticEvidence([]byte(sseErrWithContent), "text/event-stream") {
+	if rawSemanticEvidence(model.ProtoAnthropic, []byte(sseErrWithContent), "text/event-stream") {
 		t.Fatal("SSE structured error with content text must not count as semantic")
 	}
 }
 
-func TestHasSemanticEvidence_PositiveUsageAndRefusal(t *testing.T) {
+func TestWireSemantic_PositiveUsageAndRefusal(t *testing.T) {
 	// §8.8：正数 output usage 单独即判活。
 	usageOnly := []byte(`{"type":"message_delta","usage":{"output_tokens":3}}`)
-	if !HasSemanticEvidence(usageOnly, "application/json") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, usageOnly, "application/json") {
 		t.Fatal("positive output_tokens alone must set semantic evidence")
 	}
-	if HasSemanticEvidence([]byte(`{"type":"message_delta","usage":{"output_tokens":0}}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoAnthropic, []byte(`{"type":"message_delta","usage":{"output_tokens":0}}`), "application/json") {
 		t.Fatal("output_tokens:0 must not count as semantic")
 	}
-	if HasSemanticEvidence([]byte(`{"usage":{"completion_tokens":0}}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoOpenAIChat, []byte(`{"usage":{"completion_tokens":0}}`), "application/json") {
 		t.Fatal("completion_tokens:0 must not count as semantic")
 	}
-	if HasSemanticEvidence([]byte(`{"usage":{"input_tokens":9}}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoAnthropic, []byte(`{"usage":{"input_tokens":9}}`), "application/json") {
 		t.Fatal("input_tokens alone must not count as semantic")
 	}
-	if HasSemanticEvidence([]byte(`{"usage":{"prompt_tokens":8,"completion_tokens":0}}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoOpenAIChat, []byte(`{"usage":{"prompt_tokens":8,"completion_tokens":0}}`), "application/json") {
 		t.Fatal("prompt_tokens with zero completion must not count as semantic")
 	}
-	if HasSemanticEvidence([]byte(`{"usage":{"output_tokens":-1}}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoAnthropic, []byte(`{"usage":{"output_tokens":-1}}`), "application/json") {
 		t.Fatal("negative output_tokens must not count as positive")
 	}
 	chatUsage := []byte(`{"choices":[],"usage":{"completion_tokens":3}}`)
-	if !HasSemanticEvidence(chatUsage, "application/json") {
+	if !rawSemanticEvidence(model.ProtoOpenAIChat, chatUsage, "application/json") {
 		t.Fatal("positive completion_tokens on empty choices must be semantic")
 	}
 	responsesUsage := []byte(`{"type":"response.completed","response":{"usage":{"output_tokens":2}}}`)
-	if !HasSemanticEvidence(responsesUsage, "application/json") {
+	if !rawSemanticEvidence(model.ProtoOpenAIResponses, responsesUsage, "application/json") {
 		t.Fatal("nested response.usage output_tokens>0 must be semantic")
 	}
 	sseUsage := "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n"
-	if !HasSemanticEvidence([]byte(sseUsage), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(sseUsage), "text/event-stream") {
 		t.Fatal("SSE positive usage alone must be semantic")
 	}
 
 	// §8.8：非空 refusal delta 单独即判活。
 	refusal := []byte(`{"type":"response.refusal.delta","delta":"no"}`)
-	if !HasSemanticEvidence(refusal, "application/json") {
+	if !rawSemanticEvidence(model.ProtoOpenAIResponses, refusal, "application/json") {
 		t.Fatal("non-empty refusal delta must be semantic")
 	}
 	sseRefusal := "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n"
-	if !HasSemanticEvidence([]byte(sseRefusal), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoOpenAIResponses, []byte(sseRefusal), "text/event-stream") {
 		t.Fatal("SSE non-empty refusal delta must be semantic")
 	}
-	if HasSemanticEvidence([]byte(`{"type":"response.refusal.delta","delta":""}`), "application/json") {
+	if rawSemanticEvidence(model.ProtoOpenAIResponses, []byte(`{"type":"response.refusal.delta","delta":""}`), "application/json") {
 		t.Fatal("empty refusal delta must not count")
 	}
 	chatRefusal := []byte(`{"choices":[{"delta":{"refusal":"no"}}]}`)
-	if !HasSemanticEvidence(chatRefusal, "application/json") {
+	if !rawSemanticEvidence(model.ProtoOpenAIChat, chatRefusal, "application/json") {
 		t.Fatal("chat non-empty refusal field must be semantic")
 	}
 
 	// 结构化 error 优先：即便伴生正数 usage 也不能当语义成功。
 	errWithUsage := []byte(`{"error":{"message":"boom"},"usage":{"output_tokens":9}}`)
-	if HasSemanticEvidence(errWithUsage, "application/json") {
+	if rawSemanticEvidence(model.ProtoAnthropic, errWithUsage, "application/json") {
 		t.Fatal("structured error with usage must not count as semantic")
 	}
 }
 
-func TestHasSemanticEvidence_ThinkingAndToolDeltas(t *testing.T) {
+func TestWireSemantic_ThinkingAndToolDeltas(t *testing.T) {
 	thinking := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n"
-	if !HasSemanticEvidence([]byte(thinking), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(thinking), "text/event-stream") {
 		t.Fatal("non-empty thinking delta must be semantic evidence")
 	}
 	tool := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n"
-	if !HasSemanticEvidence([]byte(tool), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(tool), "text/event-stream") {
 		t.Fatal("non-empty tool/input JSON delta must be semantic evidence")
 	}
 	// 正文仅含字母 error 仍是语义证据，不得当失败。
 	withErrorWord := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"error\"}}\n\n"
-	if !HasSemanticEvidence([]byte(withErrorWord), "text/event-stream") {
+	if !rawSemanticEvidence(model.ProtoAnthropic, []byte(withErrorWord), "text/event-stream") {
 		t.Fatal(`text delta containing "error" must still count as semantic`)
 	}
 }
@@ -319,4 +320,12 @@ func TestCommit_HTML200HasNoSemanticSeen(t *testing.T) {
 	if res.SemanticSeen {
 		t.Fatal("HTML 200 must not set SemanticSeen")
 	}
+}
+
+// Protocol is explicit in every test; production never guesses from a payload.
+func rawSemanticEvidence(proto model.Protocol, body []byte, contentType string) bool {
+	w := newWireEvidence(proto, http.Header{"Content-Type": {contentType}}, nil)
+	w.feed(body, time.Now())
+	w.finish()
+	return !w.snapshot().FirstSemanticAt.IsZero()
 }

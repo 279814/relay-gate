@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/protocol"
+	"testing"
+)
 
 // 这组测试的重心不在「能认出错误」，而在「**不会**把好响应当成错误」。
 //
@@ -8,7 +12,7 @@ import "testing"
 // 表现为「偶尔慢一倍」，几乎不可能被联想到是网关自己丢的。
 // 所以下面反例（must_not_be_error）的数量刻意多于正例。
 
-func TestClassifyPayload_RealErrors(t *testing.T) {
+func TestWirePayload_RealErrors(t *testing.T) {
 	cases := []struct {
 		name string
 		ct   string
@@ -37,7 +41,7 @@ func TestClassifyPayload_RealErrors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyPayload([]byte(c.body), c.ct); got != payloadError {
+			if got := rawProtocolError([]byte(c.body), c.ct); !got {
 				t.Errorf("应判定为错误载荷，得到 %v", got)
 			}
 		})
@@ -45,7 +49,7 @@ func TestClassifyPayload_RealErrors(t *testing.T) {
 }
 
 // 核心防线：这些都**不是**错误，判错了就会丢掉一个好答案。
-func TestClassifyPayload_MustNotBeError(t *testing.T) {
+func TestWirePayload_MustNotBeError(t *testing.T) {
 	cases := []struct {
 		name string
 		ct   string
@@ -123,7 +127,7 @@ func TestClassifyPayload_MustNotBeError(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyPayload([]byte(c.body), c.ct); got == payloadError {
+			if got := rawProtocolError([]byte(c.body), c.ct); got {
 				t.Errorf("不该判成错误载荷 —— %s", c.why)
 			}
 		})
@@ -135,22 +139,40 @@ func TestClassifyPayload_MustNotBeError(t *testing.T) {
 // 这时字节已经在往客户端写了（§3.5：写出字节后禁止重试），
 // 而且丢掉一个「生成到一半才出错」的响应比原样传给客户端更糟 ——
 // 客户端至少能看到已经生成的部分。
-func TestClassifyPayload_ContentBeforeErrorWins(t *testing.T) {
+func TestWirePayload_ContentBeforeErrorWins(t *testing.T) {
 	body := "event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"开始回答"}}` + "\n\n" +
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"
 
-	if got := classifyPayload([]byte(body), "text/event-stream"); got != payloadContent {
+	if got := rawSemanticEvidence(model.ProtoAnthropic, []byte(body), "text/event-stream"); !got {
 		t.Errorf("内容先于错误出现时应判 payloadContent（不可重试），得到 %v", got)
 	}
 }
 
 // 反过来：错误在最前面，就是可重试的那一类。
-func TestClassifyPayload_ErrorBeforeContentIsRetryable(t *testing.T) {
+func TestWirePayload_ErrorBeforeContentIsRetryable(t *testing.T) {
 	body := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
 
-	if got := classifyPayload([]byte(body), "text/event-stream"); got != payloadError {
+	if got := rawProtocolError([]byte(body), "text/event-stream"); !got {
 		t.Errorf("错误先出现应判 payloadError，得到 %v", got)
 	}
+}
+
+func rawProtocolError(body []byte, contentType string) bool {
+	decoder, err := protocol.NewDecoder(protocol.DecoderSpec{Endpoint: model.EndpointMessages, Protocol: model.ProtoAnthropic}, protocol.WireAuto, controlEventLimit, controlInputLimit)
+	if err != nil {
+		return false
+	}
+	events, err := decoder.Feed(body)
+	tail, finishErr := decoder.Finish()
+	if err != nil || finishErr != nil {
+		return false
+	}
+	for _, event := range append(events, tail...) {
+		if event.Kind == protocol.EventRemoteError {
+			return true
+		}
+	}
+	return false
 }

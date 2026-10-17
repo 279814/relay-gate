@@ -8,7 +8,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -367,11 +369,11 @@ func TestCommitSSE_RespTeeRunsAfterLiveFlush(t *testing.T) {
 	w := &flushTrackingWriter{ResponseRecorder: httptest.NewRecorder()}
 	probe := &flushOrderTee{w: w}
 	at := &Attempt{
-		f: &Forwarder{RespTee: probe},
+		f: &Forwarder{RespTee: probe, Protocol: model.ProtoAnthropic, Timeouts: fastTimeouts()},
 		resp: &http.Response{StatusCode: 200,
 			Header: http.Header{"Content-Type": {"text/event-stream"}},
 			Body:   io.NopCloser(strings.NewReader(stream))},
-		res:       &Result{},
+		res:       &Result{SentAt: time.Now()},
 		cancel:    func() {},
 		ctx:       context.Background(),
 		clientCtx: context.Background(),

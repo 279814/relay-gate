@@ -857,7 +857,7 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 		return
 	}
 	// 非流式 message 正文：text 在 content 块数组里，不是字符串字段。
-	// 与真实流量 HasSemanticEvidence 共用 semanticevidence.AnthropicContentSemantic。
+	// 所有流量共用 semanticevidence.AnthropicContentSemantic。
 	if name == "message" || name == "" {
 		if kind, ok := semanticevidence.AnthropicContentSemantic(object["content"]); ok {
 			event.Semantic = true

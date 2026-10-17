@@ -836,7 +836,7 @@ func TestSafeRetryEvidence_NilTraceUsesSentAt(t *testing.T) {
 }
 
 // §11.2: 提交前首响应体字节超时 (ErrFirstTokenTimeout) 仅 Aggressive 换站。
-// 默认 Balanced：一站、网关 504、无第二次 RoundTrip。
+// Balanced：头部失败为504；短窗口未知body则提交原始头，之后只终止、不重发。
 func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 	stallHeader := func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
@@ -879,8 +879,8 @@ func TestRetry_FirstTokenTimeoutFailoverOnlyAggressive(t *testing.T) {
 		shortStages(hs)
 
 		rec := hs.serve(hs.req())
-		if rec.Code != http.StatusGatewayTimeout {
-			t.Fatalf("应回网关 504，得到 %d：%s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Fatalf("§11.5 短窗口未知时提交原始200头，之后仅终止流：%d %q", rec.Code, rec.Body.String())
 		}
 		if strings.Contains(rec.Body.String(), "must-not-reach") {
 			t.Error("Balanced 不应因 Peek 首字节超时换站")

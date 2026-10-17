@@ -26,7 +26,7 @@ func testForwarder(t *testing.T, to Timeouts) *Forwarder {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Forwarder{Transport: tr, Timeouts: to}
+	return &Forwarder{Transport: tr, Timeouts: to, Protocol: model.ProtoAnthropic}
 }
 
 func fastTimeouts() Timeouts {
@@ -170,8 +170,8 @@ type flushRecorder struct {
 func (f *flushRecorder) Flush() { f.flushes++; f.ResponseRecorder.Flush() }
 
 // §6.8 / §8.12：HTTP 200 SSE 在写出内容后出现协议错误事件，不得按 200 判活。
-// Commit 路径必须把错误帧写入 ErrBody，供 classifyReal 拒绝 piggyback。
-func TestCommit_MidStreamSSEErrorCapturesErrBody(t *testing.T) {
+// Commit 保留原始流；健康与重试各自消费同一原始 Decoder 证据。
+func TestCommit_MidStreamSSEErrorPassesThrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -198,19 +198,16 @@ func TestCommit_MidStreamSSEErrorCapturesErrBody(t *testing.T) {
 	if res.Status != 200 {
 		t.Fatalf("status=%d", res.Status)
 	}
-	if len(res.ErrBody) == 0 {
-		t.Fatal("mid-stream SSE error must fill ErrBody for health")
-	}
-	if !IsStructuredErrorPayload(res.ErrBody, "text/event-stream") {
-		t.Fatalf("ErrBody must be structured error, got %q", res.ErrBody)
+	if !rawProtocolError(rec.Body.Bytes(), "text/event-stream") {
+		t.Fatal("mid-stream SSE error must preserve the original structured error")
 	}
 	if !strings.Contains(rec.Body.String(), `"text":"hi"`) {
 		t.Fatalf("client must still receive prior content, body=%q", rec.Body.String())
 	}
 }
 
-// 正文里出现字母 error 的正常 delta 不得填 ErrBody。
-func TestCommit_TextDeltaSpellingErrorLeavesErrBodyEmpty(t *testing.T) {
+// 正文里出现字母 error 的正常 delta 不得变成协议错误。
+func TestCommit_TextDeltaSpellingErrorIsNotProtocolError(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -229,12 +226,13 @@ func TestCommit_TextDeltaSpellingErrorLeavesErrBodyEmpty(t *testing.T) {
 	if at.Failed() {
 		t.Fatalf("Send: %v", at.Result().Err)
 	}
-	res := at.Commit(httptest.NewRecorder())
+	rec := httptest.NewRecorder()
+	res := at.Commit(rec)
 	if res.Err != nil {
 		t.Fatalf("Commit: %v", res.Err)
 	}
-	if len(res.ErrBody) != 0 {
-		t.Fatalf("text spelling \"error\" must not fill ErrBody, got %q", res.ErrBody)
+	if rawProtocolError(rec.Body.Bytes(), "text/event-stream") {
+		t.Fatalf("text spelling \"error\" must not become a protocol error, got %v", rawProtocolError(rec.Body.Bytes(), "text/event-stream"))
 	}
 }
 
@@ -324,16 +322,21 @@ func TestStreamBody_IdleFiredButClientGoneIsCanceled(t *testing.T) {
 	defer clientCancel()
 	ctx := context.Background() // 不随 clientCancel 结束
 
-	f := &Forwarder{Timeouts: fastTimeouts()}
+	f := &Forwarder{Timeouts: fastTimeouts(), Protocol: model.ProtoAnthropic}
 	res := &Result{
 		Status:      200,
+		SentAt:      time.Now(),
 		RespHeaders: http.Header{"Content-Type": []string{"text/event-stream"}},
 	}
 	rec := httptest.NewRecorder()
+	at := &Attempt{f: f, res: res, resp: &http.Response{StatusCode: 200, Body: pr}, ctx: ctx, clientCtx: clientCtx,
+		wire: newWireEvidence(f.Protocol, res.RespHeaders, nil)}
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := f.streamBody(ctx, clientCtx, rec, pr, pr, res)
+		stop := at.watchResponse()
+		defer stop()
+		_, err := at.streamBody(rec, pr, false)
 		errCh <- err
 	}()
 

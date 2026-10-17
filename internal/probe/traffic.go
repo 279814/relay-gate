@@ -324,6 +324,11 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 		stop:       make(chan struct{}),
 		capability: capability,
 	}
+	obs.progress.changes = make(chan struct{}, 1)
+	capability.progress = &obs.progress
+	if !full {
+		obs.progress.fail(model.ObserverCapacity)
+	}
 	if len(request.Body) > 0 || len(request.Header) > 0 {
 		obs.TryRequest(request)
 	}
@@ -363,6 +368,7 @@ type trafficObserver struct {
 	trace      *outbound.AttemptTrace
 	full       bool
 	capability *capabilityTraffic
+	progress   trafficProgress
 
 	mu          sync.Mutex
 	incomplete  model.ObserverIncompleteReason
@@ -381,6 +387,7 @@ type trafficObserver struct {
 func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	defer func() { o.progress.fail(o.incomplete) }()
 	if o.finished || o.incomplete != "" {
 		return false
 	}
@@ -423,6 +430,7 @@ func (o *trafficObserver) TryHeaders(status int, header http.Header, at time.Tim
 func (o *trafficObserver) TryChunk(chunk []byte, at time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	defer func() { o.progress.fail(o.incomplete) }()
 	if o.finished || len(chunk) == 0 {
 		return false
 	}
@@ -505,6 +513,7 @@ func (o *trafficObserver) worker() {
 			o.incomplete = model.ObserverPanic
 			o.mu.Unlock()
 			o.capability.decodeErr = errTrafficObserverPanic
+			o.progress.fail(model.ObserverPanic)
 		}
 		<-o.stop
 		for {
@@ -543,6 +552,9 @@ func (o *trafficObserver) consume(event trafficEvent) {
 		if len(event.chunk) > 0 {
 			o.m.copyBytes.Add(-int64(len(event.chunk)))
 		}
+		if o.capability.decodeErr != nil {
+			o.progress.fail(model.ObserverDecodeFailure)
+		}
 	}()
 	o.capability.consume(event)
 	if event.kind == "headers" && o.capability.decodeErr == nil && o.capability.encoding != "" && o.capability.encoding != "identity" {
@@ -551,7 +563,8 @@ func (o *trafficObserver) consume(event trafficEvent) {
 }
 
 var (
-	_ health.AttemptObserverFactory = (*TrafficObserverManager)(nil)
-	_ health.AttemptObserver        = (*trafficObserver)(nil)
-	_ ProbeSnapshotSource           = (*livecfg.Source)(nil)
+	_ health.AttemptObserverFactory  = (*TrafficObserverManager)(nil)
+	_ health.AttemptObserver         = (*trafficObserver)(nil)
+	_ health.AttemptResponseProgress = (*trafficObserver)(nil)
+	_ ProbeSnapshotSource            = (*livecfg.Source)(nil)
 )

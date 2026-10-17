@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/model"
 )
 
 func prepareInstrumentation(factory health.AttemptObserverFactory, ctx context.Context, target health.AttemptTarget, request health.AttemptRequestView) (instrumentation health.AttemptInstrumentation) {
@@ -52,6 +53,27 @@ func (observer *isolatedObserver) Finish(view health.AttemptFinish) {
 	observer.finish.Do(func() { observer.observer.Finish(view) })
 }
 
+func (observer *isolatedObserver) ResponseProgress() (progress health.ResponseProgress) {
+	progress.Incomplete = model.ObserverPrepareFailure
+	defer func() {
+		if recover() != nil {
+			progress.Incomplete = model.ObserverPanic
+		}
+	}()
+	if source, ok := observer.observer.(health.AttemptResponseProgress); ok {
+		return source.ResponseProgress()
+	}
+	return progress
+}
+
+func (observer *isolatedObserver) ProgressChanges() (changes <-chan struct{}) {
+	defer func() { _ = recover() }()
+	if source, ok := observer.observer.(health.AttemptResponseProgress); ok {
+		return source.ProgressChanges()
+	}
+	return nil
+}
+
 // observerTee is attached after the normal writer/Flush and to discard drains.
 // Observation never changes bytes or propagates a callback failure upstream.
 type observerTee struct{ observer health.AttemptObserver }
@@ -69,6 +91,7 @@ type observedUpstreamBody struct {
 	io.ReadCloser
 	observer  observerTee
 	readError *error
+	wire      *wireEvidence
 }
 
 func (body observedUpstreamBody) Read(p []byte) (int, error) {
@@ -77,7 +100,13 @@ func (body observedUpstreamBody) Read(p []byte) (int, error) {
 		*body.readError = err
 	}
 	if n > 0 {
-		_, _ = body.observer.Write(p[:n])
+		if body.observer.observer != nil {
+			_, _ = body.observer.Write(p[:n])
+		}
+		body.wire.feed(p[:n], time.Now())
+	}
+	if err == io.EOF {
+		body.wire.finish()
 	}
 	return n, err
 }

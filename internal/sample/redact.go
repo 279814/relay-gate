@@ -210,7 +210,7 @@ func RedactCredentialSetCookie(h http.Header, keys []string) {
 //
 // 与 finding Detail / RedactDiagnosticText 共用 security.RedactSecrets：原文、
 // url.QueryEscape、小写 hex 百分号编码、以及 JSON \uXXXX（hex 大小写不敏感）
-// 一并遮掉。不能只做原文 ReplaceAll，否则编码形态会漏进 ErrBody / last_error /
+// 一并遮掉。不能只做原文 ReplaceAll，否则编码形态会漏进 响应诊断 / last_error /
 // count_tokens 日志。
 //
 // 与 RedactBodyKeys / RedactText 一样跳过短于 MinRedactableKeyLen 的 needle
