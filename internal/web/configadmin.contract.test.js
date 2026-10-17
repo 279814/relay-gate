@@ -50,5 +50,23 @@ eval(fs.readFileSync(path.join(__dirname, 'static/app.js'), 'utf8'));
   releaseOld({items: [{id: 1}], next_cursor: ''});
   await oldLoad;
   assert.deepEqual(shell.upstreams.map(row => row.id), [99], 'late page response must not replace the selected filter');
+
+  for (const [edit, save, field] of [['editUp','saveUp','upForm'], ['editMn','saveMn','mnForm'], ['editRt','saveRt','rtForm']]) {
+    shell[edit](null);
+    calls = [];
+    shell.api = async (method, resource, body) => {
+      calls.push({method, resource, body});
+      const error = new Error('activation pending'); error.status = 503;
+      error.data = {persisted: true, resource_id: 44, revision: 1};
+      throw error;
+    };
+    await shell[save]();
+    assert.equal(shell[field].id, 44, field + ' must retain the already committed create ID');
+    assert.equal(shell[field].revision, 1);
+    assert.equal(calls.length, 1, 'pending create must not automatically fetch/adopt another version');
+    await shell[save]();
+    assert.equal(calls[1].method, 'PUT', 'retry must not duplicate the already committed resource');
+    assert.equal(calls[1].body.expected_revision, 1);
+  }
   console.log('ok configadmin client revision, conflict draft, cursor and explicit bundle');
 })().catch(error => { console.error(error); process.exitCode = 1; });
