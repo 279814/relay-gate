@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -123,7 +125,13 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	// only a resolved row supplies an API key for ScanText redaction. Unknown
 	// / empty refs leave Upstream empty — never persist the raw client string
 	// (it can be nearly the whole 1MiB body).
-	upLabel, upKey := s.resolveUpstreamForScan(body.Upstream)
+	upLabel, upKey, lookupErr := s.resolveUpstreamForScan(r.Context(), body.Upstream)
+	if lookupErr != nil {
+		// No raw text may become a finding when the selected site's known
+		// credential cannot be read. Do not log the input or driver error.
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"上游凭据暂不可读，请修复后重试"})
+		return
+	}
 	var keys []string
 	if upKey != "" {
 		keys = append(keys, upKey)
@@ -147,29 +155,30 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 
 // resolveUpstreamForScan resolves body.upstream as id or name. On hit it
 // returns a canonical label (name, else decimal id) and the decrypted API key.
-// Empty / missing store / unknown → "", "" (caller must not invent a key or
-// store the raw ref).
-func (s *Server) resolveUpstreamForScan(ref string) (label, apiKey string) {
+// Empty / missing store / unknown has no identity (never store the raw ref).
+// A selected credential read failure makes the caller reject before recording.
+func (s *Server) resolveUpstreamForScan(ctx context.Context, ref string) (label, apiKey string, lookupErr error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" || s.st == nil {
-		return "", ""
+		return "", "", nil
 	}
 	if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 {
-		up, err := s.st.GetUpstream(id)
-		if err == nil && up != nil {
-			return upstreamScanLabel(up), up.APIKey
+		up, err := s.configAdmin.GetUpstream(ctx, id)
+		if err == nil {
+			return upstreamScanLabel(&up), up.APIKey, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return "", "", err
 		}
 	}
-	ups, err := s.st.ListUpstreams()
+	up, err := s.configAdmin.GetUpstreamByName(ctx, ref)
 	if err != nil {
-		return "", ""
-	}
-	for _, up := range ups {
-		if up != nil && up.Name == ref {
-			return upstreamScanLabel(up), up.APIKey
+		if errors.Is(err, store.ErrNotFound) {
+			return "", "", nil
 		}
+		return "", "", err
 	}
-	return "", ""
+	return upstreamScanLabel(&up), up.APIKey, nil
 }
 
 func upstreamScanLabel(up *model.Upstream) string {

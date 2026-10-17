@@ -14,6 +14,7 @@ import (
 type ConfigAdmin interface {
 	ListUpstreams(context.Context, model.UpstreamFilter) (model.Page[model.Upstream], error)
 	GetUpstream(context.Context, int64) (model.Upstream, error)
+	GetUpstreamByName(context.Context, string) (model.Upstream, error)
 	CreateUpstream(context.Context, model.Upstream, []configadmin.EndpointMutation) (model.Upstream, error)
 	UpdateUpstream(context.Context, int64, int64, model.Upstream) (model.Upstream, error)
 	DeleteUpstream(context.Context, int64, int64) error
@@ -23,6 +24,7 @@ type ConfigAdmin interface {
 	UpdateModelName(context.Context, int64, int64, model.ModelName) (model.ModelName, error)
 	DeleteModelName(context.Context, int64, int64) error
 	ListRoutes(context.Context, model.RouteFilter) (model.Page[model.Route], error)
+	ListRouteMetadata(context.Context, model.RouteFilter) (model.Page[model.RouteMetadata], error)
 	GetRoute(context.Context, int64) (model.Route, error)
 	CreateRoute(context.Context, model.Route) (model.Route, error)
 	UpdateRoute(context.Context, int64, int64, model.Route) (model.Route, error)
