@@ -3,7 +3,7 @@ module github.com/279814/relay-gate
 go 1.26.9
 
 require (
-	github.com/andybalholm/brotli v1.2.2
+	github.com/andybalholm/brotli v1.2.6
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.55.0
