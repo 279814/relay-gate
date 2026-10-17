@@ -89,10 +89,11 @@ func (s *Server) listUpstreamEndpoints(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	filter := model.EndpointFilter{PageRequest: pageFromQuery(r)}
-	if v := r.URL.Query().Get("upstream_id"); v != "" {
-		id, _ := strconv.ParseInt(v, 10, 64)
-		filter.UpstreamID = id
+	q := &probeListQuery{r: r}
+	filter := model.EndpointFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid), NeedsReview: q.boolean("needs_review")}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
 	}
 	page, err := s.probeAdmin.ListEndpoints(r.Context(), filter)
 	if err != nil {
@@ -246,7 +247,13 @@ func (s *Server) listProbeSecrets(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListSecrets(r.Context(), model.ProbeSecretFilter{PageRequest: pageFromQuery(r)})
+	q := &probeListQuery{r: r}
+	filter := model.ProbeSecretFilter{PageRequest: q.page(), NamePrefix: q.text("name_prefix")}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
+	}
+	page, err := s.probeAdmin.ListSecrets(r.Context(), filter)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -342,22 +349,14 @@ func (s *Server) listProbeRecipes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	request, err := recipePage(r)
-	if err != nil {
-		s.writeRecipeErr(w, err)
+	q := &probeListQuery{r: r}
+	filter := model.RecipeFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), RouteID: q.id("route_id"),
+		Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid), Status: probeEnum(q, "status", model.RecipeStatus.Valid)}
+	if q.err != nil {
+		s.writeRecipeErr(w, q.err)
 		return
 	}
-	upstreamID, err := recipeFilterID(r, "upstream_id")
-	if err != nil {
-		s.writeRecipeErr(w, err)
-		return
-	}
-	routeID, err := recipeFilterID(r, "route_id")
-	if err != nil {
-		s.writeRecipeErr(w, err)
-		return
-	}
-	page, err := s.probeAdmin.ListRecipes(r.Context(), model.RecipeFilter{PageRequest: request, UpstreamID: upstreamID, RouteID: routeID, Endpoint: model.EndpointKind(r.URL.Query().Get("endpoint")), Status: model.RecipeStatus(r.URL.Query().Get("status"))})
+	page, err := s.probeAdmin.ListRecipes(r.Context(), filter)
 	if err != nil {
 		s.writeRecipeErr(w, err)
 		return
@@ -410,7 +409,15 @@ func (s *Server) listProbeExecutions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListExecutions(r.Context(), model.ProbeExecutionFilter{PageRequest: pageFromQuery(r)})
+	q := &probeListQuery{r: r}
+	filter := model.ProbeExecutionFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), RouteID: q.id("route_id"),
+		Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid), ErrorClass: probeEnum(q, "error_class", model.ErrorClass.Valid),
+		Trigger: probeEnum(q, "trigger", model.ProbeTrigger.Valid), CapabilityState: probeEnum(q, "capability_state", model.CapabilityState.Valid)}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
+	}
+	page, err := s.probeAdmin.ListExecutions(r.Context(), filter)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -451,7 +458,14 @@ func (s *Server) listCapabilities(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListCapabilities(r.Context(), model.CapabilityFilter{PageRequest: pageFromQuery(r)})
+	q := &probeListQuery{r: r}
+	filter := model.CapabilityFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), RouteID: q.id("route_id"),
+		Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid), State: probeEnum(q, "state", model.CapabilityState.Valid), Expired: q.boolean("expired")}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
+	}
+	page, err := s.probeAdmin.ListCapabilities(r.Context(), filter)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -472,7 +486,14 @@ func (s *Server) listReachability(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListReachability(r.Context(), model.ReachabilityFilter{PageRequest: pageFromQuery(r)})
+	q := &probeListQuery{r: r}
+	filter := model.ReachabilityFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), Current: q.boolean("current"),
+		State: model.ReachabilityState(q.oneOf("state", string(model.ReachabilityUnknown), string(model.ReachabilityReachable), string(model.ReachabilityUnreachable)))}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
+	}
+	page, err := s.probeAdmin.ListReachability(r.Context(), filter)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -501,7 +522,14 @@ func (s *Server) listCalibrations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListCalibrations(r.Context(), model.CalibrationFilter{PageRequest: pageFromQuery(r)})
+	q := &probeListQuery{r: r}
+	filter := model.CalibrationFilter{PageRequest: q.page(), RouteID: q.id("route_id"), Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid),
+		State: model.CalibrationState(q.oneOf("state", string(model.CalibrationPlanned), string(model.CalibrationRunning), string(model.CalibrationSucceeded), string(model.CalibrationFailed), string(model.CalibrationCanceled), string(model.CalibrationInterrupted)))}
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
+	}
+	page, err := s.probeAdmin.ListCalibrations(r.Context(), filter)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -587,14 +615,16 @@ func (s *Server) listProbeCosts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	filter := model.ProbeCostFilter{PageRequest: pageFromQuery(r)}
-	if v := r.URL.Query().Get("route_id"); v != "" {
-		id, _ := strconv.ParseInt(v, 10, 64)
-		filter.RouteID = id
+	q := &probeListQuery{r: r}
+	filter := model.ProbeCostFilter{PageRequest: q.page(), RouteID: q.id("route_id"), UpstreamID: q.id("upstream_id"),
+		Endpoint: probeEnum(q, "endpoint", model.EndpointKind.Valid), Trigger: probeEnum(q, "trigger", model.ProbeTrigger.Valid), Origin: probeEnum(q, "origin", model.RecipeSource.Valid),
+		DayFrom: q.day("day_from"), DayTo: q.day("day_to")}
+	if filter.DayFrom != "" && filter.DayTo != "" && filter.DayFrom > filter.DayTo {
+		q.reject("day_from/day_to")
 	}
-	if v := r.URL.Query().Get("upstream_id"); v != "" {
-		id, _ := strconv.ParseInt(v, 10, 64)
-		filter.UpstreamID = id
+	if q.err != nil {
+		s.writeErr(w, q.err)
+		return
 	}
 	page, err := s.probeAdmin.ListCosts(r.Context(), filter)
 	if err != nil {
@@ -602,11 +632,6 @@ func (s *Server) listProbeCosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
-}
-
-func pageFromQuery(r *http.Request) model.PageRequest {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	return model.PageRequest{Cursor: r.URL.Query().Get("cursor"), Limit: limit}
 }
 
 // 编译期确认 probe.Service 满足 ProbeAdmin。
