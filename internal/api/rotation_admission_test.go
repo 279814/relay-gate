@@ -201,7 +201,7 @@ func TestMasterRotation_DrainsAcceptedEncryptedWriteAndRejectsNewWrites(t *testi
 	writeResult := make(chan int, 1)
 	go func() {
 		response := doSession(t, h, http.MethodPut, "/admin/api/upstreams/"+itoa(u.ID),
-			`{"api_key":"sk-accepted-before-rotation"}`, session)
+			withExpectedRevision(t, `{"api_key":"sk-accepted-before-rotation"}`, u.Revision), session)
 		writeResult <- response.Code
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -230,7 +230,7 @@ func TestMasterRotation_DrainsAcceptedEncryptedWriteAndRejectsNewWrites(t *testi
 		time.Sleep(time.Millisecond)
 	}
 	blocked := doSession(t, h, http.MethodPut, "/admin/api/upstreams/"+itoa(u.ID),
-		`{"api_key":"sk-must-never-write-old-master"}`, session)
+		withExpectedRevision(t, `{"api_key":"sk-must-never-write-old-master"}`, u.Revision), session)
 	if blocked.Code != http.StatusConflict {
 		t.Fatalf("new write entered during rotation drain: %d", blocked.Code)
 	}

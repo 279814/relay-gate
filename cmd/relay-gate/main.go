@@ -246,9 +246,7 @@ func runServer() error {
 	//
 	// 探活成本计数（§5.2d）落库跨重启：纯内存计数在重启后归零，
 	// 「今日 L1 次数」会一天里越报越少 —— 会骗人的计数器比没有更糟。
-	cost := probe.NewCost()
-	costPersister := probe.NewCostPersister(cost, st, log)
-	costPersister.Restore()
+	cost := probe.NewDurableCostView(st)
 
 	// Recipe 四级解析器（§8.2）。探活与 Executor 共用这一份。
 	recipes := probe.NewRecipeResolver(st).WithNotFound(func(err error) bool {
@@ -286,7 +284,6 @@ func runServer() error {
 		probe.WallClock(), log)
 
 	sched := probe.NewScheduler(cfgSrc, fwd, tracker, gate, log).
-		WithCost(cost).
 		WithTargets(targets, st).
 		WithRecipes(recipes).
 		WithExecutor(executor).
@@ -373,10 +370,9 @@ func runServer() error {
 	calibrator.WithInvalidator(inv).WithConfigPublisher(cfgSrc)
 	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv).WithManualPreparer(sched)
 	var bg sync.WaitGroup
-	bg.Add(6)
+	bg.Add(5)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()
 	go func() { defer bg.Done(); persister.Run(bgCtx) }()
-	go func() { defer bg.Done(); costPersister.Run(bgCtx) }()
 	go func() { defer bg.Done(); calibrator.Run(bgCtx) }()
 	go func() { defer bg.Done(); traffic.Run(bgCtx) }()
 	go func() { defer bg.Done(); janitor.Run(bgCtx) }()

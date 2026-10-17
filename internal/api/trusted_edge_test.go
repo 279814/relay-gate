@@ -87,7 +87,7 @@ func TestPublicAdmin_RejectsCrossOriginBeforeMutatingStorage(t *testing.T) {
 	if session == nil || !session.Secure {
 		t.Fatal("trusted HTTPS login did not issue a secure cookie")
 	}
-	request := publicAPIRequest(http.MethodPost, "/admin/api/upstreams", `{"name":"cross-origin-write","base_url":"https://fixture.example","api_key":"sk-cross-origin-fixture"}`)
+	request := publicAPIRequest(http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"cross-origin-write","base_url":"https://fixture.example","api_key":"sk-cross-origin-fixture"}`))
 	request.AddCookie(session)
 	request.Header.Set("Origin", "https://attacker.example")
 	request.Host = "attacker.example"
@@ -100,14 +100,14 @@ func TestPublicAdmin_RejectsCrossOriginBeforeMutatingStorage(t *testing.T) {
 	if err != nil || len(values) != 0 {
 		t.Fatalf("cross-origin write reached database: count=%d err=%v", len(values), err)
 	}
-	request = publicAPIRequest(http.MethodPost, "/admin/api/upstreams", `{"name":"same-origin-write","base_url":"https://fixture.example","api_key":"sk-same-origin-fixture"}`)
+	request = publicAPIRequest(http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"same-origin-write","base_url":"https://fixture.example","api_key":"sk-same-origin-fixture"}`))
 	request.AddCookie(session)
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("same-origin session write failed: %d", response.Code)
 	}
-	request = publicAPIRequest(http.MethodPost, "/admin/api/upstreams", `{"name":"explicit-cli-write","base_url":"https://fixture.example","api_key":"sk-explicit-cli-fixture"}`)
+	request = publicAPIRequest(http.MethodPost, "/admin/api/upstreams", upstreamFixture(t, `{"name":"explicit-cli-write","base_url":"https://fixture.example","api_key":"sk-explicit-cli-fixture"}`))
 	request.Header.Del("Origin")
 	request.Header.Set("Authorization", "Bearer "+testAdminPW)
 	response = httptest.NewRecorder()
