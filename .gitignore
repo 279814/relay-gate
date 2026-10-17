@@ -52,3 +52,5 @@ mock-*.log
 .idea/
 .vscode/
 .vs/
+__pycache__/
+*.pyc
