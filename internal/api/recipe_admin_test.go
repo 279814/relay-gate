@@ -124,7 +124,7 @@ func recipeHTTPFixture(t *testing.T) (*Server, http.Handler, *livecfg.Source, *p
 		t.Fatal(err)
 	}
 	t.Cleanup(seq.Close)
-	scheduler := probe.NewScheduler(source, nil, nil, nil, s.log).WithSequencer(seq).WithRecipes(recipes)
+	scheduler := probe.NewScheduler(source, nil, nil, s.log).WithSequencer(seq).WithRecipes(recipes)
 	admin := probe.NewService(s.st, executor, nil, source, nil, nil).WithManualPreparer(scheduler)
 	h := s.WithProbeAdmin(admin).Routes(testAdminPW)
 	return s, h, source, coordinator, &calls, recipeID, version, route

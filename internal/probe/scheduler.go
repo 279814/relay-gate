@@ -463,6 +463,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		return
 	}
 	wasUnreachable := s.reach.Effective(up.ID, up.NetworkRevision) == model.ReachabilityUnreachable
+	targets := s.captureL1HealthTargets(up.ID)
 	result := s.execL1(ctx, up, settings)
 	if result.Outcome.Verdict == health.VerdictIgnore || result.Decision.ErrorClass == model.ErrorIgnored || result.Apply.Reachability != model.ApplyCurrent || result.Apply.CommittedReachability == nil {
 		return
@@ -472,7 +473,7 @@ func (s *Scheduler) runL1(ctx context.Context, up *model.Upstream, settings mode
 		return
 	}
 	if !reachable {
-		s.propagateL1Failure(up, result.Outcome)
+		s.propagateL1Failure(up, result.Outcome, targets)
 		return
 	}
 	if wasUnreachable && result.Apply.CommittedReachability.State != model.ReachabilityUnreachable && s.reach.OK(up.ID, up.NetworkRevision) {
@@ -503,24 +504,40 @@ func l1StationEffect(decision Decision) (reachable, apply bool) {
 	return false, true
 }
 
-// propagateL1Failure 把站级失败落到该 Upstream 下的每个 Route。
-func (s *Scheduler) propagateL1Failure(up *model.Upstream, out Outcome) {
+type l1HealthTarget struct {
+	routeID    int64
+	generation uint64
+}
+
+// Capture child generations before sending. A committed SQL return can arrive
+// after re-enable or ID reuse; enumerating current routes then reporting an
+// unbound generation would turn that old failure into new health evidence.
+func (s *Scheduler) captureL1HealthTargets(upstreamID int64) []l1HealthTarget {
 	snap, err := s.cfg.Snapshot()
-	if err != nil {
-		return
+	if err != nil || snap == nil {
+		return nil
 	}
-	var affected int
+	var targets []l1HealthTarget
 	for _, rts := range snap.RoutesByModelName {
 		for _, rt := range rts {
-			if rt.UpstreamID != up.ID || !rt.Enabled {
+			if rt.UpstreamID != upstreamID || !rt.Enabled {
 				continue
 			}
-			if s.track.Report(health.Report{
-				RouteID: rt.ID, Verdict: out.Verdict, Source: health.SourceL1,
-				Err: out.Err, RetryAfter: out.RetryAfter,
-			}) {
-				affected++
+			if generation := ensureRouteGeneration(s.track, rt.ID); generation > 0 {
+				targets = append(targets, l1HealthTarget{rt.ID, generation})
 			}
+		}
+	}
+	return targets
+}
+
+// propagateL1Failure updates only the child identities captured for this attempt.
+func (s *Scheduler) propagateL1Failure(up *model.Upstream, out Outcome, targets []l1HealthTarget) {
+	var affected int
+	for _, target := range targets {
+		if s.track.Report(health.Report{RouteID: target.routeID, Generation: target.generation,
+			Verdict: out.Verdict, Source: health.SourceL1, Err: out.Err, RetryAfter: out.RetryAfter}) {
+			affected++
 		}
 	}
 	s.log.Warn("上游 L1 失败", "upstream", up.Name, "verdict", out.Verdict.String(),

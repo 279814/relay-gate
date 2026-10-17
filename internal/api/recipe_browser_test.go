@@ -30,7 +30,7 @@ func TestRecipeAdminBrowserFixture(t *testing.T) {
 	if err := controller.BindSyntheticController(coordinator); err != nil {
 		t.Fatal(err)
 	}
-	s.WithRunState(controller).WithHealth(health.NewTracker(source), health.NewUpstreamGate(), nil)
+	s.WithRunState(controller).WithHealth(health.NewTracker(source), health.NewReachabilityTracker(source))
 	profile := &model.ClientProbeProfile{UpstreamID: route.UpstreamID, Endpoint: model.EndpointChatCompletions, ClientFamily: "generic", ShapeHash: "browser-fixture-shape", SeenCount: 1}
 	if err := s.st.CreateClientProfileCandidate(context.Background(), profile); err != nil {
 		t.Fatal(err)
