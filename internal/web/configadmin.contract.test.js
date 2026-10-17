@@ -68,5 +68,13 @@ eval(fs.readFileSync(path.join(__dirname, 'static/app.js'), 'utf8'));
     assert.equal(calls[1].method, 'PUT', 'retry must not duplicate the already committed resource');
     assert.equal(calls[1].body.expected_revision, 1);
   }
+	for (const method of ['delUp','delMn']) {
+	  let prompt;
+	  global.confirm = message => { prompt = message; return false; };
+	  await shell[method]({id: 7, revision: 2, name: 'referenced'});
+	  assert.match(prompt, /禁止硬删除|不能删除/);
+	  assert.match(prompt, /历史不会/);
+	  assert.ok(!prompt.includes('一并删除'));
+	}
   console.log('ok configadmin client revision, conflict draft, cursor and explicit bundle');
 })().catch(error => { console.error(error); process.exitCode = 1; });
