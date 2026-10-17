@@ -98,8 +98,12 @@ func (p *Prober) prepareExplicit(ctx context.Context, req ExecutionRequest) (*pr
 	if req.ExplicitRecipe == nil || req.Upstream == nil {
 		return nil, ResolvedRecipe{}, errors.New("explicit prepare 缺少 recipe/upstream")
 	}
-	if req.ExplicitRecipe.Identity.Storage != model.RecipeStorageDB || req.ExplicitRecipe.Identity.DBVersionID < 1 {
-		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 StorageDB+DBVersionID")
+	identity := req.ExplicitRecipe.Identity
+	if err := identity.Validate(); err != nil {
+		return nil, ResolvedRecipe{}, err
+	}
+	if identity.Storage != model.RecipeStorageDB && (identity.Storage != model.RecipeStorageProfile || req.ExplicitRecipe.Facts.Use != model.BindingExplicitProfileTest) {
+		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 DB 版本或明确绑定的 Profile 测试")
 	}
 	facts := req.ExplicitRecipe.Facts
 	if facts.Use == "" {

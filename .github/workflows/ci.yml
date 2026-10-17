@@ -69,7 +69,7 @@ jobs:
         run: node internal/web/app.contract.test.js
 
       - name: 前端模块契约测试
-        run: node --test internal/web/modules.contract.test.mjs
+        run: node --test internal/web/modules.contract.test.mjs internal/web/recipe_admin.contract.test.mjs
 
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

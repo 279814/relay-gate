@@ -34,6 +34,15 @@ type ProbeAdmin interface {
 	CreateRecipe(ctx context.Context, scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) (model.ProbeRecipe, error)
 	ListVersions(ctx context.Context, f model.RecipeVersionFilter) (model.Page[model.ProbeRecipeVersion], error)
 	GetVersion(ctx context.Context, versionID int64) (model.ProbeRecipeVersion, error)
+	AddVersion(ctx context.Context, recipeID, expectedRevision int64, in probe.RecipeVersionMutation) (model.ProbeRecipeVersion, error)
+	Preview(ctx context.Context, versionID int64, in probe.PreviewInput) (probe.RedactedPreview, error)
+	Test(ctx context.Context, versionID int64, in probe.ManualTestInput) (model.ProbeExecution, error)
+	Publish(ctx context.Context, recipeID, versionID int64, testExecutionID string, expectedRevision int64, force bool) (model.ProbeRecipe, error)
+	ListClientProfiles(ctx context.Context, filter model.ClientProfileFilter) (model.Page[model.ClientProbeProfile], error)
+	GetClientProfile(ctx context.Context, id int64) (model.ClientProbeProfile, error)
+	PreviewClientProfile(ctx context.Context, id int64, in probe.PreviewInput) (probe.RedactedPreview, error)
+	TestClientProfile(ctx context.Context, id, routeID, expectedRevision int64) (model.ProbeExecution, error)
+	DisableClientProfile(ctx context.Context, id, expectedRevision int64) error
 	DisableRecipe(ctx context.Context, recipeID, expectedRevision int64) (model.ProbeRecipe, error)
 	ArchiveRecipe(ctx context.Context, recipeID, expectedRevision int64) (model.ProbeRecipe, error)
 
@@ -333,9 +342,24 @@ func (s *Server) listProbeRecipes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"probe admin 未装配"})
 		return
 	}
-	page, err := s.probeAdmin.ListRecipes(r.Context(), model.RecipeFilter{PageRequest: pageFromQuery(r)})
+	request, err := recipePage(r)
 	if err != nil {
-		s.writeErr(w, err)
+		s.writeRecipeErr(w, err)
+		return
+	}
+	upstreamID, err := recipeFilterID(r, "upstream_id")
+	if err != nil {
+		s.writeRecipeErr(w, err)
+		return
+	}
+	routeID, err := recipeFilterID(r, "route_id")
+	if err != nil {
+		s.writeRecipeErr(w, err)
+		return
+	}
+	page, err := s.probeAdmin.ListRecipes(r.Context(), model.RecipeFilter{PageRequest: request, UpstreamID: upstreamID, RouteID: routeID, Endpoint: model.EndpointKind(r.URL.Query().Get("endpoint")), Status: model.RecipeStatus(r.URL.Query().Get("status"))})
+	if err != nil {
+		s.writeRecipeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -375,7 +399,7 @@ func (s *Server) createProbeRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 	recipe, err := s.probeAdmin.CreateRecipe(r.Context(), body.Scope, body.ScopeID, body.Endpoint)
 	if err != nil {
-		s.writeErr(w, err)
+		s.writeRecipeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, recipe)

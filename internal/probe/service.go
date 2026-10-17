@@ -31,8 +31,14 @@ type AdminStore interface {
 	CreateRecipe(scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) (int64, error)
 	ListRecipeVersionsPage(ctx context.Context, filter model.RecipeVersionFilter) (model.Page[*model.ProbeRecipeVersion], error)
 	GetRecipeVersion(ctx context.Context, id int64) (*model.ProbeRecipeVersion, error)
+	AddRecipeVersion(version *model.ProbeRecipeVersion, expectedRecipeRevision int64) error
+	PublishRecipeVersion(recipeID, versionID int64, testExecutionID string, expectedRecipeRevision int64, force bool) error
 	DisableRecipe(ctx context.Context, recipeID, expectedRevision int64) error
 	ArchiveRecipe(ctx context.Context, recipeID, expectedRevision int64) error
+	ListClientProfilesPage(ctx context.Context, filter model.ClientProfileFilter) (model.Page[*model.ClientProbeProfile], error)
+	GetClientProfile(ctx context.Context, id int64) (*model.ClientProbeProfile, error)
+	MarkClientProfileTested(ctx context.Context, id int64, executionID string, expectedRevision int64) error
+	DisableClientProfile(ctx context.Context, id, expectedRevision int64) error
 
 	ListProbeExecutions(ctx context.Context, filter model.ProbeExecutionFilter) (model.Page[*model.ProbeExecution], error)
 	GetProbeExecution(ctx context.Context, id string) (*model.ProbeExecution, error)
@@ -232,11 +238,18 @@ func (s *Service) GetRecipe(ctx context.Context, id int64) (model.ProbeRecipe, e
 }
 
 func (s *Service) CreateRecipe(ctx context.Context, scope model.RecipeScope, scopeID int64, endpoint model.EndpointKind) (model.ProbeRecipe, error) {
+	if scope == model.RecipeScopeRoute && endpoint == model.EndpointModels {
+		return model.ProbeRecipe{}, model.WrapValidation("models Recipe 只能绑定 Upstream")
+	}
 	id, err := s.store.CreateRecipe(scope, scopeID, endpoint)
 	if err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	return s.GetRecipe(ctx, id)
+	recipe, err := s.GetRecipe(ctx, id)
+	if err != nil {
+		return recipe, err
+	}
+	return recipe, s.publishAdminCommit("probe_recipe", id, recipe.Revision, nil)
 }
 
 func (s *Service) ListVersions(ctx context.Context, f model.RecipeVersionFilter) (model.Page[model.ProbeRecipeVersion], error) {
@@ -260,7 +273,9 @@ func (s *Service) DisableRecipe(ctx context.Context, recipeID, expectedRevision 
 	if err := s.store.DisableRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
+	if err := s.publishAdminCommit("probe_recipe", recipeID, expectedRevision+1, func() { s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID) }); err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	return s.GetRecipe(ctx, recipeID)
 }
 
@@ -272,7 +287,9 @@ func (s *Service) ArchiveRecipe(ctx context.Context, recipeID, expectedRevision 
 	if err := s.store.ArchiveRecipe(ctx, recipeID, expectedRevision); err != nil {
 		return model.ProbeRecipe{}, err
 	}
-	s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID)
+	if err := s.publishAdminCommit("probe_recipe", recipeID, expectedRevision+1, func() { s.invalidateRecipeScope(recipe.ScopeType, recipe.ScopeID) }); err != nil {
+		return model.ProbeRecipe{}, err
+	}
 	return s.GetRecipe(ctx, recipeID)
 }
 
