@@ -38,6 +38,7 @@ function app() {
     modelNames: [],
     routes: [],
   configPages: {
+    health: {cursor: '', next: '', history: [], limit: 25, enabled: '', upstream_id: '', model_name_id: ''},
     upstreams: {cursor: '', next: '', history: [], limit: 25, enabled: '', probe_mode: ''},
     'model-names': {cursor: '', next: '', history: [], limit: 25, enabled: '', protocol: ''},
     routes: {cursor: '', next: '', history: [], limit: 25, enabled: '', upstream_id: '', model_name_id: ''},
@@ -264,6 +265,13 @@ function app() {
       }
       const result = await this.api('GET', '/' + resource + '?' + query);
     if (request !== page.request) return;
+      if (resource === 'health') {
+        const routes = [...(result.routes || [])].sort((a, b) =>
+          ((a.model_name_id || 0) - (b.model_name_id || 0)) || (a.priority - b.priority) || (a.route_id - b.route_id));
+        this.health = {...result, routes};
+        page.cursor = cursor; page.history = history; page.next = result.next_cursor || '';
+        return;
+      }
       const field = {'upstreams': 'upstreams', 'model-names': 'modelNames', 'routes': 'routes'}[resource];
       this[field] = result.items;
       page.cursor = cursor; page.history = history; page.next = result.next_cursor || '';
@@ -314,14 +322,16 @@ function app() {
     },
 
     async loadHealth() {
+      const page = this.configPages.health;
+      const healthLoad = this.loadConfigPage('health');
+      const request = page.request;
       try {
-        const [h, rt] = await Promise.all([
-          this.api('GET', '/health'),
-          this.api('GET', '/runtime'),
+        await Promise.all([
+          healthLoad,
+          this.api('GET', '/runtime').then(rt => { if (request === page.request) this.runtime = rt || {}; }),
         ]);
-        this.health = h || {};
-        this.runtime = rt || {};
       } catch (e) {
+        if (request !== page.request) return;
         // 503 = 探活未启用，那不是错误，其余页面照常可用（api.Server 在
         // healthView 为 nil 时刻意回 503 而不是让整个管理接口不可用）。
         // 按状态码判断而不是匹配错误文案 —— 后端改一次措辞就会让匹配失效。
