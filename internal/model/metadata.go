@@ -6,10 +6,12 @@ package model
 type RouteMetadata struct {
 	Route                   Route
 	ModelName               string
+	ModelProtocol           Protocol
 	ModelEnabled            bool
 	ModelExists             bool
 	UpstreamName            string
 	UpstreamEnabled         bool
 	UpstreamExists          bool
 	UpstreamNetworkRevision int64
+	UpstreamProbeMode       ProbeMode
 }

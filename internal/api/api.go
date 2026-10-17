@@ -49,10 +49,10 @@ type Server struct {
 
 	// 探活链路。同样可以为 nil —— 探活未启用时相关端点回 503，
 	// 而不是让整个管理接口不可用（管理端点必须始终可用，§4.8）。
-	healthView      HealthView
-	manualRunner    ManualProbeRunner
-	reachability    ReachabilityView
-	countTokensView CountTokensView
+	healthView   HealthView
+	manualRunner ManualProbeRunner
+	reachability ReachabilityView
+	capabilities CapabilityView
 
 	// cost 是探活成本计数器（§5.2d）。为 nil 时对应端点回 503。
 	cost CostView

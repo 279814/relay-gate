@@ -20,15 +20,14 @@ type ReachabilityView interface {
 	Effective(int64, int64) model.ReachabilityState
 }
 
-// CountTokensView 暴露 Route 级 count_tokens 的 effective Capability。
-// 由 probe.CapabilityRegistry 实现；与 proxy 选 count_tokens Route 时读的是同一个值
-// （过期、配置 revision 不匹配都回落 unknown），界面不另行推断。
-type CountTokensView interface {
+// CapabilityView exposes the same current endpoint evidence read by routing.
+// A health page never substitutes a separately loaded UI capability page.
+type CapabilityView interface {
 	Effective(scope model.RecipeScope, scopeID int64,
 		endpoint model.EndpointKind, expectedToken string) model.CapabilityState
 }
 
-var _ CountTokensView = (*probe.CapabilityRegistry)(nil)
+var _ CapabilityView = (*probe.CapabilityRegistry)(nil)
 
 // WithHealth 接上健康看板与手动探活。分成单独的 setter，理由同 WithRuntime：
 // 这些属于探活链路，而 api.Server 的主职责是配置 CRUD。
@@ -42,10 +41,10 @@ func (s *Server) WithManualProbeRunner(runner ManualProbeRunner) *Server {
 	return s
 }
 
-// WithCountTokensView 让健康看板每行带上该 Route 的 count_tokens Capability。
-// 未接入时字段省略，界面显示「—」而不是伪装成 unknown。
-func (s *Server) WithCountTokensView(v CountTokensView) *Server {
-	s.countTokensView = v
+// WithCapabilities wires model and count_tokens observations from one registry.
+// Missing wiring is represented by absent fields, rather than invented unknown.
+func (s *Server) WithCapabilities(v CapabilityView) *Server {
+	s.capabilities = v
 	return s
 }
 
@@ -74,6 +73,9 @@ type healthRow struct {
 	Reason     string `json:"reason,omitempty"`
 
 	CountTokens model.CapabilityState `json:"count_tokens,omitempty"`
+	Endpoint    model.EndpointKind    `json:"endpoint,omitempty"`
+	Capability  model.CapabilityState `json:"capability,omitempty"`
+	ProbeMode   model.ProbeMode       `json:"probe_mode"`
 
 	Health health.Status         `json:"health"`
 	L1     health.UpstreamStatus `json:"l1"`
@@ -87,45 +89,47 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mns, err := s.st.ListModelNames()
+	page, err := configPage(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	ups, err := s.st.ListUpstreams()
+	enabled, err := configEnabled(r)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	routes, err := s.st.ListRoutes(0)
+	modelID, err := configIDFilter(r, "model_name_id")
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
 
-	mnByID := make(map[int64]*model.ModelName, len(mns))
-	for _, mn := range mns {
-		mnByID[mn.ID] = mn
+	upstreamID, err := configIDFilter(r, "upstream_id")
+	if err != nil {
+		s.writeErr(w, err)
+		return
 	}
-	upByID := make(map[int64]*model.Upstream, len(ups))
-	for _, up := range ups {
-		upByID[up.ID] = up
+	metadata, err := s.configAdmin.ListRouteMetadata(r.Context(), model.RouteFilter{PageRequest: page, Enabled: enabled, ModelNameID: modelID, UpstreamID: upstreamID})
+	if err != nil {
+		s.writeErr(w, err)
+		return
 	}
-
-	rows := make([]healthRow, 0, len(routes))
-	for _, rt := range routes {
+	rows := make([]healthRow, 0, len(metadata.Items))
+	for _, entry := range metadata.Items {
+		rt := &entry.Route
 		st := s.healthView.Status(rt.ID)
 		row := healthRow{
 			RouteID: rt.ID, ModelNameID: rt.ModelNameID, UpstreamID: rt.UpstreamID,
 			Priority: rt.Priority, Weight: rt.Weight, Enabled: rt.Enabled,
 			State: st.State, Health: st,
+			ModelName: entry.ModelName, Upstream: entry.UpstreamName,
+			ProbeMode: entry.UpstreamProbeMode,
 		}
-		if mn := mnByID[rt.ModelNameID]; mn != nil {
-			row.ModelName = mn.Name
-		}
-		up := upByID[rt.UpstreamID]
-		if up != nil {
-			row.Upstream = up.Name
+		row.Endpoint, _ = entry.ModelProtocol.Endpoint()
+		var up *model.Upstream
+		if entry.UpstreamExists {
+			up = &model.Upstream{ID: rt.UpstreamID, Name: entry.UpstreamName, Enabled: entry.UpstreamEnabled, NetworkRevision: entry.UpstreamNetworkRevision}
 		}
 		row.L1 = health.UpstreamStatus{UpstreamID: rt.UpstreamID, OK: true}
 		if s.reachability != nil && up != nil {
@@ -138,22 +142,34 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		row.Selectable, row.Reason = selectability(rt, up, st)
+		if !entry.ModelExists {
+			row.Selectable = false
+			row.Reason = "ModelName 已不存在"
+		} else if !entry.ModelEnabled {
+			row.Selectable = false
+			row.Reason = "ModelName 已手动停用"
+		}
 		if row.Selectable && !row.L1.OK {
 			row.Selectable = false
 			row.Reason = "Upstream 网络不可达"
 		}
-		if s.countTokensView != nil {
-			row.CountTokens = s.countTokensView.Effective(model.RecipeScopeRoute, rt.ID,
+		if s.capabilities != nil {
+			row.CountTokens = s.capabilities.Effective(model.RecipeScopeRoute, rt.ID,
 				model.EndpointCountTokens, "")
+			if row.Endpoint != "" {
+				row.Capability = s.capabilities.Effective(model.RecipeScopeRoute, rt.ID, row.Endpoint, "")
+			}
 		}
 		rows = append(rows, row)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"routes": rows,
-		"summary": map[string]int{
+		"routes":      rows,
+		"next_cursor": metadata.NextCursor,
+		"summary": map[string]any{
 			"total":      len(rows),
 			"selectable": countSelectable(rows),
+			"scope":      "page",
 		},
 	})
 }

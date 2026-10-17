@@ -223,6 +223,66 @@ t('配置客户端版本、冲突草稿、游标与五端点契约', () => {
   require('child_process').execFileSync(process.execPath, [path.join(__dirname, 'configadmin.contract.test.js')], {stdio: 'inherit'});
 });
 
+group('健康页有界分页');
+
+t('健康下一页只请求目标页并保留筛选与回退游标', async () => {
+  const a = app();
+  const requested = [];
+  a.api = async (method, path) => {
+    requested.push(path);
+    if (path === '/runtime') return {};
+    const query = new URL('http://fixture' + path).searchParams;
+    assert.ok(path.startsWith('/health?'));
+    assert.equal(query.get('limit'), '25');
+    assert.equal(query.get('upstream_id'), '17');
+    return query.get('cursor')
+      ? {routes: [{route_id: 3, priority: 1}], next_cursor: '', summary: {scope: 'page'}}
+      : {routes: [{route_id: 1, priority: 2}, {route_id: 2, priority: 1}], next_cursor: 'health-next', summary: {scope: 'page'}};
+  };
+  a.configPages.health.upstream_id = '17';
+  await a.loadHealth();
+  assert.deepEqual(a.health.routes.map(row => row.route_id), [2, 1]);
+  await a.pageConfig('health', 'next');
+  assert.deepEqual(a.health.routes.map(row => row.route_id), [3]);
+  assert.equal(a.configPages.health.cursor, 'health-next');
+  assert.deepEqual(a.configPages.health.history, ['']);
+  assert.equal(requested.filter(path => path.startsWith('/health?')).length, 2);
+  await a.pageConfig('health', 'prev');
+  assert.equal(a.configPages.health.cursor, '');
+});
+
+t('晚到的健康与runtime刷新不能恢复登出后的视图', async () => {
+  const a = app();
+  let finishHealth, finishRuntime;
+  a.api = async (method, path) => path === '/runtime'
+    ? new Promise(resolve => { finishRuntime = resolve; })
+    : new Promise(resolve => { finishHealth = resolve; });
+  const old = a.loadHealth();
+  a.reset();
+  finishHealth({routes: [{route_id: 99}], next_cursor: ''});
+  finishRuntime({in_flight: 99});
+  await old;
+  assert.deepEqual(a.health, {});
+  assert.deepEqual(a.runtime, {});
+});
+
+t('晚到的旧健康页不能覆盖已经打开的下一页', async () => {
+  const a = app();
+  let finishOld;
+  a.api = async (method, path) => {
+    if (path === '/runtime') return {};
+    if (new URL('http://fixture' + path).searchParams.get('cursor')) return {routes: [{route_id: 2, priority: 1}], next_cursor: ''};
+    return new Promise(resolve => { finishOld = resolve; });
+  };
+  const old = a.loadHealth();
+  a.configPages.health.next = 'new-page';
+  await a.pageConfig('health', 'next');
+  finishOld({routes: [{route_id: 1, priority: 1}], next_cursor: 'old-next'});
+  await old;
+  assert.equal(a.configPages.health.cursor, 'new-page');
+  assert.deepEqual(a.health.routes.map(row => row.route_id), [2]);
+});
+
 runAll().then(() => {
   console.log(failed ? `\n${failed} 条失败` : '\n全部通过');
   process.exit(failed ? 1 : 0);

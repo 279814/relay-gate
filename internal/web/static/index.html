@@ -57,7 +57,7 @@
           <div>
             <div class="cards">
               <div class="card">
-                <h3>可选路 / 总数</h3>
+                <h3>本页可选路 / 本页总数</h3>
                 <div class="v" x-text="`${health.summary?.selectable ?? 0} / ${health.summary?.total ?? 0}`"></div>
                 <div class="sub">「可选路」复述的是选路此刻的真实判定</div>
               </div>
@@ -124,9 +124,18 @@
               <label class="check">
                 <input type="checkbox" x-model="autoRefresh"> 自动刷新（3s）
               </label>
+              <select x-model="configPages.health.enabled" @change="pageConfig('health','reset')">
+                <option value="">全部路由</option><option value="true">已启用路由</option><option value="false">已停用路由</option>
+              </select>
+              <input type="number" min="1" x-model="configPages.health.upstream_id" placeholder="上游 ID" style="width:7rem">
+              <input type="number" min="1" x-model="configPages.health.model_name_id" placeholder="模型 ID" style="width:7rem">
+              <button @click="pageConfig('health','reset')">筛选</button>
               <span class="grow"></span>
+              <button :disabled="busy || !configPages.health.history.length" @click="pageConfig('health','prev')">上一页</button>
+              <button :disabled="busy || !configPages.health.next" @click="pageConfig('health','next')">下一页</button>
               <button @click="loadHealth()">立即刷新</button>
             </div>
+            <p class="dim">分页不影响实际选路；优先级数字越小越先尝试，本页按模型与优先级展示。</p>
 
             <table>
               <thead>
@@ -142,15 +151,15 @@
                     <td x-text="r.model_name || `#${r.model_name_id}`"></td>
                     <td>
                       <span x-text="r.upstream || `#${r.upstream_id}`"></span>
-                      <span class="tag warn" x-show="lazyProbeWarning(upstreams.find(u => u.id === r.upstream_id))"
+                      <span class="tag warn" x-show="lazyProbeWarning(r)"
                             x-text="'Lazy'" title="Lazy 不会周期请求"></span>
                     </td>
                     <td x-text="`${r.priority} / ${r.weight}`"></td>
                     <td>
-                      <span class="tag" x-text="reachStateFor(r.upstream_id)"></span>
+                      <span class="tag" x-text="r.l1?.probed ? (r.l1?.ok ? 'reachable' : 'unreachable') : 'unknown'"></span>
                     </td>
                     <td>
-                      <span class="tag" x-text="capStateFor(r.route_id, 'messages')"></span>
+                      <span class="tag" x-text="r.capability || '—'" :title="r.endpoint || '能力视图未装配'"></span>
                     </td>
                     <td>
                       <span class="tag" :class="countTokensClass(r.count_tokens)"
@@ -175,7 +184,7 @@
                     <td class="wrap dim" x-text="r.health?.last_error || '—'"></td>
                     <td class="nowrap">
                       <button @click="probe(r.route_id)" :disabled="probing === r.route_id"
-                              :title="lazyProbeWarning(upstreams.find(u => u.id === r.upstream_id)) || '手动探活一次'"
+                              :title="lazyProbeWarning(r) || '手动探活一次'"
                               x-text="probing === r.route_id ? '探测中…' : '测试'"></button>
                     </td>
                   </tr>

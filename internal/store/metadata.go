@@ -61,8 +61,8 @@ func (s *Store) ListRouteMetadataPage(ctx context.Context, filter model.RouteFil
 	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.model_name_id,r.upstream_id,r.priority,r.weight,r.upstream_model,
 		r.max_concurrency,r.enabled,r.created_at,r.updated_at,r.revision,r.capability_revision,
-		COALESCE(m.name,''),COALESCE(m.enabled,0),m.id IS NOT NULL,
-		COALESCE(u.name,''),COALESCE(u.enabled,0),u.id IS NOT NULL,COALESCE(u.network_revision,0)
+		COALESCE(m.name,''),COALESCE(m.protocol,''),COALESCE(m.enabled,0),m.id IS NOT NULL,
+		COALESCE(u.name,''),COALESCE(u.enabled,0),u.id IS NOT NULL,COALESCE(u.network_revision,0),COALESCE(u.probe_mode,'')
 		FROM route r LEFT JOIN model_name m ON m.id=r.model_name_id LEFT JOIN upstream u ON u.id=r.upstream_id
 		WHERE `+strings.Join(conditions, " AND ")+` ORDER BY r.id LIMIT ?`, args...)
 	if err != nil {
@@ -75,8 +75,8 @@ func (s *Store) ListRouteMetadataPage(ctx context.Context, filter model.RouteFil
 		r := &item.Route
 		if err := rows.Scan(&r.ID, &r.ModelNameID, &r.UpstreamID, &r.Priority, &r.Weight, &r.UpstreamModel, &r.MaxConcurrency,
 			&r.Enabled, &r.CreatedAt, &r.UpdatedAt, &r.Revision, &r.CapabilityRevision,
-			&item.ModelName, &item.ModelEnabled, &item.ModelExists, &item.UpstreamName, &item.UpstreamEnabled,
-			&item.UpstreamExists, &item.UpstreamNetworkRevision); err != nil {
+			&item.ModelName, &item.ModelProtocol, &item.ModelEnabled, &item.ModelExists, &item.UpstreamName, &item.UpstreamEnabled,
+			&item.UpstreamExists, &item.UpstreamNetworkRevision, &item.UpstreamProbeMode); err != nil {
 			return model.Page[model.RouteMetadata]{}, err
 		}
 		items = append(items, item)

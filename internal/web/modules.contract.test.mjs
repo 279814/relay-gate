@@ -266,6 +266,17 @@ await check('count_tokens station posture: uniform, mixed, not wired', () => {
   assert.equal(shell.countTokensPosture(50).state, 'mixed');
 });
 
+await check('count_tokens posture identifies a partial health page without inventing no-routes', () => {
+  const shell = {health: {routes: [{route_id: 1, upstream_id: 10, count_tokens: 'supported'}], next_cursor: 'next'}, configPages: {health: {cursor: ''}}, routes: []};
+  createCountTokensFeature(shell);
+  assert.equal(shell.countTokensPosture(10).text, '本页 supported');
+  assert.equal(shell.countTokensPosture(20).state, 'na');
+  assert.equal(shell.countTokensPosture(20).text, '未在本页');
+  shell.health.next_cursor = '';
+  shell.configPages.health.cursor = 'last-page';
+  assert.equal(shell.countTokensPosture(20).state, 'na');
+});
+
 await check('Master rotation never sends requests while environment override or status is unknown', async () => {
   for (const status of [null, { rotation_allowed: false, blocked_reason: 'Run credentials migrate and restart without ENCRYPTION_KEY' }]) {
     const sent = [];
