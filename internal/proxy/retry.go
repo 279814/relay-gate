@@ -295,7 +295,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				oc.res = h.commitLive(w, la)
 				// fail_closed response transform before any client byte.
 				if oc.res != nil && oc.res.Err != nil && !oc.res.HeadersSent &&
-					la.compiled != nil {
+					la.compiled != nil && !isForwardError(oc.res.Err) {
 					writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
 					finishObserver(la, health.AttemptFinish{})
 					la.cand.Release()
@@ -888,8 +888,7 @@ func finishObserver(la *liveAttempt, fin health.AttemptFinish) {
 		fin.ReadErr = res.upstreamReadErr
 		fin.ClientCanceled = errors.Is(res.Err, ErrCanceled) || errors.Is(res.Err, ErrClientGone)
 		if fin.ReadErr == nil && res.Err != nil && !fin.ClientCanceled {
-			if errors.Is(res.Err, ErrConnect) || errors.Is(res.Err, ErrFirstTokenTimeout) || errors.Is(res.Err, ErrStreamStalled) ||
-				errors.Is(res.Err, ErrTotalTimeout) || errors.Is(res.Err, ErrUpstreamBroke) || errors.Is(res.Err, ErrStreamBroke) {
+			if isForwardError(res.Err) {
 				fin.ReadErr = res.Err
 			} else {
 				// Local response-transform failures provide no upstream health evidence.

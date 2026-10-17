@@ -50,6 +50,9 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
+	if at.failBeforeCommit() {
+		return at.res
+	}
 	stop := at.watchResponse()
 	defer stop()
 	observer := observerTee{at.f.RespObserver}
@@ -89,18 +92,17 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		if policy == "" {
 			policy = transform.FailOpen
 		}
-		if policy == transform.FailClosed {
-			if record != nil {
-				record(transform.ExecutionRecord{
-					Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
-					InputHash: transform.HashBytes(nil),
-				})
-			}
-			return res
+		if record != nil {
+			record(transform.ExecutionRecord{
+				Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
+			})
 		}
-		// fail_open on transport read error: pass empty body into ApplyResponse
-		// so header rules still run; body stays empty.
-		body = nil
+		// fail_open handles local transform failures. It cannot recover a
+		// failed upstream read by turning an incomplete body into empty 200.
+		return res
+	}
+	if at.failBeforeCommit() {
+		return res
 	}
 
 	// §15: non-stream body transform requires a complete read within MaxBodyBuffer.
@@ -169,6 +171,9 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		Body:   body,
 	}
 	out := compiled.ApplyResponse(in)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if out.Err != nil && out.PolicyUsed == transform.FailClosed {
 		res.Err = out.Err
 		if record != nil {
@@ -194,6 +199,9 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		}
 	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range out.Header {
 		for _, v := range vs {
@@ -263,6 +271,9 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 	}
 
 	// fail_open: original status/headers/body, no transform (§15.7).
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
@@ -291,6 +302,9 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 // under fail_open (client keeps a consistent encoding + unmodified bytes).
 func (at *Attempt) commitEncodedPassthrough(w http.ResponseWriter, f *Forwarder, body []byte) *Result {
 	res := at.res
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
@@ -396,6 +410,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		hdrIn.Header.Del("ETag")
 	}
 	hdrOut := compiled.ApplyResponse(hdrIn)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
 		res.Err = hdrOut.Err
 		if record != nil {
@@ -407,6 +424,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		return res
 	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range hdrOut.Header {
 		for _, v := range vs {
@@ -579,6 +599,9 @@ func (at *Attempt) commitHeaderTransformed(w http.ResponseWriter, compiled *tran
 		Body:   nil,
 	}
 	hdrOut := compiled.ApplyResponse(hdrIn)
+	if at.failBeforeCommit() {
+		return res
+	}
 	if hdrOut.Err != nil && hdrOut.PolicyUsed == transform.FailClosed {
 		res.Err = hdrOut.Err
 		if record != nil {
@@ -600,6 +623,9 @@ func (at *Attempt) commitHeaderTransformed(w http.ResponseWriter, compiled *tran
 			Error: errText, FailPolicyUsed: hdrOut.PolicyUsed, HitRules: hdrOut.HitRules})
 	}
 
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range hdrOut.Header {
 		for _, v := range vs {

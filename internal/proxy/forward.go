@@ -487,6 +487,9 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
+	if at.failBeforeCommit() {
+		return at.res
+	}
 
 	res, f := at.res, at.f
 	stop := at.watchResponse()
@@ -494,6 +497,9 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 
 	// 响应头原样回传。ReverseProxy 会做的逐跳清理这里手动做一次；
 	// 同时丢掉上游试图覆盖管理会话的 Set-Cookie: relay_session。
+	if at.failBeforeCommit() {
+		return res
+	}
 	dst := w.Header()
 	for k, vs := range at.resp.Header {
 		for _, v := range vs {
