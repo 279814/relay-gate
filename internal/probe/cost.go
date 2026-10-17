@@ -1,42 +1,9 @@
 package probe
 
 import (
-	"sort"
-	"sync"
-	"time"
-	"unicode"
-
 	"github.com/279814/relay-gate/internal/model"
+	"unicode"
 )
-
-// Cost 累计探活开销（§5.2d）。
-//
-// 为什么需要它：当前只有状态没有计数，无法回答「探活策略是不是太激进」。
-// 而这个项目的探活是刻意频繁的（dead 站 20s 一次 L1），激进本身是设计选择 ——
-// 但那要求代价可见，否则就只是「看起来没问题」。
-//
-// 计数在内存里累加、按天分桶，由 CostPersister 周期落库（与健康状态同一套
-// 做法）。落库是必须的：**「今日」的语义要跨重启**。纯内存计数在每次重启后
-// 归零，于是「今日 L1 = 12 次」这种数字会在一天里越报越少 —— 一个会骗人的
-// 计数器比没有计数器更糟。
-type Cost struct {
-	mu sync.Mutex
-	// day 是当前累计的 UTC 日期（YYYY-MM-DD），与 probe_cost_daily.day_utc
-	// 及 CostPersister.restoreFromDaily 一致。跨 UTC 日时归零重开。
-	day string
-	// perRoute 是各 Route 明细，§5.2d 明确要求「各 Route 明细」。
-	perRoute map[int64]*RouteCost
-	// l1 是站级的，不挂在 Route 上：一次 L1 被同站多个 Route 共享
-	// （scheduler.beginL1 收敛），记到 Route 上会把一次请求算成 N 次。
-	perUpstream map[int64]*UpstreamCost
-
-	now func() time.Time // 测试注入时钟
-}
-
-// utcDay 与 restoreFromDaily / day_utc 同一套日期键。
-func utcDay(t time.Time) string {
-	return t.UTC().Format("2006-01-02")
-}
 
 // RouteCost 是单个 Route 的 L2 开销。
 //
@@ -61,72 +28,6 @@ type UpstreamCost struct {
 	LastL1At   int64 `json:"last_l1_at"`
 }
 
-func NewCost() *Cost {
-	return &Cost{
-		perRoute:    map[int64]*RouteCost{},
-		perUpstream: map[int64]*UpstreamCost{},
-		now:         time.Now,
-	}
-}
-
-// AddL1 记一次 L1。零 token，只计次数。
-func (c *Cost) AddL1(upstreamID int64, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.rollLocked()
-
-	uc := c.perUpstream[upstreamID]
-	if uc == nil {
-		uc = &UpstreamCost{UpstreamID: upstreamID}
-		c.perUpstream[upstreamID] = uc
-	}
-	uc.L1Count++
-	if !ok {
-		uc.L1Failed++
-	}
-	uc.LastL1At = c.now().UnixMilli()
-}
-
-// AddL2 记一次 L2 及其估算 token。
-func (c *Cost) AddL2(routeID int64, ok bool, estTokens int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.rollLocked()
-
-	rc := c.perRoute[routeID]
-	if rc == nil {
-		rc = &RouteCost{RouteID: routeID}
-		c.perRoute[routeID] = rc
-	}
-	rc.L2Count++
-	if !ok {
-		rc.L2Failed++
-	}
-	rc.EstTokens += int64(estTokens)
-	rc.LastL2At = c.now().UnixMilli()
-}
-
-// rollLocked 跨 UTC 日时清零，并在首次调用时把 day 初始化成今天（UTC）。
-// 调用方必须已持有锁。
-//
-// 每个读写入口都必须先调它，两个理由：
-//   - 只在读路径调的话，跨天后第一次 Add 会把新一天的计数加进旧桶，
-//     而那个桶随后才被清空 —— 这次探活就凭空消失了
-//   - day 的零值是空串，与任何日期都不相等，所以首次调用会走清零分支，
-//     顺带完成初始化。少调一处就是「计数永远是 0」
-//
-// 按 UTC 分天：GET /admin/api/probe-cost 的「今日」必须与 probe_cost_daily.day_utc
-// 对齐；本地时区跨日晚于 UTC 时，否则 Snapshot 会在 UTC 日切换后仍带着昨天的总量。
-func (c *Cost) rollLocked() {
-	today := utcDay(c.now())
-	if c.day == today {
-		return
-	}
-	c.day = today
-	c.perRoute = map[int64]*RouteCost{}
-	c.perUpstream = map[int64]*UpstreamCost{}
-}
-
 // CostSnapshot 是成本视图的对外形状。
 type CostSnapshot struct {
 	Day string `json:"day"`
@@ -139,58 +40,6 @@ type CostSnapshot struct {
 
 	Routes    []RouteCost    `json:"routes"`
 	Upstreams []UpstreamCost `json:"upstreams"`
-}
-
-// Snapshot 返回当日成本快照，明细按 ID 升序（稳定输出便于 UI 与测试）。
-func (c *Cost) Snapshot() CostSnapshot {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.rollLocked()
-
-	out := CostSnapshot{
-		Day:       c.day,
-		Routes:    make([]RouteCost, 0, len(c.perRoute)),
-		Upstreams: make([]UpstreamCost, 0, len(c.perUpstream)),
-	}
-	for _, rc := range c.perRoute {
-		out.Routes = append(out.Routes, *rc)
-		out.L2Count += rc.L2Count
-		out.L2Failed += rc.L2Failed
-		out.EstTokens += rc.EstTokens
-	}
-	for _, uc := range c.perUpstream {
-		out.Upstreams = append(out.Upstreams, *uc)
-		out.L1Count += uc.L1Count
-		out.L1Failed += uc.L1Failed
-	}
-	sort.Slice(out.Routes, func(i, j int) bool {
-		return out.Routes[i].RouteID < out.Routes[j].RouteID
-	})
-	sort.Slice(out.Upstreams, func(i, j int) bool {
-		return out.Upstreams[i].UpstreamID < out.Upstreams[j].UpstreamID
-	})
-	return out
-}
-
-// Restore 用落库的快照重建当日计数，供启动时调用。
-//
-// 只在日期相同时接受：库里存的是昨天的数据时，「今日」应当从零开始。
-func (c *Cost) Restore(snap CostSnapshot) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if snap.Day != utcDay(c.now()) {
-		return
-	}
-	c.day = snap.Day
-	for i := range snap.Routes {
-		rc := snap.Routes[i]
-		c.perRoute[rc.RouteID] = &rc
-	}
-	for i := range snap.Upstreams {
-		uc := snap.Upstreams[i]
-		c.perUpstream[uc.UpstreamID] = &uc
-	}
 }
 
 // estimateL2Tokens 按 ModelName 估算一次 L2 探活消耗的 token。
