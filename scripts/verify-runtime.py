@@ -97,8 +97,10 @@ class MockUpstream(http.server.BaseHTTPRequestHandler):
 
 class Runtime:
     def __init__(self, binary, root):
-        self.binary, self.root = binary, root
-        self.database = root / "runtime.db"
+        # macOS /var and Windows short TEMP names may be filesystem aliases.
+        # Exercise the canonical path, as the production instance lock requires.
+        self.binary, self.root = binary, root.resolve()
+        self.database = self.root / "runtime.db"
         self.port = free_port()
         self.origin = f"http://127.0.0.1:{self.port}"
         self.process = None
@@ -117,7 +119,12 @@ class Runtime:
             env.pop(name, None)
         env.update(RELAY_DB=str(self.database), RELAY_ADDR=f"127.0.0.1:{self.port}")
         self.process = subprocess.Popen([str(self.binary)], env=env, stdout=self.log, stderr=subprocess.STDOUT, cwd=self.root)
-        eventually(lambda: self.request("GET", "/healthz", auth=False)[0] == 200)
+        try:
+            eventually(lambda: self.request("GET", "/healthz", auth=False)[0] == 200)
+        except AssertionError as error:
+            diagnostic = path.read_text(encoding="utf-8", errors="replace")
+            diagnostic = re.sub(r"(?m)^(ADMIN_PASSWORD|RELAY_KEYS|ENCRYPTION_KEY)=.*$", r"\1=[REDACTED]", diagnostic)
+            raise AssertionError(f"binary startup failed (exit={self.process.poll()}): " + diagnostic[-4000:]) from error
         text = path.read_text(encoding="utf-8")
         if self.starts == 1:
             self.admin = re.search(r"^ADMIN_PASSWORD=(\S+)$", text, re.M)[1]

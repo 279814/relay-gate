@@ -34,9 +34,34 @@ function Check($what, $ok, $detail) {
     if ($ok) { Pass $what } else { Fail "$what —— $detail" }
 }
 
+function RemoveSmokeData {
+    $target = [IO.Path]::GetFullPath((Join-Path $root $DATA))
+    $expected = [IO.Path]::GetFullPath((Join-Path $root 'data/m7-smoke'))
+    if ($target -ne $expected) { throw '拒绝清理非 M7 专用夹具目录' }
+    if (-not (Test-Path -LiteralPath $target)) { return }
+    foreach ($path in @((Split-Path -Parent $target), $target)) {
+        if ((Get-Item -LiteralPath $path -Force).LinkType) { throw '拒绝通过链接清理 M7 夹具' }
+    }
+    # The service correctly creates 0700/0600 files owned by 10001. A Linux
+    # runner cannot recursively remove them until a root helper returns only
+    # this verified disposable volume to the runner's actual UID/GID.
+    if ($IsLinux) {
+        docker image inspect $TAG 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $fixtureUID = (& id -u).Trim()
+            $fixtureGID = (& id -g).Trim()
+            if ($fixtureUID -notmatch '^\d+$' -or $fixtureGID -notmatch '^\d+$') { throw '无效的夹具属主' }
+            docker run --rm --user 0 --entrypoint sh -v "${target}:/fixture" $TAG `
+                -c "chown -R ${fixtureUID}:${fixtureGID} /fixture" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw '无法收回 M7 夹具目录属主' }
+        }
+    }
+    Remove-Item -LiteralPath $target -Recurse -Force
+}
+
 function Cleanup {
     docker rm -f $CNAME 2>&1 | Out-Null
-    Remove-Item -Recurse -Force $DATA -ErrorAction SilentlyContinue
+    RemoveSmokeData
     Remove-Item -Force 'm7-*.log' -ErrorAction SilentlyContinue
     if ($script:envCreatedByUs) {
         Remove-Item -Force '.env' -ErrorAction SilentlyContinue
@@ -169,7 +194,7 @@ try {
 
     Say '环境变量凭据仍可用（覆盖 bootstrap）'
     docker rm -f $CNAME 2>&1 | Out-Null
-    Remove-Item -Recurse -Force $DATA -ErrorAction SilentlyContinue
+    RemoveSmokeData
     New-Item -ItemType Directory -Force $DATA | Out-Null
     $absData = (Resolve-Path $DATA).Path
     docker run -d --name $CNAME `
