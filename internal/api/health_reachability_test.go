@@ -40,12 +40,12 @@ func applyAPIReachability(t *testing.T, tracker *health.ReachabilityTracker, set
 func TestGetHealthUsesCurrentReachabilityAndKeepsStaleDiagnosticSeparate(t *testing.T) {
 	s, _ := newTestServer(t)
 	seedConfig(t, s, 1, 1)
-	upstreams, err := s.st.ListUpstreams()
+	upstreams, err := fixtureUpstreams(s.st)
 	if err != nil {
 		t.Fatal(err)
 	}
 	up := upstreams[0]
-	routes, err := s.st.ListRoutes(0)
+	routes, err := fixtureRoutes(s.st, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,12 +77,12 @@ func TestGetHealthUsesCurrentReachabilityAndKeepsStaleDiagnosticSeparate(t *test
 func TestGetHealthCommittedHTTP503IsReachableButTransportFailureBlocks(t *testing.T) {
 	s, _ := newTestServer(t)
 	seedConfig(t, s, 1, 1)
-	upstreams, err := s.st.ListUpstreams()
+	upstreams, err := fixtureUpstreams(s.st)
 	if err != nil {
 		t.Fatal(err)
 	}
 	up := upstreams[0]
-	routes, err := s.st.ListRoutes(0)
+	routes, err := fixtureRoutes(s.st, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

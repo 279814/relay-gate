@@ -90,11 +90,11 @@ func seedConfig(t *testing.T, s *Server, nUp, nMn int) {
 			t.Fatal(err)
 		}
 	}
-	ups, err := s.st.ListUpstreams()
+	ups, err := fixtureUpstreams(s.st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mns, err := s.st.ListModelNames()
+	mns, err := fixtureModelNames(s.st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestGetHealth_ReadsDatabaseEveryCall(t *testing.T) {
 	if err := s.st.CreateUpstream(u); err != nil {
 		t.Fatal(err)
 	}
-	mns, _ := s.st.ListModelNames()
+	mns, _ := fixtureModelNames(s.st)
 	rt := &model.Route{ModelNameID: mns[0].ID, UpstreamID: u.ID, Enabled: true}
 	rt.Defaults()
 	if err := s.st.CreateRoute(rt); err != nil {

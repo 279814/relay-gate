@@ -131,8 +131,8 @@ func TestCreateUpstreamMaterializesLegacyURLSwitches(t *testing.T) {
 	}
 }
 
-// 保持 full_url_mode 改 base_url 时，也不得把新 URL 盖到四个协议端点上（§19.2）。
-func TestUpdateUpstreamFullURLModeDoesNotStampProtocolEndpoints(t *testing.T) {
+// 捕获的 Endpoint URL 不能被站级更新跨 origin 改写（§19.2）。
+func TestUpstreamCASRejectsOriginChangeWithCapturedEndpointURLs(t *testing.T) {
 	store := testStore(t)
 	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry",
 		APIKey: "sk-fullurl-upd1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
@@ -142,8 +142,8 @@ func TestUpdateUpstreamFullURLModeDoesNotStampProtocolEndpoints(t *testing.T) {
 	}
 
 	upstream.BaseURL = "https://b.com/other/entry"
-	if err := store.UpdateUpstream(upstream); err != nil {
-		t.Fatal(err)
+	if err := store.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("cross-origin parent update must reject: %v", err)
 	}
 
 	for _, kind := range []model.EndpointKind{
@@ -162,13 +162,13 @@ func TestUpdateUpstreamFullURLModeDoesNotStampProtocolEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := models.URLOverride, "https://b.com/status"; got != want {
+	if got, want := models.URLOverride, "https://a.com/status"; got != want {
 		t.Errorf("models 的 url_override want %q got %q", want, got)
 	}
 }
 
 // 用户在单个协议 Endpoint 上显式设置的 override 不属于站级翻译，
-// 改 base_url / l1_path / full_url_mode 都不得把它清掉。
+// 合法 base_url 修改不得清它；旧全局字段的写入口已退出。
 func TestUpdateUpstreamKeepsExplicitProtocolEndpointOverride(t *testing.T) {
 	bases := map[bool][2]string{
 		false: {"https://a.com", "https://a.com:443"},
@@ -193,31 +193,31 @@ func TestUpdateUpstreamKeepsExplicitProtocolEndpointOverride(t *testing.T) {
 		}
 
 		upstream.BaseURL = bases[fullURL][1]
-		if err := st.UpdateUpstream(upstream); err != nil {
+		if err := st.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); err != nil {
 			t.Fatal(err)
 		}
 		upstream.L1Path = "/status"
-		if err := st.UpdateUpstream(upstream); err != nil {
-			t.Fatal(err)
+		if err := st.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); !errors.Is(err, model.ErrValidation) {
+			t.Fatalf("legacy l1_path mutation must reject: %v", err)
 		}
 		upstream.BaseURL = "https://a.com"
 		upstream.FullURLMode = !fullURL
-		if err := st.UpdateUpstream(upstream); err != nil {
-			t.Fatal(err)
+		if err := st.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); !errors.Is(err, model.ErrValidation) {
+			t.Fatalf("legacy full_url_mode mutation must reject: %v", err)
 		}
 
 		got, err := st.Endpoint(context.Background(), upstream.ID, model.EndpointResponses)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.URLOverride != explicit {
+		if got.URLOverride != explicit || got.Revision != endpoint.Revision {
 			t.Errorf("full_url_mode=%v: 显式 override 被改成 %q", fullURL, got.URLOverride)
 		}
 	}
 }
 
-// 旧创建路径写下的 full_url_mode 猜测值（base_url 本身）在站级 URL 改变时清空。
-func TestUpdateUpstreamClearsLegacyFullURLStamp(t *testing.T) {
+// 即使来自旧创建路径，现有 Endpoint URL 也不能由站级改动悄悄清空。
+func TestUpstreamCASPreservesCapturedProtocolURLs(t *testing.T) {
 	st := testStore(t)
 	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com/custom/entry/",
 		APIKey: "sk-legacy-stamp1", AuthStyle: model.AuthXAPIKey, FullURLMode: true,
@@ -232,7 +232,7 @@ func TestUpdateUpstreamClearsLegacyFullURLStamp(t *testing.T) {
 	}
 
 	upstream.BaseURL = "https://a.com/next/entry"
-	if err := st.UpdateUpstream(upstream); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); err != nil {
 		t.Fatal(err)
 	}
 	for _, kind := range []model.EndpointKind{
@@ -243,8 +243,8 @@ func TestUpdateUpstreamClearsLegacyFullURLStamp(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.URLOverride != "" {
-			t.Errorf("%s 的旧猜测值应清空，得到 %q", kind, got.URLOverride)
+		if got.URLOverride != "https://a.com/custom/entry" || got.Revision != 1 {
+			t.Errorf("%s 捕获的 URL/revision 被站级改动改写", kind)
 		}
 	}
 }
@@ -276,7 +276,7 @@ func TestUpdateUpstreamDoesNotBumpUnchangedEndpointOverrides(t *testing.T) {
 	}
 
 	upstream.BaseURL = "https://b.com"
-	if err := store.UpdateUpstream(upstream); err != nil {
+	if err := store.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); err != nil {
 		t.Fatal(err)
 	}
 
@@ -292,9 +292,8 @@ func TestUpdateUpstreamDoesNotBumpUnchangedEndpointOverrides(t *testing.T) {
 	}
 }
 
-// 反面：override 真的改变时必须写入并 bump revision。
-// 与上一条互为对照 —— 少了它，「一律不更新」也能让上一条通过。
-func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
+// Endpoint URL 必须通过对应 Endpoint 的 revision 显式编辑。
+func TestEndpointURLChangesRequireExplicitRevisionedEdit(t *testing.T) {
 	store := testStore(t)
 	upstream := &model.Upstream{Name: "s", BaseURL: "https://a.com", APIKey: "sk-rewrite-ok1",
 		AuthStyle: model.AuthXAPIKey, L1Path: "/status", Enabled: false}
@@ -308,7 +307,11 @@ func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
 	beforeRevision := models.Revision
 
 	upstream.BaseURL = "https://b.com"
-	if err := store.UpdateUpstream(upstream); err != nil {
+	if err := store.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); !errors.Is(err, model.ErrValidation) {
+		t.Fatalf("cross-origin parent update must reject: %v", err)
+	}
+	models.URLOverride = "https://a.com/new-status"
+	if err := store.UpdateEndpoint(models, models.Revision); err != nil {
 		t.Fatal(err)
 	}
 
@@ -316,8 +319,8 @@ func TestUpdateUpstreamRewritesChangedEndpointOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if models.URLOverride != "https://b.com/status" {
-		t.Errorf("override 应跟随 base_url，得到 %q", models.URLOverride)
+	if models.URLOverride != "https://a.com/new-status" {
+		t.Errorf("显式 Endpoint override 未保存，得到 %q", models.URLOverride)
 	}
 	if models.Revision <= beforeRevision {
 		t.Errorf("override 变了就必须 bump revision：%d -> %d", beforeRevision, models.Revision)

@@ -51,7 +51,7 @@ func routeCapabilityCount(t *testing.T, st *Store, routeID int64) int {
 func TestDeleteRoute_PreservesRouteScopedCapability(t *testing.T) {
 	st := testStore(t)
 	_, r := routeWithCapability(t, st, "del-rt-cap")
-	if err := st.DeleteRoute(r.ID); !errors.Is(err, ErrDependencyConflict) {
+	if err := st.DeleteRouteWithRevision(context.Background(), r.ID, r.Revision); !errors.Is(err, ErrDependencyConflict) {
 		t.Fatalf("DeleteRoute must reject capability history: %v", err)
 	}
 	if _, err := st.GetRoute(r.ID); err != nil {
@@ -66,7 +66,7 @@ func TestDeleteRoute_PreservesRouteScopedCapability(t *testing.T) {
 func TestDeleteModelName_PreservesChildRouteScopedCapability(t *testing.T) {
 	st := testStore(t)
 	mn, r := routeWithCapability(t, st, "del-mn-cap")
-	if err := st.DeleteModelName(mn.ID); !errors.Is(err, ErrDependencyConflict) {
+	if err := st.DeleteModelNameWithRevision(context.Background(), mn.ID, mn.Revision); !errors.Is(err, ErrDependencyConflict) {
 		t.Fatalf("DeleteModelName must reject child reference: %v", err)
 	}
 	if _, err := st.GetModelName(mn.ID); err != nil {

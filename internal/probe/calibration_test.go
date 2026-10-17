@@ -172,7 +172,7 @@ func TestCalibration_LazyRejectsAutomaticPlan(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	up.ProbeMode = model.ProbeModeLazy
-	if err := st.UpdateUpstream(up); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
 		t.Fatal(err)
 	}
 	svc, _ := newCalibrationHarness(t, st, up, nil)
@@ -194,7 +194,7 @@ func TestService_PlanCalibrationAcceptsExplicitLazyStart(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	up.ProbeMode = model.ProbeModeLazy
-	if err := st.UpdateUpstream(up); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
 		t.Fatal(err)
 	}
 	cal, _ := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
@@ -221,7 +221,7 @@ func TestCalibration_RejectsDisabledUpstream(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	up.Enabled = false
-	if err := st.UpdateUpstream(up); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err != nil {
 		t.Fatal(err)
 	}
 	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
@@ -267,7 +267,7 @@ func TestCalibration_RejectsDisabledRoute(t *testing.T) {
 	st := calibrationTestStore(t)
 	up, _, rt := seedCalibrationRoute(t, st)
 	rt.Enabled = false
-	if err := st.UpdateRoute(rt); err != nil {
+	if err := st.UpdateRouteWithRevision(context.Background(), rt, rt.Revision); err != nil {
 		t.Fatal(err)
 	}
 	svc, counter := newCalibrationHarness(t, st, up, func(*http.Request) (*http.Response, error) {
@@ -300,7 +300,7 @@ func TestCalibration_StartRejectsAfterDisable(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt.Enabled = false
-	if err := st.UpdateRoute(rt); err != nil {
+	if err := st.UpdateRouteWithRevision(context.Background(), rt, rt.Revision); err != nil {
 		t.Fatal(err)
 	}
 	_, err = svc.Start(context.Background(), run.ID, run.Revision)
@@ -832,7 +832,7 @@ func TestCalibration_CredentialChangeAfterExecution_RequiresRetest(t *testing.T)
 		t.Fatal(err)
 	}
 	freshUp.APIKey = "sk-cal-rotated-after-probe"
-	if err := st.UpdateUpstream(freshUp); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), freshUp, freshUp.Revision); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := st.GetCalibrationRun(context.Background(), started.ID)

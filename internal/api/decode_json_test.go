@@ -38,7 +38,7 @@ func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 	if created.Code != http.StatusCreated {
 		t.Fatalf("seed create = %d: %s", created.Code, created.Body.String())
 	}
-	list, err := server.st.ListUpstreams()
+	list, err := fixtureUpstreams(server.st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestDecodeJSON_RejectsTrailingSecondValue(t *testing.T) {
 		t.Fatalf("trailing update = %d: %s, want 400", dupUpdate.Code, dupUpdate.Body.String())
 	}
 
-	after, err := server.st.ListUpstreams()
+	after, err := fixtureUpstreams(server.st)
 	if err != nil {
 		t.Fatal(err)
 	}

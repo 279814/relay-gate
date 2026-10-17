@@ -46,25 +46,6 @@ func (s *Store) scanUpstream(sc interface{ Scan(...any) error }) (*model.Upstrea
 	return &u, nil
 }
 
-func (s *Store) ListUpstreams() ([]*model.Upstream, error) {
-	// id<=0 is the internal recipe-archive holder, not an operator-facing site.
-	rows, err := s.db.Query(`SELECT ` + upstreamCols + ` FROM upstream WHERE id>0 ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []*model.Upstream{}
-	for rows.Next() {
-		u, err := s.scanUpstream(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, u)
-	}
-	return out, rows.Err()
-}
-
 func (s *Store) ListUpstreamsPage(ctx context.Context, filter model.UpstreamFilter) (model.Page[*model.Upstream], error) {
 	limit, err := normalizePageLimit(filter.Limit)
 	if err != nil {
@@ -141,26 +122,14 @@ func (s *Store) CreateUpstream(u *model.Upstream) error {
 	return s.CreateUpstreamWithEndpoints(context.Background(), u, canonicalEndpointBundle(u))
 }
 
-// UpdateUpstream 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
+// UpdateUpstreamWithRevision 全量更新。APIKey 为空或等于 MaskKey(现钥) 表示「不改 key」——
 // GET/list 回显的是脱敏值，前端把它原样提交回来时不能当作真 key 写入，
 // 否则一次编辑就会把 key 破坏成 "sk-abcd…wxyz"。
 // proxy_url 同理：回显经 MaskProxyURL 去掉 password，原样提交必须保留库中真凭据。
-func (s *Store) UpdateUpstream(u *model.Upstream) error {
-	current, err := s.GetUpstream(u.ID)
-	if err != nil {
-		return err
-	}
-	return s.updateUpstream(context.Background(), u, current.Revision, true)
-}
-
 func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.Upstream, expectedRevision int64) (err error) {
 	if expectedRevision < 1 {
 		return model.WrapValidation("expected_revision 必须为正数")
 	}
-	return s.updateUpstream(ctx, upstream, expectedRevision, false)
-}
-
-func (s *Store) updateUpstream(ctx context.Context, upstream *model.Upstream, expectedRevision int64, legacy bool) (err error) {
 	upstream.Defaults()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -184,7 +153,7 @@ func (s *Store) updateUpstream(ctx context.Context, upstream *model.Upstream, ex
 	if len(upstream.ProbeHeaders) == 0 && len(current.ProbeHeaders) == 0 {
 		upstream.ProbeHeaders = current.ProbeHeaders
 	}
-	if !legacy && (upstream.AuthStyle != current.AuthStyle || upstream.FullURLMode != current.FullURLMode || upstream.L1Path != current.L1Path || !reflect.DeepEqual(upstream.ProbeHeaders, current.ProbeHeaders)) {
+	if upstream.AuthStyle != current.AuthStyle || upstream.FullURLMode != current.FullURLMode || upstream.L1Path != current.L1Path || !reflect.DeepEqual(upstream.ProbeHeaders, current.ProbeHeaders) {
 		return model.WrapValidation("旧全局 auth_style/full_url_mode/l1_path/probe_headers 不可修改，请编辑对应 Endpoint 或 Recipe")
 	}
 	// 由停用转启用时必须先补齐五类 Endpoint。放行一个缺 Endpoint 的站，
@@ -212,7 +181,7 @@ func (s *Store) updateUpstream(ctx context.Context, upstream *model.Upstream, ex
 	if err := upstream.Validate(); err != nil {
 		return err
 	}
-	if !legacy && upstream.BaseURL != current.BaseURL {
+	if upstream.BaseURL != current.BaseURL {
 		if err := validateCurrentEndpointOrigins(ctx, tx, upstream.ID, upstream.BaseURL); err != nil {
 			return err
 		}
@@ -291,49 +260,6 @@ func (s *Store) updateUpstream(ctx context.Context, upstream *model.Upstream, ex
 			return err
 		}
 	}
-	if legacy && upstream.AuthStyle != current.AuthStyle {
-		mode, headerName := legacyAuthProfile(upstream.AuthStyle)
-		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET auth_mode=?,auth_header_name=?,
-			legacy_compat_real_only=?,auth_profile_revision=auth_profile_revision+1,
-			revision=revision+1,updated_at=? WHERE upstream_id=?`,
-			mode, headerName, mode == model.AuthModeLegacyAutoRealOnly, upstream.UpdatedAt, upstream.ID); err != nil {
-			return err
-		}
-	}
-	// base_url、full_url_mode 与 l1_path 任一改变，都要重新翻译受影响 Endpoint
-	// 的 url_override —— 它们三个共同决定 override 的值（EndpointURLOverride），
-	// 只盯 l1_path 的话，改 base_url 会留下一个指向旧域名的 override。
-	if legacy && (upstream.L1Path != current.L1Path || upstream.BaseURL != current.BaseURL ||
-		upstream.FullURLMode != current.FullURLMode) {
-
-		// 只改 canonical Endpoint：legacy_exact 的 URL 存在加密记录里，
-		// 它的行为必须逐字节保持不变（§19.2），碰它就是改动线上语义。
-		//
-		// `url_override<>?` 是必须的：Endpoint revision 会失效对应的
-		// Capability（§4.2），无条件 bump 等于把「改了 base_url」变成
-		// 「五个端点全部重新探活」，而其中四个的 override 通常都是空、
-		// 压根没变。规范也明确要求仅时间戳不构成一次写入。
-		if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override=?,
-			revision=revision+1,updated_at=? WHERE upstream_id=? AND endpoint=? AND url_mode=?
-			AND url_override<>?`,
-			upstream.EndpointURLOverride(model.EndpointModels), upstream.UpdatedAt, upstream.ID,
-			model.EndpointModels, model.EndpointURLCanonical,
-			upstream.EndpointURLOverride(model.EndpointModels)); err != nil {
-			return err
-		}
-		// 协议端点的 override 不由站级字段决定：用户逐个设置的值必须保留。
-		// 只清掉旧创建路径按 full_url_mode 写下的猜测值（base_url 本身）。
-		if legacyStamp := strings.TrimRight(current.BaseURL, "/"); current.FullURLMode && legacyStamp != "" {
-			if _, err := tx.ExecContext(ctx, `UPDATE upstream_endpoint SET url_override='',
-				revision=revision+1,updated_at=? WHERE upstream_id=? AND url_mode=? AND url_override=?
-				AND endpoint IN (?,?,?,?)`,
-				upstream.UpdatedAt, upstream.ID, model.EndpointURLCanonical, legacyStamp,
-				model.EndpointMessages, model.EndpointResponses,
-				model.EndpointChatCompletions, model.EndpointCountTokens); err != nil {
-				return err
-			}
-		}
-	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
@@ -365,12 +291,6 @@ func validateCurrentEndpointOrigins(ctx context.Context, tx *sql.Tx, upstreamID 
 	return rows.Err()
 }
 
-// DeleteUpstream removes only an unreferenced, history-free Upstream and its
-// current owned Endpoint configuration. Historical rows keep their owner.
-func (s *Store) DeleteUpstream(id int64) error {
-	return s.deleteUpstream(context.Background(), id, 0)
-}
-
 // DeleteUpstreamWithRevision rejects a stale administrator view in the same
 // transaction as detaching references and deleting the row.
 func (s *Store) DeleteUpstreamWithRevision(ctx context.Context, id, expectedRevision int64) error {
@@ -394,7 +314,7 @@ func (s *Store) deleteUpstream(ctx context.Context, id, expectedRevision int64) 
 	if err != nil {
 		return err
 	}
-	if expectedRevision > 0 && revision != expectedRevision {
+	if revision != expectedRevision {
 		return ErrRevisionConflict
 	}
 	if err = requireEntityDeleteUnreferenced(ctx, tx, "upstream", id); err != nil {

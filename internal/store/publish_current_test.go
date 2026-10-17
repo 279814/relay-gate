@@ -148,14 +148,14 @@ func TestPublishRecipeVersionRejectsChangesAfterTest(t *testing.T) {
 				err = st.UpdateEndpoint(ep, ep.Revision)
 			case "network":
 				up.BaseURL = "https://changed.example"
-				err = st.UpdateUpstream(up)
+				err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 			case "auth":
 				ep.AuthProfile.Mode = model.AuthModeXAPIKey
 				ep.LegacyCompatRealOnly = false
 				err = st.UpdateEndpoint(ep, ep.Revision)
 			case "credential":
 				up.APIKey = "changed-current-upstream-secret"
-				err = st.UpdateUpstream(up)
+				err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 			case "secret":
 				_, err = st.UpdateProbeSecret(secret.ID, secret.Revision, []byte("after"))
 			case "endpoint-secret":
@@ -171,9 +171,9 @@ func TestPublishRecipeVersionRejectsChangesAfterTest(t *testing.T) {
 				err = st.DisableRecipe(ctx, recipeID, recipe.Revision)
 			case "reenable":
 				up.Enabled = false
-				if err = st.UpdateUpstream(up); err == nil {
+				if err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err == nil {
 					up.Enabled = true
-					err = st.UpdateUpstream(up)
+					err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 				}
 			}
 			if err != nil {
@@ -254,7 +254,7 @@ func TestMarkClientProfileTestedRejectsChangedTarget(t *testing.T) {
 				err = st.UpdateEndpoint(ep, ep.Revision)
 			case "credential":
 				up.APIKey = "changed-profile-target-key"
-				err = st.UpdateUpstream(up)
+				err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 			case "endpoint-secret":
 				_, err = st.UpdateProbeSecret(endpointSecret.ID, endpointSecret.Revision, []byte("after-profile-endpoint-secret"))
 			case "settings":
@@ -263,9 +263,9 @@ func TestMarkClientProfileTestedRejectsChangedTarget(t *testing.T) {
 				_, err = st.SaveSettingsWithRevision(settings, settingsRevision)
 			case "reenable":
 				up.Enabled = false
-				if err = st.UpdateUpstream(up); err == nil {
+				if err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision); err == nil {
 					up.Enabled = true
-					err = st.UpdateUpstream(up)
+					err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 				}
 			}
 			if err != nil {
@@ -337,27 +337,27 @@ func TestExplicitTestBindingRejectsChangedRouteAndModel(t *testing.T) {
 				switch change {
 				case "route-model":
 					route.UpstreamModel = "changed-model-name"
-					err = st.UpdateRoute(route)
+					err = st.UpdateRouteWithRevision(context.Background(), route, route.Revision)
 				case "model-prompt":
 					name.ProbePrompt = "changed-probe-prompt"
-					err = st.UpdateModelName(name)
+					err = st.UpdateModelNameWithRevision(context.Background(), name, name.Revision)
 				case "route-disable", "route-reenable":
 					route.Enabled = false
-					err = st.UpdateRoute(route)
+					err = st.UpdateRouteWithRevision(context.Background(), route, route.Revision)
 					if err == nil && change == "route-reenable" {
 						route.Enabled = true
-						err = st.UpdateRoute(route)
+						err = st.UpdateRouteWithRevision(context.Background(), route, route.Revision)
 					}
 				case "model-disable", "model-reenable":
 					name.Enabled = false
-					err = st.UpdateModelName(name)
+					err = st.UpdateModelNameWithRevision(context.Background(), name, name.Revision)
 					if err == nil && change == "model-reenable" {
 						name.Enabled = true
-						err = st.UpdateModelName(name)
+						err = st.UpdateModelNameWithRevision(context.Background(), name, name.Revision)
 					}
 				case "upstream-disable":
 					up.Enabled = false
-					err = st.UpdateUpstream(up)
+					err = st.UpdateUpstreamWithRevision(context.Background(), up, up.Revision)
 				}
 				if err != nil {
 					t.Fatal(err)

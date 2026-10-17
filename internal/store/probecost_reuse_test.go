@@ -42,6 +42,14 @@ func TestEntityDeletePreservesProbeCostUntilExplicitRetentionCleanup(t *testing.
 		t.Run(kind, func(t *testing.T) {
 			st := testStore(t)
 			target := mkRoute(t, st)
+			targetUp, err := st.GetUpstream(target.UpstreamID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetModel, err := st.GetModelName(target.ModelNameID)
+			if err != nil {
+				t.Fatal(err)
+			}
 			siblingUp := mkUpstream(t, st, "cost-sibling")
 			sibling := &model.Route{UpstreamID: siblingUp.ID, ModelNameID: target.ModelNameID, Enabled: true}
 			if err := st.CreateRoute(sibling); err != nil {
@@ -49,12 +57,16 @@ func TestEntityDeletePreservesProbeCostUntilExplicitRetentionCleanup(t *testing.
 			}
 			insertProbeCostDaily(t, st, target.ID, target.UpstreamID)
 			insertProbeCostDaily(t, st, sibling.ID, sibling.UpstreamID)
-			remove := func() error { return st.DeleteRoute(target.ID) }
+			remove := func() error { return st.DeleteRouteWithRevision(context.Background(), target.ID, target.Revision) }
 			if kind == "upstream" {
-				remove = func() error { return st.DeleteUpstream(target.UpstreamID) }
+				remove = func() error {
+					return st.DeleteUpstreamWithRevision(context.Background(), target.UpstreamID, targetUp.Revision)
+				}
 			}
 			if kind == "model" {
-				remove = func() error { return st.DeleteModelName(target.ModelNameID) }
+				remove = func() error {
+					return st.DeleteModelNameWithRevision(context.Background(), target.ModelNameID, targetModel.Revision)
+				}
 			}
 			assertDeleteHistoryConflict(t, st, remove)
 			if countProbeCostByRoute(t, st, target.ID) != 1 || countProbeCostByUpstream(t, st, sibling.UpstreamID) != 1 {
@@ -68,7 +80,7 @@ func TestEntityDeletePreservesProbeCostUntilExplicitRetentionCleanup(t *testing.
 				t.Fatal(err)
 			}
 			if kind == "upstream" {
-				if err := st.DeleteRoute(target.ID); err != nil {
+				if err := st.DeleteRouteWithRevision(context.Background(), target.ID, target.Revision); err != nil {
 					t.Fatal(err)
 				}
 			}

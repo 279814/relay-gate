@@ -42,7 +42,7 @@ func healthRowsByRoute(t *testing.T, h http.Handler) map[int64]map[string]any {
 func TestGetHealth_CountTokensPerRoute(t *testing.T) {
 	s, _ := newTestServer(t)
 	seedConfig(t, s, 2, 2)
-	routes, err := s.st.ListRoutes(0)
+	routes, err := fixtureRoutes(s.st, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

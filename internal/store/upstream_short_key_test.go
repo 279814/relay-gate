@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -35,7 +36,7 @@ func TestUpdateUpstreamRejectsKeepWhenStoredKeyShorterThanMinRedactable(t *testi
 
 	got.Name = "dirty-renamed"
 	got.APIKey = ""
-	err = st.UpdateUpstream(got)
+	err = st.UpdateUpstreamWithRevision(context.Background(), got, got.Revision)
 	if err == nil {
 		t.Fatal("留空保留短 key 的部分更新应被拒绝")
 	}
@@ -52,7 +53,7 @@ func TestUpdateUpstreamRejectsKeepWhenStoredKeyShorterThanMinRedactable(t *testi
 
 	got.Name = "dirty-mask"
 	got.APIKey = MaskKey(short)
-	err = st.UpdateUpstream(got)
+	err = st.UpdateUpstreamWithRevision(context.Background(), got, got.Revision)
 	if err == nil {
 		t.Fatal("MaskKey 回显保留短 key 的部分更新应被拒绝")
 	}
@@ -70,7 +71,7 @@ func TestUpdateUpstreamRejectsKeepWhenStoredKeyShorterThanMinRedactable(t *testi
 	exact := strings.Repeat("z", model.MinRedactableKeyLen)
 	got.APIKey = exact
 	got.Name = "dirty-fixed"
-	if err := st.UpdateUpstream(got); err != nil {
+	if err := st.UpdateUpstreamWithRevision(context.Background(), got, got.Revision); err != nil {
 		t.Fatalf("换足够长的新 key 应成功：%v", err)
 	}
 	final, err := st.GetUpstream(u.ID)

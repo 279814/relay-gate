@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -97,7 +98,7 @@ func TestRequestLogKeepsUpstreamNameAfterRejectedDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteUpstream(up.ID); !errors.Is(err, ErrDependencyConflict) {
+	if err := st.DeleteUpstreamWithRevision(context.Background(), up.ID, up.Revision); !errors.Is(err, ErrDependencyConflict) {
 		t.Fatalf("request log history must retain its upstream: %v", err)
 	}
 

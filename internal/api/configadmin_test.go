@@ -93,7 +93,7 @@ func TestConfigAdminHTTP_CreateRequiresExplicitCompleteEndpointBundle(t *testing
 			t.Fatalf("server guessed initial endpoints: %d %s", rec.Code, rec.Body.String())
 		}
 	}
-	items, err := s.st.ListUpstreams()
+	items, err := fixtureUpstreams(s.st)
 	if err != nil || len(items) != 0 {
 		t.Fatalf("invalid bundle persisted parent: %v %v", items, err)
 	}
@@ -194,7 +194,7 @@ func TestConfigAdminHTTP_InitialBundleIsAtomicAndDoesNotInferAuth(t *testing.T) 
 		if rec.Code != 400 {
 			t.Fatalf("invalid bundle=%d %s", rec.Code, rec.Body.String())
 		}
-		rows, _ := s.st.ListUpstreams()
+		rows, _ := fixtureUpstreams(s.st)
 		eps, _ := s.st.ListEndpointsPage(context.Background(), model.EndpointFilter{})
 		if len(rows) != 0 || len(eps.Items) != 0 {
 			t.Fatal("invalid child left partial parent/endpoint rows")
@@ -207,7 +207,7 @@ func TestConfigAdminHTTP_InitialBundleIsAtomicAndDoesNotInferAuth(t *testing.T) 
 	if rec := do(t, h, "POST", "/admin/api/upstreams", valid, true); rec.Code != 500 {
 		t.Fatalf("injected insert=%d %s", rec.Code, rec.Body.String())
 	}
-	rows, _ := s.st.ListUpstreams()
+	rows, _ := fixtureUpstreams(s.st)
 	eps, _ := s.st.ListEndpointsPage(context.Background(), model.EndpointFilter{})
 	if len(rows) != 0 || len(eps.Items) != 0 {
 		t.Fatal("SQL failure left partial bundle")

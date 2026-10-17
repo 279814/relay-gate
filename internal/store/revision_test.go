@@ -67,12 +67,12 @@ func TestRevisionAwareConfigurationUpdatesSeparateRowAndSemanticRevisions(t *tes
 	}
 }
 
-func TestLegacyUpdateAdaptersAlsoAdvanceRevisions(t *testing.T) {
+func TestUpstreamCASUpdateAdvancesHeldRevision(t *testing.T) {
 	store := testStore(t)
 	upstream := mkUpstream(t, store, "legacy-revision")
 	upstream.Name = "legacy-revision-renamed"
 	upstream.APIKey = ""
-	if err := store.UpdateUpstream(upstream); err != nil {
+	if err := store.UpdateUpstreamWithRevision(context.Background(), upstream, upstream.Revision); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetUpstream(upstream.ID)
@@ -80,6 +80,6 @@ func TestLegacyUpdateAdaptersAlsoAdvanceRevisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Revision != 2 {
-		t.Fatalf("legacy adapter revision = %d", got.Revision)
+		t.Fatalf("CAS update revision = %d", got.Revision)
 	}
 }

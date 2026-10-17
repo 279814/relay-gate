@@ -184,5 +184,5 @@ func TestUpstreamDeleteKeepsExternalEndpointTransformReference(t *testing.T) {
 	// Historical/externally supplied bindings can name an Endpoint without a
 	// current Route on its owning Upstream. A parent delete must not erase it.
 	insertTransformBinding(t, st, 999, ep.ID, 88)
-	assertDeleteHistoryConflict(t, st, func() error { return st.DeleteUpstream(up.ID) })
+	assertDeleteHistoryConflict(t, st, func() error { return st.DeleteUpstreamWithRevision(context.Background(), up.ID, up.Revision) })
 }
