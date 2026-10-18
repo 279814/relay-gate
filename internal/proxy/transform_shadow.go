@@ -16,12 +16,12 @@ import (
 // pre-published request (§15.2) and records a redacted diff. It never returns
 // bytes to the caller: the live request stays whatever published/passthrough
 // produced, shadow errors never fail the attempt, and no upstream call is made.
-func (h *Handler) shadowRequest(cand *router.Candidate, endpointID int64,
+func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candidate, endpointID int64,
 	header http.Header, body []byte) {
 	if h.transforms == nil || endpointID == 0 {
 		return
 	}
-	c, verID, err := h.transforms.ShadowCompiled(cand.Route.ID, endpointID)
+	c, verID, err := view.ShadowCompiled(cand.Route.ID, endpointID)
 	if err != nil {
 		h.log.Warn("加载 shadow transform 失败", "err", err, "route", cand.Route.ID)
 		return
@@ -72,7 +72,7 @@ func (h *Handler) attachResponseShadow(w http.ResponseWriter, la *liveAttempt) *
 		la.at.f == nil || la.at.resp == nil {
 		return nil
 	}
-	c, verID, err := h.transforms.ShadowCompiled(la.cand.Route.ID, la.endpointID)
+	c, verID, err := la.transforms.ShadowCompiled(la.cand.Route.ID, la.endpointID)
 	if err != nil {
 		h.log.Warn("加载 shadow transform 失败", "err", err, "route", la.cand.Route.ID)
 		return nil
