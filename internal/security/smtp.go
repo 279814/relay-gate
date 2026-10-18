@@ -1,6 +1,7 @@
 package security
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/smtp"
@@ -44,18 +45,20 @@ type AlertMailer struct {
 	digestStarted time.Time
 	digestTimer   *time.Timer
 	now           func() time.Time
-	testClock     bool // WithNowForTest: tests drive FlushDigest; no wall timer
+	testClock     bool        // WithNowForTest: tests drive FlushDigest; no wall timer
+	tlsConfig     *tls.Config // package-local test trust roots; nil uses system roots
+	timeout       time.Duration
 }
 
-// NewAlertMailer constructs a mailer. dial/send nil → net defaults.
+// NewAlertMailer constructs a mailer with bounded, certificate-verified TLS.
 func NewAlertMailer() *AlertMailer {
 	return &AlertMailer{
 		dial:    func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) },
-		send:    smtp.SendMail,
 		lastAt:  map[string]time.Time{},
 		pending: map[string]digestItem{},
 		window:  5 * time.Minute,
 		now:     time.Now,
+		timeout: 10 * time.Second,
 	}
 }
 
@@ -75,7 +78,8 @@ func (m *AlertMailer) Config() MailConfig {
 	return c
 }
 
-// WithSendForTest injects smtp.SendMail replacement (local fake SMTP).
+// WithSendForTest captures message delivery in content/rate-limit tests.
+// Transport security is exercised separately against real TLS SMTP listeners.
 func (m *AlertMailer) WithSendForTest(fn func(addr string, a smtp.Auth, from string, to []string, msg []byte) error) *AlertMailer {
 	m.send = fn
 	return m
@@ -296,24 +300,25 @@ func (m *AlertMailer) flushDigestLocked(now time.Time) error {
 	return err
 }
 
-func (m *AlertMailer) doSend(cfg MailConfig, msg []byte) error {
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	var auth smtp.Auth
-	if cfg.Username != "" {
-		auth = smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
-	}
-	return m.send(addr, auth, cfg.From, cfg.Recipients, msg)
-}
-
 // SendTest sends a test alert with smtp_test source.
 func (m *AlertMailer) SendTest(adminURL string) error {
-	return m.MaybeNotify(Finding{
+	if m == nil {
+		return fmt.Errorf("SMTP mailer is not configured")
+	}
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+	// A deliberate test is independent of alert enablement, threshold and
+	// dedupe. Success means this call actually completed one SMTP delivery.
+	cfg.Enabled = true
+	finding := Finding{
 		ID:       "smtp-test",
 		Severity: SeverityCritical,
 		Category: "smtp_test",
 		Summary:  "SMTP 测试邮件",
 		Source:   "smtp_test",
-	}, adminURL)
+	}
+	return m.doSend(cfg, BuildAlertMessage(cfg.From, cfg.Recipients, finding, adminURL))
 }
 
 func severityAtLeast(got, min Severity) bool {

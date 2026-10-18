@@ -46,7 +46,7 @@ async function main() {
   const known = new Set(Object.keys(inst));
 
   const builtins = new Set([
-    '$watch', '$el', '$refs', '$store', '$dispatch', '$nextTick', '$root', '$data', '$id',
+    '$watch', '$el', '$refs', '$store', '$dispatch', '$nextTick', '$root', '$data', '$id', '$event',
     'true', 'false', 'null', 'undefined', 'JSON', 'Object', 'Math', 'Date', 'String',
     'Number', 'Array', 'confirm', 'window', 'console',
     'r', 'u', 'm', 's', 't', 'rc', 'uc', 'c', 'e', 'i', 'v', 'n', 'x', 'p', 'k', 'd',
@@ -65,7 +65,7 @@ async function main() {
       .replace(/'[^']*'/g, "''")
       .replace(/`[^`]*`/g, '``')
       .replace(/"[^"]*"/g, '""');
-    const idRe = /(\.\s*)?\b([A-Za-z_$][\w$]*)\b/g;
+    const idRe = /(\.\s*)?(?<![\w$])([A-Za-z_$][\w$]*)/g;
     let m;
     while ((m = idRe.exec(e)) !== null) {
       if (m[1]) continue;
