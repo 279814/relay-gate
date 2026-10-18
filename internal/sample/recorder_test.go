@@ -152,7 +152,7 @@ func TestRecorder_DropsWhenFullNeverBlocks(t *testing.T) {
 	r.Close()
 }
 
-// 落库失败只记日志，不重试、不阻塞、不影响后续样本。
+// 落库失败计入 dropped 并记日志，不重试、不阻塞、不影响后续样本。
 func TestRecorder_ContinuesAfterWriteError(t *testing.T) {
 	w := &fakeWriter{failNth: 2}
 	r := newTestRecorder(w, testSettings())
@@ -165,8 +165,8 @@ func TestRecorder_ContinuesAfterWriteError(t *testing.T) {
 	if got := w.count(); got != 3 {
 		t.Errorf("失败 1 条后其余 3 条仍应写入，得到 %d", got)
 	}
-	if written, _ := r.Stats(); written != 3 {
-		t.Errorf("written 不该把失败的算进去，得到 %d", written)
+	if written, dropped := r.Stats(); written != 3 || dropped != 1 {
+		t.Errorf("失败一组应只计一次 dropped，得到 written=%d dropped=%d", written, dropped)
 	}
 }
 

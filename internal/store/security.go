@@ -121,6 +121,17 @@ func (s *Store) GetSMTPConfig() (SMTPConfig, error) {
 
 // SaveSMTPConfig upserts SMTP settings. passwordPlain empty keeps existing password.
 func (s *Store) SaveSMTPConfig(c SMTPConfig, passwordPlain string) error {
+	if c.Port == 0 {
+		c.Port = 587
+		if c.UseSMTPS {
+			c.Port = 465
+		}
+	}
+	if err := (security.MailConfig{Enabled: c.Enabled, Host: c.Host, Port: c.Port,
+		UseSTARTTLS: c.UseSTARTTLS, UseSMTPS: c.UseSMTPS, From: c.From,
+		Recipients: strings.Split(c.Recipients, ","), MinSeverity: security.Severity(c.MinSeverity)}).Validate(); err != nil {
+		return err
+	}
 	var pwSQL any
 	keepPW := true
 	if strings.TrimSpace(passwordPlain) != "" {
@@ -140,9 +151,6 @@ func (s *Store) SaveSMTPConfig(c SMTPConfig, passwordPlain string) error {
 	}
 	if c.UseSMTPS {
 		sm = 1
-	}
-	if c.Port <= 0 {
-		c.Port = 587
 	}
 	if c.MinSeverity == "" {
 		c.MinSeverity = "critical"

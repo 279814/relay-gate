@@ -72,10 +72,18 @@ export function createSecurityFeature(shell, api) {
 
   shell.saveSMTP = async function saveSMTP() {
     const state = this.security;
+    const config = state.smtp;
+    const modeCount = Number(config?.use_starttls === true) + Number(config?.use_smtps === true);
+    if (!config || modeCount > 1 || (config.enabled === true && modeCount !== 1)) {
+      this.err = 'SMTP 必须明确选择 STARTTLS 或 SMTPS 加密模式';
+      return;
+    }
     try {
-      const body = Object.assign({}, this.security.smtp || {}, {
-        password: this.security.smtpPassword || undefined,
-      });
+      const body = {};
+      for (const key of ['enabled', 'host', 'port', 'use_starttls', 'use_smtps', 'from', 'recipients', 'username', 'min_severity']) {
+        body[key] = config[key];
+      }
+      if (state.smtpPassword) body.password = state.smtpPassword;
       const smtp = await api.put('/security/smtp', body);
       if (this.security !== state) return;
       state.smtp = smtp;
@@ -84,6 +92,16 @@ export function createSecurityFeature(shell, api) {
     } catch (e) {
       if (this.security !== state) return;
       this.err = e && e.message ? e.message : String(e);
+    }
+  };
+
+  shell.setSMTPMode = function setSMTPMode(mode) {
+    const config = this.security.smtp;
+    if (!config || !['starttls', 'smtps'].includes(mode)) return;
+    config.use_starttls = mode === 'starttls';
+    config.use_smtps = mode === 'smtps';
+    if (!config.port || config.port === 587 || config.port === 465) {
+      config.port = config.use_smtps ? 465 : 587;
     }
   };
 

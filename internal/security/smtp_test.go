@@ -72,6 +72,7 @@ func TestAdminURL_NoSMTPHeaderInjection(t *testing.T) {
 		Enabled:     true,
 		Host:        "smtp.test.local",
 		Port:        587,
+		UseSTARTTLS: true,
 		From:        "relay@test.local",
 		Recipients:  []string{"ops@test.local"},
 		MinSeverity: security.SeverityInfo,
@@ -189,6 +190,7 @@ func TestSummary_NoSMTPHeaderInjection(t *testing.T) {
 		Enabled:     true,
 		Host:        "smtp.test.local",
 		Port:        587,
+		UseSTARTTLS: true,
 		From:        "relay@test.local",
 		Recipients:  []string{"ops@test.local"},
 		MinSeverity: security.SeverityInfo,
@@ -217,45 +219,22 @@ func TestSummary_NoSMTPHeaderInjection(t *testing.T) {
 	}
 }
 
-func TestAlertMailerSendAgainstFakeSMTP(t *testing.T) {
+func TestAlertMailerRejectsFakePlainSMTP(t *testing.T) {
 	addr, _, closeFn := security.StartFakeSMTP(t)
 	defer closeFn()
 	host, port, _ := strings.Cut(addr, ":")
-	var captured []string
-	m := security.NewAlertMailer().WithSendForTest(func(a string, auth smtp.Auth, from string, to []string, msg []byte) error {
-		captured = append(captured, string(msg))
-		return smtp.SendMail(a, auth, from, to, msg)
-	})
+	m := security.NewAlertMailer()
 	m.SetConfig(security.MailConfig{
 		Enabled:     true,
 		Host:        host,
 		Port:        atoiPort(port),
+		UseSTARTTLS: true,
 		From:        "relay@test.local",
 		Recipients:  []string{"ops@test.local"},
 		MinSeverity: security.SeverityInfo,
 	})
-	if err := m.SendTest(""); err != nil {
-		// Fake SMTP may not speak AUTH; use capture-only path.
-		m.WithSendForTest(func(a string, auth smtp.Auth, from string, to []string, msg []byte) error {
-			if a == "" || from == "" || len(to) == 0 {
-				t.Fatalf("bad args")
-			}
-			captured = append(captured, string(msg))
-			return nil
-		})
-		if err2 := m.SendTest(""); err2 != nil {
-			t.Fatal(err2)
-		}
-	}
-	if len(captured) == 0 {
-		t.Fatal("no message captured")
-	}
-	body := captured[len(captured)-1]
-	if strings.Contains(body, "<script>") || strings.Contains(strings.ToLower(body), "api key") {
-		t.Fatal("sensitive content in mail")
-	}
-	if !strings.Contains(body, "smtp_test") && !strings.Contains(body, "SMTP") {
-		t.Fatalf("unexpected body: %s", body)
+	if err := m.SendTest(""); err == nil {
+		t.Fatal("a plaintext fake server cannot prove TLS delivery")
 	}
 }
 
@@ -285,6 +264,7 @@ func TestAlertMailer_CriticalImmediate_NonCriticalDigestDedupe(t *testing.T) {
 		Enabled:     true,
 		Host:        "smtp.test.local",
 		Port:        587,
+		UseSTARTTLS: true,
 		From:        "relay@test.local",
 		Recipients:  []string{"ops@test.local"},
 		MinSeverity: security.SeverityInfo,
