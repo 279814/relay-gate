@@ -126,6 +126,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
       - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
@@ -133,6 +136,11 @@ jobs:
         run: python scripts/deploy.contract.test.py
       - name: 公网安装脚本离线行为回归
         run: python scripts/deploy-public.contract.test.py
+      - name: Probe CLI wrapper authorization and private stdin contracts
+        run: python scripts/probe-cli.contract.test.py
+      - name: Isolated native capture with disposable fake client
+        if: runner.os == 'Windows'
+        run: go test ./internal/probe -run='^TestClaudeCaptureScriptFailsClosedAndProtectsOutput$' -count=1 -timeout=3m
 
   runtime:
     strategy:

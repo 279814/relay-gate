@@ -111,7 +111,7 @@ export ANTHROPIC_AUTH_TOKEN=<RELAY_KEYS 打印出的值>
 
 不启动网关，直接对 sub2api / New API / One API 等中转站测 `/v1/models`、`/v1/messages`、
 `/v1/messages/count_tokens`、`/v1/responses`（及 chat），逐端点打印 `PASS` / `FAIL`。
-会产生真实费用（每端点 1 次最小请求），所以必须显式加 `--online --accept-probe-cost`。
+会产生真实费用：每站 `/models` 一次，每个 Claude 模型的 messages/count_tokens 各一次，每个 GPT 模型的 responses/chat 各一次；无隐藏重试。必须显式加 `--online --accept-probe-cost`。
 key 只从环境变量或被 gitignore 的 TSV 读，不走命令行参数：
 
 ```powershell
@@ -121,13 +121,25 @@ go run ./cmd/relay-gate probe-matrix --online --accept-probe-cost `
   --claude-model claude-opus-5 --gpt-model gpt-5.6-sol
 ```
 
-模型 ID 应替换为该站实际支持的值。多站批量可按 `scripts/upstreams.example.tsv` 填 `scripts/upstreams.tsv`（已 gitignore），再运行 `bash scripts/probe-all.sh scripts/upstreams.tsv`。该包装脚本会启用线上调用与费用确认，执行前须核对 TSV 中的目标；默认输出到 `.local/p0/reports/`。第二、第三个位置参数可指定 JSON、Markdown 输出：
+模型 ID 应替换为该站实际支持的值。多个模型用逗号分隔。多站批量按 `scripts/upstreams.example.tsv` 填 `scripts/upstreams.tsv`；文件还须只有当前用户可读，并被 Git/Docker 同时排除。wrapper 与 CLI 使用相同的命名参数，不自动补费用授权，也不接受旧的明文 Key 位置参数：
 
 ```bash
-bash scripts/probe-all.sh scripts/upstreams.tsv .local/p0/reports/matrix.json .local/p0/reports/matrix.md
+umask 077
+mkdir -p .local/p0/reports
+chmod 600 scripts/upstreams.tsv
+bash scripts/probe-all.sh --online --accept-probe-cost \
+  --input scripts/upstreams.tsv \
+  --output .local/p0/reports/matrix.json --report .local/p0/reports/matrix.md
+# 单站：同样的参数，加 --name <TSV中的alias>
+bash scripts/probe-upstream.sh --online --accept-probe-cost \
+  --input scripts/upstreams.tsv --name "<alias>"
 ```
 
-直接调用 `probe-matrix` 时才使用 `--output` / `--report` 选项；私有输入与报告路径必须被 Git 忽略。
+也可用 `--input -` 从 stdin 读取 TSV。报告目录须预先存在、仅当前用户可访问；Windows 还会检查 ACL。stdout/report 只含 alias、决策、阶段时间、版本、成本和临时密钥保护的证据哈希，响应哈希明确表示实际观察到的 wire 前缀。
+
+没有对应 control 时只报告 `control_missing`，Probe 自身 PASS 不代表与原生一致。重放专用 control 必须额外提供 `--control-manifest <私有manifest> --accept-control-replay`，每个有 control 的候选另外发送一次原始 control。工具会在第一次发送前报告总请求数和成本估算，并在实际发送层守住捕获完成后 60 秒期限。
+
+Windows 的隔离 Claude capturer 可同时写出 typed v2 fixture 和相邻 manifest：先为 `.local/p0/captures` 准备当前用户专属权限，再运行 `pwsh -File scripts/capture-claude-request.ps1 -Execute -AllowedRoot <私有目录> -OutputPath <同目录的新fixture.json> -ManifestPath <同目录的新manifest.json> -Alias <TSV中的alias>`。它只用空临时目录、隔离配置和 loopback 假上游捕获固定 nonce 提示，不调用真实模型；旧 v1 capture 或 `test_mode` 文件不能充当原生证据。CLI 会重读 fixture，校验来源/隔离声明、原始有序 headers/body 哈希、权限和完整性，再使用生产 Executor 真实执行 control 与 Probe。OpenAI control 同样必须来自可证明隔离的本次专用会话；没有该证据时保留 `control_missing`，不从历史样本补齐。
 
 ## 为什么不是「重试就行了」
 
