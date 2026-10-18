@@ -216,6 +216,7 @@ func (s *Scheduler) execL2(ctx context.Context, up *model.Upstream, mn *model.Mo
 		s.log.Error("L2 执行失败", "upstream", up.Name, "model", mn.Name, "err", err)
 		return ExecutionResult{Outcome: Outcome{Verdict: health.VerdictIgnore}}, nil
 	}
+	res.healthIdentity = req.healthIdentity
 	return res, req.CapabilityExpectation
 }
 
@@ -273,6 +274,7 @@ func (s *Scheduler) attachExpectations(ctx context.Context, req *ExecutionReques
 	}
 	req.ReachabilityExpectation, req.ReachabilityPolicy = reach, reachPol
 	req.CapabilityExpectation, req.CapabilityPolicy = cap, capPol
+	req.healthIdentity = capturedRouteHealthIdentity(snap, cap, reach, nil)
 	timeout := recipe.TimeoutProfile
 	if timeout == "" {
 		timeout = model.TimeoutL2Standard
@@ -505,6 +507,7 @@ func l1StationEffect(decision Decision) (reachable, apply bool) {
 type l1HealthTarget struct {
 	routeID    int64
 	generation uint64
+	identity   *model.RouteHealthIdentity
 }
 
 // Capture child generations before sending. A committed SQL return can arrive
@@ -516,13 +519,14 @@ func (s *Scheduler) captureL1HealthTargets(upstreamID int64) []l1HealthTarget {
 		return nil
 	}
 	var targets []l1HealthTarget
+	proofSnapshot := healthSnapshot(s.cfg)
 	for _, rts := range snap.RoutesByModelName {
 		for _, rt := range rts {
 			if rt.UpstreamID != upstreamID || !rt.Enabled {
 				continue
 			}
 			if generation := ensureRouteGeneration(s.track, rt.ID); generation > 0 {
-				targets = append(targets, l1HealthTarget{rt.ID, generation})
+				targets = append(targets, l1HealthTarget{rt.ID, generation, capturedL1RouteHealthIdentity(proofSnapshot, rt.ID)})
 			}
 		}
 	}
@@ -534,7 +538,7 @@ func (s *Scheduler) propagateL1Failure(up *model.Upstream, out Outcome, targets 
 	var affected int
 	for _, target := range targets {
 		if s.track.Report(health.Report{RouteID: target.routeID, Generation: target.generation,
-			Verdict: out.Verdict, Source: health.SourceL1, Err: out.Err, RetryAfter: out.RetryAfter}) {
+			Verdict: out.Verdict, Source: health.SourceL1, Err: out.Err, RetryAfter: out.RetryAfter, Identity: target.identity}) {
 			affected++
 		}
 	}
@@ -601,7 +605,8 @@ func (s *Scheduler) runL2(ctx context.Context, up *model.Upstream,
 
 	changed := s.track.Report(health.Report{
 		RouteID: rt.ID, Generation: generation,
-		Verdict: out.Verdict, Source: health.SourceL2,
+		Identity: healthIdentityForResult(result.healthIdentity, result.Execution.StatusCode),
+		Verdict:  out.Verdict, Source: health.SourceL2,
 		HalfOpen: true, // Claimed L2 is the armed synthetic recovery path (§9.1)
 		Err:      out.Err, TTFT: out.TTFT, RetryAfter: out.RetryAfter,
 	})

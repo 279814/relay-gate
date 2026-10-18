@@ -12,10 +12,36 @@ import (
 )
 
 func dataKeyBackupFixture(t *testing.T) (*Store, MigrationBackupResult, []byte) {
+	return dataKeyBackupFixtureForSchema(t, 9)
+}
+
+// Historical readers must be tested against an actual schema-8 database, not
+// a schema-9 file with an old number written into its backup manifest.
+func schemaEightDataKeyBackupFixture(t *testing.T) (*Store, MigrationBackupResult, []byte) {
+	return dataKeyBackupFixtureForSchema(t, 8)
+}
+
+func dataKeyBackupFixtureForSchema(t *testing.T, schema int) (*Store, MigrationBackupResult, []byte) {
 	t.Helper()
 	dir := t.TempDir()
 	c, _ := NewCipher("backup-data-key-master-long-enough")
-	st, err := Open(filepath.Join(dir, "relay.db"), c)
+	path := filepath.Join(dir, "relay.db")
+	var st *Store
+	var err error
+	if schema == 8 {
+		lock, lockErr := acquireInstanceLock(path)
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+		db := openDatabaseAtPath(t, path)
+		if err := initializeEmptySchemaEight(context.Background(), db, c); err != nil {
+			lock.Close()
+			t.Fatal(err)
+		}
+		st = &Store{db: db, cipher: c, lock: lock, path: path}
+	} else {
+		st, err = Open(path, c)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +81,7 @@ func TestDataKey_BackupReaderContractRejectsSchemaSevenReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := CheckBackup(context.Background(), st.path, backup.ManifestPath, st.cipher); err == nil {
-		t.Fatal("schema8 backup accepted a schema7 reader contract")
+		t.Fatal("current backup accepted a schema7 reader contract")
 	}
 }
 
@@ -90,8 +116,8 @@ func TestDataKey_MigrationManifestPairsCanonicalAndExplicitReaders(t *testing.T)
 
 func TestDataKey_RotationBackupRestoresDatabaseAndSecretRoot(t *testing.T) {
 	st, backup, credentials := dataKeyBackupFixture(t)
-	if backup.Manifest.SourceSchema != 8 || backup.Manifest.TargetSchema != 8 || backup.Manifest.SecretsFile != "secrets.json" {
-		t.Fatal("rotation backup missing schema8/secret pairing")
+	if backup.Manifest.SourceSchema != 9 || backup.Manifest.TargetSchema != 9 || backup.Manifest.SecretsFile != "secrets.json" {
+		t.Fatal("rotation backup missing schema9/secret pairing")
 	}
 	if _, err := CheckBackup(context.Background(), st.path, backup.ManifestPath, st.cipher); err != nil {
 		t.Fatal(err)
@@ -108,7 +134,7 @@ func TestDataKey_RotationBackupRestoresDatabaseAndSecretRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RestoredSchemaVersion != 8 {
+	if result.RestoredSchemaVersion != 9 {
 		t.Fatalf("restored schema=%d", result.RestoredSchemaVersion)
 	}
 	restored, err := os.ReadFile(credentialPath)
@@ -164,7 +190,7 @@ func TestDataKey_ResumeRestoreAfterDatabaseRenameBeforeSecretsInstall(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := restoreIntent{FormatVersion: restoreIntentVersion, Phase: restorePhasePrepared, DatabasePath: st.path, ManifestPath: backup.ManifestPath, BackupDatabasePath: backup.DatabasePath, StagingPath: stage, IsolationDirectory: isolation, DatabaseSHA256: backup.Manifest.DatabaseSHA256, DatabaseSize: backup.Manifest.DatabaseSize, SourceSchema: 8, PairedBuildID: backup.Manifest.PairedBuildID, ReaderContract: backup.Manifest.ReaderContract, LegacyCipherID: backup.Manifest.LegacyCipherID, SecretsStagingDirectory: secretStage, SecretsFile: backup.Manifest.SecretsFile, SecretsSize: backup.Manifest.SecretsSize, SecretsSHA256: backup.Manifest.SecretsSHA256}
+	intent := restoreIntent{FormatVersion: restoreIntentVersion, Phase: restorePhasePrepared, DatabasePath: st.path, ManifestPath: backup.ManifestPath, BackupDatabasePath: backup.DatabasePath, StagingPath: stage, IsolationDirectory: isolation, DatabaseSHA256: backup.Manifest.DatabaseSHA256, DatabaseSize: backup.Manifest.DatabaseSize, SourceSchema: 9, PairedBuildID: backup.Manifest.PairedBuildID, ReaderContract: backup.Manifest.ReaderContract, LegacyCipherID: backup.Manifest.LegacyCipherID, SecretsStagingDirectory: secretStage, SecretsFile: backup.Manifest.SecretsFile, SecretsSize: backup.Manifest.SecretsSize, SecretsSHA256: backup.Manifest.SecretsSHA256}
 	if err := isolateLiveDatabaseGroup(intent); err != nil {
 		t.Fatal(err)
 	}

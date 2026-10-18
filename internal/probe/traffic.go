@@ -87,13 +87,14 @@ func NewTrafficObserverManager(
 }
 
 type trafficWrite struct {
-	observation *model.ProbeObservation
-	target      health.AttemptTarget
-	finish      health.AttemptFinish
-	barrier     chan error
-	shape       model.ClientRequestShape
-	piggyback   *model.ProbeCostDaily
-	eventID     string
+	healthIdentity *model.RouteHealthIdentity
+	observation    *model.ProbeObservation
+	target         health.AttemptTarget
+	finish         health.AttemptFinish
+	barrier        chan error
+	shape          model.ClientRequestShape
+	piggyback      *model.ProbeCostDaily
+	eventID        string
 }
 
 func (m *TrafficObserverManager) WithHealthTracker(tracker Tracker) *TrafficObserverManager {

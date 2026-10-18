@@ -411,10 +411,13 @@ type Status struct {
 	// 前者要用户去改配置，后者等它自己恢复就行（§4.3）。
 	Reason string `json:"reason"`
 	// CooldownUntil 是 429 冷却截止（Unix 毫秒）。0 表示不在冷却中。
-	CooldownUntil int64 `json:"cooldown_until"`
-	LastRealOKAt  int64 `json:"last_real_ok_at"`
-	NextL1At      int64 `json:"next_l1_at"`
-	NextL2At      int64 `json:"next_l2_at"`
+	CooldownUntil  int64                      `json:"cooldown_until"`
+	LastRealOKAt   int64                      `json:"last_real_ok_at"`
+	NextL1At       int64                      `json:"next_l1_at"`
+	NextL2At       int64                      `json:"next_l2_at"`
+	RecoverySource string                     `json:"recovery_source,omitempty"`
+	DeadSince      int64                      `json:"-"`
+	Identity       *model.RouteHealthIdentity `json:"-"`
 }
 
 // Status 返回单个 Route 的快照。
@@ -456,6 +459,9 @@ func (t *Tracker) statusOf(id int64, rs *routeState) Status {
 		LastRealOKAt:    msOrZero(rs.lastRealOKAt),
 		NextL1At:        msOrZero(rs.nextL1At),
 		NextL2At:        msOrZero(rs.nextL2At),
+		DeadSince:       msOrZero(rs.deadSince),
+		Identity:        model.CloneRouteHealthIdentity(rs.identity),
+		RecoverySource:  rs.recoverySource,
 	}
 	// 只在冷却仍然有效时报告。过期的截止时刻对 UI 是噪音 ——
 	// 「冷却到 10 分钟前」读起来像个 bug。

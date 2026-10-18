@@ -1,7 +1,6 @@
 // Package health 维护 Route 的运行时健康状态。
 //
-// 状态以内存为准（§2.4）：重启后一律回到 unknown，不从库里恢复。
-// route_health 表只是给 UI 看的历史快照。
+// 状态以内存为准；冷启动只恢复经过当前配置身份验证的负状态（§5.2）。
 package health
 
 import (
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 // Tracker 是 router.HealthView 的生产实现，也是 §4.3/§4.4 状态机的宿主。
@@ -58,7 +58,9 @@ type routeState struct {
 	deadSince time.Time
 
 	// cooldownUntil 是 429 冷却的截止时刻。零值表示不在冷却中。
-	cooldownUntil time.Time
+	cooldownUntil  time.Time
+	identity       *model.RouteHealthIdentity
+	recoverySource string
 
 	// lastRealOKAt 支撑 piggyback（§4.6）：真实请求成功等价于一次 L2 探活，
 	// 所以 L2 周期到了但这个时间戳还新鲜的话就跳过本轮，省掉探活 token。
@@ -212,6 +214,7 @@ func (t *Tracker) Snapshot() map[int64]int {
 // 未绑定世代的调用（测试 / 站级 L1 连坐当前快照），仍按 id 取或建。
 func (t *Tracker) Report(rep Report) (changed bool) {
 	s := t.currentSettings()
+	policy := revisioncodec.RouteHealthSettingsFingerprint(s)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -224,6 +227,12 @@ func (t *Tracker) Report(rep Report) (changed bool) {
 		}
 	} else {
 		rs = t.get(rep.RouteID)
+	}
+	initialState := rs.state
+	if rep.Verdict != VerdictIgnore && rep.Identity != nil && rs.identity != nil && rs.identity.HealthSettingsFingerprint != policy {
+		// Reduction thresholds are applied now, unlike the sent request's stage
+		// policy. Do not carry old-policy counters into a newly bound snapshot.
+		*rs = routeState{generation: rs.generation, inFlight: rs.inFlight, nextL1At: rs.nextL1At, nextL2At: rs.nextL2At, state: model.StateUnknown}
 	}
 	before := rs.state
 	now := t.now()
@@ -270,7 +279,12 @@ func (t *Tracker) Report(rep Report) (changed bool) {
 	case before != model.StateDead:
 		rs.deadSince = now
 	}
-	return rs.state != before
+	rs.identity = model.CloneRouteHealthIdentity(rep.Identity)
+	if rs.identity != nil {
+		rs.identity.HealthSettingsFingerprint = policy
+	}
+	rs.recoverySource = ""
+	return rs.state != initialState
 }
 
 // applyOK 处理成功判定，实现 §4.4 的恢复规则。
