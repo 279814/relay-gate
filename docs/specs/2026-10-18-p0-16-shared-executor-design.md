@@ -12,7 +12,7 @@
 
 ## Control 输入
 
-版本化 manifest 显式引用有序多值 headers 与原始 body bytes 的 fixture。严格校验协议/端点、一次性 control ID/nonce、专用隔离会话来源及配置/MCP/hook/plugin/环境隔离证据、完整捕获、认证占位符、原始 header/body SHA-256 和长度。只接受固定无隐私 control 提示；附件、工具结果、真实凭据或不明正文拒绝，不从“最近样本”或历史任务恢复。
+版本 1 manifest 显式引用 typed v2 fixture；headers 哈希覆盖 fixture 内原始有序 header 数组的 JSON 字节，body 哈希覆盖解码后的原始 body bytes。旧 capture v1 不具备相同来源/隔离合同，不自动升级为可信 control。严格校验协议/端点、一次性 control ID/nonce、专用隔离会话来源及配置/MCP/hook/plugin/环境隔离证据、完整捕获、认证占位符、原始 header/body SHA-256 和长度。只接受固定无隐私 control 提示；附件、工具结果、真实凭据或不明正文拒绝，不从“最近样本”或历史任务恢复。
 
 读取前验证 realpath、允许根、Git/Docker 排除、全部祖先无 symlink/reparse、regular file 和用户专属权限；文件句柄读取前后身份一致、内容有界。每一次发送前复查 freshness：completed_at 不在未来，captured_at≤completed_at，control 完成至 Probe 开始不超过 60 秒。任何输入错误在首次联网和输出文件创建前拒绝。
 

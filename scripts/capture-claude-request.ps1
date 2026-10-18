@@ -5,6 +5,8 @@ param(
     [string]$RepositoryRoot,
     [string]$AllowedRoot,
     [string]$OutputPath,
+    [string]$ManifestPath,
+    [string]$Alias,
     [switch]$ValidateIsolationOnly,
     [switch]$ValidateTargetOnly,
     [switch]$ReservePrivateOutput,
@@ -460,6 +462,7 @@ function Read-ControlExchange {
         throw "capture_unexpected_request_line"
     }
     $headers = [ordered]@{}
+    $headerEntries = [Collections.Generic.List[object]]::new()
     foreach ($line in $lines[1..($lines.Count - 1)]) {
         $separator = $line.IndexOf(':')
         if ($separator -le 0) {
@@ -467,6 +470,7 @@ function Read-ControlExchange {
         }
         $name = $line.Substring(0, $separator).Trim().ToLowerInvariant()
         $value = $line.Substring($separator + 1).Trim()
+        $headerEntries.Add([ordered]@{ Name = $line.Substring(0, $separator).Trim(); Values = @($value) })
         if ($headers.Contains($name)) {
             $headers[$name] = @($headers[$name]) + @($value)
         } else {
@@ -515,6 +519,7 @@ function Read-ControlExchange {
         Kind = 'messages'
         RequestLine = $lines[0]
         Headers = $headers
+        HeaderEntries = @($headerEntries.ToArray())
         Body = $bodyBytes
     }
 }
@@ -609,6 +614,103 @@ function Start-IsolatedClaudeProcess {
     return $process
 }
 
+function ConvertTo-VerifiedControlEnvelope {
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$FakeKey,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$SourceVersion,
+        [Parameter(Mandatory)][string]$CapturedAt,
+        [Parameter(Mandatory)][string]$CompletedAt
+    )
+    $safeHeaders = [Collections.Generic.List[object]]::new()
+    $authCount = 0
+    foreach ($header in $Request.HeaderEntries) {
+        $name = $header.Name
+        $values = @($header.Values)
+        switch ($name.ToLowerInvariant()) {
+            'authorization' {
+                if ($values.Count -ne 1 -or $values[0] -cne "Bearer $FakeKey") { throw 'capture_unverified_authentication' }
+                $values = @('Bearer {{UPSTREAM_API_KEY}}')
+                $authCount++
+            }
+            { $_ -in @('x-api-key', 'api-key') } {
+                if ($values.Count -ne 1 -or $values[0] -cne $FakeKey) { throw 'capture_unverified_authentication' }
+                $values = @('{{UPSTREAM_API_KEY}}')
+                $authCount++
+            }
+            { $_ -in @('cookie', 'proxy-authorization', 'x-admin-password') } { throw 'capture_unsupported_authentication' }
+        }
+        foreach ($value in $values) {
+            if ($value.Contains($FakeKey, [StringComparison]::Ordinal)) { throw 'capture_credential_outside_auth' }
+        }
+        $safeHeaders.Add([ordered]@{ name = $name; values = @($values) })
+    }
+    if ($authCount -ne 1) { throw 'capture_requires_single_authentication' }
+    [byte[]]$body = $Request.Body
+    if ([Text.Encoding]::UTF8.GetString($body).Contains($FakeKey, [StringComparison]::Ordinal)) { throw 'capture_credential_in_body' }
+    $requestParts = $Request.RequestLine -split ' '
+    if ($requestParts.Count -ne 3 -or $requestParts[0] -cne 'POST' -or $requestParts[2] -cne 'HTTP/1.1') { throw 'capture_invalid_request_line' }
+    $headerJSON = ConvertTo-Json -InputObject @($safeHeaders.ToArray()) -Depth 8 -Compress
+    $headerBytes = [Text.Encoding]::UTF8.GetBytes($headerJSON)
+    $capture = [ordered]@{
+        format_version = 2
+        test_mode = ($env:RELAY_GATE_CAPTURE_TESTING -ceq '1')
+        source_version = $SourceVersion
+        source = 'claude-code-isolated'
+        protocol = 'anthropic'
+        endpoint = 'messages'
+        captured_at = $CapturedAt
+        completed_at = $CompletedAt
+        control_id = $Nonce
+        nonce = $Nonce
+        truncated = $false
+        isolation = [ordered]@{ configuration = $true; mcp = $true; hooks = $true; plugins = $true; environment = $true; temporary_workdir = $true }
+        method = $requestParts[0]
+        request_target = $requestParts[1]
+        request_line = $Request.RequestLine
+        headers = @($safeHeaders.ToArray())
+        header_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($headerBytes)).ToLowerInvariant()
+        body_base64 = [Convert]::ToBase64String($body)
+        body_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($body)).ToLowerInvariant()
+        body_bytes = $body.Length
+        secret_scan_version = '1'
+        authentication_verified = $true
+    }
+    return ,([Text.UTF8Encoding]::new($false).GetBytes(($capture | ConvertTo-Json -Depth 10 -Compress)))
+}
+
+function ConvertTo-ControlManifest {
+    param(
+        [Parameter(Mandatory)][byte[]]$ControlContent,
+        [Parameter(Mandatory)][string]$Alias,
+        [Parameter(Mandatory)][string]$FixtureFileName
+    )
+    if ($Alias -cnotmatch '^[\p{L}\p{Nd}_.-]{1,64}$' -or [IO.Path]::GetFileName($FixtureFileName) -cne $FixtureFileName) { throw 'capture_manifest_arguments_invalid' }
+    # Preserve the original RFC3339 strings. ConvertFrom-Json may coerce them
+    # to DateTime and silently change their offset/fraction on serialization.
+    $document = [Text.Json.JsonDocument]::Parse([Text.Encoding]::UTF8.GetString($ControlContent))
+    $capture = $document.RootElement
+    try { $entry = [ordered]@{
+        alias = $Alias
+        protocol = $capture.GetProperty('protocol').GetString()
+        endpoint = $capture.GetProperty('endpoint').GetString()
+        fixture_path = $FixtureFileName
+        control_id = $capture.GetProperty('control_id').GetString()
+        nonce = $capture.GetProperty('nonce').GetString()
+        captured_at = $capture.GetProperty('captured_at').GetString()
+        completed_at = $capture.GetProperty('completed_at').GetString()
+        header_sha256 = $capture.GetProperty('header_sha256').GetString()
+        body_sha256 = $capture.GetProperty('body_sha256').GetString()
+        body_bytes = $capture.GetProperty('body_bytes').GetInt32()
+        truncated = $capture.GetProperty('truncated').GetBoolean()
+        source = $capture.GetProperty('source').GetString()
+        secret_scan_version = $capture.GetProperty('secret_scan_version').GetString()
+    } } finally { $document.Dispose() }
+    $json = [ordered]@{ version = '1'; entries = @($entry) } | ConvertTo-Json -Depth 8 -Compress
+    return ,([Text.UTF8Encoding]::new($false).GetBytes($json))
+}
+
 function Invoke-ControlCapture {
     param(
         [Parameter(Mandatory)][string]$Target,
@@ -627,6 +729,8 @@ function Invoke-ControlCapture {
     $cleanupError = $null
     $request = $null
     $nonce = $null
+    $capturedAt = $null
+    $completedAt = $null
     try {
         $workingDirectory = Join-Path $temporaryRoot 'cwd'
         $configDirectory = Join-Path $temporaryRoot 'config'
@@ -682,6 +786,7 @@ function Invoke-ControlCapture {
                 continue
             }
             $request = $exchange
+            $capturedAt = [DateTimeOffset]::UtcNow.ToString('O')
             Write-ControlResponse -Stream $stream
             $client.Close()
             $client = $null
@@ -696,6 +801,7 @@ function Invoke-ControlCapture {
         if ($process.ExitCode -ne 0) {
             throw "claude_process_failed"
         }
+        $completedAt = [DateTimeOffset]::UtcNow.ToString('O')
     } catch {
         $operationError = $_
     } finally {
@@ -736,19 +842,7 @@ function Invoke-ControlCapture {
         throw $cleanupError
     }
 
-    $capture = [ordered]@{
-        format_version = 1
-        test_mode = ($env:RELAY_GATE_CAPTURE_TESTING -ceq '1')
-        claude_version = $Claude.Version
-        captured_at_utc = [DateTimeOffset]::UtcNow.ToString('O')
-        control_id = $nonce
-        request_line = $request.RequestLine
-        headers = $request.Headers
-        body_base64 = [System.Convert]::ToBase64String($request.Body)
-        authentication_verified = $true
-    }
-    $json = $capture | ConvertTo-Json -Depth 8 -Compress
-    return ,([System.Text.UTF8Encoding]::new($false).GetBytes($json))
+    return ,(ConvertTo-VerifiedControlEnvelope -Request $request -FakeKey $fakeKey -Nonce $nonce -SourceVersion $Claude.Version -CapturedAt $capturedAt -CompletedAt $completedAt)
 }
 
 function Invoke-Main {
@@ -787,6 +881,12 @@ function Invoke-Main {
     }
 
     $target = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $OutputPath
+    $manifestTarget = $null
+    if ($ManifestPath -or $Alias) {
+        if (-not $ManifestPath -or -not $Alias) { throw 'capture_manifest_requires_path_and_alias' }
+        $manifestTarget = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $ManifestPath
+        if ([IO.Path]::GetDirectoryName($manifestTarget) -cne [IO.Path]::GetDirectoryName($target) -or $manifestTarget -ceq $target) { throw 'capture_manifest_must_be_distinct_and_adjacent' }
+    }
     if ($ValidateTargetOnly) {
         Write-Output "capture_target_valid"
         return
@@ -801,6 +901,11 @@ function Invoke-Main {
     [byte[]]$captureContent = Invoke-ControlCapture -Target $target -Claude $claude -SelectedModel $Model
     $target = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $OutputPath
     New-PrivateCaptureFile -Path $target -Content $captureContent
+    if ($manifestTarget) {
+        [byte[]]$manifestContent = ConvertTo-ControlManifest -ControlContent $captureContent -Alias $Alias -FixtureFileName ([IO.Path]::GetFileName($target))
+        $manifestTarget = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $ManifestPath
+        New-PrivateCaptureFile -Path $manifestTarget -Content $manifestContent
+    }
     Write-Output "capture_completed"
 }
 

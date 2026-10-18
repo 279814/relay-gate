@@ -131,11 +131,11 @@ func TestProbeCLI_MockMatrix_UsesDecoderClassifier(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := t.TempDir()
-	tsv := filepath.Join(dir, "in.tsv")
-	out := filepath.Join(dir, "out.json")
-	report := filepath.Join(dir, "report.md")
-	writeFile(t, tsv, "mock\t"+srv.URL+"\tfake-key\tclaude-x\t-\tok\n")
+	dir := cliPrivateRepository(t)
+	tsv := filepath.Join(dir, ".local", "p0", "in.tsv")
+	out := filepath.Join(dir, ".local", "p0", "reports", "out.json")
+	report := filepath.Join(dir, ".local", "p0", "reports", "report.md")
+	writeFile(t, tsv, "mock\t"+srv.URL+"\tsynthetic-test-cli-fixture-credential\tclaude-x\t-\tok\n")
 
 	var stdout, stderr bytes.Buffer
 	code := runProbeCLI([]string{
@@ -144,7 +144,7 @@ func TestProbeCLI_MockMatrix_UsesDecoderClassifier(t *testing.T) {
 	}, nil, &stdout, &stderr, probeCLIDeps{
 		transport: srv.Client().Transport,
 		now:       time.Now,
-		repoRoot:  "",
+		repoRoot:  dir,
 	})
 	if code != exitOK && code != exitFail {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
@@ -192,16 +192,17 @@ func TestProbeCLI_DoesNotFollowRedirect(t *testing.T) {
 	}))
 	defer up.Close()
 
-	dir := t.TempDir()
-	out := filepath.Join(dir, "out.json")
-	tsv := filepath.Join(dir, "in.tsv")
-	writeFile(t, tsv, "a\t"+up.URL+"\tsk-secret\tclaude-x\t-\tok\n")
+	dir := cliPrivateRepository(t)
+	out := filepath.Join(dir, ".local", "p0", "reports", "out.json")
+	tsv := filepath.Join(dir, ".local", "p0", "in.tsv")
+	writeFile(t, tsv, "a\t"+up.URL+"\tsynthetic-test-cli-fixture-credential\tclaude-x\t-\tok\n")
 
 	code := runProbeCLI([]string{
 		"probe-one", "--online", "--accept-probe-cost",
 		"--input", tsv, "--name", "a", "--output", out,
 	}, nil, io.Discard, io.Discard, probeCLIDeps{
-		now: func() time.Time { return time.Unix(1, 0) },
+		now:      func() time.Time { return time.Unix(1, 0) },
+		repoRoot: dir,
 	})
 	if code != exitOK && code != exitFail {
 		t.Fatalf("unexpected code=%d", code)
