@@ -44,7 +44,7 @@ type Recorder struct {
 	w   Writer
 	log *slog.Logger
 
-	// dropped 记录因队列满而丢弃的样本数，暴露在 UI（§3.6.3a）。
+	// dropped 记录因队列满、配额不足或落库失败而丢弃的 Group 数（§5.4）。
 	// 不暴露的话，「样本怎么少了几条」会变成无从下手的疑问。
 	dropped atomic.Int64
 	written atomic.Int64
@@ -183,8 +183,9 @@ func (r *Recorder) write(s *model.Sample) {
 	if qw, ok := r.w.(quotaWriter); ok {
 		inserted, err := qw.InsertSampleWithinQuota(s, r.diskQuotaBytes())
 		if err != nil {
-			// 只记日志，不重试：重试会让积压更严重，而样本本身是可丢的。
-			r.log.Error("样本落库失败", "err", err, "route", s.RouteID)
+			// 按 Group 计丢弃，不重试：重试会让积压更严重。
+			n := r.dropped.Add(1)
+			r.log.Error("样本落库失败", "err", err, "route", s.RouteID, "dropped_total", n)
 			return
 		}
 		if !inserted {
@@ -199,8 +200,9 @@ func (r *Recorder) write(s *model.Sample) {
 		return
 	}
 	if err := r.w.InsertSample(s); err != nil {
-		// 只记日志，不重试：重试会让积压更严重，而样本本身是可丢的。
-		r.log.Error("样本落库失败", "err", err, "route", s.RouteID)
+		// 按 Group 计丢弃，不重试：重试会让积压更严重。
+		n := r.dropped.Add(1)
+		r.log.Error("样本落库失败", "err", err, "route", s.RouteID, "dropped_total", n)
 		return
 	}
 	r.written.Add(1)
