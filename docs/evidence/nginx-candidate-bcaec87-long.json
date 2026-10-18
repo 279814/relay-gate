@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "scope": "candidate: real Nginx and local CA with synthetic SSE; no public ACME",
+  "source_revision": "bcaec875a50e04be35e9182d85f082984376539f",
+  "workflow_run_id": 39080999048,
+  "workflow_url": "https://github.com/279814/relay-gate/actions/runs/39080999048",
+  "test": "TestPublicRealNginxLocalCAIntegration",
+  "requested_seconds": 2105,
+  "elapsed_seconds": 2105.006860742,
+  "heartbeats": 421,
+  "exact_wire": true,
+  "long_duration_gate": true,
+  "status": "passed"
+}
