@@ -793,11 +793,19 @@
               </tbody>
             </table>
             <h3 style="font-size:13px;margin:18px 0 8px">SMTP 告警</h3>
-            <div class="cards" x-show="security.smtp">
+            <template x-if="security.smtp">
+            <div class="cards">
               <div class="card">
                 <label><input type="checkbox" x-model="security.smtp.enabled"> 启用</label>
                 <div class="field"><label>Host</label><input x-model="security.smtp.host"></div>
                 <div class="field"><label>Port</label><input type="number" x-model.number="security.smtp.port"></div>
+                <div class="field"><label>连接安全</label>
+                  <select :value="security.smtp.use_smtps ? 'smtps' : security.smtp.use_starttls ? 'starttls' : ''" @change="setSMTPMode($event.target.value)">
+                    <option value="">请选择加密模式</option>
+                    <option value="starttls">STARTTLS</option>
+                    <option value="smtps">SMTPS</option>
+                  </select>
+                </div>
                 <div class="field"><label>From</label><input x-model="security.smtp.from"></div>
                 <div class="field"><label>Recipients（逗号分隔）</label><input x-model="security.smtp.recipients"></div>
                 <div class="field"><label>Username</label><input x-model="security.smtp.username"></div>
@@ -811,10 +819,11 @@
                 </div>
                 <div class="bar" style="margin-top:8px">
                   <button class="primary" @click="saveSMTP()">保存</button>
-                  <button @click="testSMTP()">发送测试</button>
+                  <button @click="testSMTP()">测试已保存配置</button>
                 </div>
               </div>
             </div>
+            </template>
           </div>
         </template>
 

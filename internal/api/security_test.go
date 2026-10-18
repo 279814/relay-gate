@@ -407,11 +407,12 @@ func TestAPI_SMTPTestDoesNotEchoRawSendError(t *testing.T) {
 
 	s, _ := newTestServer(t)
 	if err := s.st.SaveSMTPConfig(store.SMTPConfig{
-		Enabled:    true,
-		Host:       "smtp.evil",
-		Port:       587,
-		From:       "relay@test.local",
-		Recipients: "ops@test.local",
+		Enabled:     true,
+		Host:        "smtp.evil",
+		Port:        587,
+		UseSTARTTLS: true,
+		From:        "relay@test.local",
+		Recipients:  "ops@test.local",
 	}, "smtp-pw"); err != nil {
 		t.Fatal(err)
 	}
