@@ -77,8 +77,8 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 			if cand.Route.UpstreamModel != "" {
 				protectedModel = cand.Route.UpstreamModel
 			}
-			_, validationErr := ExtractModel(tr.Body)
-			if validationErr == nil {
+			currentModel, validationErr := ExtractModel(tr.Body)
+			if validationErr == nil && currentModel != protectedModel {
 				tr.Body, validationErr = ReplaceModel(tr.Body, protectedModel)
 			}
 			if validationErr != nil {

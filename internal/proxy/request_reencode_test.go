@@ -229,6 +229,16 @@ func TestRequestTransformCannotOverrideRouteModel(t *testing.T) {
 	}
 }
 
+func TestHeaderOnlyTransformPreservesEscapedModelBytes(t *testing.T) {
+	hs := newHarness(t, nil)
+	hs.publishRequestTransform(t, 100, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Only", Value: "header"}})
+	body := ` { "model" : "claude-opus-\u0035", "max_tokens":1 } `
+	rec := hs.serve(hs.anthropicRequest(body))
+	if rec.Code != 200 || string(hs.gotReq.body) != body {
+		t.Fatalf("header-only transform changed original bytes: status=%d body=%s want=%s", rec.Code, hs.gotReq.body, body)
+	}
+}
+
 func TestRequestTransformRejectsInvalidModelWithVersionFailurePolicy(t *testing.T) {
 	for _, policy := range []string{transform.FailClosed, transform.FailOpen} {
 		for _, invalid := range []string{`{"removed":true}`, `{"model":"a","model":"b"}`, `{"model":123}`} {
