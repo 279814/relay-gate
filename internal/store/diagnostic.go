@@ -7,12 +7,13 @@ import (
 )
 
 // DiagnosticRedactionKeys is the complete current key set needed to redact
-// administrative diagnostics, including disabled sites without routes. It is
+// administrative diagnostics, including disabled sites and current ProbeSecrets. It is
 // not an entity list: only encrypted credential columns are read, with no
 // configuration parsing, defaults or pagination that could omit a secret.
 // Any unreadable key rejects the entire result; callers must omit raw details.
 func (s *Store) DiagnosticRedactionKeys(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT api_key_enc FROM upstream WHERE api_key_enc<>''`)
+	rows, err := s.db.QueryContext(ctx, `SELECT api_key_enc FROM upstream WHERE api_key_enc<>''
+		UNION ALL SELECT value_enc FROM probe_secret WHERE value_enc<>''`)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +30,7 @@ func (s *Store) DiagnosticRedactionKeys(ctx context.Context) ([]string, error) {
 		}
 		if key != "" {
 			if len(key) < model.MinRedactableKeyLen {
-				return nil, model.WrapValidation("历史上游凭据过短，诊断无法安全脱敏，请先替换凭据")
+				return nil, model.WrapValidation("凭据过短，诊断无法安全脱敏，请先替换凭据")
 			}
 			keys = append(keys, key)
 		}
