@@ -75,11 +75,7 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		if err != nil || cand == nil {
 			return false
 		}
-		if pre.compressedNeedsMapping(cand.Route) {
-			tried[cand.Route.ID] = true
-			cand.Release()
-			continue
-		}
+
 		// recovering 须占 RecoveryGate（§9.1 / §9.4）；拿不到则跳过，不排队。
 		wrapped, ok := h.wrapRecoveryIfNeeded(cand)
 		if !ok {
@@ -172,11 +168,6 @@ func (h *Handler) countTokensPreferOK(routeID int64, prefer countTokensPrefer) b
 func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	pre *preambleResult, cand *router.Candidate, remaining time.Duration) string {
 
-	outBody, err := ReplaceModel(pre.body, cand.Route.UpstreamModel)
-	if err != nil {
-		return fmt.Sprintf("替换 model 失败: %v", err)
-	}
-
 	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
 	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
 	// 所以显式给 EndpointCountTokens 而不是从 Protocol 推。
@@ -188,7 +179,12 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return fmt.Sprintf("改写出站认证失败: %v", err)
 	}
-	redactKeys := append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)
+	prepared, status := h.prepareOutboundRequest(r, pre, cand, target, outHeader)
+	if status != dispatchSent {
+		return "请求转换或压缩映射不可用"
+	}
+	outHeader, outBody := prepared.header, prepared.body
+	redactKeys := prepared.keys
 
 	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
 	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，

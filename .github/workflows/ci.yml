@@ -86,6 +86,9 @@ jobs:
       - name: Endpoint editor mutation contract
         run: node --test internal/web/endpoint.contract.test.mjs
 
+      - name: Explicit request reencoding contract
+        run: node --test internal/web/transforms.reencode.test.mjs
+
       - name: 可达漏洞检查
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 

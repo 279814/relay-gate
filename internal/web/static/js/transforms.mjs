@@ -10,6 +10,7 @@ const initialState = () => ({
   selected: null,
   newName: '',
   draftRulesJSON: '[]',
+  requestReencode: false,
   reqFailPolicy: 'fail_closed',
   resFailPolicy: 'fail_open',
   note: '',
@@ -66,7 +67,9 @@ export function createTransformsFeature(shell, api) {
     this.transforms.selectedId = set.id;
     this.transforms.selected = set;
     const draft = set.draft || {};
-    this.transforms.draftRulesJSON = JSON.stringify(draft.rules || [], null, 2);
+    const rules = draft.rules || [];
+    this.transforms.requestReencode = rules.some((r) => r.kind === 'request_reencode');
+    this.transforms.draftRulesJSON = JSON.stringify(rules.filter((r) => r.kind !== 'request_reencode'), null, 2);
     this.transforms.reqFailPolicy = draft.req_fail_policy || 'fail_closed';
     this.transforms.resFailPolicy = draft.res_fail_policy || 'fail_open';
     this.transforms.note = draft.note || '';
@@ -107,6 +110,8 @@ export function createTransformsFeature(shell, api) {
         this.err = '规则必须是 JSON 数组';
         return;
       }
+      rules = rules.filter((r) => r && r.kind !== 'request_reencode');
+      if (this.transforms.requestReencode) rules.unshift({ kind: 'request_reencode' });
       const set = await api.put('/transforms/' + this.transforms.selectedId + '/draft', {
         rules,
         req_fail_policy: this.transforms.reqFailPolicy,

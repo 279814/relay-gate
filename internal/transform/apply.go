@@ -77,6 +77,18 @@ func (c *Compiled) HasRequestBodyRules() bool {
 	return false
 }
 
+// AllowsRequestReencoding is an explicit published-version opt-in (§6.7).
+func (c *Compiled) AllowsRequestReencoding() bool {
+	if c != nil {
+		for _, rule := range c.Version.Rules {
+			if rule.Kind == KindRequestReencode {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ApplyRequestSecrets is ApplyRequest with optional secret resolution for
 // secret_ref / {{SECRET:name}} rules. Rendered secrets are tainted.
 func (c *Compiled) ApplyRequestSecrets(in RequestInput, secrets SecretMap) RequestResult {

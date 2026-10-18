@@ -37,6 +37,9 @@ const (
 	KindJSONPatchRemove = "json_patch_remove"
 	KindJSONPatchCopy   = "json_patch_copy"
 	KindBodyTemplate    = "body_template" // full body replacement; declarative literal only
+	// KindRequestReencode explicitly permits gzip/br request-body rewriting.
+	// The proxy owns decoding/encoding; the rule never controls response coding.
+	KindRequestReencode = "request_reencode"
 	KindSetStatus       = "set_status"
 	KindSSEMatch        = "sse_match"
 	KindSSEAppendEnd    = "sse_append_end" // synthetic completion
