@@ -55,7 +55,7 @@ func createMigrationBackup(ctx context.Context, conn *sql.Conn, databasePath str
 	if databasePath == "" || databasePath == ":memory:" {
 		return result, fmt.Errorf("migration backup requires a file database")
 	}
-	if (spec.TargetSchema != spec.SourceSchema+1 && !(spec.TargetSchema == 8 && spec.SourceSchema == 8 && spec.SourceValidator == "schema-8-data-key-v2")) || spec.SourceFingerprint == "" || spec.LegacyCipherID == "" {
+	if (spec.TargetSchema != spec.SourceSchema+1 && !rotationBackupBoundary(spec.SourceSchema, spec.TargetSchema, spec.SourceValidator)) || spec.SourceFingerprint == "" || spec.LegacyCipherID == "" {
 		return result, fmt.Errorf("migration backup metadata is incomplete")
 	}
 	if err := ctx.Err(); err != nil {
@@ -258,15 +258,25 @@ func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult
 	if err != nil {
 		return MigrationBackupResult{}, err
 	}
-	if state.Version != 8 {
-		return MigrationBackupResult{}, fmt.Errorf("rotation backup requires schema 8")
+	validator, contract := "", ""
+	switch state.Version {
+	case 8:
+		validator, contract = "schema-8-data-key-v2", "schema-8-data-key-v2-reader"
+	case 9:
+		validator, contract = "schema-9-route-health-v1", "schema-9-route-health-v1-reader"
+	default:
+		return MigrationBackupResult{}, fmt.Errorf("rotation backup requires schema 8 or 9")
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return MigrationBackupResult{}, err
 	}
 	defer conn.Close()
-	return createMigrationBackup(ctx, conn, s.path, MigrationBackupSpec{SourceSchema: 8, TargetSchema: 8, SourceFingerprint: state.Fingerprint, LegacyCipherID: s.cipher.KeyID(), SourceValidator: "schema-8-data-key-v2", PairedBuildID: buildID, ReaderContract: "schema-8-data-key-v2-reader"})
+	return createMigrationBackup(ctx, conn, s.path, MigrationBackupSpec{SourceSchema: state.Version, TargetSchema: state.Version, SourceFingerprint: state.Fingerprint, LegacyCipherID: s.cipher.KeyID(), SourceValidator: validator, PairedBuildID: buildID, ReaderContract: contract})
+}
+
+func rotationBackupBoundary(source, target int, validator string) bool {
+	return source == target && ((source == 8 && validator == "schema-8-data-key-v2") || (source == 9 && validator == "schema-9-route-health-v1"))
 }
 
 func syncDirectory(path string) error {

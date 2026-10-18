@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -31,8 +32,8 @@ type HealthWriter interface {
 
 // Persister 定期把内存里的健康状态刷进 route_health 表。
 //
-// 它是**单向**的：只写不读。启动时不从库里恢复状态 —— 那会让一个
-// 崩溃前被判死的站在重启后继续被排除，而它可能早就好了（§2.4）。
+// 只写已捕获的状态与身份。启动恢复由独立的 current 校验完成，不能在
+// flush 时给旧状态盖上新配置的身份。
 type Persister struct {
 	src SnapshotSource
 	w   HealthWriter
@@ -77,6 +78,9 @@ func (p *Persister) flush() {
 			LastErrAt:       st.LastErrAt,
 			LastError:       st.LastError,
 			LastTTFTMS:      st.LastTTFTMS,
+			CooldownUntil:   st.CooldownUntil, DeadSince: st.DeadSince,
+			RecoveryRequired: st.State == model.StateDead || st.State == model.StateRecovering,
+			Identity:         st.Identity,
 		})
 	}
 

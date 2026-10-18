@@ -169,7 +169,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	// 再去挨个试 dead 站，花的是客户端剩下的预算，撞上的是已知挂掉的站。
 	cand, halfOpen, err := h.selectFor(pre, proto, nil, true)
 	if err != nil {
-		h.writeSelectError(w, err, proto, pre.inModel)
+		h.writeSelectError(w, err, proto, pre.inModel, pre.snapshot)
 		return nil, false
 	}
 	// halfOpenRouteID is the Route that Claimed RecoveryGate for this §4.4c
@@ -212,7 +212,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			"upstream", cand.Upstream.Name, "route", cand.Route.ID)
 		held.Release()
 		held = nil
-		h.writeSelectError(w, router.ErrNoRouteAvailable, proto, pre.inModel)
+		h.writeSelectError(w, router.ErrNoRouteAvailable, proto, pre.inModel, pre.snapshot)
 		return nil, false
 	}
 
@@ -261,7 +261,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 					if selErr == nil || !errors.Is(selErr, router.ErrNoRouteAvailable) {
 						selErr = router.ErrNoRouteAvailable
 					}
-					h.writeSelectError(w, selErr, proto, pre.inModel)
+					h.writeSelectError(w, selErr, proto, pre.inModel, pre.snapshot)
 					return
 				}
 				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")

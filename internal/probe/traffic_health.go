@@ -51,7 +51,7 @@ func (m *TrafficObserverManager) applyHealth(item trafficWrite, result model.Pro
 		retryAfter = 0
 	}
 	m.tracker.Report(health.Report{RouteID: execution.RouteID, Generation: item.target.HealthGeneration, Source: health.SourceReal,
-		Verdict: verdict, HalfOpen: item.finish.HalfOpen, Err: err, TTFT: ttft, RetryAfter: retryAfter})
+		Verdict: verdict, HalfOpen: item.finish.HalfOpen, Err: err, TTFT: ttft, RetryAfter: retryAfter, Identity: healthIdentityForResult(item.healthIdentity, execution.StatusCode)})
 	if verdict == health.VerdictOK {
 		if m.sched != nil {
 			m.sched.ObserveRealSuccess(ScheduleKey{ScopeType: model.RecipeScopeRoute, ScopeID: execution.RouteID, UpstreamID: execution.UpstreamID, Endpoint: execution.Endpoint}, time.UnixMilli(execution.DoneAtMS))

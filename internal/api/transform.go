@@ -193,6 +193,10 @@ func (s *Server) transformBindAction(w http.ResponseWriter, r *http.Request, act
 	// immediately. Shadow only points a non-live pointer — do not Forget.
 	if action == "publish" {
 		s.invalidateRoute(body.RouteID)
+		if err := s.publishAfterSuccessfulWrite(); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "config_activation_pending", "error": "转换已保存，配置激活待重试", "persisted": true, "binding": b, "revision": b.Revision})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"binding": b, "version": v, "action": action})
 }
@@ -218,6 +222,10 @@ func (s *Server) postTransformRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	// §9.2: rollback retargets the published Transform — Forget old RouteHealth.
 	s.invalidateRoute(body.RouteID)
+	if err := s.publishAfterSuccessfulWrite(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "config_activation_pending", "error": "转换回滚已保存，配置激活待重试", "persisted": true, "binding": b, "revision": b.Revision})
+		return
+	}
 	writeJSON(w, http.StatusOK, b)
 }
 

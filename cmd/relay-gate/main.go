@@ -276,6 +276,11 @@ func runServer() error {
 	} else if n > 0 {
 		log.Info("已恢复站级不可达状态", "rows", n)
 	}
+	if n, err := probe.RestoreRouteHealth(context.Background(), tracker, st, cfgSrc); err != nil {
+		return fmt.Errorf("恢复 RouteHealth 负状态: %w", err)
+	} else if n > 0 {
+		log.Info("已恢复 RouteHealth 负状态（legacy_unverified 必须单次恢复确认）", "rows", n)
+	}
 
 	// P0-12：Controller → Coordinator → Executor/Calibration → Scheduler resume bind。
 	runCtrl, err := runstate.NewController(st)
