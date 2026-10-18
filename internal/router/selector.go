@@ -131,6 +131,31 @@ func MatchModelName(snap *Snapshot, inModel string,
 	return nil, fmt.Errorf("%w: %q", ErrModelNotFound, inModel)
 }
 
+// CandidateRouteIDs identifies the Routes whose request-scoped configuration
+// may be needed by SelectExcluding, including its exact-to-prefix retry walk.
+// It does not acquire concurrency/recovery slots or inspect changing health.
+func CandidateRouteIDs(snap *Snapshot, inModel string, protocol model.Protocol) []int64 {
+	if snap == nil || inModel == "" {
+		return nil
+	}
+	matches, fallback, disabled := orderedModelNameMatches(snap, inModel, protocol)
+	if len(matches) == 0 && !disabled && fallback != nil {
+		matches = []*model.ModelName{fallback}
+	}
+	var ids []int64
+	for _, mn := range matches {
+		if mn.Protocol != protocol {
+			break
+		}
+		for _, route := range snap.RoutesByModelName[mn.ID] {
+			if route != nil && route.Enabled {
+				ids = append(ids, route.ID)
+			}
+		}
+	}
+	return ids
+}
+
 // orderedModelNameMatches 拆出名称命中与兜底。
 //
 // nameMatches 顺序：精确（快照遍历顺序）→ 前缀（最长优先，同长按 ID）。
