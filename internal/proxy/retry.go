@@ -98,7 +98,8 @@ type liveAttempt struct {
 	url         string
 	instr       health.AttemptInstrumentation
 	configFacts *health.AttemptConfigFacts
-	// Published transform selected at dispatch (immutable for this Attempt).
+	// Request-start transform view is shared by every retry and both shadow phases.
+	transforms *transform.RequestView
 	compiled   *transform.Compiled
 	verID      int64
 	endpointID int64
@@ -527,7 +528,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	shadowHeader, shadowBody := outHeader, outBody
 	if h.transforms != nil && target.EndpointID != 0 {
 		var terr error
-		compiled, verID, terr = h.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
+		compiled, verID, terr = pre.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
 		if terr != nil {
 			h.log.Error("加载 transform 失败", "err", terr, "route", cand.Route.ID)
 			return nil, dispatchRouteLocal
@@ -581,7 +582,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	// Edge identity is local metadata even if a published transform tries to
 	// reintroduce it after the inbound blacklist was applied.
 	edge.StripForwardingHeaders(outHeader)
-	h.shadowRequest(cand, target.EndpointID, shadowHeader, shadowBody)
+	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
@@ -658,7 +659,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
 		instr: instr, configFacts: configFacts,
-		compiled: compiled, verID: verID, endpointID: target.EndpointID,
+		compiled: compiled, verID: verID, endpointID: target.EndpointID, transforms: pre.transforms,
 	}, dispatchSent
 }
 

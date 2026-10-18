@@ -327,10 +327,11 @@ func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
 
 // preambleResult 是 preamble 已经完成的那几步的产物。
 type preambleResult struct {
-	settings model.Settings
-	body     []byte
-	inModel  string
-	snapshot *router.Snapshot
+	settings   model.Settings
+	body       []byte
+	inModel    string
+	snapshot   *router.Snapshot
+	transforms *transform.RequestView
 	// encoding 是入站请求 body 的 Content-Encoding（gzip / br），identity 为 ""。
 	// 非空时 body 仍是原压缩字节，只能原样转发（§6.7）。
 	encoding string
@@ -471,9 +472,13 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
+	var transformView *transform.RequestView
+	if h.transforms != nil {
+		transformView = h.transforms.CaptureRoutes(router.CandidateRouteIDs(snap, inModel, proto))
+	}
 	return &preambleResult{
 		settings: settings, body: body, inModel: inModel, snapshot: snap,
-		encoding: enc, decoded: decoded,
+		encoding: enc, decoded: decoded, transforms: transformView,
 	}, true
 }
 
