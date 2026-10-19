@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/279814/relay-gate/internal/configadmin"
 	"github.com/279814/relay-gate/internal/credential"
@@ -86,6 +87,7 @@ type Server struct {
 	rotationQuiesce              func(context.Context) (func(), error)
 	masterKeyEnvironmentOverride bool
 	publicHTTPSStatusFile        string
+	auditMissed                  atomic.Uint64
 
 	// adminPW 由 Routes 装配时写入（环境变量明文，旧部署兼容）。
 	// adminHash 来自 data/secrets/ Argon2id（§12.5）；登录与 Bearer 两条路径共用。
@@ -121,8 +123,15 @@ func (s *Server) WithRuntime(inFlight InFlightView, samples, reqLogs SampleStats
 // ── 响应helper ────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	audit, _ := w.(*auditResponseWriter)
+	if audit != nil {
+		audit.auditPayload(v)
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
+	if audit != nil && audit.blocked {
+		return
+	}
 	if v != nil {
 		_ = json.NewEncoder(w).Encode(v)
 	}

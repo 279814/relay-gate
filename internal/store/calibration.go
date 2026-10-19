@@ -635,7 +635,7 @@ func (store *Store) AdvanceCalibrationAfterExecution(ctx context.Context, runID 
 	return store.GetCalibrationRun(ctx, runID)
 }
 
-func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.CalibrationCommit) (*model.ProbeRecipeVersion, error) {
+func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.CalibrationCommit) (version *model.ProbeRecipeVersion, err error) {
 	if commit.RunID == "" || commit.ExecutionID == "" || commit.ExpectedRunRevision < 1 ||
 		commit.SelectedVersionID < 1 || commit.RecipeID < 1 {
 		return nil, model.WrapValidation("commit calibration 参数无效")
@@ -648,6 +648,9 @@ func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.C
 	defer func() {
 		if err != nil {
 			_ = tx.Rollback()
+			if auditErr := store.recordCalibrationPublishFailure(ctx, commit.RunID, err); auditErr != nil {
+				err = errors.Join(err, ErrAuditUnavailable)
+			}
 		}
 	}()
 
@@ -800,9 +803,12 @@ func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.C
 		return nil, err
 	}
 
-	version, err := scanRecipeVersion(tx.QueryRowContext(ctx, `SELECT `+recipeVersionCols+
+	version, err = scanRecipeVersion(tx.QueryRowContext(ctx, `SELECT `+recipeVersionCols+
 		` FROM probe_recipe_version WHERE id=?`, commit.SelectedVersionID))
 	if err != nil {
+		return nil, err
+	}
+	if err = insertCalibrationPublishAuditTx(ctx, tx, run.ID); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
