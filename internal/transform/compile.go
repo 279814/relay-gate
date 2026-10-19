@@ -64,6 +64,10 @@ func validateRule(i int, rule Rule) error {
 		return fmt.Errorf("rule %d: kind required", i)
 	}
 	switch kind {
+	case KindRequestReencode:
+		if rule != (Rule{Kind: KindRequestReencode}) {
+			return fmt.Errorf("rule %d: request_reencode takes no parameters", i)
+		}
 	case KindSetHeader, KindDeleteHeader:
 		if strings.TrimSpace(rule.Name) == "" {
 			return fmt.Errorf("rule %d: header name required", i)
