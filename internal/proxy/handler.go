@@ -333,6 +333,7 @@ func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
 
 // preambleResult 是 preamble 已经完成的那几步的产物。
 type preambleResult struct {
+	countLogs  *countAttemptLogs
 	published  *livecfg.PublishedConfig
 	settings   model.Settings
 	body       []byte

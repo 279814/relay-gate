@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -74,6 +75,31 @@ func (s *Server) listSamples(w http.ResponseWriter, r *http.Request) {
 // 口令放在 JSON body（{"password":"..."}）；缺省或错误一律 401 且不返回正文。
 func (s *Server) getSample(w http.ResponseWriter, r *http.Request) {
 	s.sampleWithReauth(w, r, http.StatusUnauthorized)
+}
+
+func (s *Server) sampleMetadata(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	value, err := s.st.GetSampleMetadata(r.Context(), id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
+	value.ReqID = sample.RedactDiagnosticText(value.ReqID, keys)
+	value.Endpoint = sample.RedactDiagnosticText(value.Endpoint, keys)
+	value.ModelIn = sample.RedactDiagnosticText(value.ModelIn, keys)
+	for i := range value.Attempts {
+		value.Attempts[i].ModelOut = sample.RedactDiagnosticText(value.Attempts[i].ModelOut, keys)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, value)
 }
 
 // Browsers cannot send a GET body. POST view carries the per-request password;

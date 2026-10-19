@@ -2,10 +2,43 @@ package proxy
 
 import (
 	"github.com/279814/relay-gate/internal/livecfg"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
 )
+
+func TestCountTokensLogsOnlyActualSendsWithExactAttemptFacts(t *testing.T) {
+	hs := newMultiHarness(t, respondStatus(503, `down`), respondOK(`{"input_tokens":5}`))
+	hs.h.WithCountTokensCapability(&memoryCountCaps{states: map[int64]model.CapabilityState{100: model.CapabilitySupported, 200: model.CapabilitySupported}})
+	sink := hs.withLogs()
+	mux := http.NewServeMux()
+	hs.h.Routes(mux)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(hs.req()))
+	req.Header.Set("X-Api-Key", hs.relayPW)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rows := sink.all()
+	if len(rows) != 2 {
+		t.Fatalf("count actual sends not logged: %d", len(rows))
+	}
+	for i, row := range rows {
+		if row.Endpoint != "/v1/messages/count_tokens" || row.Attempt != i+1 || row.Attempts != 2 || row.Metadata.ExecutionID == "" || row.Metadata.RequestWriteState != "written" || row.Metadata.RequestDiffReason != "sample_disabled" {
+			t.Errorf("attempt %d=%+v", i, row)
+		}
+	}
+	if rows[0].ReqID != rows[1].ReqID || !rows[0].Retried || rows[1].Retried || rows[0].Metadata.ExecutionID == rows[1].Metadata.ExecutionID {
+		t.Fatalf("count group/attempt facts wrong: %+v", rows)
+	}
+	if len(hs.sink.all()) != 0 {
+		t.Fatal("count_tokens unexpectedly retained a sample body")
+	}
+}
 
 type attemptBundleConfig struct {
 	*fakeConfig

@@ -83,6 +83,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 
 	mux.HandleFunc("GET /admin/api/samples", s.listSamples)
 	mux.HandleFunc("GET /admin/api/samples/{id}", s.getSample)
+	mux.HandleFunc("GET /admin/api/samples/{id}/metadata", s.sampleMetadata)
 	mux.HandleFunc("POST /admin/api/samples/{id}/view", s.viewSample)
 	mux.HandleFunc("POST /admin/api/samples/{id}/pin", s.pinSample)
 	mux.HandleFunc("DELETE /admin/api/samples", s.clearSamples)
