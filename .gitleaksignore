@@ -21,3 +21,6 @@ cc7204487ec212a286d55671296182da08208770:internal/store/endpoint_test.go:generic
 d8a69c8c34475269fd0fa1676421d08940aafdd0:scripts/smoke-m6.ps1:generic-api-key:108
 de52935f845abf50837a10c2e9e973b7463ad41c:internal/probe/executor_reachability_test.go:generic-api-key:38
 ff5be6e727d19c70c481505a23e6c856bf98b20b:internal/api/probe_redact_test.go:generic-api-key:45
+
+# Synthetic finite-evidence hash fixture; reviewed 2026-10-19. No real credential.
+a6f6f62b070217618e94ec154f4265d78b2d0d49:internal/security/scan_boundaries_test.go:generic-api-key:45

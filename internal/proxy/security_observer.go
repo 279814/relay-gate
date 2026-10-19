@@ -51,6 +51,9 @@ func (o *securityObserver) TryRequest(view health.AttemptRequestView) {
 func (o *securityObserver) Finish(view health.AttemptFinish) {
 	defer func() { _ = recover() }()
 	o.finish.Do(func() {
+		if view.ReadErr != nil || view.ClientCanceled || view.ServiceCanceled {
+			o.capture.Interrupted()
+		}
 		defer o.capture.Complete(view.ClientCommitted)
 		if o.next != nil {
 			o.next.Finish(view)

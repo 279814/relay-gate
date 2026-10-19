@@ -110,6 +110,19 @@ func (c *Capture) TryChunk(body []byte) {
 	c.tailPos = (c.tailPos + len(body)) % len(tail)
 }
 
+// Interrupted records only a fixed reason, never transport error text. A
+// partially delivered response cannot support a complete scan conclusion.
+func (c *Capture) Interrupted() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.observer != nil && !c.completed {
+		c.job.input.IncompleteReason = appendIncomplete(c.job.input.IncompleteReason, "capture_interrupted")
+	}
+}
+
 // Complete is idempotent. Only bytes actually committed to the client qualify;
 // retry/discard/fallback paths pass false and immediately release admission.
 func (c *Capture) Complete(committed bool) {

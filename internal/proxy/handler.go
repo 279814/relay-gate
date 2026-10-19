@@ -535,23 +535,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 	} else {
 		closeSampleTrail(oc.trail)
 	}
-	if h.security != nil && oc.secTee != nil {
-		upName := ""
-		if oc.cand != nil && oc.cand.Upstream != nil {
-			upName = oc.cand.Upstream.Name
-		}
-		var routeID int64
-		if oc.cand != nil && oc.cand.Route != nil {
-			routeID = oc.cand.Route.ID
-		}
-		h.security.Enqueue(security.ObserveJob{
-			Body:     oc.secTee.Bytes(),
-			Upstream: upName,
-			RouteID:  routeID,
-			ReqID:    oc.reqID,
-			Keys:     oc.keys, // redact Detail before persist (§14.5 / §16.4)
-		})
-	}
+
 }
 
 // halfOpen 在「全部 Route 都 dead」时放行一次试探（§4.4c）。
