@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +43,7 @@ type Finding struct {
 	Truncated        bool     `json:"truncated"`
 	DecodeDepth      int      `json:"decode_depth"`
 	EvidenceHash     string   `json:"evidence_hash"` // SHA-256 of finite redacted Detail, not the response body
-	IncompleteReason string   `json:"incomplete_reason,omitempty"`
+	IncompleteReason string   `json:"incomplete_reason"`
 }
 
 // Center is the in-process Security Center store (bounded ring).
@@ -129,13 +128,6 @@ func (c *Center) Count() int {
 	return len(c.findings)
 }
 
-var (
-	reScript    = regexp.MustCompile(`(?i)<\s*script\b`)
-	reJSURL     = regexp.MustCompile(`(?i)\bjavascript\s*:`)
-	reOnAttr    = regexp.MustCompile(`(?i)\bon[a-z]+\s*=`)
-	rePromptInj = regexp.MustCompile(`(?i)ignore\s+(all\s+)?(previous|prior)\s+instructions`)
-)
-
 // ScanText runs passive rules on a text body. Does not mutate input.
 //
 // keys are upstream/relay secrets known for this scan. They are redacted from
@@ -143,34 +135,13 @@ var (
 // raw matched secret (§14.3 / §14.5 / §16.4). Scanning still uses the original
 // text so pattern detection is unchanged.
 func ScanText(text, sourceLabel string, keys ...string) []Finding {
-	if text == "" {
-		return nil
+	var segments []Segment
+	if len(text) > MaxScanBytes {
+		segments = []Segment{{Body: []byte(text[:MaxScanBytes/2])}, {Offset: int64(len(text) - MaxScanBytes/2), Body: []byte(text[len(text)-MaxScanBytes/2:])}}
+	} else {
+		segments = []Segment{{Body: []byte(text)}}
 	}
-	safeDetail := clip(RedactSecrets(text, keys), 512)
-	var out []Finding
-	add := func(sev Severity, cat, summary string) {
-		out = append(out, Finding{
-			Severity: sev,
-			Category: cat,
-			Summary:  summary,
-			Detail:   safeDetail,
-			Source:   "passive",
-		})
-		_ = sourceLabel
-	}
-	if reScript.MatchString(text) {
-		add(SeverityHigh, "xss_pattern", "检测到疑似 script 标签")
-	}
-	if reJSURL.MatchString(text) {
-		add(SeverityMedium, "xss_pattern", "检测到 javascript: URL")
-	}
-	if reOnAttr.MatchString(text) {
-		add(SeverityMedium, "xss_pattern", "检测到 HTML 事件属性")
-	}
-	if rePromptInj.MatchString(text) {
-		add(SeverityMedium, "prompt_injection", "检测到常见提示注入措辞")
-	}
-	return out
+	return defaultScanner.Scan(ScanInput{Segments: segments, TotalBytes: int64(len(text)), Keys: keys, Source: sourceLabel})
 }
 
 // RedactFindingForRead applies RedactSecrets to free-text finding fields
