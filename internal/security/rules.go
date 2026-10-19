@@ -77,18 +77,7 @@ func (r *scanRun) inspectTextVisible(text, evidence string, depth int, visible s
 		return
 	}
 	r.depth = max(r.depth, depth)
-	redacted := RedactSecrets(text, r.input.Keys)
-	if redacted != text {
-		r.add(SeverityCritical, "credential_exposure", "响应包含已知 Credential", evidence)
-		if depth > 0 && RedactSecrets(evidence, r.input.Keys) == evidence {
-			r.hiddenCredential = true
-		}
-	}
-	for _, key := range r.input.Keys {
-		if len(key) >= 24 && (strings.Contains(text, key[:12]) || strings.Contains(text, key[len(key)-12:])) {
-			r.add(SeverityHigh, "credential_fragment", "响应包含已知 Credential 片段", evidence)
-		}
-	}
+	r.credentialSignals(text, evidence, depth)
 	if reScript.MatchString(text) {
 		r.add(SeverityLow, "xss_pattern", "发现脚本/HTML 线索；单项不证明恶意", evidence)
 	}
@@ -157,6 +146,21 @@ func (r *scanRun) inspectTextVisible(text, evidence string, depth int, visible s
 			childVisible = strings.Repeat(" ", len(value.text))
 		}
 		r.inspectTextVisible(value.text, evidence, depth+1, childVisible)
+	}
+}
+
+func (r *scanRun) credentialSignals(text, evidence string, depth int) {
+	redacted := RedactSecrets(text, r.input.Keys)
+	if redacted != text {
+		r.add(SeverityCritical, "credential_exposure", "响应包含已知 Credential", evidence)
+		if depth > 0 && RedactSecrets(evidence, r.input.Keys) == evidence {
+			r.hiddenCredential = true
+		}
+	}
+	for _, key := range r.input.Keys {
+		if len(key) >= 24 && (strings.Contains(text, key[:12]) || strings.Contains(text, key[len(key)-12:])) {
+			r.add(SeverityHigh, "credential_fragment", "响应包含已知 Credential 片段", evidence)
+		}
 	}
 }
 

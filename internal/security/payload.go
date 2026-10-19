@@ -158,9 +158,7 @@ func (r *scanRun) credentialsInValue(value any, depth int) {
 	}
 	switch value := value.(type) {
 	case string:
-		if RedactSecrets(value, r.input.Keys) != value {
-			r.add(SeverityCritical, "credential_exposure", "响应包含已知 Credential", value)
-		}
+		r.credentialValue(value, 0)
 	case map[string]any:
 		for _, child := range value {
 			r.credentialsInValue(child, depth+1)
@@ -169,6 +167,27 @@ func (r *scanRun) credentialsInValue(value any, depth int) {
 		for _, child := range value {
 			r.credentialsInValue(child, depth+1)
 		}
+	}
+}
+
+// Unknown protocol fields cannot establish role/tool facts, but must not hide
+// known credentials by placing them in an encoded metadata string.
+func (r *scanRun) credentialValue(text string, depth int) {
+	if len(r.input.Keys) == 0 || text == "" || !r.spend(len(text)) {
+		return
+	}
+	r.depth = max(r.depth, depth)
+	r.credentialSignals(text, text, depth)
+	for _, value := range decodedVariants(text) {
+		if value.failed {
+			r.incomplete("payload_decode_failed", false)
+			continue
+		}
+		if depth >= MaxDecodeDepth {
+			r.incomplete("decode_depth_limit", true)
+			continue
+		}
+		r.credentialValue(value.text, depth+1)
 	}
 }
 

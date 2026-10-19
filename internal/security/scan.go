@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/279814/relay-gate/internal/model"
 )
@@ -368,6 +369,9 @@ func clip(s string, n int) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…"
 }

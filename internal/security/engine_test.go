@@ -210,3 +210,20 @@ func TestPassiveEncodedCredentialNeverStored(t *testing.T) {
 		}
 	}
 }
+
+func TestPassiveEncodedCredentialInUnknownMetadataStillDetected(t *testing.T) {
+	const credential = "synthetic-metadata-credential-for-test"
+	encoded := base64.StdEncoding.EncodeToString([]byte(credential))
+	body := `{"type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"metadata":{"note":"` + encoded + `"}}`
+	in := scanInput(body, model.EndpointMessages, model.ProtoAnthropic)
+	in.Keys = []string{credential}
+	fs := defaultScanner.Scan(in)
+	if !containsFinding(fs, "credential_exposure") {
+		t.Fatalf("encoded metadata credential missed: %+v", fs)
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, credential) || strings.Contains(f.Detail, encoded) {
+			t.Fatalf("encoded metadata evidence leaked: %+v", f)
+		}
+	}
+}
