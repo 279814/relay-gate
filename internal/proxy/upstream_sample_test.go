@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
@@ -26,10 +29,11 @@ func (r *finalEOFSampleReader) Read(p []byte) (int, error) {
 }
 
 func TestOriginalSampleRecordsEOFReturnedWithExactDrainLimit(t *testing.T) {
-	capture := &upstreamSampleCapture{sink: sample.NewHeadTail(0, 0), status: 200}
+	tee := sample.NewHeadTail(0, 0)
+	capture := &upstreamSampleCapture{sink: tee, status: 200}
 	at := &Attempt{f: &Forwarder{upstreamSample: capture}, res: &Result{}, resp: &http.Response{Body: io.NopCloser(&finalEOFSampleReader{body: bytes.Repeat([]byte("x"), discardDrainLimit)})}}
 	at.captureDrain()
-	if !capture.complete || capture.view() != "upstream_response" || len(capture.sink.Bytes()) != discardDrainLimit {
+	if !capture.complete || capture.view() != "upstream_response" || len(tee.Bytes()) != discardDrainLimit {
 		t.Fatalf("ignored an observed EOF at the exact drain boundary: complete=%v view=%s", capture.complete, capture.view())
 	}
 }
@@ -37,11 +41,89 @@ func TestOriginalSampleRecordsEOFReturnedWithExactDrainLimit(t *testing.T) {
 func TestOriginalSampleRecordsObservedEOFWhenClientCancelsBeforeWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	capture := &upstreamSampleCapture{sink: sample.NewHeadTail(0, 0), status: 200}
+	tee := sample.NewHeadTail(0, 0)
+	capture := &upstreamSampleCapture{sink: tee, status: 200}
 	at := &Attempt{f: &Forwarder{upstreamSample: capture}, res: &Result{}, clientCtx: ctx, ctx: ctx}
 	at.streamBody(httptest.NewRecorder(), &finalEOFSampleReader{body: []byte("original")}, false)
-	if !capture.complete || string(capture.sink.Bytes()) != "original" {
+	if !capture.complete || string(tee.Bytes()) != "original" {
 		t.Fatal("client cancellation erased an already observed upstream EOF")
+	}
+}
+
+type blockedRawSampleWriter struct {
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (w *blockedRawSampleWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+type rawSampleProgressObserver struct {
+	chunk chan struct{}
+	once  sync.Once
+}
+
+func (o *rawSampleProgressObserver) TryHeaders(int, http.Header, time.Time) bool { return true }
+func (o *rawSampleProgressObserver) TryChunk([]byte, time.Time) bool {
+	o.once.Do(func() { close(o.chunk) })
+	return true
+}
+func (o *rawSampleProgressObserver) Finish(health.AttemptFinish) {}
+
+func TestOriginalWireObservationPrecedesBlockedSampleCopy(t *testing.T) {
+	for _, transformed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "passthrough", true: "transform"}[transformed], func(t *testing.T) {
+			remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"content":[{"type":"text","text":"before"}]}`)
+			}))
+			defer remote.Close()
+			blocked := &blockedRawSampleWriter{started: make(chan struct{}), release: make(chan struct{})}
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(blocked.release) }) }
+			defer unblock()
+			observer := &rawSampleProgressObserver{chunk: make(chan struct{})}
+			f := testForwarder(t, fastTimeouts())
+			f.Protocol = model.ProtoAnthropic
+			f.RespObserver = observer
+			f.upstreamSample = &upstreamSampleCapture{sink: blocked, status: 200}
+			at := f.Send(context.Background(), http.MethodPost, remote.URL, http.Header{}, []byte(`{}`))
+			if at.Failed() {
+				t.Fatalf("fixture RoundTrip failed: %v", at.Result().Err)
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if transformed {
+					c, _ := transform.Compile(transform.Version{Rules: []transform.Rule{{Kind: transform.KindReplaceBytes, From: "before", To: "after"}}})
+					at.CommitTransformed(httptest.NewRecorder(), c, nil)
+				} else {
+					at.Commit(httptest.NewRecorder())
+				}
+			}()
+			select {
+			case <-blocked.started:
+			case <-time.After(time.Second):
+				t.Fatal("sample copy did not start")
+			}
+			select {
+			case <-observer.chunk:
+			default:
+				t.Error("sample copy delayed original Observer evidence")
+			}
+			if at.wire.firstByte.Load() == 0 {
+				t.Error("sample copy delayed Canonical first-byte evidence")
+			}
+			unblock()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("forward did not finish after sample release")
+			}
+		})
 	}
 }
 

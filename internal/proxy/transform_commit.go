@@ -54,13 +54,10 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
-	if at.f.upstreamSample != nil {
-		if len(at.peeked) > 0 {
+	if at.failBeforeCommit() {
+		if at.f.upstreamSample != nil && len(at.peeked) > 0 {
 			_, _ = at.f.upstreamSample.Write(at.peeked)
 		}
-		at.resp.Body = upstreamSampleBody{ReadCloser: at.resp.Body, capture: at.f.upstreamSample}
-	}
-	if at.failBeforeCommit() {
 		return at.res
 	}
 	stop := at.watchResponse()
@@ -71,8 +68,14 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 			_, _ = observer.Write(at.peeked)
 		}
 		at.wire.feed(at.peeked, time.Now())
+		if at.f.upstreamSample != nil {
+			_, _ = at.f.upstreamSample.Write(at.peeked)
+		}
 	}
 	at.resp.Body = observedUpstreamBody{ReadCloser: at.resp.Body, observer: observer, wire: at.wire, readError: &at.res.upstreamReadErr}
+	if at.f.upstreamSample != nil {
+		at.resp.Body = upstreamSampleBody{ReadCloser: at.resp.Body, capture: at.f.upstreamSample}
+	}
 	if !responseRulesTouchBody(compiled) && !responseRulesTouchSSE(compiled) {
 		var src io.Reader = at.resp.Body
 		if len(at.peeked) > 0 {

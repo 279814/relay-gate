@@ -658,14 +658,14 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 			if canFlush {
 				flusher.Flush()
 			}
-			if !inputObserved && f.upstreamSample != nil {
-				_, _ = f.upstreamSample.Write(buf[:n])
-			}
 			if !inputObserved {
 				if f.RespObserver != nil {
 					_, _ = (observerTee{f.RespObserver}).Write(buf[:n])
 				}
 				at.wire.feed(buf[:n], time.Now())
+			}
+			if !inputObserved && f.upstreamSample != nil {
+				_, _ = f.upstreamSample.Write(buf[:n])
 			}
 			if f.RespTee != nil {
 				_, _ = f.RespTee.Write(buf[:n])
