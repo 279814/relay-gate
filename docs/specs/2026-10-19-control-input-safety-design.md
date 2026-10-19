@@ -8,4 +8,6 @@ capture producer 通过已验证的 --system-prompt 能力显式设置公开控�
 
 Query 仅接受现有控制回归所需的 beta=true、mode=fixture 固定参数，可组合但不能重复。检查解码后的键和值及所有已知凭据，拒绝认证参数、业务值、未知参数与模板占位符；验收通过后保留原 RawQuery 字节。
 
+Headers 只接受已有生产 shape sanitizer 维护的 SDK/版本/OS/架构/协议 beta 词表及有界的本地 Host、正确 Content-Length、Connection 和编码枚举；未知 custom header 或 Content-Type 参数拒绝。验证不改变批准头的名称、数组顺序及多值。JSON schema 键必须精确小写，防止大小写不敏感解码接受别名后重放另一份正文；已知凭据同时扫描原字节和 JSON 解码字符串，query 同时扫描百分号解码值。
+
 回归先证明危险输入在第一次发送及报告创建前被拒绝，再核对 producer→reader、四端点批准形状、原文/RawQuery 保真、单认证与共享 Executor。最终运行完整 cmd 测试、wrapper 合同、build 和 vet。没有真实用户输入或线上模型请求。

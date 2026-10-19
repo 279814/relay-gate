@@ -141,6 +141,8 @@ bash scripts/probe-upstream.sh --online --accept-probe-cost \
 
 Windows 的隔离 Claude capturer 可同时写出 typed v2 fixture 和相邻 manifest：先为 `.local/p0/captures` 准备当前用户专属权限，再运行 `pwsh -File scripts/capture-claude-request.ps1 -Execute -AllowedRoot <私有目录> -OutputPath <同目录的新fixture.json> -ManifestPath <同目录的新manifest.json> -Alias <TSV中的alias>`。它只用空临时目录、隔离配置和 loopback 假上游捕获固定 nonce 提示，不调用真实模型；旧 v1 capture 或 `test_mode` 文件不能充当原生证据。CLI 会重读 fixture，校验来源/隔离声明、原始有序 headers/body 哈希、权限和完整性，再使用生产 Executor 真实执行 control 与 Probe。OpenAI control 同样必须来自可证明隔离的本次专用会话；没有该证据时保留 `control_missing`，不从历史样本补齐。
 
+Control 还逐值校验内容：每个端点只接受对应的单条 nonce 输入、有限类型参数及批准的 SDK/协议头；system 只接受 capturer 显式设置的公开控制句 `Reply with 2 only.`，metadata 必须为空，thinking 只接受 disabled。认证只能在唯一的占位符认证头，query 仅允许 `beta=true`、`mode=fixture` 固定参数。未知业务正文、header、query、会话元数据或大小写别名均拒绝；不会清洗后冒充原始捕获。未批准的原生版本或结构需重新验收，本地合成回归不证明真实原生兼容。
+
 ## 为什么不是「重试就行了」
 
 被动 failover（请求失败再换下一个）在长思考场景下代价很高：一次首 Token 超时可能是

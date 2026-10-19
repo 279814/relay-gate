@@ -22,8 +22,8 @@ func TestCaptureProducerEmitsControlAcceptedByTheRealCLIReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	const key = "synthetic-cli-capture-fixture-credential"
-	body := []byte(`{"model":"captured-model","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)
-	request := map[string]any{"RequestLine": "POST /v1/messages?beta=true HTTP/1.1", "HeaderEntries": []map[string]any{{"Name": "x-api-key", "Values": []string{key}}, {"Name": "Content-Type", "Values": []string{"application/json"}}, {"Name": "X-Control-Test", "Values": []string{"one"}}, {"Name": "X-Between", "Values": []string{"literal"}}, {"Name": "X-Control-Test", "Values": []string{"two"}}}, "Headers": map[string][]string{"x-api-key": {key}, "content-type": {"application/json"}, "x-control-test": {"one", "two"}}, "BodyBase64": base64.StdEncoding.EncodeToString(body)}
+	body := []byte(`{"model":"captured-model","max_tokens":1,"stream":true,"system":[{"type":"text","text":"Reply with 2 only.","cache_control":{"type":"ephemeral"}}],"metadata":{},"thinking":{"type":"disabled"},"stop_sequences":[],"temperature":0,"top_p":1,"top_k":1,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)
+	request := map[string]any{"RequestLine": "POST /v1/messages?beta=true HTTP/1.1", "HeaderEntries": []map[string]any{{"Name": "x-api-key", "Values": []string{key}}, {"Name": "Content-Type", "Values": []string{"application/json"}}, {"Name": "Accept", "Values": []string{"application/json"}}, {"Name": "X-App", "Values": []string{"cli"}}, {"Name": "Accept", "Values": []string{"text/event-stream"}}}, "Headers": map[string][]string{"x-api-key": {key}, "content-type": {"application/json"}, "accept": {"application/json", "text/event-stream"}}, "BodyBase64": base64.StdEncoding.EncodeToString(body)}
 	input := filepath.Join(directory, "request.local.json")
 	data, _ := json.Marshal(request)
 	if err := os.WriteFile(input, data, 0600); err != nil {
@@ -82,7 +82,7 @@ $now = [DateTimeOffset]::UtcNow.ToString('O')
 	if err := json.Unmarshal(output, &capture); err != nil {
 		t.Fatal(err)
 	}
-	if len(capture.Headers) != 5 || capture.Headers[2].Name != "X-Control-Test" || capture.Headers[3].Name != "X-Between" || capture.Headers[4].Name != "X-Control-Test" {
+	if len(capture.Headers) != 5 || capture.Headers[2].Name != "Accept" || capture.Headers[3].Name != "X-App" || capture.Headers[4].Name != "Accept" || capture.Headers[2].Values[0] != "application/json" || capture.Headers[4].Values[0] != "text/event-stream" {
 		t.Fatal("capture lost interleaved raw header order")
 	}
 	fixture := filepath.Join(directory, "control.json")
@@ -99,5 +99,51 @@ $now = [DateTimeOffset]::UtcNow.ToString('O')
 	}
 	if _, err := loadControlManifest(manifest, root, time.Now()); err != nil {
 		t.Fatalf("real capture format cannot reach the CLI: %v", err)
+	}
+}
+
+func TestCaptureProducerRejectsUnknownAndBusinessHeadersBeforeExport(t *testing.T) {
+	powerShell, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell unavailable")
+	}
+	source, _ := filepath.Abs(filepath.Join("..", "..", "scripts", "capture-claude-request.ps1"))
+	for _, header := range []struct{ name, value string }{{"X-Private-Project", "private"}, {"User-Agent", "claude-cli/2.1.220 private"}, {"Content-Type", "application/json; private=business"}, {"X-Stainless-Os", "private"}} {
+		t.Run(header.name, func(t *testing.T) {
+			command := exec.Command(powerShell, "-NoProfile", "-NonInteractive", "-Command", `. $env:CLI_CAPTURE_SOURCE
+$request = @{ RequestLine='POST /v1/messages HTTP/1.1'; HeaderEntries=@(@{Name='x-api-key';Values=@('synthetic-capture-key')},@{Name=$env:CLI_CAPTURE_HEADER;Values=@($env:CLI_CAPTURE_VALUE)}); Body=[Text.Encoding]::UTF8.GetBytes('{"model":"captured-model","max_tokens":1,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}') }
+$now=[DateTimeOffset]::UtcNow.ToString('O')
+[void](ConvertTo-VerifiedControlEnvelope -Request $request -FakeKey 'synthetic-capture-key' -Nonce '0123456789abcdef' -SourceVersion 'fixture-client' -CapturedAt $now -CompletedAt $now)
+`)
+			command.Env = append(os.Environ(), "CLI_CAPTURE_SOURCE="+source, "CLI_CAPTURE_HEADER="+header.name, "CLI_CAPTURE_VALUE="+header.value)
+			if output, err := command.CombinedOutput(); err == nil {
+				t.Fatalf("producer exported unchecked header: %s", output)
+			}
+		})
+	}
+}
+
+func TestCaptureProducerRejectsBusinessFieldsBeforeExport(t *testing.T) {
+	powerShell, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell unavailable")
+	}
+	source, err := filepath.Abs(filepath.Join("..", "..", "scripts", "capture-claude-request.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"system":"private project"`, `"metadata":{"user_id":"private user"}`, `"thinking":{"type":"disabled","text":"private"}`, `"input":"private"`} {
+		t.Run(field, func(t *testing.T) {
+			body := []byte(`{"model":"captured-model","max_tokens":1,` + field + `,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)
+			command := exec.Command(powerShell, "-NoProfile", "-NonInteractive", "-Command", `. $env:CLI_CAPTURE_SOURCE
+$request = @{ RequestLine='POST /v1/messages?beta=true HTTP/1.1'; HeaderEntries=@(@{Name='x-api-key';Values=@('synthetic-capture-key')}); Body=[Convert]::FromBase64String($env:CLI_CAPTURE_BODY) }
+$now=[DateTimeOffset]::UtcNow.ToString('O')
+[void](ConvertTo-VerifiedControlEnvelope -Request $request -FakeKey 'synthetic-capture-key' -Nonce '0123456789abcdef' -SourceVersion 'fixture-client' -CapturedAt $now -CompletedAt $now)
+`)
+			command.Env = append(os.Environ(), "CLI_CAPTURE_SOURCE="+source, "CLI_CAPTURE_BODY="+base64.StdEncoding.EncodeToString(body))
+			if output, err := command.CombinedOutput(); err == nil {
+				t.Fatalf("producer exported unchecked business body: %s", output)
+			}
+		})
 	}
 }

@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/279814/relay-gate/internal/model"
 )
 
 func controlDigest(body []byte) string { sum := sha256.Sum256(body); return hex.EncodeToString(sum[:]) }
@@ -26,7 +28,7 @@ func writeControlPair(t *testing.T, root string, mutate func(map[string]any, map
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	body := []byte("{ \"model\":\"captured-model\",\"stream\":true,\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"1+1=? control:0123456789abcdef\"}]}\n")
-	headers := json.RawMessage(`[{"name":"Content-Type","values":["application/json"]},{"name":"X-Api-Key","values":["{{UPSTREAM_API_KEY}}"]},{"name":"X-Control-Test","values":["one","two"]},{"name":"Accept-Encoding","values":["gzip, br"]},{"name":"Connection","values":["X-Hop"]},{"name":"X-Hop","values":["must-not-leave"]}]`)
+	headers := json.RawMessage(`[{"name":"Content-Type","values":["application/json"]},{"name":"X-Api-Key","values":["{{UPSTREAM_API_KEY}}"]},{"name":"Accept","values":["application/json","text/event-stream"]},{"name":"Accept-Encoding","values":["gzip, br"]},{"name":"Connection","values":["close"]}]`)
 	isolation := map[string]bool{"configuration": true, "mcp": true, "hooks": true, "plugins": true, "environment": true, "temporary_workdir": true}
 	fixture := map[string]any{"format_version": 2, "protocol": "anthropic", "endpoint": "messages", "source": "claude-code-isolated", "control_id": "0123456789abcdef", "nonce": "0123456789abcdef",
 		"captured_at": now.Add(-time.Second).Format(time.RFC3339), "completed_at": now.Format(time.RFC3339), "truncated": false, "authentication_verified": true, "isolation": isolation,
@@ -104,7 +106,7 @@ func TestProbeCLIPrivateInputAndOutputPolicyPrecedesAnySend(t *testing.T) {
 
 func TestProbeCLIControlReadsAndReplaysExactFixtureBeforeCompactProbe(t *testing.T) {
 	root := cliPrivateRepository(t)
-	manifest := writeControlPair(t, root, nil)
+	manifest := writeControlPair(t, root, func(f, _ map[string]any) { f["request_target"] = "/v1/messages?%62eta=%74rue&mode=fixture" })
 	if _, err := readCLIPrivateFile(manifest, root, maxControlBytes); err != nil {
 		t.Fatalf("manifest file protection: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestProbeCLIControlReadsAndReplaysExactFixtureBeforeCompactProbe(t *testing
 			requests = append(requests, string(body))
 			mu.Unlock()
 			if strings.Contains(string(body), "control:0123456789abcdef") {
-				if r.URL.RawQuery != "beta=true" || strings.Join(r.Header.Values("X-Control-Test"), ",") != "one,two" || r.Header.Get("Accept-Encoding") != "gzip, br" || r.Header.Get("X-Hop") != "" {
+				if r.URL.RawQuery != "%62eta=%74rue&mode=fixture" || strings.Join(r.Header.Values("Accept"), ",") != "application/json,text/event-stream" || r.Header.Get("Accept-Encoding") != "gzip, br" || r.Header.Get("Connection") != "" {
 					t.Error("control headers/query were not preserved")
 				}
 			}
@@ -313,6 +315,27 @@ func TestProbeCLIControlRejectsUnverifiedFixtureBeforeAnySendOrReport(t *testing
 			e["body_sha256"] = controlDigest(body)
 			e["body_bytes"] = len(body)
 		}},
+		{"business-system", controlBodyMutation(`{"model":"captured","system":"synthetic-private-project-roadmap","messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"business-metadata", controlBodyMutation(`{"model":"captured","metadata":{"user_id":"synthetic-private-user"},"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"business-thinking", controlBodyMutation(`{"model":"captured","thinking":{"type":"disabled","text":"synthetic-private-project-roadmap"},"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"business-stop-sequence", controlBodyMutation(`{"model":"captured","stop_sequences":["synthetic-private-project-roadmap"],"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"business-numeric-option", controlBodyMutation(`{"model":"captured","temperature":{"private":"business"},"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"cross-protocol-input", controlBodyMutation(`{"model":"captured","input":"synthetic-private-project-roadmap","messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"case-alias-hides-business", controlBodyMutation(`{"model":"captured","max_tokens":1,"messages":[{"role":"user","content":"private"}],"MESSAGES":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"nested-case-alias-hides-business", controlBodyMutation(`{"model":"captured","max_tokens":1,"messages":[{"role":"user","content":"private","CONTENT":"1+1=? control:0123456789abcdef"}]}`)},
+		{"case-alias-output-limit", controlBodyMutation(`{"model":"captured","MAX_TOKENS":1,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
+		{"known-credential-query", func(f, _ map[string]any) {
+			f["request_target"] = "/v1/messages?api_key=synthetic-cli-control-fixture-credential"
+		}},
+		{"encoded-known-credential-query", func(f, _ map[string]any) {
+			f["request_target"] = "/v1/messages?beta=%73ynthetic-cli-control-fixture-credential"
+		}},
+		{"second-auth-query", func(f, _ map[string]any) { f["request_target"] = "/v1/messages?api_key=synthetic-unrelated-token" }},
+		{"business-query", func(f, _ map[string]any) { f["request_target"] = "/v1/messages?task=synthetic-private-project-roadmap" }},
+		{"business-header", controlHeaderMutation(`[{"name":"X-Api-Key","values":["{{UPSTREAM_API_KEY}}"]},{"name":"X-Private-Project","values":["synthetic-private-project-roadmap"]}]`)},
+		{"business-in-approved-header", controlHeaderMutation(`[{"name":"X-Api-Key","values":["{{UPSTREAM_API_KEY}}"]},{"name":"User-Agent","values":["claude-cli/2.1.220 private-project"]}]`)},
+		{"business-media-param", controlHeaderMutation(`[{"name":"X-Api-Key","values":["{{UPSTREAM_API_KEY}}"]},{"name":"Content-Type","values":["application/json; private=business"]}]`)},
+		{"escaped-credential-model", controlBodyMutation(`{"model":"\u0073ynthetic-cli-control-fixture-credential","max_tokens":1,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)},
 		{"credential-in-isolated-metadata", func(f, e map[string]any) {
 			body := []byte(`{"model":"captured","system":"synthetic-cli-control-fixture-credential","messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`)
 			f["body_base64"] = base64.StdEncoding.EncodeToString(body)
@@ -344,6 +367,88 @@ func TestProbeCLIControlRejectsUnverifiedFixtureBeforeAnySendOrReport(t *testing
 			}
 			if _, err := os.Stat(output); !os.IsNotExist(err) {
 				t.Fatal("invalid control created a false result")
+			}
+		})
+	}
+}
+
+func controlBodyMutation(body string) func(map[string]any, map[string]any) {
+	return func(f, e map[string]any) {
+		f["body_base64"] = base64.StdEncoding.EncodeToString([]byte(body))
+		e["body_sha256"] = controlDigest([]byte(body))
+		e["body_bytes"] = len(body)
+	}
+}
+
+func controlHeaderMutation(headers string) func(map[string]any, map[string]any) {
+	return func(f, e map[string]any) {
+		f["headers"] = json.RawMessage(headers)
+		e["header_sha256"] = controlDigest([]byte(headers))
+	}
+}
+
+func TestControlPromptRejectsBusinessOutsideEndpointInput(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"captured","input":"1+1=? control:0123456789abcdef","messages":[{"role":"user","content":"private"}]}`,
+		`{"model":"captured","input":"1+1=? control:0123456789abcdef","system":"private"}`,
+		`{"model":"captured","input":"1+1=? control:0123456789abcdef","metadata":{"user_id":"private"}}`,
+	} {
+		if err := validateControlPrompt(model.EndpointResponses, []byte(body), "0123456789abcdef"); err == nil {
+			t.Fatalf("responses accepted unchecked business fields: %s", body)
+		}
+	}
+}
+
+func TestControlPromptApprovedEndpointMatrix(t *testing.T) {
+	for _, test := range []struct {
+		endpoint model.EndpointKind
+		body     string
+	}{
+		{model.EndpointMessages, `{"model":"captured","max_tokens":1,"stream":true,"system":"Reply with 2 only.","metadata":{},"thinking":{"type":"disabled"},"stop_sequences":[],"temperature":0,"top_p":1,"top_k":0,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`},
+		{model.EndpointCountTokens, `{"model":"captured","system":[{"type":"text","text":"Reply with 2 only.","cache_control":{"type":"ephemeral"}}],"metadata":{},"messages":[{"role":"user","content":[{"type":"text","text":"1+1=? control:0123456789abcdef"}]}]}`},
+		{model.EndpointResponses, `{"model":"captured","max_output_tokens":16,"stream":true,"metadata":{},"input":[{"role":"user","content":[{"type":"input_text","text":"1+1=? control:0123456789abcdef"}]}]}`},
+		{model.EndpointChatCompletions, `{"model":"captured","max_completion_tokens":1,"stream":true,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`},
+	} {
+		t.Run(string(test.endpoint), func(t *testing.T) {
+			if err := validateControlPrompt(test.endpoint, []byte(test.body), "0123456789abcdef"); err != nil {
+				t.Fatalf("approved dedicated control was rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestControlPromptRejectsInvalidOptionsAndHiddenValues(t *testing.T) {
+	for _, extra := range []string{
+		`"system":[{"type":"text","text":"Reply with 2 only.","private":"business"}]`,
+		`"system":[{"type":"text","text":"Reply with 2 only.","cache_control":{"type":"ephemeral","private":"business"}}]`,
+		`"system":[{"type":"text","text":"Reply with 2 only.","cache_control":null}]`,
+		`"metadata":null`, `"metadata":[]`, `"thinking":{"type":"enabled","budget_tokens":1024}`,
+		`"temperature":"private"`, `"temperature":-1`, `"temperature":3`, `"top_p":2`, `"top_k":-1`,
+		`"stream":"private"`, `"stream":null`, `"max_output_tokens":16`, `"max_completion_tokens":1`,
+	} {
+		body := `{"model":"captured","max_tokens":1,` + extra + `,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`
+		if err := validateControlPrompt(model.EndpointMessages, []byte(body), "0123456789abcdef"); err == nil {
+			t.Fatalf("invalid control option accepted: %s", extra)
+		}
+	}
+	for _, limit := range []string{"0", "-1", "1.5", "2147483648", `"private"`, "null"} {
+		body := `{"model":"captured","max_tokens":` + limit + `,"messages":[{"role":"user","content":"1+1=? control:0123456789abcdef"}]}`
+		if err := validateControlPrompt(model.EndpointMessages, []byte(body), "0123456789abcdef"); err == nil {
+			t.Fatalf("invalid output bound accepted: %s", limit)
+		}
+	}
+}
+
+func TestProbeCLIModelCannotInjectControlTemplateOrCredentials(t *testing.T) {
+	for _, modelName := range []string{"{{UPSTREAM_API_KEY}}", "synthetic-cli-control-fixture-credential"} {
+		t.Run(modelName, func(t *testing.T) {
+			root := cliPrivateRepository(t)
+			manifest := writeControlPair(t, root, nil)
+			sends := 0
+			code := runProbeCLI([]string{"probe-one", "--name", "fixture", "--online", "--accept-probe-cost", "--accept-control-replay", "--control-manifest", manifest, "--base-url", "http://127.0.0.1:9", "--key-env", "KEY", "--claude-model", modelName}, nil, io.Discard, io.Discard,
+				probeCLIDeps{repoRoot: root, transport: roundTripFunc(func(*http.Request) (*http.Response, error) { sends++; return nil, io.EOF }), getenv: func(string) string { return "synthetic-cli-control-fixture-credential" }})
+			if code == exitOK || sends != 0 {
+				t.Fatalf("model input reached transport with template/credential: code=%d sends=%d", code, sends)
 			}
 		})
 	}

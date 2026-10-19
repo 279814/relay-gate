@@ -56,6 +56,16 @@ func validateProbeCLIRows(rows []tsvRow) error {
 			if other.APIKey != "" && strings.Contains(row.Alias, other.APIKey) {
 				return errCLIPrivateInput
 			}
+			for _, names := range [][]string{row.ClaudeModels, row.GPTModels} {
+				for _, name := range names {
+					// Control recipes are materialized after the model mapping.
+					// A model must remain literal input, never new template syntax
+					// or a credential accidentally placed in a model column.
+					if strings.Contains(name, "{{") || (other.APIKey != "" && strings.Contains(name, other.APIKey)) {
+						return errCLIPrivateInput
+					}
+				}
+			}
 		}
 	}
 	return nil

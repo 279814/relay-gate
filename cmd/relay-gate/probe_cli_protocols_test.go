@@ -25,7 +25,7 @@ func TestProbeCLISharedControlPreservesOpenAIProtocolsAndCompressedWire(t *testi
 			root := cliPrivateRepository(t)
 			manifest := writeControlPair(t, root, func(f, e map[string]any) {
 				body := []byte(test.body)
-				headers := json.RawMessage(`[{"name":"Content-Type","values":["application/json"]},{"name":"Authorization","values":["Bearer {{UPSTREAM_API_KEY}}"]},{"name":"X-Control-Test","values":["one","two"]},{"name":"Accept-Encoding","values":["gzip"]}]`)
+				headers := json.RawMessage(`[{"name":"Content-Type","values":["application/json"]},{"name":"Authorization","values":["Bearer {{UPSTREAM_API_KEY}}"]},{"name":"Accept","values":["application/json","text/event-stream"]},{"name":"Accept-Encoding","values":["gzip"]}]`)
 				for _, object := range []map[string]any{f, e} {
 					object["protocol"] = test.protocol
 					object["endpoint"] = test.endpoint
@@ -67,7 +67,7 @@ func TestProbeCLISharedControlPreservesOpenAIProtocolsAndCompressedWire(t *testi
 				}
 				w.Header().Set("Content-Type", "application/json")
 				if bytes.Contains(body, []byte("control:0123456789abcdef")) {
-					if r.URL.RawQuery != "mode=fixture" || strings.Join(r.Header.Values("X-Control-Test"), ",") != "one,two" || r.Header.Get("Accept-Encoding") != "gzip" {
+					if r.URL.RawQuery != "mode=fixture" || strings.Join(r.Header.Values("Accept"), ",") != "application/json,text/event-stream" || r.Header.Get("Accept-Encoding") != "gzip" {
 						t.Error("native control headers/query changed")
 					}
 					w.Header().Set("Content-Encoding", "gzip")

@@ -106,7 +106,10 @@ func uniqueControlJSON(data []byte) error {
 					return errCLIPrivateInput
 				}
 				name, ok := key.(string)
-				if !ok || seen[name] {
+				// Every field in the reviewed control schemas is lowercase.
+				// encoding/json otherwise accepts case aliases and can validate a
+				// last-key-wins value while replaying a different original field.
+				if !ok || name != strings.ToLower(name) || seen[name] {
 					return errCLIPrivateInput
 				}
 				seen[name] = true
@@ -210,10 +213,8 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 		if err != nil || len(body) != entry.BodyBytes || controlHash(body) != entry.BodySHA256 || controlHash(capture.Headers) != entry.HeaderSHA256 {
 			return nil, errCLIPrivateInput
 		}
-		for _, secret := range knownSecrets {
-			if secret != "" && (bytes.Contains(body, []byte(secret)) || bytes.Contains(capture.Headers, []byte(secret))) {
-				return nil, errCLIPrivateInput
-			}
+		if controlJSONContainsSecret(body, knownSecrets...) || controlJSONContainsSecret(capture.Headers, knownSecrets...) {
+			return nil, errCLIPrivateInput
 		}
 		if (capture.HeaderSHA256 != "" && capture.HeaderSHA256 != entry.HeaderSHA256) || (capture.BodySHA256 != "" && capture.BodySHA256 != entry.BodySHA256) || (capture.BodyBytes != 0 && capture.BodyBytes != entry.BodyBytes) || (capture.SecretScanVersion != "" && capture.SecretScanVersion != "1") {
 			return nil, errCLIPrivateInput
@@ -255,6 +256,9 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 				}
 				continue
 			}
+			if !validControlHeader(header, len(body)) {
+				return nil, errCLIPrivateInput
+			}
 			// Reuse the production forwarding protection, including headers named
 			// by Connection and trusted-edge metadata. Never create a CLI variant.
 			if _, kept := safeHeaders[name]; !kept {
@@ -270,6 +274,9 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 			return nil, errCLIPrivateInput
 		}
 		loaded.rawQuery = target.RawQuery
+		if err := validateControlQuery(loaded.rawQuery, knownSecrets...); err != nil {
+			return nil, err
+		}
 		if err := validateControlPrompt(endpoint, body, entry.Nonce); err != nil {
 			return nil, err
 		}
@@ -287,33 +294,26 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 	return &manifest, nil
 }
 
-// Verify the dedicated one-turn control, not an arbitrary successful history.
-// Native SDK numeric/boolean options and isolated system metadata may remain;
-// user input is exactly the nonce prompt, with no attachments/tool results.
-func validateControlPrompt(endpoint model.EndpointKind, body []byte, nonce string) error {
-	if endpoint == model.EndpointModels {
-		if len(body) != 0 {
-			return errCLIPrivateInput
-		}
-		return nil
-	}
-	if _, err := proxy.ExtractModel(body); err != nil {
+func validateControlQuery(raw string, knownSecrets ...string) error {
+	values, err := url.ParseQuery(raw)
+	if err != nil {
 		return errCLIPrivateInput
 	}
-	var fields map[string]json.RawMessage
-	if err := decodeControlJSON(body, &fields); err != nil {
-		return err
-	}
-	allowed := map[string]bool{"model": true, "messages": true, "input": true, "stream": true, "max_tokens": true, "max_output_tokens": true, "max_completion_tokens": true, "temperature": true, "top_p": true, "top_k": true, "system": true, "metadata": true, "thinking": true, "stop_sequences": true}
-	for key := range fields {
-		if !allowed[key] {
+	for name, items := range values {
+		for _, secret := range knownSecrets {
+			if secret != "" && (strings.Contains(raw, secret) || strings.Contains(name, secret) || strings.Contains(strings.Join(items, ""), secret)) {
+				return errCLIPrivateInput
+			}
+		}
+		if len(items) != 1 || !((name == "beta" && items[0] == "true") || (name == "mode" && items[0] == "fixture")) {
 			return errCLIPrivateInput
 		}
 	}
-	prompt := "1+1=? control:" + nonce
-	input := fields["messages"]
+	return nil
+}
+
+func validateControlMessages(endpoint model.EndpointKind, input json.RawMessage, prompt string) error {
 	if endpoint == model.EndpointResponses {
-		input = fields["input"]
 		var text string
 		if json.Unmarshal(input, &text) == nil && text == prompt {
 			return nil
