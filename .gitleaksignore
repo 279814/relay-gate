@@ -24,3 +24,5 @@ ff5be6e727d19c70c481505a23e6c856bf98b20b:internal/api/probe_redact_test.go:gener
 
 # Synthetic finite-evidence hash fixture; reviewed 2026-10-19. No real credential.
 a6f6f62b070217618e94ec154f4265d78b2d0d49:internal/security/scan_boundaries_test.go:generic-api-key:45
+# The same reviewed fixture after PR #401 squash merge moved it to line 109.
+7df586020ab9c4a07e23492f517fc1e171da4bff:internal/security/scan_boundaries_test.go:generic-api-key:109
