@@ -20,6 +20,6 @@
 
 ## 持久化与验收
 
-先完成 Go 类型与真实测试；等待 RouteHealth schema9 稳定后，独占 schema10 添加 security_finding 的 truncated/decode_depth 列，并同步精确 reader、备份、恢复与迁移契约，不借旧列存 JSON。旧行明确默认未知/零层，不伪装升级后的扫描。
+先完成 Go 类型与真实测试；等待 RouteHealth schema9 稳定后，独占 schema10 添加 security_finding 的 truncated/decode_depth/evidence_hash 列（hash 仅覆盖有限脱敏证据，不是完整正文），并同步精确 reader、备份、恢复与迁移契约，不借旧列存 JSON。旧行明确默认未知/零层，不伪装升级后的扫描。
 
 先红后绿覆盖合法代码、各类组合风险、三协议事件、gzip/br、尾部与跨 chunk 模式、跨缺口不误匹配、超限/坏编码/两层/CPU/RE2、队满/释放/持久 flush、原始字节与 Transform 隔离、健康 optional 接口透传和无观察器采集。所有测试使用临时数据库、合成凭据与 loopback；不访问私有输入或在线模型。

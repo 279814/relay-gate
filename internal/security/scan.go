@@ -41,6 +41,9 @@ type Finding struct {
 	ScannerVersion   string   `json:"scanner_version,omitempty"`
 	RuleVersion      string   `json:"rule_version,omitempty"`
 	BytesScanned     int64    `json:"bytes_scanned,omitempty"`
+	Truncated        bool     `json:"truncated"`
+	DecodeDepth      int      `json:"decode_depth"`
+	EvidenceHash     string   `json:"evidence_hash"` // SHA-256 of finite redacted Detail, not the response body
 	IncompleteReason string   `json:"incomplete_reason,omitempty"`
 }
 

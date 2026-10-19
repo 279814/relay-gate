@@ -55,8 +55,8 @@ func TestEmptyDBOpensAsSchema9(t *testing.T) {
 	if err := st.DB().QueryRow(`SELECT version FROM schema_version WHERE singleton = 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 9 {
-		t.Fatalf("schema_version=%d want 9", version)
+	if version != 10 {
+		t.Fatalf("schema_version=%d want 10", version)
 	}
 	var n int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='security_finding'`).Scan(&n); err != nil || n != 1 {

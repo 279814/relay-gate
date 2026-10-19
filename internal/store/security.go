@@ -20,11 +20,11 @@ func (s *Store) InsertSecurityFinding(f security.Finding) error {
 	}
 	_, err = s.db.Exec(`INSERT OR REPLACE INTO security_finding (
 		id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
-		scanner_version, rule_version, bytes_scanned, incomplete_reason
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		scanner_version, rule_version, bytes_scanned, incomplete_reason, truncated, decode_depth, evidence_hash
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		f.ID, f.AtMS, string(f.Severity), f.Category, f.Summary, detail,
 		f.Upstream, f.RouteID, f.ReqID, f.Source,
-		f.ScannerVersion, f.RuleVersion, f.BytesScanned, f.IncompleteReason,
+		f.ScannerVersion, f.RuleVersion, f.BytesScanned, f.IncompleteReason, f.Truncated, f.DecodeDepth, f.EvidenceHash,
 	)
 	return err
 }
@@ -39,7 +39,7 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 		return nil, err
 	}
 	q := `SELECT id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
-		scanner_version, rule_version, bytes_scanned, incomplete_reason
+		scanner_version, rule_version, bytes_scanned, incomplete_reason, truncated, decode_depth, evidence_hash
 		FROM security_finding`
 	args := []any{}
 	if severity != "" {
@@ -59,7 +59,7 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 		var sev string
 		if err := rows.Scan(&f.ID, &f.AtMS, &sev, &f.Category, &f.Summary, &f.Detail,
 			&f.Upstream, &f.RouteID, &f.ReqID, &f.Source,
-			&f.ScannerVersion, &f.RuleVersion, &f.BytesScanned, &f.IncompleteReason); err != nil {
+			&f.ScannerVersion, &f.RuleVersion, &f.BytesScanned, &f.IncompleteReason, &f.Truncated, &f.DecodeDepth, &f.EvidenceHash); err != nil {
 			return nil, err
 		}
 		f.Severity = security.Severity(sev)
