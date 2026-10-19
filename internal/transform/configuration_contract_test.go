@@ -1,11 +1,13 @@
 package transform_test
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
@@ -53,6 +55,25 @@ func TestPublishCASPersistsOneWinnerAndLifecycleKeepsFrozenRequest(t *testing.T)
 		t.Fatal(err)
 	}
 	defer db.Close()
+	// Strict administrative publications require real owned targets, even when
+	// the test is focused on CAS and in-flight lifecycle behavior.
+	up := &model.Upstream{Name: "cas-target", BaseURL: "https://fixture.invalid", APIKey: "fixture-cas-only", Enabled: true}
+	if err := db.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	name := &model.ModelName{Name: "cas-model", Protocol: model.ProtoAnthropic}
+	if err := db.CreateModelName(name); err != nil {
+		t.Fatal(err)
+	}
+	route := &model.Route{UpstreamID: up.ID, ModelNameID: name.ID, Enabled: true}
+	if err := db.CreateRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	endpoints, err := db.ListEndpointsPage(context.Background(), model.EndpointFilter{UpstreamID: up.ID})
+	if err != nil || len(endpoints.Items) == 0 {
+		t.Fatalf("targets: %+v %v", endpoints, err)
+	}
+	endpoint := endpoints.Items[0]
 	registry := transform.NewRegistry(8).WithPersist(db)
 	set, err := registry.CreateSet("concurrent publish")
 	if err != nil {
@@ -70,7 +91,7 @@ func TestPublishCASPersistsOneWinnerAndLifecycleKeepsFrozenRequest(t *testing.T)
 		go func() {
 			defer group.Done()
 			<-start
-			_, err := registry.PublishAtRevision(set.ID, 3, 7, false, transform.PublishPreconditions{SetRevision: set.Revision, BindingRevision: 0})
+			_, err := registry.PublishAtRevision(set.ID, route.ID, endpoint.ID, false, transform.PublishPreconditions{SetRevision: set.Revision, BindingRevision: 0})
 			results <- err
 		}()
 	}
@@ -98,30 +119,30 @@ func TestPublishCASPersistsOneWinnerAndLifecycleKeepsFrozenRequest(t *testing.T)
 	if err != nil || current.Revision != 3 || len(current.History) != 1 {
 		t.Fatal("restart did not retain the unique publish")
 	}
-	binding, _ := registry.GetBinding(3, 7)
-	frozen := registry.CaptureRoutes([]int64{3})
+	binding, _ := registry.GetBinding(route.ID, endpoint.ID)
+	frozen := registry.CaptureRoutes([]int64{route.ID})
 	disabled, err := registry.SetLifecycleAtRevision(set.ID, current.Revision, transform.LifecycleDisabled)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if compiled, _, err := registry.CaptureRoutes([]int64{3}).PublishedCompiled(3, 7); err != nil || compiled != nil {
+	if compiled, _, err := registry.CaptureRoutes([]int64{route.ID}).PublishedCompiled(route.ID, endpoint.ID); err != nil || compiled != nil {
 		t.Fatal("new request used a disabled transform")
 	}
-	if compiled, id, err := frozen.PublishedCompiled(3, 7); err != nil || compiled == nil || id != binding.PublishedID {
+	if compiled, id, err := frozen.PublishedCompiled(route.ID, endpoint.ID); err != nil || compiled == nil || id != binding.PublishedID {
 		t.Fatal("disable changed an in-flight request")
 	}
 	enabled, err := registry.SetLifecycleAtRevision(set.ID, disabled.Revision, transform.LifecycleActive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.RollbackAtRevision(3, 7, binding.PublishedID, binding.Revision); !errors.Is(err, transform.ErrRevisionConflict) {
+	if _, err := registry.RollbackAtRevision(route.ID, endpoint.ID, binding.PublishedID, binding.Revision); !errors.Is(err, transform.ErrRevisionConflict) {
 		t.Fatalf("old binding revision survived lifecycle: %v", err)
 	}
 	if _, err := registry.SetLifecycleAtRevision(set.ID, enabled.Revision, transform.LifecycleArchived); err != nil {
 		t.Fatal(err)
 	}
 	latest, _ := registry.GetSet(set.ID)
-	if _, err := registry.PublishAtRevision(set.ID, 3, 7, false, transform.PublishPreconditions{SetRevision: latest.Revision, BindingRevision: 3}); err == nil {
+	if _, err := registry.PublishAtRevision(set.ID, route.ID, endpoint.ID, false, transform.PublishPreconditions{SetRevision: latest.Revision, BindingRevision: 3}); err == nil {
 		t.Fatal("archived set was republished")
 	}
 	after, _ := registry.GetSet(set.ID)
