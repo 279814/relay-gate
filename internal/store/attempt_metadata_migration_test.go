@@ -11,7 +11,7 @@ import (
 
 func TestAttemptMetadataRotationBackupPinsReaderAndRestoresFacts(t *testing.T) {
 	ctx := context.Background()
-	st := testStore(t)
+	st, _ := schemaTwelveSMTPFixture(t)
 	if _, err := st.db.Exec(`INSERT INTO request_log(req_id,attempt,attempts,ts_recv,ts_sent,ts_first_byte,ts_done,endpoint,model_in,model_out,model_name_id,route_id,upstream_id,upstream_name,resp_status,ttft_ms,bytes_written,outcome,retried,half_open,error) VALUES ('metadata',1,1,1,2,3,4,'','','',0,0,0,'',200,1,1,'ok',0,0,''); INSERT INTO request_log_metadata(owner_id,execution_id,capability_effect) VALUES (last_insert_rowid(),'exact-execution','pending')`); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestAttemptMetadataMigrationPairsSchemaEleven(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 12 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("attempt schema=%+v err=%v", state, err)
 	}
 	files, err := filepath.Glob(filepath.Join(filepath.Dir(path), "backups", "schema-11-to-12-*", "manifest.json"))
