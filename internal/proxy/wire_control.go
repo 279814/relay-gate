@@ -86,6 +86,10 @@ func (w *wireEvidence) accept(events []protocol.ProtocolEvent, at time.Time) {
 	s := w.snapshot()
 	changed := false
 	for _, event := range events {
+		if s.FirstEventAt.IsZero() {
+			s.FirstEventAt = at
+			changed = true
+		}
 		if event.Semantic {
 			changed = true
 			if s.FirstSemanticAt.IsZero() {
@@ -138,6 +142,7 @@ func (at *Attempt) projectWire() {
 		return
 	}
 	s := at.wire.snapshot()
+	at.res.FirstEventAt = s.FirstEventAt
 	at.res.ObserverIncomplete = s.Incomplete
 	if at.res.FirstByteAt.IsZero() && at.wire.firstByte.Load() != 0 {
 		at.res.FirstByteAt = time.Unix(0, at.wire.firstByte.Load())

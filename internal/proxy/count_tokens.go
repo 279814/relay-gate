@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/protocol"
@@ -35,6 +37,8 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	pre.countLogs = &countAttemptLogs{reqID: sample.NewReqID(), recvAt: time.Now()}
+	defer h.recordCountAttemptLogs(pre)
 
 	// §7.4：一次客户端请求的多次上游尝试共享同一份 count_tokens_total_sec。
 	// 不夹剩余预算的话，每个 Route 各拿一份完整 total，客户端最坏等 N 倍时长。
@@ -173,7 +177,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
 	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
 	// 所以显式给 EndpointCountTokens 而不是从 Protocol 推。
-	target, err := h.resolveTarget(r, cand, model.EndpointCountTokens)
+	target, err := h.resolveTarget(r, pre, cand, model.EndpointCountTokens)
 	if err != nil {
 		return fmt.Sprintf("解析出站目标失败: %v", err), sent
 	}
@@ -187,6 +191,8 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 	outHeader, outBody := prepared.header, prepared.body
 	redactKeys := prepared.keys
+	// count_tokens keeps no samples; its logs carry only send/observer facts.
+	prepared.metadata = model.AttemptMetadata{RequestDiffReason: "sample_disabled"}
 
 	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
 	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，
@@ -211,8 +217,20 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 	req.ContentLength = int64(len(outBody))
 	instr := health.NoopInstrumentation()
+	executionID := sample.NewReqID()
+	observeCtx := ctx
+	if pre.published != nil {
+		observeCtx = livecfg.WithCapturedProbeSnapshot(observeCtx, pre.published.Probe)
+	}
+	var reqID string
+	var attempt int
+	if pre.countLogs != nil {
+		reqID = pre.countLogs.reqID
+		attempt = len(pre.countLogs.rows) + 1
+	}
 	if h.observers != nil {
-		instr = prepareInstrumentation(h.observers, ctx, health.AttemptTarget{
+		instr = prepareInstrumentation(h.observers, observeCtx, health.AttemptTarget{
+			ExecutionID: executionID, ReqID: reqID, Attempt: attempt,
 			Protocol: model.ProtoAnthropic, Endpoint: model.EndpointCountTokens,
 			UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID,
 			HealthGeneration: cand.HealthGeneration,
@@ -227,28 +245,52 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 				RouteCapabilityRevision:    cand.Route.CapabilityRevision,
 				ModelCapabilityRevision:    cand.ModelName.CapabilityRevision,
 				ResolvedURLHash:            target.ResolvedURLHash,
+				RequestTransformRevision:   pre.transforms.BindingRevision(cand.Route.ID, target.EndpointID),
 			},
 		}, health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
 	}
 	var capture *security.Capture
 	if h.security != nil {
-		capture = h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: sample.NewReqID(), Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: model.EndpointCountTokens, Protocol: model.ProtoAnthropic}})
+		capture = h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: model.EndpointCountTokens, Protocol: model.ProtoAnthropic}})
 		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
 		capture.TryRequest(outBody, false)
 		defer capture.Complete(false)
 	}
 	var readErr error
+	var clientWriteErr error
+	res := &Result{}
+	trace := instr.Trace
+	if trace == nil {
+		trace = &outbound.AttemptTrace{}
+	}
+	la := &liveAttempt{cand: cand, instr: instr, trace: trace, keys: redactKeys, metadata: preparedAttemptMetadata(pre, cand, target, prepared, executionID, instr.ObservationPrepared)}
+	la.metadata.RetryPolicy = "unknown" // count_tokens uses its independent supported/unknown pass policy.
 	defer func() {
 		if instr.Observer != nil {
-			instr.Observer.Finish(health.AttemptFinish{ReadErr: readErr, ClientCanceled: r.Context().Err() != nil})
+			instr.Observer.Finish(health.AttemptFinish{ReadErr: readErr, ClientCanceled: r.Context().Err() != nil || clientWriteErr != nil, ClientCommitted: res.BytesWritten > 0})
+		}
+		if sent && pre.countLogs != nil {
+			res.DoneAt = time.Now()
+			res.Err = readErr
+			if clientWriteErr != nil {
+				res.Err = ErrClientGone
+			}
+			row := h.attemptLog(la, pre, model.ProtoAnthropic, reqID, attempt, false, false, res, pre.countLogs.recvAt)
+			row.Endpoint = model.EndpointCountTokens.CanonicalPath()
+			if len(pre.countLogs.rows) > 0 {
+				prior := pre.countLogs.rows[len(pre.countLogs.rows)-1]
+				prior.Retried = true
+				prior.Metadata.Retried = true
+			}
+			pre.countLogs.rows = append(pre.countLogs.rows, row)
 		}
 	}()
-	if instr.Trace != nil {
-		instr.Trace.MarkSent(time.Now())
-		req = req.WithContext(outbound.WithAttemptTrace(req.Context(), instr.Trace))
-	}
+	trace.MarkSent(time.Now())
+	req = req.WithContext(outbound.WithAttemptTrace(req.Context(), trace))
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) { trace.MarkRequestWritten(time.Now(), info.Err) }}))
 
 	sent = true // only an actual RoundTrip consumes the one unknown observation
+	res.SentAt = time.Now()
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		readErr = err
@@ -261,19 +303,19 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 			sample.RedactDiagnosticText(err.Error(), redactKeys)), sent
 	}
 	defer resp.Body.Close()
+	res.Status = resp.StatusCode
+	res.ResponseHeaderAt = time.Now()
+	trace.MarkResponseHeader(res.ResponseHeaderAt)
 	if instr.Observer != nil {
 		instr.Observer.TryHeaders(resp.StatusCode, resp.Header, time.Now())
 	}
 
 	// 响应很小（Anthropic 的格式就是 {"input_tokens":N}），限长只为防异常站
 	// 回一个巨大的错误页。
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCountTokensResp))
+	respBody, err := io.ReadAll(io.LimitReader(&countObservedReader{ReadCloser: resp.Body, res: res, observer: instr.Observer}, maxCountTokensResp))
 	if err != nil {
 		readErr = err
 		return fmt.Sprintf("读响应失败: %v", err), sent
-	}
-	if instr.Observer != nil {
-		instr.Observer.TryChunk(respBody, time.Now())
 	}
 
 	// 4xx/5xx 对客户端一律降级到本地估算（拿不到准确值）。Capability 写回
@@ -304,6 +346,8 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	dst.Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	n, writeErr := w.Write(respBody)
+	res.BytesWritten = int64(n)
+	clientWriteErr = writeErr
 	if writeErr != nil {
 		capture.Interrupted()
 	}

@@ -47,16 +47,25 @@ test('background home refresh leaves an open modal pagination position intact',a
   assert.deepEqual(shell.recentErrors.logs.map(row=>row.id),ids);assert.equal(calls.length,before);
 });
 
-test('Capability and related Execution links execute the real target list filters',async()=>{
+test('Capability links execute current target filters and Execution opens only its exact stored ID',async()=>{
   const {shell,calls}=setup(()=>({items:[],next_cursor:''}));
   shell.capabilities.filter.state='unsupported';shell.executions.filter.error_class='auth';
   const row={route_id:10,upstream_id:20,endpoint_kind:'messages'};
   await shell.openRecentErrorCapabilities(row);
   let url=new URL(calls.find(path=>path.startsWith('/capabilities?')),'http://fixture');
   assert.equal(shell.tab,'capabilities');assert.equal(url.searchParams.get('route_id'),'10');assert.equal(url.searchParams.get('upstream_id'),'20');assert.equal(url.searchParams.get('endpoint'),'messages');assert.equal(url.searchParams.has('state'),false);
-  await shell.openRecentErrorExecutions(row);
-  url=new URL(calls.find(path=>path.startsWith('/probe-executions?')),'http://fixture');
-  assert.equal(shell.tab,'executions');assert.equal(url.searchParams.get('route_id'),'10');assert.equal(url.searchParams.get('upstream_id'),'20');assert.equal(url.searchParams.get('endpoint'),'messages');assert.equal(url.searchParams.has('error_class'),false);
+  let opened;shell.openExecution=async id=>{opened=id;};
+  await shell.openRecentErrorExecutions({...row,metadata:{execution_id:'exact-one',execution_stored:true}});
+  assert.equal(opened,'exact-one');assert.equal(calls.some(path=>path.startsWith('/probe-executions?')),false);
+  opened=null;await shell.openRecentErrorExecutions(row);
+  assert.equal(opened,null);assert.match(shell.err,/未记录|保留/);
+});
+
+test('fine ErrorClass filter is independent of coarse Outcome',async()=>{
+ const {shell,calls}=setup(()=>({logs:[],failed_count:0}));
+ shell.recentErrors.error_class='auth_rejected';await shell.openRecentErrors();
+ const query=new URL(calls[0],'http://fixture').searchParams;
+ assert.equal(query.get('error_class'),'auth_rejected');assert.equal(query.has('outcome'),false);
 });
 
 test('RequestLog links query the exact ReqID group and Sample links only open reauthentication',async()=>{

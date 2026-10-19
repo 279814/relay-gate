@@ -83,8 +83,12 @@ func prepareCapabilityTraffic(ctx context.Context, snap *livecfg.ProbeSnapshot, 
 	if err != nil {
 		return nil
 	}
+	executionID := target.ExecutionID
+	if executionID == "" {
+		executionID = sample.NewReqID()
+	}
 	return &capabilityTraffic{recipe: recipe, req: ExecutionRequest{
-		ExecutionID: sample.NewReqID(), Trigger: model.TriggerRealTraffic, Upstream: up, Route: route, ModelName: mn,
+		ExecutionID: executionID, Trigger: model.TriggerRealTraffic, Upstream: up, Route: route, ModelName: mn,
 		Endpoint: target.Endpoint, ObservationOrder: order, CapabilityExpectation: expectation, CapabilityPolicy: policy,
 		ReachabilityExpectation: reach, ReachabilityPolicy: reachPolicy,
 		healthIdentity: capturedRouteHealthIdentity(snap, expectation, reach, nil),

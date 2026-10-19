@@ -75,7 +75,7 @@
                 <div class="sub">丢弃是静默的：队列满时宁可丢样本也不阻塞转发</div>
               </div>
               <div class="card" style="cursor:pointer" @click="openRecentErrors && openRecentErrors()">
-                <h3 x-text="(recentErrors.upstream_id || recentErrors.route_id || recentErrors.protocol || recentErrors.outcome || recentErrors.from_time || recentErrors.to_time)
+                <h3 x-text="(recentErrors.upstream_id || recentErrors.route_id || recentErrors.protocol || recentErrors.outcome || recentErrors.error_class || recentErrors.from_time || recentErrors.to_time)
                   ? '最近错误（筛选后）' : '最近错误'"></h3>
                 <div class="v" x-text="recentErrors?.failed_count ?? 0"></div>
                 <div class="sub" x-text="recentErrors?.latest?.error
@@ -96,7 +96,7 @@
                   <span class="grow"></span>
                   <button type="button" @click="closeRecentErrors && closeRecentErrors()">关闭</button>
                 </div>
-                <p class="dim">完整脱敏文本；按请求接收时间筛选失败的 Attempt。Capability 是当前同路由能力，Execution 是同路由相关执行，尚无精确请求关联。</p>
+                <p class="dim">完整脱敏文本；按请求接收时间筛选失败的 Attempt。Capability 显示当前能力；Execution 打开该 Attempt 的精确记录。历史缺失或已清理的详情不可打开。</p>
                 <div class="bar">
                   <label>Upstream ID
                     <input type="number" min="1" style="width:7rem" x-model="recentErrors.upstream_id" @change="applyRecentErrorFilters()">
@@ -116,6 +116,17 @@
                       <option value="timeout">超时</option><option value="fake_alive">假活</option><option value="client_abort">客户端取消</option>
                     </select>
                   </label>
+                  <label>错误类别（ErrorClass）
+                    <select x-model="recentErrors.error_class" @change="applyRecentErrorFilters()">
+                      <option value="">全部类别</option><option value="auth_rejected">认证拒绝</option>
+                      <option value="request_shape_rejected">请求结构拒绝</option><option value="config_error">配置错误</option>
+                      <option value="unsupported">不支持</option><option value="model_not_found">模型不存在</option>
+                      <option value="rate_limited">限流</option><option value="unreachable">不可达</option>
+                      <option value="transient_error">暂时错误</option><option value="fake_alive">假活</option>
+                      <option value="partial_failure">部分失败</option><option value="ignored">未采用</option>
+                      <option value="none">无上游错误</option><option value="unknown">历史未记录</option>
+                    </select>
+                  </label>
                   <label>接收时间从<input type="datetime-local" x-model="recentErrors.from_time" @change="applyRecentErrorFilters()"></label>
                   <label>至<input type="datetime-local" x-model="recentErrors.to_time" @change="applyRecentErrorFilters()"></label>
                   <button type="button" :disabled="recentErrors.loading" @click="refreshRecentErrors(true)">刷新</button>
@@ -132,13 +143,13 @@
                         <td x-text="fmtTime(row.ts_recv)"></td>
                         <td><div x-text="row.upstream_name"></div><span x-text="row.route_id"></span></td>
                         <td><div x-text="row.protocol || '未记录'"></div><span x-text="row.endpoint"></span></td>
-                        <td x-text="row.outcome"></td>
+                        <td><div x-text="row.metadata?.error_class || 'unknown'"></div><span class="dim" x-text="row.outcome"></span></td>
                         <td x-text="row.model_in"></td>
                         <td><pre class="err-pre" style="overflow-wrap:anywhere;word-break:break-word" x-text="row.error || ''"></pre></td>
                         <td>
                           <button type="button" @click="copyRecentError(row.error)">复制</button>
                           <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorCapabilities(row)">当前 Capability</button>
-                          <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorExecutions(row)">相关 Execution</button>
+                          <button type="button" :disabled="!row.metadata?.execution_id || !row.metadata?.execution_stored" @click="openRecentErrorExecutions(row)">精确 Execution</button>
                           <button type="button" :disabled="!row.req_id" @click="openRecentErrorRequestLogs(row)">RequestLog</button>
                           <button type="button" :disabled="!row.sample_id" @click="openRecentErrorSample(row)">Sample</button>
                         </td>

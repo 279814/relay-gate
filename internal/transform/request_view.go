@@ -15,6 +15,7 @@ type RequestView struct {
 }
 
 type requestBinding struct {
+	revision  int64
 	published requestVersion
 	shadow    requestVersion
 }
@@ -36,7 +37,7 @@ func (r *Registry) CaptureRoutes(routeIDs []int64) *RequestView {
 		if !wanted[b.RouteID] {
 			continue
 		}
-		view.bindings[key] = requestBinding{published: r.captureVersionLocked(b.SetID, b.PublishedID), shadow: r.captureVersionLocked(b.SetID, b.ShadowID)}
+		view.bindings[key] = requestBinding{revision: b.Revision, published: r.captureVersionLocked(b.SetID, b.PublishedID), shadow: r.captureVersionLocked(b.SetID, b.ShadowID)}
 	}
 	return view
 }
@@ -56,6 +57,13 @@ func (r *Registry) captureVersionLocked(setID, versionID int64) requestVersion {
 		}
 	}
 	return requestVersion{err: fmt.Errorf("transform version missing")}
+}
+
+func (v *RequestView) BindingRevision(routeID, endpointID int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return v.bindings[bindKey(routeID, endpointID)].revision
 }
 
 func (v *RequestView) PublishedCompiled(routeID, endpointID int64) (*Compiled, int64, error) {

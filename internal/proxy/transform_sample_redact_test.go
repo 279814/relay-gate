@@ -64,6 +64,10 @@ func TestSample_RedactsTransformSecretRefInBodyAndCustomHeader(t *testing.T) {
 	if bytes.Contains(smp.OutBody, []byte(upKey)) {
 		t.Fatalf("OutBody still has raw key: %s", smp.OutBody)
 	}
+	m := smp.Attempts[0].Metadata
+	if m.RequestDiffReason != "secret_taint" || m.RequestInputHash != "" || m.RequestOutputHash != "" || m.RequestBodyChanged || m.RequestHeadersChanged {
+		t.Fatalf("secret-tainted hash/diff persisted: %+v", m)
+	}
 	// Structure must remain useful for diagnosis.
 	if smp.OutHeaders.Get("X-Site-Token") == "" {
 		t.Fatal("X-Site-Token header name should remain after redaction")

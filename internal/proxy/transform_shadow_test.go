@@ -99,15 +99,12 @@ func TestShadowBinding_LiveSideCopyDiffWithoutChangingRequest(t *testing.T) {
 	if !sr.OK {
 		t.Fatalf("shadow record should be OK: %+v", sr)
 	}
-	if sr.InputHash != transform.HashBytes([]byte(body)) {
-		t.Fatalf("shadow input must be the pre-published request: %s", sr.InputHash)
+	if sr.InputHash != "" {
+		t.Fatalf("SecretRef-tainted shadow must omit hashes: %s", sr.InputHash)
 	}
 	shadowOut := transform.HashBytes([]byte(`{"model":"claude-opus-5","max_tokens":99}`))
-	if !strings.Contains(sr.DiffSummary, "changed=true") || !strings.Contains(sr.DiffSummary, shadowOut) {
-		t.Fatalf("shadow diff missing change/output hash: %s", sr.DiffSummary)
-	}
-	if !strings.Contains(sr.DiffSummary, "r0:replace_bytes") {
-		t.Fatalf("shadow diff missing hit rules: %s", sr.DiffSummary)
+	if !strings.Contains(sr.DiffSummary, "secret_taint") || strings.Contains(sr.DiffSummary, shadowOut) {
+		t.Fatalf("tainted shadow diff was not omitted: %s", sr.DiffSummary)
 	}
 	if strings.Contains(sr.DiffSummary, "sk-upstream-secret") || strings.Contains(sr.DiffSummary, "max_tokens") {
 		t.Fatalf("shadow diff must not carry secrets or raw body: %s", sr.DiffSummary)
