@@ -321,7 +321,10 @@ func validateBackupPaths(databasePath, manifestPath string) (absDB, absManifest,
 	if m.SourceSchema == 8 && m.ReaderContract != "schema-8-data-key-v2-reader" {
 		return "", "", "", nil, fmt.Errorf("%w: schema 8 backup requires schema-8-data-key-v2-reader", ErrRestoreRejected)
 	}
-	if m.SourceSchema < 0 || (m.TargetSchema != m.SourceSchema+1 && !(m.SourceSchema == 8 && m.TargetSchema == 8 && m.SourceValidator == "schema-8-data-key-v2")) {
+	if m.SourceSchema == 9 && m.ReaderContract != "schema-9-route-health-v1-reader" {
+		return "", "", "", nil, fmt.Errorf("%w: schema 9 backup requires schema-9-route-health-v1-reader", ErrRestoreRejected)
+	}
+	if m.SourceSchema < 0 || (m.TargetSchema != m.SourceSchema+1 && !rotationBackupBoundary(m.SourceSchema, m.TargetSchema, m.SourceValidator)) {
 		return "", "", "", nil, fmt.Errorf("%w: manifest schema 边界无效 source=%d target=%d", ErrRestoreRejected, m.SourceSchema, m.TargetSchema)
 	}
 	backupDB = filepath.Join(filepath.Dir(absManifest), filepath.Base(m.DatabaseFile))

@@ -23,7 +23,7 @@ func dropRetentionIndexes(t *testing.T, st *Store) {
 }
 
 func TestRetentionIndexesOldAndNewBackupFingerprintsRemainReadOnlyAndRestorable(t *testing.T) {
-	st, _, _ := dataKeyBackupFixture(t)
+	st, _, _ := schemaEightDataKeyBackupFixture(t)
 	dropRetentionIndexes(t, st)
 	state, err := inspectSchemaState(context.Background(), st.db)
 	if err != nil || state.Fingerprint != schemaV8FreshFingerprint {
@@ -165,13 +165,17 @@ func TestRetentionLookupPlanUsesCalibrationAndReferenceIndexes(t *testing.T) {
 func TestRetentionIndexEnsureCanceledTransactionDoesNotCreatePartialSet(t *testing.T) {
 	st := testStore(t)
 	dropRetentionIndexes(t, st)
+	before, err := inspectSchemaState(context.Background(), st.db)
+	if err != nil || before.Version != 9 {
+		t.Fatalf("schema9 without helper indexes: %+v %v", before, err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := ensureProbeRetentionIndexes(ctx, st.db); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled ensure=%v", err)
 	}
 	state, err := inspectSchemaState(context.Background(), st.db)
-	if err != nil || state.Fingerprint != schemaV8FreshFingerprint {
+	if err != nil || state != before {
 		t.Fatalf("canceled DDL left partial indexes: %+v %v", state, err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)

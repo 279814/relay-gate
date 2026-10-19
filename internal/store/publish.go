@@ -183,6 +183,9 @@ func (store *Store) PublishRecipeVersion(recipeID, versionID int64, testExecutio
 	if err = replaceRecipeSecretRefs(ctx, tx, recipeID, versionID); err != nil {
 		return err
 	}
+	if err = clearRecipeScopeHealthTx(ctx, tx, recipeID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

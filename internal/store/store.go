@@ -79,7 +79,7 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := openLocked(dsn, c, lock)
+	st, err := openLocked(dsn, c, lock, "")
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
@@ -90,6 +90,10 @@ func Open(dsn string, c *Cipher) (*Store, error) {
 // OpenLocked 与 Open 相同，但使用调用方已持有的同路径实例锁。
 // 成功时锁归 Store 所有（随 Store.Close 释放）；失败时仍归调用方。
 func OpenLocked(dsn string, c *Cipher, held *InstanceLock) (*Store, error) {
+	return openWithHeldLock(dsn, c, held, "")
+}
+
+func openWithHeldLock(dsn string, c *Cipher, held *InstanceLock, readerBuildID string) (*Store, error) {
 	if c == nil {
 		return nil, ErrNoKey
 	}
@@ -100,7 +104,7 @@ func OpenLocked(dsn string, c *Cipher, held *InstanceLock) (*Store, error) {
 	if err != nil || !sameFilesystemPath(absolute, held.path) {
 		return nil, fmt.Errorf("%w: 实例锁与数据库路径不一致", ErrUnsafeLockPath)
 	}
-	st, err := openLocked(dsn, c, held.lock)
+	st, err := openLocked(dsn, c, held.lock, readerBuildID)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +112,7 @@ func OpenLocked(dsn string, c *Cipher, held *InstanceLock) (*Store, error) {
 	return st, nil
 }
 
-func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
+func openLocked(dsn string, c *Cipher, lock *instanceLock, readerBuildID string) (*Store, error) {
 	databasePath := dbPathOf(dsn)
 
 	// Resume crash-interrupted restore before treating a missing/partial DB as empty.
@@ -134,7 +138,7 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 		return nil, fmt.Errorf("连接数据库: %w", err)
 	}
 
-	if err := migrateToDevelopmentSchema(context.Background(), db, databasePath, c, defaultMigrationBackupIdentity()); err != nil {
+	if err := migrateToDevelopmentSchema(context.Background(), db, databasePath, c, defaultMigrationBackupIdentity(), readerBuildID); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("迁移 schema: %w", err)
 	}
@@ -154,7 +158,7 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock) (*Store, error) {
 	// 提前 chmod 会漏掉它们。
 	restrictPerms(dsn)
 
-	st := &Store{db: db, cipher: c, lock: lock, path: databasePath}
+	st := &Store{db: db, cipher: c, lock: lock, path: databasePath, readerBuildID: readerBuildID}
 	keys, err := readDataKeys(context.Background(), db, c)
 	if err != nil {
 		db.Close()
@@ -214,7 +218,7 @@ func defaultMigrationBackupIdentity() MigrationBackupIdentity {
 	}
 }
 
-func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath string, cipher *Cipher, identity MigrationBackupIdentity) error {
+func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath string, cipher *Cipher, identity MigrationBackupIdentity, readerBuildID string) error {
 	for {
 		state, err := inspectSchemaState(ctx, db)
 		if err != nil {
@@ -222,7 +226,7 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaEight(ctx, db, cipher)
+			return initializeEmptySchemaNine(ctx, db, cipher)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
@@ -253,6 +257,10 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 			}
 		case state.Version == 7:
 			if _, err := migrateSchemaSevenToEight(ctx, db, databasePath, cipher, identity); err != nil {
+				return err
+			}
+		case state.Version == 8:
+			if _, err := migrateSchemaEightToNine(ctx, db, databasePath, cipher, identity, readerBuildID); err != nil {
 				return err
 			}
 		case state.Version == developmentSchemaVersion:

@@ -781,6 +781,9 @@ func (store *Store) CommitCalibrationSuccess(ctx context.Context, commit model.C
 	if err = replaceRecipeSecretRefs(ctx, tx, commit.RecipeID, commit.SelectedVersionID); err != nil {
 		return nil, err
 	}
+	if err = clearStaleRouteHealthTx(ctx, tx, `route_id IN (SELECT id FROM route WHERE upstream_id=?)`, false, currentEndpoint.UpstreamID); err != nil {
+		return nil, err
+	}
 
 	// Capability invalidation：删掉旧行（effective unknown）
 	if _, err = tx.ExecContext(ctx, `DELETE FROM endpoint_capability

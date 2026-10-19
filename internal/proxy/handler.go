@@ -957,7 +957,7 @@ func (h *Handler) InvalidateTransport(upstreamID int64) {
 }
 
 func (h *Handler) writeSelectError(w http.ResponseWriter, err error,
-	proto model.Protocol, inModel string) {
+	proto model.Protocol, inModel string, snapshot *router.Snapshot) {
 
 	// X-Relay-Reason 让 503 可诊断：不带它的话，客户端只看到「服务不可用」，
 	// 分不清是配置错了还是所有站都挂了。
@@ -973,12 +973,34 @@ func (h *Handler) writeSelectError(w http.ResponseWriter, err error,
 	case errors.Is(err, router.ErrProtocolMismatch):
 		writeAPIError(w, http.StatusBadRequest, proto, "invalid_request_error", err.Error())
 	case errors.Is(err, router.ErrNoRouteAvailable):
+		w.Header().Set("Retry-After", strconv.FormatInt(h.noRouteRetryAfter(snapshot, inModel, proto), 10))
 		h.log.Warn("无可用 Route", "model", inModel, "err", err)
 		writeAPIError(w, http.StatusServiceUnavailable, proto, "overloaded_error", err.Error())
 	default:
 		h.log.Error("选路失败", "model", inModel, "err", err)
 		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "内部错误")
 	}
+}
+
+func (h *Handler) noRouteRetryAfter(snapshot *router.Snapshot, inModel string, protocol model.Protocol) int64 {
+	statuses, ok := h.health.(interface{ Status(int64) health.Status })
+	if !ok {
+		return 60
+	}
+	now := time.Now().UnixMilli()
+	var minimum int64
+	for _, routeID := range router.CandidateRouteIDs(snapshot, inModel, protocol) {
+		if remaining := statuses.Status(routeID).CooldownUntil - now; remaining > 0 {
+			seconds := (remaining + 999) / 1000
+			if minimum == 0 || seconds < minimum {
+				minimum = seconds
+			}
+		}
+	}
+	if minimum == 0 {
+		return 60
+	}
+	return minimum
 }
 
 func (h *Handler) logResult(cand *router.Candidate, inModel, outURL string,

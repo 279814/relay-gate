@@ -153,6 +153,7 @@ func TestConfigAdminHTTP_DeleteSQLFailureRestoresTransformAndEmptyDraft(t *testi
 		t.Fatal(err)
 	}
 	forceTableDeleteFail(t, s, "route")
+	beforeInv, beforeRef := pub.counts()
 	response = do(t, h, "DELETE", "/admin/api/routes/1?expected_revision=1", "", true)
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("SQL failure not reported: HTTP %d", response.Code)
@@ -167,7 +168,7 @@ func TestConfigAdminHTTP_DeleteSQLFailureRestoresTransformAndEmptyDraft(t *testi
 	if recipe, err := s.st.GetRecipe(context.Background(), recipeID); err != nil || recipe.Status != model.RecipeDraft || recipe.Revision != 1 {
 		t.Error("failed SQL delete did not restore the empty current draft")
 	}
-	if inv, ref := pub.counts(); inv != 0 || ref != 0 {
+	if inv, ref := pub.counts(); inv != beforeInv || ref != beforeRef {
 		t.Error("failed SQL delete published configuration")
 	}
 }

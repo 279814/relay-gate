@@ -57,18 +57,12 @@ func TestDataKey_BackupRejectsAuthenticatedBodyCorruption(t *testing.T) {
 	if err := st.InsertSample(sample); err != nil {
 		t.Fatal(err)
 	}
-	state, err := inspectSchemaState(context.Background(), st.db)
+	backup, err := st.CreateRotationBackup(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := st.db.Conn(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	backup, err := createMigrationBackup(context.Background(), conn, st.path, MigrationBackupSpec{SourceSchema: 8, TargetSchema: 9, SourceFingerprint: state.Fingerprint, LegacyCipherID: st.cipher.KeyID(), SourceValidator: "schema-8-data-key-v2", PairedBuildID: "fixture-build", ReaderContract: "schema-8-data-key-v2-reader"})
-	conn.Close()
-	if err != nil {
-		t.Fatal(err)
+	if _, err := CheckBackup(context.Background(), st.path, backup.ManifestPath, st.cipher); err != nil {
+		t.Fatalf("undamaged current backup rejected: %v", err)
 	}
 	db, err := sql.Open("sqlite", backup.DatabasePath+connPragmas)
 	if err != nil {

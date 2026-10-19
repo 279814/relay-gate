@@ -81,12 +81,13 @@ type ExecutionRecorder interface {
 // 渲染 → 认证），避免把那条链再抄一遍。调用方（Scheduler）负责算出 Budget、
 // 期望与 ObservationOrder。
 type ExecutionRequest struct {
-	ExecutionID string
-	Trigger     model.ProbeTrigger
-	Upstream    *model.Upstream
-	ModelName   *model.ModelName
-	Route       *model.Route
-	Endpoint    model.EndpointKind
+	healthIdentity *model.RouteHealthIdentity
+	ExecutionID    string
+	Trigger        model.ProbeTrigger
+	Upstream       *model.Upstream
+	ModelName      *model.ModelName
+	Route          *model.Route
+	Endpoint       model.EndpointKind
 	// Mode 区分主动探活与真实流量旁路（§6.8）。零值按 probe 处理。
 	Mode ObservationMode
 	// Budget 是这次执行的分阶段时间预算，从 Settings 经 outbound.*Budget 得到。
@@ -122,6 +123,7 @@ type ExecutionRequest struct {
 // Decision 是权威结论；Outcome 是给 P0-10 之前的 health.Tracker 用的兼容映射；
 // Execution 是落库的那一行（recorder 为 nil 时仍然构造，供调用方观察）。
 type ExecutionResult struct {
+	healthIdentity *model.RouteHealthIdentity
 	Decision       Decision
 	Outcome        Outcome
 	Execution      model.ProbeExecution

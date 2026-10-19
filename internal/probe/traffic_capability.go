@@ -87,6 +87,7 @@ func prepareCapabilityTraffic(ctx context.Context, snap *livecfg.ProbeSnapshot, 
 		ExecutionID: sample.NewReqID(), Trigger: model.TriggerRealTraffic, Upstream: up, Route: route, ModelName: mn,
 		Endpoint: target.Endpoint, ObservationOrder: order, CapabilityExpectation: expectation, CapabilityPolicy: policy,
 		ReachabilityExpectation: reach, ReachabilityPolicy: reachPolicy,
+		healthIdentity: capturedRouteHealthIdentity(snap, expectation, reach, nil),
 	}, shapeReason: model.ShapeUnsupported}
 }
 
@@ -305,7 +306,7 @@ func (o *trafficObserver) queueCapabilityObservation() {
 	select {
 	case <-o.m.stop:
 		o.m.persistDrops.Add(1)
-	case o.m.queue <- trafficWrite{observation: observation, target: o.target, finish: o.finishView, shape: o.capability.shape}:
+	case o.m.queue <- trafficWrite{observation: observation, target: o.target, finish: o.finishView, shape: o.capability.shape, healthIdentity: o.capability.req.healthIdentity}:
 	default:
 		o.m.persistDrops.Add(1)
 	}
