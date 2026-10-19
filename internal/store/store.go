@@ -181,6 +181,10 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock, readerBuildID string)
 		db.Close()
 		return nil, fmt.Errorf("初始化分阶段设置: %w", err)
 	}
+	if err := st.interruptPendingAuditEvents(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("标记未完成审计: %w", err)
+	}
 	return st, nil
 }
 

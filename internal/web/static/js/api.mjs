@@ -26,6 +26,16 @@ export function createApiClient(hooks = {}) {
     throw error;
   }
 
+  function auditStatus(data, response) {
+    if (response.headers?.get?.('X-Audit-Status') !== 'pending') return data;
+    const eventId = response.headers.get('X-Audit-Event-ID') || '';
+    const result = data && typeof data === 'object' ? data : {};
+    result.audit_pending = true;
+    result.audit_event_id = eventId;
+    hooks.onAuditPending?.({eventId});
+    return result;
+  }
+
   async function request(method, path, body) {
     const requestOwner = owner;
     const opt = { method, headers: {}, credentials: 'same-origin' };
@@ -46,7 +56,7 @@ export function createApiClient(hooks = {}) {
       e.status = 401;
       throw e;
     }
-    if (r.status === 204) return null;
+    if (r.status === 204) return auditStatus(null, r);
     const text = await readCurrent(r.text(), requestOwner);
     let data = null;
     if (text) {
@@ -62,7 +72,7 @@ export function createApiClient(hooks = {}) {
       e.data = data;
       throw e;
     }
-    return data;
+    return auditStatus(data, r);
   }
 
   return {

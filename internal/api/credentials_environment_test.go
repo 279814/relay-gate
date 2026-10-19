@@ -1,12 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -34,6 +36,15 @@ func TestMasterRotation_EnvironmentMasterOverrideRejectsBeforeAnyWrite(t *testin
 	if err := s.st.DB().QueryRow(`SELECT total_changes()`).Scan(&writesBefore); err != nil {
 		t.Fatal(err)
 	}
+	beforeConfig, err := s.st.LoadConfigBundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCredentials := s.creds.Status()
+	var lastAuditID int64
+	if err := s.st.DB().QueryRow(`SELECT COALESCE(MAX(id),0) FROM audit_event`).Scan(&lastAuditID); err != nil {
+		t.Fatal(err)
+	}
 	status := doSession(t, h, http.MethodGet, "/admin/api/credentials", "", session)
 	var state struct {
 		Allowed bool   `json:"rotation_allowed"`
@@ -58,7 +69,18 @@ func TestMasterRotation_EnvironmentMasterOverrideRejectsBeforeAnyWrite(t *testin
 	if err := s.st.DB().QueryRow(`SELECT total_changes()`).Scan(&writesAfter); err != nil {
 		t.Fatal(err)
 	}
-	if string(before) != string(after) || writesBefore != writesAfter || s.runState.InMaintenance() {
+	afterConfig, err := s.st.LoadConfigBundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var auditCount int
+	if err := s.st.DB().QueryRow(`SELECT COUNT(*) FROM audit_event WHERE id>? AND action='master_rotate' AND outcome='failed' AND reason_code='conflict'`, lastAuditID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	// Only the matching audit INSERT + terminal UPDATE may change SQLite.
+	// The original zero-mutation condition remains for every domain row/key.
+	if string(before) != string(after) || writesAfter-writesBefore != 2 || auditCount != 1 ||
+		!reflect.DeepEqual(beforeConfig, afterConfig) || !reflect.DeepEqual(beforeCredentials, s.creds.Status()) || s.runState.InMaintenance() {
 		t.Fatal("environment rejection changed keyring/database or entered maintenance")
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(s.st.DatabasePath()), "backups")); !os.IsNotExist(err) {

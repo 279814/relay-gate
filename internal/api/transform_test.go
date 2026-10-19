@@ -66,7 +66,8 @@ func TestAPI_ListTransformExecutions_PageLimitDefaultAndCap(t *testing.T) {
 
 func TestTransformAPI_PublishPreview(t *testing.T) {
 	reg := transform.NewRegistry(20)
-	s := New(nil, nil).WithTransformRegistry(reg)
+	s, _ := newTestServer(t)
+	s.WithTransformRegistry(reg)
 	h := s.Routes("pw")
 
 	create := httptest.NewRequest(http.MethodPost, "/admin/api/transforms", bytes.NewReader([]byte(`{"name":"t1"}`)))
@@ -105,7 +106,8 @@ func TestTransformAPI_PublishPreview(t *testing.T) {
 
 func TestTransformAPI_PublishRollback(t *testing.T) {
 	reg := transform.NewRegistry(20)
-	s := New(nil, nil).WithTransformRegistry(reg)
+	s, _ := newTestServer(t)
+	s.WithTransformRegistry(reg)
 	h := s.Routes("pw")
 
 	create := httptest.NewRequest(http.MethodPost, "/admin/api/transforms", bytes.NewReader([]byte(`{"name":"rb"}`)))
@@ -170,11 +172,13 @@ func TestTransformAPI_PublishRollback(t *testing.T) {
 	if binding.PublishedID != v1.ID {
 		t.Fatalf("published=%d want %d", binding.PublishedID, v1.ID)
 	}
+	latestAudit(t, s, "transform_rollback", "succeeded")
 }
 
 func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
 	reg := transform.NewRegistry(20)
-	s := New(nil, nil).WithTransformRegistry(reg)
+	s, _ := newTestServer(t)
+	s.WithTransformRegistry(reg)
 	h := s.Routes("pw")
 
 	raise := httptest.NewRequest(http.MethodPut, "/admin/api/transforms/budgets",

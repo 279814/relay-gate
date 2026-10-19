@@ -27,7 +27,9 @@ func TestTransformAPI_PersistErrorIsInternalNotValidation(t *testing.T) {
 	var logBuf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	reg := transform.NewRegistry(4).WithPersist(sqliteFailPersist{})
-	h := New(nil, log).WithTransformRegistry(reg).Routes(testAdminPW)
+	s, _ := newTestServer(t)
+	s.log = log
+	h := s.WithTransformRegistry(reg).Routes(testAdminPW)
 
 	rec := do(t, h, "POST", "/admin/api/transforms", `{"name":"leak"}`, true)
 	if rec.Code != http.StatusInternalServerError {
