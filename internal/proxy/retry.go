@@ -4,16 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
-	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	"github.com/279814/relay-gate/internal/protocol"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -57,7 +57,6 @@ type forwardOutcome struct {
 	outHeader http.Header
 	outURL    string
 	respTee   *sample.HeadTail
-	secTee    *sample.HeadTail // passive security scan copy (§14.2); independent of sample switch
 	res       *Result
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
@@ -91,7 +90,6 @@ type liveAttempt struct {
 	cand        *router.Candidate
 	at          *Attempt
 	tee         *sample.HeadTail
-	secTee      *sample.HeadTail
 	keys        []string
 	body        []byte
 	header      http.Header
@@ -118,6 +116,7 @@ type retryPlan struct {
 	// maxLocalSkips bounds route-local failures (§6.5): Transform / binding
 	// errors that never hit the wire. They do not consume maxAttempts.
 	maxLocalSkips int
+	localSkips    int
 }
 
 // dispatchStatus distinguishes fatal client errors from route-local skips (§6.5).
@@ -135,6 +134,7 @@ const (
 	// published request transform rewrites the body (§6.7). Skip like a
 	// mapping Route; when no Route is left the client gets 415.
 	dispatchRouteCompressedTransform
+	dispatchRouteCompressedMapping
 )
 
 // forwardWithRetry 完成选路 + 转发，失败时按 §3.5 换站重试。
@@ -204,18 +204,6 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		}
 	}()
 
-	// RecoveryGate/TryAcquire 之后、RoundTrip 之前再读一次：停用可能已经
-	// 落库并发布。halfOpen 选路用的是 preamble 快照；已武装的试探必须自己
-	// 停在出网前，且不得另起一次探活。
-	if halfOpen && !h.halfOpenStillEnabled(cand.Route.ID, cand.Upstream.ID) {
-		h.log.Info("Route/Upstream 已停用，跳过已武装的半开试探",
-			"upstream", cand.Upstream.Name, "route", cand.Route.ID)
-		held.Release()
-		held = nil
-		h.writeSelectError(w, router.ErrNoRouteAvailable, proto, pre.inModel, pre.snapshot)
-		return nil, false
-	}
-
 	// reqID 在这里生成而不是在写日志时：同一次客户端请求的所有尝试
 	// （以及它那条样本）都要用同一个值，而日志是逐次写的。
 	reqID := sample.NewReqID()
@@ -225,31 +213,61 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	var observing *liveAttempt
 	defer func() { finishObserver(observing, health.AttemptFinish{ServiceCanceled: true}) }()
 	defer func() { closeSampleTrail(trail) }()
-	localSkips := 0
+	var ready *liveAttempt
+	defer func() {
+		if ready != nil {
+			ready.at.Discard()
+			finishObserver(ready, health.AttemptFinish{ServiceCanceled: true})
+			ready.cand.Release()
+			if ready.tee != nil {
+				ready.tee.Close()
+			}
+		}
+	}()
 	attempt := 0
 
 	for {
+		// RecoveryGate/TryAcquire 之后、RoundTrip 之前再读一次：停用可能已经
+		// 落库并发布。halfOpen 选路用的是 preamble 快照；已武装的试探必须自己
+		// 停在出网前，且不得另起一次探活。
+		if armedHalfOpen(cand.Route.ID, attempt+1) && !h.halfOpenStillEnabled(cand.Route.ID, cand.Upstream.ID) {
+			h.log.Info("Route/Upstream 已停用，跳过已武装的半开试探",
+				"upstream", cand.Upstream.Name, "route", cand.Route.ID)
+			held.Release()
+			held = nil
+			h.writeSelectError(w, router.ErrNoRouteAvailable, proto, pre.inModel, pre.snapshot)
+			return nil, false
+		}
 		plan.tried[cand.Route.ID] = true
 
-		la, status := h.dispatch(w, r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline))
+		la, status := ready, dispatchSent
+		ready = nil
+		if la == nil {
+			la, status = h.dispatch(r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline), nil)
+		}
 		observing = la
 		if status == dispatchFatal {
+			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 			cand.Release()
 			held = nil
 			return nil, false
 		}
 		if status == dispatchRouteLocal || status == dispatchRouteAuthConfig ||
-			status == dispatchRouteCompressedTransform {
+			status == dispatchRouteCompressedTransform || status == dispatchRouteCompressedMapping {
 			// §6.5 / §15.7: Transform fail_closed and Auth Secret errors are
 			// route-local — no upstream send, no maxAttempts burn; skip to the
 			// next Route.
 			cand.Release()
 			held = nil
-			localSkips++
+			plan.localSkips++
 			h.log.Info("route-local 本地失败，跳过本 Route",
-				"route", cand.Route.ID, "local_skips", localSkips,
+				"route", cand.Route.ID, "local_skips", plan.localSkips,
 				"max_local_skips", plan.maxLocalSkips)
 			exhausted := func(selErr error) {
+				if status == dispatchRouteCompressedMapping {
+					h.writeSelectError(w, errCompressedNeedsMapping, proto, pre.inModel, pre.snapshot)
+					return
+				}
 				if status == dispatchRouteCompressedTransform {
 					writeAPIError(w, http.StatusUnsupportedMediaType, proto, "invalid_request_error",
 						msgCompressedNeedsTransform)
@@ -266,26 +284,41 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				}
 				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")
 			}
-			if localSkips >= plan.maxLocalSkips {
+			if plan.localSkips >= plan.maxLocalSkips {
 				exhausted(nil)
 				return nil, false
 			}
-			next, _, selErr := h.selectFor(pre, proto, plan.tried, false)
+			next, nextHalfOpen, selErr := h.selectFor(pre, proto, plan.tried, attempt == 0)
 			if selErr != nil || next == nil {
 				exhausted(selErr)
 				return nil, false
 			}
 			cand = next
+			if nextHalfOpen {
+				halfOpenRouteID = cand.Route.ID
+			}
 			held = cand
 			continue
 		}
 		attempt++
 
-		next := h.nextCandidate(r, pre, proto, plan, la, attempt)
-		if next == nil {
+		ready = h.nextPreparedAttempt(r, pre, proto, plan, la, reqID, attempt, func() {
+			// Discard completes the original response observation before releasing this attempt.
+			la.at.Discard()
+			// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
+			// （§5.4 / §16.3），留到收尾由 recordSample 落库。
+			trail = append(trail, la)
+			finishObserver(la, health.AttemptFinish{HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
+			h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
+			logs = append(logs, h.attemptLog(la, pre, proto, reqID,
+				attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
+			la.cand.Release()
+			held = nil
+		})
+		if ready == nil {
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
-				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
+				outURL: la.url, respTee: la.tee, keys: la.keys,
 				res: la.at.Result(), attempts: attempt,
 				halfOpen: armedHalfOpen(la.cand.Route.ID, attempt),
 				reqID:    reqID,
@@ -324,17 +357,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			return oc, true
 		}
 
-		// Discard completes the original response observation before releasing this attempt.
-		la.at.Discard()
-		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
-		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
-		trail = append(trail, la)
-		finishObserver(la, health.AttemptFinish{HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
-		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
-		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
-			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
-		la.cand.Release()
-		cand = next
+		cand = ready.cand
 		held = cand
 	}
 }
@@ -353,10 +376,6 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 		exclude = map[int64]bool{}
 	}
 	ep, _ := proto.Endpoint()
-	// §6.7: a compressed body cannot take a Route that maps the model. Skip it
-	// so a later Route without mapping can still pass the original bytes; if
-	// nothing else is left, the client gets 415 instead of no-route.
-	skippedForMapping := false
 	for {
 		cand, err := router.SelectExcluding(pre.snapshot, h.health, pre.inModel, proto, exclude)
 		if err == nil {
@@ -365,12 +384,7 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 				cand.Release()
 				continue
 			}
-			if pre.compressedNeedsMapping(cand.Route) {
-				skippedForMapping = true
-				exclude[cand.Route.ID] = true
-				cand.Release()
-				continue
-			}
+
 			// 脏行/历史短 api_key：SelectExcluding 已按短钥剔除并阻断前缀/兜底回落。
 			// 若仍选出，fail closed，不得再 exclude 后跨 ModelName 重选。
 			if model.APIKeyTooShortForOutbound(cand.Upstream.APIKey) {
@@ -390,13 +404,11 @@ func (h *Handler) selectFor(pre *preambleResult, proto model.Protocol,
 		}
 		if allowHalfOpen {
 			if c := h.halfOpen(pre.snapshot, pre.inModel, proto, pre.settings, err,
-				pre.compressedNeedsMapping); c != nil {
+				func(rt *model.Route) bool { return exclude[rt.ID] }); c != nil {
 				return c, true, nil
 			}
 		}
-		if skippedForMapping && errors.Is(err, router.ErrNoRouteAvailable) {
-			return nil, false, errCompressedNeedsMapping
-		}
+
 		return nil, false, err
 	}
 }
@@ -430,8 +442,8 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 只收入站原文与候选 —— 见文件头「为什么每次尝试都必须重建」。
 // budget 是本次请求剩余的总时长预算。
 //
-// dispatchFatal：错误响应已写好。这类失败是 request-global（非法 body、
-// 协议/全局配置），换站无意义。
+// dispatchFatal：未发上游的全局准备失败。调用方仍持有先前响应时保留它，
+// 首次准备失败则由调用方写固定配置错误。
 // dispatchRouteLocal：尚未写客户端、尚未发上游（§6.5 Transform fail_closed）；
 // 调用方应跳过本 Route 并选下一个，不消耗 retry_max_attempts。
 // dispatchRouteAuthConfig：同上，原因是本 Route 的 URL 或 Auth Secret 配置
@@ -439,31 +451,17 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 已把该 Route 当前 Endpoint 的 Capability 记为 config_error。
 // dispatchRouteCompressedTransform：同上，原因是压缩请求体遇上请求 body 转换（§6.7）。
 // dispatchSent：已发出上游请求，la 非空。
-func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
+func (h *Handler) dispatch(r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
-	reqID string, attempt int, budget time.Duration) (*liveAttempt, dispatchStatus) {
+	reqID string, attempt int, budget time.Duration, beforeSend func()) (*liveAttempt, dispatchStatus) {
 
 	settings := pre.settings
-
-	if pre.compressedNeedsMapping(cand.Route) {
-		writeAPIError(w, http.StatusUnsupportedMediaType, proto, "invalid_request_error",
-			msgCompressedNeedsMapping)
-		return nil, dispatchFatal
-	}
-	outBody, err := ReplaceModel(pre.body, cand.Route.UpstreamModel)
-	if err != nil {
-		h.log.Error("替换 model 失败", "err", err, "route", cand.Route.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error",
-			fmt.Sprintf("改写请求失败: %v", err))
-		return nil, dispatchFatal
-	}
 
 	// 出站 URL 只有一个来源（§7.1）。endpoint 由入站协议决定 ——
 	// 这三个透传端点与协议是一一对应的。
 	kind, ok := proto.Endpoint()
 	if !ok {
 		h.log.Error("协议没有对应的 Endpoint", "proto", proto, "route", cand.Route.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 	instr := health.NoopInstrumentation()
@@ -499,7 +497,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 	configFacts = &health.AttemptConfigFacts{EndpointID: target.EndpointID, EndpointRevision: target.EndpointRevision,
@@ -517,72 +514,15 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 
-	// Published binding only; unbound → passthrough (§15.1).
-	var compiled *transform.Compiled
-	var verID int64
-	redactKeys := append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)
-	shadowHeader, shadowBody := outHeader, outBody
-	if h.transforms != nil && target.EndpointID != 0 {
-		var terr error
-		compiled, verID, terr = pre.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
-		if terr != nil {
-			h.log.Error("加载 transform 失败", "err", terr, "route", cand.Route.ID)
-			return nil, dispatchRouteLocal
-		}
-		if compiled != nil && pre.encoding != "" && compiled.HasRequestBodyRules() {
-			h.log.Info("压缩请求体不能走请求 body 转换，跳过本 Route",
-				"route", cand.Route.ID, "endpoint", target.EndpointID)
-			return nil, dispatchRouteCompressedTransform
-		}
-		if compiled != nil {
-			beforeBody := outBody
-			// Resolve upstream_api_key for secret_ref / {{SECRET:…}} on the
-			// live path; rendered plaintext is tainted for sample redaction.
-			var secrets transform.SecretMap
-			if key := cand.Upstream.APIKey; key != "" && !model.APIKeyTooShortForOutbound(key) {
-				secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
-			}
-			tr := compiled.ApplyRequestSecrets(
-				transform.RequestInput{Header: outHeader, Body: outBody}, secrets)
-			if tr.Err != nil && tr.PolicyUsed == transform.FailClosed {
-				h.transforms.RecordExecution(transform.ExecutionRecord{
-					RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: verID,
-					Mode: "published", Phase: "request", OK: false, Error: tr.Err.Error(),
-					FailPolicyUsed: tr.PolicyUsed, InputHash: transform.HashBytes(beforeBody),
-				})
-				return nil, dispatchRouteLocal
-			}
-			outHeader, outBody = tr.Header, tr.Body
-			if tr.Changed || tr.Err != nil {
-				errText := ""
-				if tr.Err != nil {
-					errText = tr.Err.Error()
-				}
-				h.transforms.RecordExecution(transform.ExecutionRecord{
-					RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: verID,
-					Mode: "published", Phase: "request", OK: tr.Err == nil,
-					HitRules: tr.HitRules, FailPolicyUsed: tr.PolicyUsed,
-					InputHash: transform.HashBytes(beforeBody), OutputHash: transform.HashBytes(outBody),
-					Error: errText,
-				})
-			}
-			// Post-transform sample redaction must include tainted secrets
-			// (§5.4 / §16.3): body PrepareBody already scans credentialsOf,
-			// but custom headers and any secret distinct from APIKey need
-			// the taint set merged in before store/encrypt.
-			if tr.Taint != nil {
-				redactKeys = append(redactKeys, tr.Taint.Secrets()...)
-			}
-		}
+	prepared, status := h.prepareOutboundRequest(r, pre, cand, target, outHeader)
+	if status != dispatchSent {
+		return nil, status
 	}
-	// Edge identity is local metadata even if a published transform tries to
-	// reintroduce it after the inbound blacklist was applied.
-	edge.StripForwardingHeaders(outHeader)
-	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody)
+	outHeader, outBody := prepared.header, prepared.body
+	compiled, verID, redactKeys := prepared.compiled, prepared.version, prepared.keys
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
@@ -594,7 +534,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 
@@ -625,23 +564,25 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 				settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
 		}
 	}
-	// 被动扫描副本与样本开关无关（§14.3：样本关闭时仍可扫描）。
-	var secTee *sample.HeadTail
-	if h.security != nil {
-		secTee = sample.NewHeadTail(256<<10, 256<<10)
-	}
-	switch {
-	case tee != nil && secTee != nil:
-		fwd.RespTee = io.MultiWriter(tee, secTee)
-	case tee != nil:
+	if tee != nil {
 		fwd.RespTee = tee
-	case secTee != nil:
-		fwd.RespTee = secTee
+	}
+	if h.security != nil {
+		capture := h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: kind, Protocol: proto}})
+		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
 	}
 	fwd.RespObserver = instr.Observer
 
 	if requestObserver, ok := instr.Observer.(health.AttemptRequestObserver); ok {
 		requestObserver.TryRequest(health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
+	}
+	// A replacement response is discarded only after this Route is fully
+	// prepared. Never hold the previous concurrency slot during the new send.
+	if beforeSend != nil {
+		if r.Context().Err() != nil {
+			return nil, dispatchFatal
+		}
+		beforeSend()
 	}
 	sendCtx := r.Context()
 	if instr.Trace != nil {
@@ -655,7 +596,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	handedOff = true
 
 	return &liveAttempt{
-		cand: cand, at: at, tee: tee, secTee: secTee,
+		cand: cand, at: at, tee: tee,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
 		instr: instr, configFacts: configFacts,
@@ -666,28 +607,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 // countCandidateRoutes returns how many enabled Routes could be selected for
 // this model (§6.5 max local skip bound). Falls back to 1 when unknown.
 func countCandidateRoutes(snap *router.Snapshot, inModel string, proto model.Protocol) int {
-	if snap == nil {
-		return 1
-	}
-	mn, err := router.MatchModelName(snap, inModel, proto)
-	if err != nil || mn == nil {
-		return 1
-	}
-	n := 0
-	for _, rt := range snap.RoutesByModelName[mn.ID] {
-		if rt == nil || !rt.Enabled {
-			continue
-		}
-		up := snap.Upstreams[rt.UpstreamID]
-		if up == nil || !up.Enabled {
-			continue
-		}
-		n++
-	}
-	if n < 1 {
-		return 1
-	}
-	return n
+	return max(1, len(router.CandidateRouteIDs(snap, inModel, proto)))
 }
 
 // nextCandidate 判断这次尝试要不要换站重来，要的话选出下一个候选。

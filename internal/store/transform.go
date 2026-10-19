@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -67,7 +68,7 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 		if _, err := tx.Exec(`UPDATE route SET capability_revision=capability_revision+1 WHERE id=?`, routeID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE route_health SET state='unknown',consecutive_ok=0,consecutive_fail=0,last_ok_at=0,last_err_at=0,last_error='',last_ttft_ms=0,cooldown_until=0,dead_since=0,recovery_required=0,identity_json='',updated_at=? WHERE route_id=?`, nowMS(), routeID); err != nil {
+		if err := resetRouteHealthTx(context.Background(), tx, routeID); err != nil {
 			return err
 		}
 	}

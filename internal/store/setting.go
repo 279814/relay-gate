@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/revisioncodec"
 )
 
 const keySettings = "settings"
@@ -180,6 +181,10 @@ func (s *Store) SaveSettingsWithRevision(settings model.Settings, expectedRevisi
 		if _, err = tx.Exec(`INSERT INTO setting(key,value,updated_at,revision) VALUES (?,?,?,1)`, keySettings, string(encoded), nowMS()); err != nil {
 			return 0, err
 		}
+		resetLegacy := revisioncodec.RouteHealthSettingsFingerprint(model.DefaultSettings()) != revisioncodec.RouteHealthSettingsFingerprint(settings)
+		if err = clearStaleRouteHealthTx(context.Background(), tx, `1=1`, resetLegacy); err != nil {
+			return 0, err
+		}
 		if err = tx.Commit(); err != nil {
 			return 0, err
 		}
@@ -212,6 +217,10 @@ func (s *Store) SaveSettingsWithRevision(settings model.Settings, expectedRevisi
 	}
 	if affected != 1 {
 		return 0, ErrRevisionConflict
+	}
+	resetLegacy := revisioncodec.RouteHealthSettingsFingerprint(current) != revisioncodec.RouteHealthSettingsFingerprint(settings)
+	if err = clearStaleRouteHealthTx(context.Background(), tx, `1=1`, resetLegacy); err != nil {
+		return 0, err
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err

@@ -333,17 +333,11 @@ type preambleResult struct {
 	snapshot   *router.Snapshot
 	transforms *transform.RequestView
 	// encoding 是入站请求 body 的 Content-Encoding（gzip / br），identity 为 ""。
-	// 非空时 body 仍是原压缩字节，只能原样转发（§6.7）。
+	// 非空时 body 仍是原压缩字节；仅显式发布 request_reencode 才可改写（§6.7）。
 	encoding string
-	// decoded 是 body 的只读解码副本，只用于 model 校验、选路与本地估算；
-	// identity 时与 body 相同。
+	// decoded 是 model 校验/选路/本地估算及显式重编码的有界工作源；
+	// 修改时另建副本，identity 时与 body 相同。
 	decoded []byte
-}
-
-// compressedNeedsMapping reports a compressed body on a Route that would
-// rewrite the model (§6.3). Strict mode cannot rewrite it (§6.7 → 415).
-func (p *preambleResult) compressedNeedsMapping(rt *model.Route) bool {
-	return p.encoding != "" && rt != nil && rt.UpstreamModel != ""
 }
 
 // errCompressedNeedsMapping: every otherwise eligible Route needs a model
@@ -534,23 +528,6 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 		h.recordSample(r, proto, oc, recvAt, pre.inModel, pre.body, pre.settings)
 	} else {
 		closeSampleTrail(oc.trail)
-	}
-	if h.security != nil && oc.secTee != nil {
-		upName := ""
-		if oc.cand != nil && oc.cand.Upstream != nil {
-			upName = oc.cand.Upstream.Name
-		}
-		var routeID int64
-		if oc.cand != nil && oc.cand.Route != nil {
-			routeID = oc.cand.Route.ID
-		}
-		h.security.Enqueue(security.ObserveJob{
-			Body:     oc.secTee.Bytes(),
-			Upstream: upName,
-			RouteID:  routeID,
-			ReqID:    oc.reqID,
-			Keys:     oc.keys, // redact Detail before persist (§14.5 / §16.4)
-		})
 	}
 }
 

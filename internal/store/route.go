@@ -200,6 +200,11 @@ func (s *Store) UpdateRouteWithRevision(ctx context.Context, value *model.Route,
 			return err
 		}
 	}
+	if semanticChanged || (!current.Enabled && value.Enabled) {
+		if err = clearStaleRouteHealthTx(ctx, tx, `route_id=?`, true, value.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

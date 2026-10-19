@@ -260,6 +260,11 @@ func (s *Store) UpdateUpstreamWithRevision(ctx context.Context, upstream *model.
 			return err
 		}
 	}
+	if networkChanged || credentialChanged || (!current.Enabled && upstream.Enabled) {
+		if err = clearStaleRouteHealthTx(ctx, tx, `route_id IN (SELECT id FROM route WHERE upstream_id=?)`, true, upstream.ID); err != nil {
+			return err
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}

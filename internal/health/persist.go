@@ -69,6 +69,12 @@ func (p *Persister) flush() {
 
 	rows := make([]*store.RouteHealth, 0, len(all))
 	for _, st := range all {
+		// Legacy recovery adds no new evidence to the already-durable row.
+		// Rewriting it could revive a snapshot cleared by a later semantic
+		// configuration transaction while this flush was waiting for SQLite.
+		if st.Identity == nil && st.RecoverySource == "legacy_unverified" {
+			continue
+		}
 		rows = append(rows, &store.RouteHealth{
 			RouteID:         st.RouteID,
 			State:           st.State,

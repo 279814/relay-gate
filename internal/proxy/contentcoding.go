@@ -14,6 +14,45 @@ import (
 	"github.com/279814/relay-gate/internal/transform"
 )
 
+// encodeRequestBody preserves the selected input coding, with independent
+// decoded and encoded limits. The writer refuses growth before allocating it.
+func encodeRequestBody(enc string, body []byte, limit int) ([]byte, error) {
+	if len(body) > limit {
+		return nil, fmt.Errorf("request body exceeds reencoding limit")
+	}
+	dst := &boundedEncodingWriter{limit: limit}
+	var writer io.WriteCloser
+	switch enc {
+	case "gzip":
+		writer = gzip.NewWriter(dst)
+	case "br":
+		writer = brotli.NewWriterLevel(dst, 1)
+	default:
+		return nil, fmt.Errorf("unsupported request encoding")
+	}
+	_, err := writer.Write(body)
+	closeErr := writer.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return dst.body.Bytes(), nil
+}
+
+type boundedEncodingWriter struct {
+	body  bytes.Buffer
+	limit int
+}
+
+func (w *boundedEncodingWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit-w.body.Len() {
+		return 0, fmt.Errorf("encoded request exceeds reencoding limit")
+	}
+	return w.body.Write(p)
+}
+
 // normalizeContentEncoding returns the single Content-Encoding token (lowercased),
 // or "" when absent / identity. Multi-coding values are returned as-is (unsupported).
 func normalizeContentEncoding(h string) string {
