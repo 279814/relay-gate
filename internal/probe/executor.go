@@ -24,6 +24,7 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	wire "github.com/279814/relay-gate/internal/protocol"
 	"github.com/279814/relay-gate/internal/revisioncodec"
 	"github.com/279814/relay-gate/internal/sample"
 )
@@ -81,6 +82,7 @@ type ExecutionRecorder interface {
 // 渲染 → 认证），避免把那条链再抄一遍。调用方（Scheduler）负责算出 Budget、
 // 期望与 ObservationOrder。
 type ExecutionRequest struct {
+	canary         *canaryCheck
 	healthIdentity *model.RouteHealthIdentity
 	ExecutionID    string
 	Trigger        model.ProbeTrigger
@@ -176,6 +178,11 @@ func NewExecutor(resolver TargetResolver, secrets outbound.SecretSource,
 // （admission 拿不到、写库失败）—— 站点自身的失败在 Decision/Outcome 里，
 // 绝不冒充成 Go error（§P0-09 第 8、10 条）。
 func (e *Executor) Execute(ctx context.Context, req ExecutionRequest) (ExecutionResult, error) {
+	if req.canary != nil {
+		req.Mode = ObserveReal
+		req.ReachabilityExpectation, req.CapabilityExpectation = nil, nil
+		req.ReachabilityPolicy, req.CapabilityPolicy = nil, nil
+	}
 	if req.Mode == "" {
 		req.Mode = ObserveProbe
 	}
@@ -335,6 +342,11 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	if requestBytes < 0 {
 		requestBytes = 0
 	}
+	if req.canary != nil && req.canary.beforeSend != nil {
+		if err := req.canary.beforeSend(ctx); err != nil {
+			return e.finishConfigError(ctx, req, prepared.recipe, err)
+		}
+	}
 
 	// SentAt 恰好在 RoundTrip 之前、且在取到连接池之后取（§P0-09 第 2 条）：
 	// 上面取连接池失败会走 finishConfigError（SentAt=0，未发送）。
@@ -343,6 +355,9 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	sentAt := e.clock.Now()
 	timing := sendTiming{sentAtMS: sentAt.UnixMilli()}
 	estInputTokens := int64(prepared.estimatedTokens(req.ModelName))
+	if req.canary != nil {
+		estInputTokens = (requestBytes + 3) / 4
+	}
 
 	deadline, deadlineCause := nextExecutionDeadline(budget, sentAt, &timing, time.Time{})
 	stageTimer := resetExecutionTimer(nil, e.clock, deadline)
@@ -416,8 +431,13 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	if req.ModelName != nil {
 		protocol = req.ModelName.Protocol
 	}
-	decoder, decErr := NewDecoder(DecoderSpec{Endpoint: req.Endpoint, Protocol: protocol},
-		WireAuto, defaultMaxEventBytes, defaultMaxTotalBytes)
+	var decoder Decoder
+	var decErr error
+	if req.canary == nil {
+		decoder, decErr = NewDecoder(DecoderSpec{Endpoint: req.Endpoint, Protocol: protocol}, WireAuto, defaultMaxEventBytes, defaultMaxTotalBytes)
+	} else {
+		decoder, decErr = wire.NewDecoderWithPayloadSink(wire.DecoderSpec{Endpoint: req.Endpoint, Protocol: protocol}, wire.WireAuto, 256<<10, 1<<20, req.canary.observe)
+	}
 	if decErr != nil {
 		// 解码器建不起来是**我们自己的**观测故障，且请求已经发出去了
 		// （§P0-09 第 2 条）：不能倒回 config_error（那会抹掉 SentAt 并谎称
@@ -742,6 +762,14 @@ func (e *Executor) finishSuccessPath(ctx context.Context, req ExecutionRequest, 
 func (e *Executor) recordExecution(ctx context.Context, req ExecutionRequest,
 	exec *model.ProbeExecution) (model.ProbeApplyResult, error) {
 
+	if req.canary != nil {
+		exec.Canary = req.canary.finalize(*exec)
+		// A canceled diagnostic still owes its already-sent accounting fact.
+		// Persistence gets a bounded cleanup context; forwarding is not involved.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+	}
 	if e.recorder == nil {
 		return model.ProbeApplyResult{}, nil
 	}

@@ -390,6 +390,16 @@ func runServer() error {
 	}
 	calibrator.WithInvalidator(inv).WithConfigPublisher(cfgSrc)
 	probeAdmin := probe.NewService(st, executor, calibrator, cfgSrc, traffic, inv).WithManualPreparer(sched)
+	sched.WithCanary(probeAdmin, st).WithCanaryReporter(func(execution model.ProbeExecution) {
+		if execution.Canary == nil {
+			return
+		}
+		severity := security.SeverityInfo
+		if execution.Canary.Verdict != "passed" {
+			severity = security.SeverityMedium
+		}
+		secCenter.Record(security.Finding{Source: "canary", Category: "canary_periodic", Severity: severity, Summary: "周期 Canary " + execution.Canary.Verdict, RouteID: execution.RouteID})
+	})
 	var bg sync.WaitGroup
 	bg.Add(5)
 	go func() { defer bg.Done(); sched.Run(bgCtx) }()

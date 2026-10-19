@@ -105,6 +105,8 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/security/findings", s.listSecurityFindings)
 	mux.HandleFunc("POST /admin/api/security/scan", s.postSecurityScan)
 	mux.HandleFunc("POST /admin/api/security/canary", s.postSecurityCanary)
+	mux.HandleFunc("GET /admin/api/security/canary-policy/{id}", s.getCanaryPolicy)
+	mux.HandleFunc("PUT /admin/api/security/canary-policy/{id}", s.putCanaryPolicy)
 	mux.HandleFunc("GET /admin/api/security/smtp", s.getSMTPConfig)
 	mux.HandleFunc("PUT /admin/api/security/smtp", s.putSMTPConfig)
 	mux.HandleFunc("POST /admin/api/security/smtp/test", s.postSMTPTest)

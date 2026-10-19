@@ -974,11 +974,11 @@ func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawM
 				break
 			}
 		}
-		if nonEmptyToolArguments(delta["tool_calls"]) {
+		if nonEmptyToolArguments(delta["tool_calls"]) || nonEmptyToolArguments(message["tool_calls"]) {
 			event.Semantic = true
 			event.SemanticKind = "tool"
 		}
-		if nonEmptyCallArguments(delta["function_call"]) {
+		if nonEmptyCallArguments(delta["function_call"]) || nonEmptyCallArguments(message["function_call"]) {
 			event.Semantic = true
 			event.SemanticKind = "function_args"
 		}
