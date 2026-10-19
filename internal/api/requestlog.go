@@ -3,8 +3,10 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -64,96 +66,83 @@ func (s *Server) listRequestLogs(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
+	}
+	for _, row := range list {
+		redactRequestLog(row, keys)
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"logs": list, "total": total})
 }
 
 // recentErrors is the P2 home summary + modal feed (§13.2).
 // Plain-text errors only; reuses failed request_log rows.
 func (s *Server) recentErrors(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, err := queryInt64(q.Get("limit"))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: 参数 limit 不是合法整数：%q",
-			model.ErrValidation, q.Get("limit")))
+	q := &probeListQuery{r: r}
+	for name := range r.URL.Query() {
+		switch name {
+		case "limit", "cursor", "upstream_id", "route_id", "protocol", "outcome", "from_ms", "to_ms":
+		default:
+			q.err = model.WrapValidation("最近错误含未知筛选参数")
+		}
+	}
+	f := store.RecentErrorFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), RouteID: q.id("route_id"),
+		Protocol: probeEnum(q, "protocol", model.Protocol.Valid),
+		Outcome:  model.Outcome(q.oneOf("outcome", string(model.OutcomeUpstreamError), string(model.OutcomeTimeout), string(model.OutcomeFakeAlive), string(model.OutcomeClientAbort)))}
+	millis := func(name string) int64 {
+		raw := q.text(name)
+		if _, present := r.URL.Query()[name]; !present {
+			return 0
+		}
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 1 || n > 253402300799999 {
+			q.reject(name)
+			return 0
+		}
+		return n
+	}
+	f.FromMS, f.ToMS = millis("from_ms"), millis("to_ms")
+	if len(f.Cursor) > 4096 {
+		q.reject("cursor")
+	}
+	if f.FromMS > 0 && f.ToMS > 0 && f.FromMS > f.ToMS {
+		q.reject("time")
+	}
+	if q.err != nil {
+		s.writeErr(w, q.err)
 		return
 	}
-	if q.Get("limit") == "" {
-		limit = 20
-	}
-	beforeID, err := queryInt64(q.Get("before_id"))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: 参数 before_id 不是合法整数：%q",
-			model.ErrValidation, q.Get("before_id")))
-		return
-	}
-	upstreamID, err := queryInt64(q.Get("upstream_id"))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: 参数 upstream_id 不是合法整数：%q",
-			model.ErrValidation, q.Get("upstream_id")))
-		return
-	}
-	pageLimit, err := store.NormalizePageLimit(int(limit))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
-		return
-	}
-	f := store.RequestLogFilter{
-		UpstreamID: upstreamID,
-		OnlyFailed: true,
-		Limit:      pageLimit,
-		BeforeID:   beforeID,
-	}
-	list, err := s.st.ListRequestLogs(f)
+	page, err := s.st.ListRecentErrors(r.Context(), f)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	failedCount, err := countFailedRequestLogs(s.st)
-	if err != nil {
-		s.writeErr(w, err)
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
 		return
 	}
-	var summary any
-	if len(list) > 0 {
-		summary = map[string]any{
-			"id":       list[0].ID,
-			"error":    list[0].Error,
-			"ts_recv":  list[0].TSRecv,
-			"upstream": list[0].UpstreamName,
-			"endpoint": list[0].Endpoint,
-			"model_in": list[0].ModelIn,
-		}
+	for _, row := range page.Logs {
+		redactRequestLog(row.RequestLog, keys)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"failed_count": failedCount,
-		"latest":       summary,
-		"logs":         list,
-	})
+	var latest any
+	if len(page.Logs) > 0 {
+		row := page.Logs[0]
+		latest = map[string]any{"id": row.ID, "error": row.Error, "ts_recv": row.TSRecv, "upstream": row.UpstreamName, "endpoint": row.Endpoint, "model_in": row.ModelIn}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"failed_count": page.FailedCount, "latest": latest, "logs": page.Logs, "next_cursor": page.NextCursor})
 }
 
-type failedLogCounter interface {
-	ListRequestLogs(store.RequestLogFilter) ([]*model.RequestLog, error)
-}
-
-func countFailedRequestLogs(st failedLogCounter) (int, error) {
-	n := 0
-	var before int64
-	for {
-		page, err := st.ListRequestLogs(store.RequestLogFilter{
-			OnlyFailed: true, Limit: store.MaximumPageLimit, BeforeID: before,
-		})
-		if err != nil {
-			return 0, err
-		}
-		if len(page) == 0 {
-			return n, nil
-		}
-		n += len(page)
-		before = page[len(page)-1].ID
-		if len(page) < store.MaximumPageLimit {
-			return n, nil
-		}
-	}
+func redactRequestLog(row *model.RequestLog, keys []string) {
+	row.Error = sample.RedactDiagnosticText(row.Error, keys)
+	row.RetryReason = sample.RedactDiagnosticText(row.RetryReason, keys)
+	row.UpstreamName = sample.RedactDiagnosticText(row.UpstreamName, keys)
+	row.ModelIn = sample.RedactDiagnosticText(row.ModelIn, keys)
+	row.ModelOut = sample.RedactDiagnosticText(row.ModelOut, keys)
+	row.ReqID = sample.RedactDiagnosticText(row.ReqID, keys)
+	row.Endpoint = sample.RedactDiagnosticText(row.Endpoint, keys)
 }
 
 // getRetryStats 汇总重试效果（M6）。
