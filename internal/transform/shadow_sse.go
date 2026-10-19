@@ -1,10 +1,10 @@
 package transform
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/279814/relay-gate/internal/security"
 	"hash"
 )
 
@@ -31,12 +31,8 @@ func (s *SSEShadow) WithSensitiveValues(values []string) *SSEShadow {
 }
 
 func (s *SSEShadow) sensitive(body []byte) bool {
-	for _, value := range s.sensitiveValues {
-		if value != "" && bytes.Contains(body, []byte(value)) {
-			return true
-		}
-	}
-	return false
+	text := string(body)
+	return security.RedactSecrets(text, s.sensitiveValues) != text
 }
 
 // NewSSEShadow starts a per-stream shadow accumulator for c.
