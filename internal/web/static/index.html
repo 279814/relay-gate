@@ -840,6 +840,32 @@
                   <option value="info">info</option>
                 </select>
               </div>
+              <div class="field" style="max-width:140px">
+                <label>Route ID</label>
+                <input type="number" min="1" step="1" x-model="security.routeID" @change="loadSecurityFindings()" placeholder="全部 Route">
+              </div>
+              <div class="field" style="max-width:220px">
+                <label>类别</label>
+                <input maxlength="64" x-model="security.category" @change="loadSecurityFindings()" placeholder="全部类别">
+              </div>
+              <div class="field">
+                <label>发现时间从</label>
+                <input type="datetime-local" x-model="security.fromTime" @change="loadSecurityFindings()">
+              </div>
+              <div class="field">
+                <label>发现时间至</label>
+                <input type="datetime-local" x-model="security.toTime" @change="loadSecurityFindings()">
+              </div>
+            </div>
+            <div class="bar">
+              <span class="dim" x-show="security.loading">正在读取筛选后的发现…</span>
+              <span class="dim" x-show="!security.loading && !security.findingsError" x-text="'本页 ' + security.findings.length + ' 条；筛选总计 ' + security.total + ' 条'"></span>
+              <span class="grow"></span>
+              <button :disabled="security.loading || !security.pageCursor" @click="loadSecurityFindings()">回到首页</button>
+              <button :disabled="security.loading || !security.nextCursor" @click="nextSecurityFindings()">下一页</button>
+            </div>
+            <p role="alert" x-show="security.findingsError" x-text="security.findingsError"></p>
+            <div class="row" style="margin-bottom:12px">
               <div class="field" style="flex:1">
                 <label>诊断扫描文本</label>
                 <input x-model="security.scanText" placeholder="粘贴响应片段（仅本地规则）">
@@ -854,18 +880,29 @@
               <button @click="runSecurityCanary()">运行 Canary</button>
             </div>
             <table>
-              <thead><tr><th>时间</th><th>级别</th><th>类别</th><th>摘要</th><th>来源</th></tr></thead>
+              <thead><tr><th>时间</th><th>级别</th><th>规则 / 类别</th><th>上游 / Route</th><th>脱敏证据与扫描事实</th><th>来源</th></tr></thead>
               <tbody>
                 <template x-for="f in (security.findings || [])" :key="f.id">
                   <tr>
-                    <td class="mono" x-text="f.at_ms"></td>
+                    <td class="nowrap dim" x-text="fmtTime(f.at_ms)"></td>
                     <td x-text="f.severity"></td>
-                    <td x-text="f.category"></td>
-                    <td class="wrap" x-text="f.summary"></td>
+                    <td><div x-text="f.rule_id || '历史规则身份未知'"></div><span class="dim" x-text="f.category"></span></td>
+                    <td><div x-text="f.upstream || '未记录上游'"></div><span class="dim" x-text="f.route_id ? 'Route ' + f.route_id : '未记录 Route'"></span></td>
+                    <td class="wrap">
+                      <details>
+                        <summary x-text="f.summary"></summary>
+                        <pre class="wrap" x-text="f.detail || '未保留脱敏片段'"></pre>
+                        <div class="dim" x-text="'Scanner ' + (f.scanner_version || '未知') + ' · Rules ' + (f.rule_version || '未知')"></div>
+                        <div class="dim" x-text="'扫描字节 ' + (f.scanner_version ? (f.bytes_scanned ?? '未知') : '未知') + ' · 解码深度 ' + (f.scanner_version ? (f.decode_depth ?? '未知') : '未知')"></div>
+                        <div class="dim" x-text="f.truncated ? '扫描已截断；缺失部分没有安全结论' : '未标记扫描截断'"></div>
+                        <div class="dim" x-show="f.incomplete_reason" x-text="f.incomplete_reason"></div>
+                        <div class="mono wrap dim" x-text="f.evidence_hash ? '脱敏证据 SHA-256 ' + f.evidence_hash : '未记录证据指纹'"></div>
+                      </details>
+                    </td>
                     <td x-text="f.source"></td>
                   </tr>
                 </template>
-                <tr x-show="!(security.findings || []).length"><td colspan="5" class="empty">暂无 finding</td></tr>
+                <tr x-show="!security.loading && !security.findingsError && !security.findings.length"><td colspan="6" class="empty">当前筛选暂无 finding</td></tr>
               </tbody>
             </table>
             <h3 style="font-size:13px;margin:18px 0 8px">SMTP 告警</h3>
