@@ -45,10 +45,13 @@ func (p *trafficProgress) fail(reason model.ObserverIncompleteReason) {
 }
 
 func (p *trafficProgress) accept(event ProtocolEvent, at time.Time) {
-	if !event.Semantic {
-		return
-	}
 	p.update(func(state *health.ResponseProgress) {
+		if state.FirstEventAt.IsZero() {
+			state.FirstEventAt = at
+		}
+		if !event.Semantic {
+			return
+		}
 		if state.FirstSemanticAt.IsZero() {
 			state.FirstSemanticAt = at
 		}

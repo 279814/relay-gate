@@ -573,7 +573,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		}
 	}
 	if syn, ok := compiled.AppendSyntheticEnd(); ok {
-		_ = writeEv(syn)
+		if err := writeEv(syn); err == nil {
+			res.SyntheticCompletion = true
+		}
 		hitAll = append(hitAll, "sse_append_end")
 	}
 	if len(hitAll) > 0 && record != nil {

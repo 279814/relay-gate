@@ -12,11 +12,13 @@ import (
 // TargetInput 是调用方视角的一次解析请求：它只知道「哪个站的哪个端点」，
 // 不需要自己去取 Endpoint 记录。
 type TargetInput struct {
-	Upstream         *model.ProbeUpstreamConfig
-	Endpoint         model.EndpointKind
-	IncomingRawQuery string
-	Values           ValueResolver
-	Use              ResolveUse
+	// CapturedEndpoints is the request's immutable published root, when known.
+	CapturedEndpoints EndpointConfigSource
+	Upstream          *model.ProbeUpstreamConfig
+	Endpoint          model.EndpointKind
+	IncomingRawQuery  string
+	Values            ValueResolver
+	Use               ResolveUse
 }
 
 // EndpointConfigSource 取一条已物化的 Endpoint 配置。
@@ -57,7 +59,11 @@ func (provider *Provider) ResolveTarget(ctx context.Context, in TargetInput) (Re
 	if !in.Endpoint.Valid() {
 		return ResolvedTarget{}, model.WrapValidation("endpoint 无效: %q", in.Endpoint)
 	}
-	endpoint, err := provider.endpoints.Endpoint(ctx, in.Upstream.ID, in.Endpoint)
+	source := provider.endpoints
+	if in.CapturedEndpoints != nil {
+		source = in.CapturedEndpoints
+	}
+	endpoint, err := source.Endpoint(ctx, in.Upstream.ID, in.Endpoint)
 	if err != nil {
 		return ResolvedTarget{}, fmt.Errorf("读取 upstream %d 的 %s endpoint: %w",
 			in.Upstream.ID, in.Endpoint, err)

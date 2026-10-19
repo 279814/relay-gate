@@ -1,14 +1,14 @@
 /* Recent errors: failed metadata, bounded pages, plain text only (§13.2). */
 const initialState = () => ({
   failed_count: 0, latest: null, logs: [], open: false, loading: false, next_cursor: '',
-  upstream_id: '', route_id: '', protocol: '', outcome: '', from_time: '', to_time: '',
+  upstream_id: '', route_id: '', protocol: '', outcome: '', error_class: '', from_time: '', to_time: '',
 });
-const filterFields = ['upstream_id', 'route_id', 'protocol', 'outcome', 'from_time', 'to_time'];
+const filterFields = ['upstream_id', 'route_id', 'protocol', 'outcome', 'error_class', 'from_time', 'to_time'];
 const filterIdentity = state => JSON.stringify(filterFields.map(key => state[key]));
 
 function filterQuery(state) {
   const query = new URLSearchParams({limit: '50'});
-  for (const key of ['upstream_id', 'route_id', 'protocol', 'outcome']) {
+  for (const key of ['upstream_id', 'route_id', 'protocol', 'outcome', 'error_class']) {
     if (state[key]) query.set(key, String(state[key]));
   }
   for (const [field, parameter] of [['from_time', 'from_ms'], ['to_time', 'to_ms']]) {
@@ -96,9 +96,11 @@ export function createRecentErrorsFeature(shell, api) {
     await Promise.all([this.loadCapabilities(true), this.loadReachability(true)]);
   };
   shell.openRecentErrorExecutions = async function openRecentErrorExecutions(row) {
-    if (!selectProbeFilter(this, 'executions', row)) return;
-    this.closeRecentErrors(); this.tab = 'executions';
-    await this.loadExecutions(true);
+    if (!row.metadata?.execution_id || !row.metadata?.execution_stored) {
+      this.err = '此 Attempt 未记录精确 Execution，或详情已超过保留期限'; return;
+    }
+    this.closeRecentErrors();
+    await this.openExecution(row.metadata.execution_id);
   };
   shell.openRecentErrorRequestLogs = async function openRecentErrorRequestLogs(row) {
     if (!row.req_id) { this.err = '历史日志未记录 ReqID'; return; }

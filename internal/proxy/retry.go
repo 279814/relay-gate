@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/protocol"
@@ -87,6 +88,8 @@ func closeSampleTrail(trail []*liveAttempt) {
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
 type liveAttempt struct {
+	metadata    model.AttemptMetadata
+	trace       *outbound.AttemptTrace
 	cand        *router.Candidate
 	at          *Attempt
 	tee         *sample.HeadTail
@@ -353,6 +356,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			// 猜的值 —— 而列表页正是靠它显示「这次试了 3 个站」。
 			for _, l := range oc.logs {
 				l.Attempts = attempt
+				l.Metadata.Attempts = attempt
 			}
 			return oc, true
 		}
@@ -465,9 +469,15 @@ func (h *Handler) dispatch(r *http.Request,
 		return nil, dispatchFatal
 	}
 	instr := health.NoopInstrumentation()
+	executionID := sample.NewReqID()
+	observeCtx := r.Context()
+	if pre.published != nil {
+		observeCtx = livecfg.WithCapturedProbeSnapshot(observeCtx, pre.published.Probe)
+	}
 	if h.observers != nil {
-		instr = prepareInstrumentation(h.observers, r.Context(), health.AttemptTarget{
-			ReqID: reqID, Attempt: attempt,
+		instr = prepareInstrumentation(h.observers, observeCtx, health.AttemptTarget{
+			ExecutionID: executionID,
+			ReqID:       reqID, Attempt: attempt,
 			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, HealthGeneration: cand.HealthGeneration,
 			Config: health.AttemptConfigFacts{
 				Generation:                 pre.snapshot.Generation,
@@ -487,7 +497,7 @@ func (h *Handler) dispatch(r *http.Request,
 			})
 		}
 	}()
-	target, err := h.resolveTarget(r, cand, kind)
+	target, err := h.resolveTarget(r, pre, cand, kind)
 	if err != nil {
 		if (errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) || errors.Is(err, outbound.ErrURLConfig)) &&
 			r.Context().Err() == nil {
@@ -523,6 +533,7 @@ func (h *Handler) dispatch(r *http.Request,
 	}
 	outHeader, outBody := prepared.header, prepared.body
 	compiled, verID, redactKeys := prepared.compiled, prepared.version, prepared.keys
+	configFacts.RequestTransformRevision = pre.transforms.BindingRevision(cand.Route.ID, target.EndpointID)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
@@ -585,10 +596,12 @@ func (h *Handler) dispatch(r *http.Request,
 		beforeSend()
 	}
 	sendCtx := r.Context()
-	if instr.Trace != nil {
-		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
-		instr.Trace.MarkSent(time.Now())
+	trace := instr.Trace
+	if trace == nil {
+		trace = &outbound.AttemptTrace{}
 	}
+	sendCtx = outbound.WithAttemptTrace(sendCtx, trace)
+	trace.MarkSent(time.Now())
 	at := fwd.Send(sendCtx, r.Method, target.RawURL, outHeader, outBody)
 	if instr.Observer != nil && at.Result() != nil && at.Result().Status > 0 {
 		instr.Observer.TryHeaders(at.Result().Status, at.Result().RespHeaders, time.Now())
@@ -596,6 +609,7 @@ func (h *Handler) dispatch(r *http.Request,
 	handedOff = true
 
 	return &liveAttempt{
+		metadata: preparedAttemptMetadata(pre, cand, target, prepared, executionID, instr.ObservationPrepared), trace: trace,
 		cand: cand, at: at, tee: tee,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
@@ -842,7 +856,8 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 	}
 
 	l := &model.RequestLog{
-		ReqID: reqID, Attempt: attempt,
+		Metadata: la.metadata,
+		ReqID:    reqID, Attempt: attempt,
 		TSRecv:      recvAt.UnixMilli(),
 		TSSent:      msOrZero(res.SentAt),
 		TSFirstByte: msOrZero(res.FirstByteAt),
@@ -879,6 +894,14 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 		// 可能把 key 放在 query 里（§7.1）。
 		l.Error = sample.RedactDiagnosticText(res.Err.Error(), la.keys)
 	}
+	l.Metadata.Attempt = attempt
+	l.Metadata.Retried, l.Metadata.HalfOpen, l.Metadata.DuplicateRisk = l.Retried, l.HalfOpen, l.DuplicateRisk
+	l.Metadata.RetryReason = l.RetryReason
+	l.Metadata.ResponseHeaderAtMS = msOrZero(res.ResponseHeaderAt)
+	l.Metadata.FirstEventAtMS = msOrZero(res.FirstEventAt)
+	l.Metadata.FirstSemanticAtMS = msOrZero(res.FirstSemanticAt)
+	l.Metadata.SyntheticCompletion = res.SyntheticCompletion
+	l.Metadata.RequestWriteState = attemptRequestWriteState(la)
 	return l
 }
 

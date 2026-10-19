@@ -16,13 +16,15 @@ type attemptTraceKey struct{}
 type AttemptTrace struct {
 	mu sync.Mutex
 
-	SentAt           time.Time
-	TLSStartAt       time.Time
-	TLSDoneAt        time.Time
-	GotConnAt        time.Time
-	ResponseHeaderAt time.Time
-	DoneAt           time.Time
-	Reused           bool
+	SentAt             time.Time
+	TLSStartAt         time.Time
+	TLSDoneAt          time.Time
+	GotConnAt          time.Time
+	ResponseHeaderAt   time.Time
+	DoneAt             time.Time
+	Reused             bool
+	RequestWrittenAt   time.Time
+	RequestWriteFailed bool
 }
 
 // WithAttemptTrace 把 trace 挂到 ctx，供 dialer/transport 钩子写入。
@@ -103,6 +105,15 @@ func (t *AttemptTrace) MarkDone(at time.Time) {
 	})
 }
 
+func (t *AttemptTrace) MarkRequestWritten(at time.Time, err error) {
+	t.mark(func(x *AttemptTrace) {
+		if x.RequestWrittenAt.IsZero() {
+			x.RequestWrittenAt = at
+			x.RequestWriteFailed = err != nil
+		}
+	})
+}
+
 // Snapshot 返回深拷贝（Finish 后读）。
 func (t *AttemptTrace) Snapshot() AttemptTraceSnapshot {
 	if t == nil {
@@ -111,25 +122,29 @@ func (t *AttemptTrace) Snapshot() AttemptTraceSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return AttemptTraceSnapshot{
-		SentAt:           t.SentAt,
-		TLSStartAt:       t.TLSStartAt,
-		TLSDoneAt:        t.TLSDoneAt,
-		GotConnAt:        t.GotConnAt,
-		ResponseHeaderAt: t.ResponseHeaderAt,
-		DoneAt:           t.DoneAt,
-		Reused:           t.Reused,
+		SentAt:             t.SentAt,
+		TLSStartAt:         t.TLSStartAt,
+		TLSDoneAt:          t.TLSDoneAt,
+		GotConnAt:          t.GotConnAt,
+		ResponseHeaderAt:   t.ResponseHeaderAt,
+		DoneAt:             t.DoneAt,
+		Reused:             t.Reused,
+		RequestWrittenAt:   t.RequestWrittenAt,
+		RequestWriteFailed: t.RequestWriteFailed,
 	}
 }
 
 // AttemptTraceSnapshot 是无锁的只读副本。
 type AttemptTraceSnapshot struct {
-	SentAt           time.Time
-	TLSStartAt       time.Time
-	TLSDoneAt        time.Time
-	GotConnAt        time.Time
-	ResponseHeaderAt time.Time
-	DoneAt           time.Time
-	Reused           bool
+	RequestWrittenAt   time.Time
+	RequestWriteFailed bool
+	SentAt             time.Time
+	TLSStartAt         time.Time
+	TLSDoneAt          time.Time
+	GotConnAt          time.Time
+	ResponseHeaderAt   time.Time
+	DoneAt             time.Time
+	Reused             bool
 }
 
 // LastConnectMS / LastTLSMS 按 §4.4 规则重建；非法次序归零。

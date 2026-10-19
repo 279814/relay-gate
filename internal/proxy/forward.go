@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,8 +67,11 @@ func RealTimeouts(s model.Settings) Timeouts {
 
 // Result 是一次转发的结果，供健康判定与样本记录使用。
 type Result struct {
-	Status      int
-	RespHeaders http.Header
+	ResponseHeaderAt    time.Time
+	FirstEventAt        time.Time
+	SyntheticCompletion bool
+	Status              int
+	RespHeaders         http.Header
 	// FirstByteAt 是收到响应体首字节的时刻。零值表示始终没收到。
 	// 样本 TSFirstByte 用它；不等同于 TTFT（见 FirstSemanticAt）。
 	FirstByteAt time.Time
@@ -257,12 +261,21 @@ func (f *Forwarder) Send(ctx context.Context, method, outURL string,
 	ctx, cancel := context.WithDeadline(clientCtx, res.SentAt.Add(f.Timeouts.Total))
 	at.ctx, at.cancel = ctx, cancel
 	req = req.WithContext(ctx)
+	if trace := outbound.TraceFromContext(ctx); trace != nil {
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) { trace.MarkRequestWritten(time.Now(), info.Err) }}))
+	}
 	deadline, kind := f.Timeouts.pendingDeadline(res.SentAt, false, time.Time{}, time.Time{}, time.Time{}, false, 0)
 	var timedOut atomic.Int32
 	headerDone := make(chan struct{})
 	headerTimer := time.AfterFunc(time.Until(deadline), func() { defer close(headerDone); timedOut.Store(kind); cancel() })
 	defer headerTimer.Stop()
 	resp, err := f.Transport.RoundTrip(req)
+	if resp != nil {
+		res.ResponseHeaderAt = time.Now()
+		if trace := outbound.TraceFromContext(ctx); trace != nil {
+			trace.MarkResponseHeader(res.ResponseHeaderAt)
+		}
+	}
 	if !headerTimer.Stop() {
 		<-headerDone
 	}

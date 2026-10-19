@@ -279,7 +279,9 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 	}
 	var snap *livecfg.ProbeSnapshot
 	var err error
-	if cached, ok := m.cfg.(interface {
+	if captured := livecfg.CapturedProbeSnapshot(ctx); captured != nil {
+		snap = captured
+	} else if cached, ok := m.cfg.(interface {
 		CachedProbeSnapshot() (*livecfg.ProbeSnapshot, error)
 	}); ok {
 		snap, err = cached.CachedProbeSnapshot()
@@ -348,9 +350,10 @@ func (m *TrafficObserverManager) PrepareAttempt(ctx context.Context, target heal
 		go obs.worker()
 	}
 	return health.AttemptInstrumentation{
-		Observer: obs,
-		Retry:    NewRetryDecider(target.Protocol),
-		Trace:    trace,
+		ObservationPrepared: true,
+		Observer:            obs,
+		Retry:               NewRetryDecider(target.Protocol),
+		Trace:               trace,
 	}
 }
 

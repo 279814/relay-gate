@@ -13,6 +13,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/httpbody"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
@@ -293,18 +294,23 @@ func (h *Handler) authValues(cand *router.Candidate) outbound.Values {
 // endpoint 由调用方按**入站端点**给出，不由 Protocol 推导：count_tokens 不是
 // 第四种协议，而是 Anthropic 协议下的一个附加端点，用 Protocol 推会把它
 // 解析成 /v1/messages。
-func (h *Handler) resolveTarget(r *http.Request, cand *router.Candidate,
+func (h *Handler) resolveTarget(r *http.Request, pre *preambleResult, cand *router.Candidate,
 	kind model.EndpointKind) (outbound.ResolvedTarget, error) {
 
 	if h.targets == nil {
 		return outbound.ResolvedTarget{}, errors.New("未装配出站目标解析器")
 	}
+	var captured outbound.EndpointConfigSource
+	if pre.published != nil && pre.published.Probe != nil {
+		captured = pre.published.Probe
+	}
 	return h.targets.ResolveTarget(r.Context(), outbound.TargetInput{
-		Upstream:         cand.Upstream.ProbeConfig(),
-		Endpoint:         kind,
-		IncomingRawQuery: r.URL.RawQuery,
-		Values:           h.authValues(cand),
-		Use:              outbound.ResolveRealForward,
+		CapturedEndpoints: captured,
+		Upstream:          cand.Upstream.ProbeConfig(),
+		Endpoint:          kind,
+		IncomingRawQuery:  r.URL.RawQuery,
+		Values:            h.authValues(cand),
+		Use:               outbound.ResolveRealForward,
 	})
 }
 
@@ -327,6 +333,7 @@ func (h *Handler) handle(proto model.Protocol) http.HandlerFunc {
 
 // preambleResult 是 preamble 已经完成的那几步的产物。
 type preambleResult struct {
+	published  *livecfg.PublishedConfig
 	settings   model.Settings
 	body       []byte
 	inModel    string
@@ -450,7 +457,15 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 	// 5. 读配置快照
 	var snap *router.Snapshot
 	var settings model.Settings
-	if published, ok := h.cfg.(interface {
+	var root *livecfg.PublishedConfig
+	if source, ok := h.cfg.(interface {
+		Bundle() (*livecfg.PublishedConfig, error)
+	}); ok {
+		root, err = source.Bundle()
+		if err == nil && root != nil {
+			snap, settings = root.Routing, root.Settings
+		}
+	} else if published, ok := h.cfg.(interface {
 		SnapshotWithSettings() (*router.Snapshot, model.Settings, error)
 	}); ok {
 		snap, settings, err = published.SnapshotWithSettings()
@@ -471,7 +486,8 @@ func (h *Handler) preamble(w http.ResponseWriter, r *http.Request,
 		transformView = h.transforms.CaptureRoutes(router.CandidateRouteIDs(snap, inModel, proto))
 	}
 	return &preambleResult{
-		settings: settings, body: body, inModel: inModel, snapshot: snap,
+		published: root,
+		settings:  settings, body: body, inModel: inModel, snapshot: snap,
 		encoding: enc, decoded: decoded, transforms: transformView,
 	}, true
 }
@@ -694,13 +710,15 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	// §5.4：入站请求只存一次；每次实际发给上游的请求与上游响应各成一条尝试，
 	// 按发送顺序排列，最终尝试在最后。route-local 跳过从未出网，不在其中。
 	attempts := make([]*model.SampleAttempt, 0, len(oc.trail)+1)
-	for _, la := range oc.trail {
+	for i, la := range oc.trail {
 		attempts = append(attempts, h.sampleAttempt(la.cand, la.body, la.header, la.url,
 			la.tee, la.at.Result(), keys, inModel, recvAt, settings))
+		attempts[len(attempts)-1].Metadata = oc.logs[i].Metadata
 		la.tee = nil
 	}
 	final := h.sampleAttempt(oc.cand, oc.outBody, oc.outHeader, oc.outURL,
 		oc.respTee, oc.res, keys, inModel, recvAt, settings)
+	final.Metadata = oc.logs[len(oc.logs)-1].Metadata
 	attempts = append(attempts, final)
 
 	var flags model.TruncFlags
@@ -709,6 +727,7 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	}
 
 	smp := &model.Sample{
+		Metadata: final.Metadata,
 		// 与这次请求的多行日志同组（M6），便于在「发了哪些字节」与
 		// 「试过哪几个站」之间互跳。
 		ReqID:  oc.reqID,

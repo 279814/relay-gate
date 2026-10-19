@@ -173,7 +173,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
 	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
 	// 所以显式给 EndpointCountTokens 而不是从 Protocol 推。
-	target, err := h.resolveTarget(r, cand, model.EndpointCountTokens)
+	target, err := h.resolveTarget(r, pre, cand, model.EndpointCountTokens)
 	if err != nil {
 		return fmt.Sprintf("解析出站目标失败: %v", err), sent
 	}
