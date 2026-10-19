@@ -14,6 +14,7 @@ type SampleMetadata struct {
 }
 
 type SampleAttemptMetadata struct {
+	Truncated   TruncFlags      `json:"truncated"`
 	ID          int64           `json:"id"`
 	TSRecv      int64           `json:"ts_recv"`
 	TSSent      int64           `json:"ts_sent"`
