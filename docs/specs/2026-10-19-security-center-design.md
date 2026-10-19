@@ -15,7 +15,7 @@
 
 ## 需要17持久字段
 
-- `security_finding` 增加 `upstream_id`、`rule_id`：新真实采集携带已固定的身份；旧行默认0/空表示未知，不能用当前配置重构。内置规则使用固定 ID，自定义规则保留已有 `Rule.ID`；类别仍是类别。
+- `security_finding` 增加 `upstream_id`、`rule_id`：新真实采集携带已固定的身份；旧行默认0/空表示未知，不能用当前配置重构。内置规则为 `builtin:<category>`，自定义规则为 `custom:<原 Rule.ID>`，命名空间避免同名碰撞；聚合使用完整 RuleID，自定义 ID 不可重复，类别仍是类别。
 - `security_finding_review(finding_id, status, revision, updated_at)`：只保存管理决定，关联 finding；未标记的逻辑默认是 open/revision1。
 - `security_ignore_rule(id, scope, rule_id, route_id, expires_at, enabled, revision, created_at, updated_at)`：有限匹配元数据，不保存 Secret、原请求、自由错误或证据。
 - 必要的固定分页/匹配索引及17精确 fingerprint、16→17配对 backup/reader、partial拒绝与恢复合同。DDL 需等16冻结后再固定，当前设计不先造迁移文件。

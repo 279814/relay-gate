@@ -303,11 +303,15 @@ func (r *scanRun) incomplete(reason string, truncated bool) {
 }
 
 func (r *scanRun) add(severity Severity, category, summary, detail string) {
-	if _, ok := r.found[category]; ok {
+	r.addRule("builtin:"+category, severity, category, summary, detail)
+}
+
+func (r *scanRun) addRule(ruleID string, severity Severity, category, summary, detail string) {
+	if _, ok := r.found[ruleID]; ok {
 		return
 	}
-	r.found[category] = Finding{Severity: severity, Category: category, Summary: safeEvidence(summary, r.input.Keys), Detail: safeEvidence(detail, r.input.Keys), Source: "passive"}
-	r.order = append(r.order, category)
+	r.found[ruleID] = Finding{RuleID: ruleID, Severity: severity, Category: category, Summary: safeEvidence(summary, r.input.Keys), Detail: safeEvidence(detail, r.input.Keys), Source: "passive"}
+	r.order = append(r.order, ruleID)
 }
 
 func (r *scanRun) finish() []Finding {
@@ -339,8 +343,8 @@ func (r *scanRun) finish() []Finding {
 	}
 	sort.Strings(reasons)
 	out := make([]Finding, 0, len(r.order))
-	for _, category := range r.order {
-		f := r.found[category]
+	for _, ruleID := range r.order {
+		f := r.found[ruleID]
 		f.ScannerVersion = ScannerVersion
 		f.RuleVersion = r.scanner.version
 		f.BytesScanned = r.bytes

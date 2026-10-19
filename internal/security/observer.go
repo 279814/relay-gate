@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	ScannerVersion = "2"
+	ScannerVersion = "3" // namespaced rule identities survive bounded aggregation
 	RuleVersion    = "2"
 	MaxScanBytes   = 1 << 20 // 1 MiB per response (§14.3)
 )

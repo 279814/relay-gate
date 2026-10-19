@@ -32,6 +32,7 @@ type Finding struct {
 	AtMS             int64    `json:"at_ms"`
 	Severity         Severity `json:"severity"`
 	Category         string   `json:"category"`
+	RuleID           string   `json:"rule_id,omitempty"` // builtin:<category> | custom:<literal Rule.ID>; legacy empty means unknown
 	Summary          string   `json:"summary"`
 	Detail           string   `json:"detail"`
 	Upstream         string   `json:"upstream,omitempty"`
