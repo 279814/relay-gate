@@ -82,7 +82,7 @@
                   ? ((recentErrors.latest.error.length > 80
                       ? recentErrors.latest.error.slice(0, 80) + '…'
                       : recentErrors.latest.error))
-                  : '点击查看全部'"></div>
+                  : (recentErrors?.latest?.metadata?.error_class || '点击查看全部')"></div>
                 <div class="sub" x-text="fmtTime(recentErrors?.latest?.ts_recv)"></div>
                 <button type="button" @click.stop="openRecentErrors()">查看全部</button>
               </div>
