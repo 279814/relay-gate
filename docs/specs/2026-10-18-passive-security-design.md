@@ -14,7 +14,7 @@
 
 规则结合协议位置、角色/工具、代码围栏、HTML 文档/登录/广告、凭据或私上下文请求、注入指令、可疑外链、隐藏 Unicode 与编码载荷。合法脚本单项仅为低等级线索，多信号或已知 Credential 泄漏才升级；不执行任何内容。请求工具列表未知时不假定工具未授权。
 
-默认扫描最多 1 MiB 解码后正文、单个 SSE/NDJSON 事件 256 KiB。Base64、URL、Unicode 解码/规范化最多两层，派生累计字节 4 MiB；扫描执行预算 100 ms（可移植 monotonic 时间保守包含等待，另有确定性字节/工作预算）。规则只允许本地字符串、Unicode、结构条件或 Go RE2，正则模式最多 4 KiB。超限、坏编码、缺口、请求上下文缺失和预算耗尽均记录可解释 incomplete。每条 finding 带 scanner/rule version、bytes_scanned、truncated、decode_depth、incomplete_reason；证据限长并先按已知凭据脱敏。
+默认扫描最多 1 MiB 解码后正文、单个 SSE/NDJSON 事件 256 KiB。Base64、URL、Unicode 解码/规范化最多两层，派生累计字节 4 MiB；扫描执行预算 100 ms（可移植 monotonic 时间保守包含等待，另有确定性字节/工作预算）。规则只允许本地字符串、Unicode、结构条件或 Go RE2，正则模式最多 4 KiB；匹配前按 RE2 程序指令数与窗口字节乘积约束工作量，复杂模式超限则跳过并记录 incomplete。超限、坏编码、缺口、请求上下文缺失和预算耗尽均记录可解释 incomplete。每条 finding 带 scanner/rule version、bytes_scanned、truncated、decode_depth、incomplete_reason；证据限长并先按已知凭据脱敏；凭据上下文丢失时不保存原始证据。协议 index 区分文本通道，工具名 delta 有界聚合后才核对授权。
 
 旧 `ScanText` 与手动扫描委托同一引擎，不能绕过资源或元数据边界。每次扫描只保存有限证据；队满计 dropped 并由后台记录/告警，主链不等待持久化。
 
