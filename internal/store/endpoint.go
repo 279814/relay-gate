@@ -412,6 +412,9 @@ func (store *Store) UpdateEndpoint(endpoint *model.UpstreamEndpoint, expectedRev
 	if err != nil {
 		return err
 	}
+	if err = clearStaleRouteHealthTx(context.Background(), tx, `route_id IN (SELECT id FROM route WHERE upstream_id=?)`, false, endpoint.UpstreamID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

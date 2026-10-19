@@ -45,8 +45,12 @@ func TestProbeCLI_FlagMode_AllEndpointsAgainstRelayShapes(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer "+fakeRelayKey {
-			fail("path %s: bad Authorization", r.URL.Path)
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			if r.Header.Get("X-Api-Key") != fakeRelayKey || r.Header.Get("Authorization") != "" {
+				fail("path %s: bad canonical Anthropic Auth", r.URL.Path)
+			}
+		} else if r.Header.Get("Authorization") != "Bearer "+fakeRelayKey || r.Header.Get("X-Api-Key") != "" {
+			fail("path %s: bad canonical OpenAI Auth", r.URL.Path)
 		}
 		var body map[string]any
 		if r.Method == http.MethodPost {
@@ -108,7 +112,7 @@ func TestProbeCLI_FlagMode_AllEndpointsAgainstRelayShapes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runProbeCLI([]string{
 		"probe-matrix", "--online", "--accept-probe-cost",
-		"--base-url", srv.URL + "/v1/", "--key-env", "RELAY_TEST_KEY",
+		"--base-url", srv.URL, "--key-env", "RELAY_TEST_KEY",
 		"--claude-model", "claude-x", "--gpt-model", "gpt-x", "--name", "relay",
 	}, nil, &stdout, &stderr, probeCLIDeps{transport: srv.Client().Transport, getenv: relayEnv})
 
@@ -166,7 +170,7 @@ func TestProbeCLI_RelayStreamErrorShapes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runProbeCLI([]string{
 		"probe-matrix", "--online", "--accept-probe-cost",
-		"--base-url", srv.URL, "--claude-model", "claude-x", "--gpt-model", "gpt-x",
+		"--base-url", srv.URL, "--key-env", "RELAY_TEST_KEY", "--claude-model", "claude-x", "--gpt-model", "gpt-x",
 	}, nil, &stdout, &stderr, probeCLIDeps{transport: srv.Client().Transport, getenv: relayEnv})
 	if code != exitFail {
 		t.Fatalf("code=%d stdout=%s", code, stdout.String())
@@ -217,7 +221,7 @@ func TestProbeCLI_StopsReadingAfterFirstSemantic(t *testing.T) {
 	go func() {
 		done <- runProbeCLI([]string{
 			"probe-matrix", "--online", "--accept-probe-cost",
-			"--base-url", srv.URL, "--claude-model", "claude-x",
+			"--base-url", srv.URL, "--key-env", "RELAY_TEST_KEY", "--claude-model", "claude-x",
 		}, nil, &stdout, io.Discard, probeCLIDeps{transport: srv.Client().Transport, getenv: relayEnv})
 	}()
 	select {

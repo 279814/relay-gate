@@ -177,6 +177,11 @@ func (s *Store) UpdateModelNameWithRevision(ctx context.Context, value *model.Mo
 			return err
 		}
 	}
+	if semanticChanged || (!current.Enabled && value.Enabled) {
+		if err = clearStaleRouteHealthTx(ctx, tx, `route_id IN (SELECT id FROM route WHERE model_name_id=?)`, true, value.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

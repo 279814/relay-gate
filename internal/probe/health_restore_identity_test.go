@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/observationseq"
 	"github.com/279814/relay-gate/internal/outbound"
@@ -45,6 +46,7 @@ func TestRouteHealthBoundProbeSecretChangeCannotReviveNegative(t *testing.T) {
 	if _, err := st.UpdateProbeSecret(secret.ID, secret.Revision, []byte("replacement-bound-health-auth")); err != nil {
 		t.Fatal(err)
 	}
+	assertDurableHealthState(t, st, route.ID, false)
 	after, err := st.Endpoint(context.Background(), up.ID, model.EndpointMessages)
 	if err != nil || after.Revision != before.Revision {
 		t.Fatal("test must change only the bound Secret revision")
@@ -84,6 +86,7 @@ func TestRouteHealthL1RestorationUsesOnlyItsActualStagePolicy(t *testing.T) {
 			if _, err := st.SaveSettingsWithRevision(settings, revision); err != nil {
 				t.Fatal(err)
 			}
+			assertDurableHealthState(t, st, route.ID, !related)
 			freshCfg, _ := restoreTestDeps(st)
 			fresh := health.NewTracker(freshCfg)
 			n, err := RestoreRouteHealth(context.Background(), fresh, st, freshCfg)
@@ -161,21 +164,8 @@ func TestRouteHealthRecipePublishAfterActualTestRejectsOldSnapshot(t *testing.T)
 	if err := st.SaveRouteHealth([]*store.RouteHealth{row}); err != nil {
 		t.Fatal(err)
 	}
-	cfg, recipes := restoreTestDeps(st)
-	if _, err := cfg.Bundle(); err != nil {
-		t.Fatal(err)
-	}
-	transport := outbound.NewManager()
-	defer transport.CloseIdleConnections()
-	executor := NewExecutor(outbound.NewProvider(cfg, st, outbound.NewResolver(testHasher{})), st, recipes, ManagerTransports{Manager: transport}, NewExecutionOnlyRecorder(st), AlwaysOpenAdmission(), WallClock(), discardLogger())
 	ctx := context.Background()
-	seq, err := observationseq.Open(ctx, st)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer seq.Close()
-	manual := NewScheduler(cfg, health.NewTracker(cfg), health.NewReachabilityTracker(cfg), discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
-	admin := NewService(st, executor, nil, cfg, nil, nil).WithManualPreparer(manual)
+	cfg, admin := healthRestoreAdmin(t, st)
 	recipe, err := admin.CreateRecipe(ctx, model.RecipeScopeRoute, route.ID, model.EndpointMessages)
 	if err != nil {
 		t.Fatal(err)
@@ -195,10 +185,29 @@ func TestRouteHealthRecipePublishAfterActualTestRejectsOldSnapshot(t *testing.T)
 	if _, err := admin.Publish(ctx, recipe.ID, version.ID, tested.ID, recipe.Revision, false); err != nil {
 		t.Fatal(err)
 	}
+	assertDurableHealthState(t, st, route.ID, false)
 	fresh := health.NewTracker(cfg)
 	if n, err := RestoreRouteHealth(ctx, fresh, st, cfg); err != nil || n != 0 || fresh.State(route.ID) != model.StateUnknown {
 		t.Fatalf("old embedded absence survived publish: n=%d state=%s err=%v", n, fresh.State(route.ID), err)
 	}
+}
+
+func healthRestoreAdmin(t *testing.T, st *store.Store) (*livecfg.Source, *Service) {
+	t.Helper()
+	cfg, recipes := restoreTestDeps(st)
+	if _, err := cfg.Bundle(); err != nil {
+		t.Fatal(err)
+	}
+	transport := outbound.NewManager()
+	t.Cleanup(transport.CloseIdleConnections)
+	executor := NewExecutor(outbound.NewProvider(cfg, st, outbound.NewResolver(testHasher{})), st, recipes, ManagerTransports{Manager: transport}, NewExecutionOnlyRecorder(st), AlwaysOpenAdmission(), WallClock(), discardLogger())
+	seq, err := observationseq.Open(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { seq.Close() })
+	manual := NewScheduler(cfg, health.NewTracker(cfg), health.NewReachabilityTracker(cfg), discardLogger()).WithRecipes(recipes).WithExecutor(executor).WithSequencer(seq)
+	return cfg, NewService(st, executor, nil, cfg, nil, nil).WithManualPreparer(manual)
 }
 
 func TestRouteHealthNewReducerPolicyDoesNotReuseOldCounters(t *testing.T) {
