@@ -1,0 +1,1 @@
+ALTER TABLE sample_attempt_metadata ADD COLUMN response_capture_view TEXT NOT NULL DEFAULT 'legacy' CHECK (response_capture_view IN ('legacy','upstream_response','upstream_attempt_prefix','no_response','omitted_secret','omitted_unverified'));

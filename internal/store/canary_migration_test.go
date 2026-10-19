@@ -50,7 +50,7 @@ func TestCanaryMigrationPreservesSchemaThirteenAndPairsBackup(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 14 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("canary schema=%+v err=%v", state, err)
 	}
 	var after []byte
@@ -104,7 +104,7 @@ func TestCanaryMigrationBackupFailureLeavesThirteen(t *testing.T) {
 }
 
 func TestCanaryRotationBackupPinsReaderAndRestoresFacts(t *testing.T) {
-	st := testStore(t)
+	st, _ := schemaFourteenSampleFixture(t)
 	route := mkRoute(t, st)
 	execution := model.ProbeExecution{ID: "canary-paired-fact", Trigger: model.TriggerManual, UpstreamID: route.UpstreamID, RouteID: route.ID,
 		Endpoint: model.EndpointMessages, RecipeBindingUse: model.BindingResolved, RecipeStorage: model.RecipeStorageEmbedded, RecipeOrigin: model.RecipeBasic,
