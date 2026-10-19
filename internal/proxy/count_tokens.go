@@ -75,11 +75,7 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		if err != nil || cand == nil {
 			return false
 		}
-		if pre.compressedNeedsMapping(cand.Route) {
-			tried[cand.Route.ID] = true
-			cand.Release()
-			continue
-		}
+
 		// recovering 须占 RecoveryGate（§9.1 / §9.4）；拿不到则跳过，不排队。
 		wrapped, ok := h.wrapRecoveryIfNeeded(cand)
 		if !ok {
@@ -91,7 +87,7 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		tried[cand.Route.ID] = true
 		// §9.4: Release on panic after acquire (defer runs while unwinding;
 		// do not recover here — panic must not start another upstream attempt).
-		reason := func() string {
+		reason, sent := func() (string, bool) {
 			defer cand.Release()
 			return h.proxyCountTokens(w, r, pre, cand, time.Until(deadline))
 		}()
@@ -100,7 +96,7 @@ func (h *Handler) tryCountTokensPass(w http.ResponseWriter, r *http.Request,
 		}
 		h.log.Info("count_tokens 转发未成功，尝试下一 Route",
 			"model", pre.inModel, "upstream", cand.Upstream.Name, "reason", reason)
-		if prefer == preferUnknown {
+		if prefer == preferUnknown && sent {
 			return false
 		}
 	}
@@ -170,25 +166,25 @@ func (h *Handler) countTokensPreferOK(routeID int64, prefer countTokensPrefer) b
 // **不得**在写出响应后再返回非空原因 —— 那会让调用方把兜底结果追加到
 // 已经写出的响应后面，客户端拿到两个拼在一起的 JSON。
 func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
-	pre *preambleResult, cand *router.Candidate, remaining time.Duration) string {
-
-	outBody, err := ReplaceModel(pre.body, cand.Route.UpstreamModel)
-	if err != nil {
-		return fmt.Sprintf("替换 model 失败: %v", err)
-	}
+	pre *preambleResult, cand *router.Candidate, remaining time.Duration) (reason string, sent bool) {
 
 	// 出站 URL 与真实转发、探活共用同一个 Resolver（§7.1）。
 	// count_tokens 不是第四种协议，而是 Anthropic 协议下的一个附加端点，
 	// 所以显式给 EndpointCountTokens 而不是从 Protocol 推。
 	target, err := h.resolveTarget(r, cand, model.EndpointCountTokens)
 	if err != nil {
-		return fmt.Sprintf("解析出站目标失败: %v", err)
+		return fmt.Sprintf("解析出站目标失败: %v", err), sent
 	}
 	outHeader, err := h.outboundHeaders(r, cand, target, model.ProtoAnthropic)
 	if err != nil {
-		return fmt.Sprintf("改写出站认证失败: %v", err)
+		return fmt.Sprintf("改写出站认证失败: %v", err), sent
 	}
-	redactKeys := append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)
+	prepared, status := h.prepareOutboundRequest(r, pre, cand, target, outHeader)
+	if status != dispatchSent {
+		return "请求转换或压缩映射不可用", sent
+	}
+	outHeader, outBody := prepared.header, prepared.body
+	redactKeys := prepared.keys
 
 	// count_tokens 有自己的 connect 与 total 预算（§7.4）：它是个轻量端点，
 	// 用真实请求那份 30 分钟的总预算会让一个卡住的站把客户端拖到超时，
@@ -197,7 +193,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	budget := outbound.CountTokensBudget(pre.settings).CapTotal(remaining)
 	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), budget.Connect))
 	if err != nil {
-		return fmt.Sprintf("取连接池失败: %v", err)
+		return fmt.Sprintf("取连接池失败: %v", err), sent
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), budget.Total)
@@ -205,7 +201,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.RawURL, bytes.NewReader(outBody))
 	if err != nil {
-		return fmt.Sprintf("构造请求失败: %v", err)
+		return fmt.Sprintf("构造请求失败: %v", err), sent
 	}
 	req.Header = outHeader
 	if target.RequestHost != "" {
@@ -243,16 +239,17 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 		req = req.WithContext(outbound.WithAttemptTrace(req.Context(), instr.Trace))
 	}
 
+	sent = true // only an actual RoundTrip consumes the one unknown observation
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		readErr = err
 		// 客户端自己走了就不该再兜底：连接已经没了，本地算完也写不出去，
 		// 而且会白占一次 CPU。
 		if r.Context().Err() != nil {
-			return ""
+			return "", sent
 		}
 		return fmt.Sprintf("转发失败: %s",
-			sample.RedactDiagnosticText(err.Error(), redactKeys))
+			sample.RedactDiagnosticText(err.Error(), redactKeys)), sent
 	}
 	defer resp.Body.Close()
 	if instr.Observer != nil {
@@ -264,7 +261,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCountTokensResp))
 	if err != nil {
 		readErr = err
-		return fmt.Sprintf("读响应失败: %v", err)
+		return fmt.Sprintf("读响应失败: %v", err), sent
 	}
 	if instr.Observer != nil {
 		instr.Observer.TryChunk(respBody, time.Now())
@@ -282,7 +279,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	if resp.StatusCode >= 400 {
 		safe := sample.RedactDiagnostic(respBody, redactKeys)
 		return fmt.Sprintf("上游返回 %d: %s", resp.StatusCode,
-			collapseSpaces(string(safe), maxCountTokensLogBody))
+			collapseSpaces(string(safe), maxCountTokensLogBody)), sent
 	}
 
 	// 成功。原样回传上游响应体。
@@ -298,7 +295,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	dst.Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
-	return ""
+	return "", sent
 }
 
 const (

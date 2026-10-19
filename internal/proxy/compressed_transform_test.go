@@ -10,8 +10,8 @@ import (
 	"github.com/279814/relay-gate/internal/transform"
 )
 
-var modelRewriteRules = []transform.Rule{
-	{Kind: transform.KindReplaceBytes, From: `"model":"claude-opus-5"`, To: `"model":"rewritten"`},
+var requestBodyRewriteRules = []transform.Rule{
+	{Kind: transform.KindReplaceBytes, From: `"content":"x"`, To: `"content":"rewritten"`},
 }
 
 // publishRequestTransform binds rules to routeID on the harness Endpoint (ID 1).
@@ -38,7 +38,7 @@ func TestCompressedRequest_BodyTransformRouteReturns415WithoutUpstream(t *testin
 	hits := []*atomic.Int32{{}}
 	hs := newHarness(t, hitsByRoute(hits))
 	hs.setMappingRoutes("")
-	hs.publishRequestTransform(t, 100, modelRewriteRules)
+	hs.publishRequestTransform(t, 100, requestBodyRewriteRules)
 	gz := gzipRequestBody(t, compressedReqBody)
 
 	rec := hs.serve(hs.encodedRequest("/v1/messages", "gzip", gz))
@@ -67,7 +67,7 @@ func TestCompressedRequest_SkipsBodyTransformRouteForPlainRoute(t *testing.T) {
 	hs := newHarness(t, hitsByRoute(hits))
 	hs.setMappingRoutes("", "")
 	hs.cfg.settings.RetryMaxAttempts = 1
-	hs.publishRequestTransform(t, 100, modelRewriteRules)
+	hs.publishRequestTransform(t, 100, requestBodyRewriteRules)
 	gz := gzipRequestBody(t, compressedReqBody)
 
 	rec := hs.serve(hs.encodedRequest("/v1/messages", "gzip", gz))
@@ -119,13 +119,13 @@ func TestCompressedRequest_UncompressedBodyTransformStillApplies(t *testing.T) {
 	hits := []*atomic.Int32{{}}
 	hs := newHarness(t, hitsByRoute(hits))
 	hs.setMappingRoutes("")
-	hs.publishRequestTransform(t, 100, modelRewriteRules)
+	hs.publishRequestTransform(t, 100, requestBodyRewriteRules)
 
 	rec := hs.serve(hs.anthropicRequest(compressedReqBody))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	want := strings.Replace(compressedReqBody, `"model":"claude-opus-5"`, `"model":"rewritten"`, 1)
+	want := strings.Replace(compressedReqBody, `"content":"x"`, `"content":"rewritten"`, 1)
 	if string(hs.gotReq.body) != want {
 		t.Fatalf("upstream body =\n%s\nwant\n%s", hs.gotReq.body, want)
 	}

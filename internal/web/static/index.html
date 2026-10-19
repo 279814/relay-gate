@@ -906,6 +906,10 @@
                   <label>草稿规则（JSON 数组）</label>
                   <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
                 </div>
+                <div class="field">
+                  <label><input type="checkbox" x-model="transforms.requestReencode"> 允许压缩请求改写（gzip/br）</label>
+                  <small>仅发布后生效。此绑定退出严格字节透传：重编码会改变原始压缩字节，正文上限 8 MiB。</small>
+                </div>
                 <div class="row">
                   <div class="field">
                     <label>请求失败策略</label>
