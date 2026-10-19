@@ -30,6 +30,9 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 	cand *router.Candidate, target outbound.ResolvedTarget, header http.Header) (preparedRequest, dispatchStatus) {
 
 	out := preparedRequest{header: header, keys: append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)}
+	if pre.encoding != "" {
+		out.tainted = containsAttemptSecret(pre.decoded, out.keys)
+	}
 	if target.EndpointID != 0 {
 		var err error
 		out.compiled, out.version, err = pre.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
@@ -95,7 +98,7 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 		if tr.Taint != nil {
 			secrets := tr.Taint.Secrets()
 			out.keys = append(out.keys, secrets...)
-			out.tainted = len(secrets) > 0
+			out.tainted = out.tainted || len(secrets) > 0
 		}
 		out.metadata.RequestHeadersChanged = !reflect.DeepEqual(beforeHeader, tr.Header)
 		if tr.Changed || tr.Err != nil {
@@ -118,7 +121,7 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 
 	}
 	edge.StripForwardingHeaders(out.header)
-	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody, out.keys)
+	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody, out.keys, out.tainted)
 	if reencode {
 		out.body, err = encodeRequestBody(pre.encoding, out.body, transform.MaxBodyBuffer)
 		if err != nil {
