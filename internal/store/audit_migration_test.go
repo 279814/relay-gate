@@ -88,7 +88,7 @@ func TestAuditSchemaRejectsPartialChangedAndUnknownObjectsWithoutRepair(t *testi
 
 func TestAuditSchemaRotationBackupPinsReaderAndRestoresHistory(t *testing.T) {
 	ctx := context.Background()
-	st := testStore(t)
+	st, _ := schemaElevenAttemptFixture(t)
 	path, cipher := st.path, st.cipher
 	if _, err := st.db.Exec(`INSERT INTO audit_event(operation_id,at_ms,category,action,resource_type,resource_id,actor_hash)
 		VALUES ('0123456789abcdef0123456789abcdef',1,'route','route_disable','route','1',?)`, strings.Repeat("a", 64)); err != nil {
@@ -148,7 +148,7 @@ func TestAuditMigrationPairsSchemaTenBeforeCreatingHistory(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(ctx, current.db)
-	if err != nil || state.Version != 11 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("audit schema=%+v err=%v", state, err)
 	}
 	files, err := filepath.Glob(filepath.Join(filepath.Dir(path), "backups", "schema-10-to-11-*", "manifest.json"))
