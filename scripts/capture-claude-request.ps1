@@ -5,6 +5,8 @@ param(
     [string]$RepositoryRoot,
     [string]$AllowedRoot,
     [string]$OutputPath,
+    [string]$ManifestPath,
+    [string]$Alias,
     [switch]$ValidateIsolationOnly,
     [switch]$ValidateTargetOnly,
     [switch]$ReservePrivateOutput,
@@ -357,6 +359,7 @@ function Assert-ClaudeIsolationCapabilities {
         '--no-session-persistence',
         '--disable-slash-commands',
         '--tools',
+        '--system-prompt',
         '--no-chrome',
         '--max-budget-usd'
     )) {
@@ -460,6 +463,7 @@ function Read-ControlExchange {
         throw "capture_unexpected_request_line"
     }
     $headers = [ordered]@{}
+    $headerEntries = [Collections.Generic.List[object]]::new()
     foreach ($line in $lines[1..($lines.Count - 1)]) {
         $separator = $line.IndexOf(':')
         if ($separator -le 0) {
@@ -467,6 +471,7 @@ function Read-ControlExchange {
         }
         $name = $line.Substring(0, $separator).Trim().ToLowerInvariant()
         $value = $line.Substring($separator + 1).Trim()
+        $headerEntries.Add([ordered]@{ Name = $line.Substring(0, $separator).Trim(); Values = @($value) })
         if ($headers.Contains($name)) {
             $headers[$name] = @($headers[$name]) + @($value)
         } else {
@@ -515,6 +520,7 @@ function Read-ControlExchange {
         Kind = 'messages'
         RequestLine = $lines[0]
         Headers = $headers
+        HeaderEntries = @($headerEntries.ToArray())
         Body = $bodyBytes
     }
 }
@@ -592,6 +598,7 @@ function Start-IsolatedClaudeProcess {
         '--mcp-config', $MCPPath,
         '--settings', $SettingsPath,
         '--tools', '',
+        '--system-prompt', 'Reply with 2 only.',
         '--disable-slash-commands',
         '--no-chrome',
         '--output-format', 'json',
@@ -607,6 +614,249 @@ function Start-IsolatedClaudeProcess {
         throw "claude_process_start_failed"
     }
     return $process
+}
+
+function Assert-ControlObjectKeys {
+    param([System.Text.Json.JsonElement]$Value, [string[]]$Allowed)
+    if ($Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'capture_control_body_rejected' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $Value.EnumerateObject()) {
+        if (-not $seen.Add($property.Name) -or $Allowed -cnotcontains $property.Name -or $property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) {
+            throw 'capture_control_body_rejected'
+        }
+    }
+}
+
+function Assert-ControlTextBlock {
+    param([System.Text.Json.JsonElement]$Value, [string]$Text, [switch]$System)
+    $allowed = @('type', 'text')
+    if ($System) { $allowed += 'cache_control' }
+    Assert-ControlObjectKeys -Value $Value -Allowed $allowed
+    if ($Value.GetProperty('type').GetString() -cne 'text' -or $Value.GetProperty('text').GetString() -cne $Text) { throw 'capture_control_body_rejected' }
+    $cache = [System.Text.Json.JsonElement]::new()
+    if ($System -and $Value.TryGetProperty('cache_control', [ref]$cache)) {
+        Assert-ControlObjectKeys -Value $cache -Allowed @('type')
+        if ($cache.GetProperty('type').GetString() -cne 'ephemeral') { throw 'capture_control_body_rejected' }
+    }
+}
+
+# This validates every accepted body value. The child isolation flags and a
+# matching nonce do not establish that arbitrary system/metadata are safe.
+function Assert-ControlRequestBody {
+    param([byte[]]$Body, [string]$Nonce, [string]$FakeKey)
+    $document = [System.Text.Json.JsonDocument]::Parse([Text.Encoding]::UTF8.GetString($Body))
+    try {
+        $value = $document.RootElement
+        Assert-ControlObjectKeys -Value $value -Allowed @('model', 'messages', 'max_tokens', 'stream', 'temperature', 'top_p', 'top_k', 'system', 'metadata', 'thinking', 'stop_sequences')
+        $model = $value.GetProperty('model').GetString()
+        if ([string]::IsNullOrEmpty($model) -or $model.Contains('{{', [StringComparison]::Ordinal) -or $model.Contains($FakeKey, [StringComparison]::Ordinal)) { throw 'capture_control_body_rejected' }
+        $limit = $value.GetProperty('max_tokens').GetInt32()
+        if ($limit -le 0) { throw 'capture_control_body_rejected' }
+        foreach ($property in $value.EnumerateObject()) {
+            switch -CaseSensitive ($property.Name) {
+                'stream' { [void]$property.Value.GetBoolean() }
+                'temperature' {
+                    $number = $property.Value.GetDouble()
+                    if ($number -lt 0 -or $number -gt 2) { throw 'capture_control_body_rejected' }
+                }
+                'top_p' {
+                    $number = $property.Value.GetDouble()
+                    if ($number -lt 0 -or $number -gt 1) { throw 'capture_control_body_rejected' }
+                }
+                'top_k' { if ($property.Value.GetInt32() -lt 0) { throw 'capture_control_body_rejected' } }
+                'metadata' { Assert-ControlObjectKeys -Value $property.Value -Allowed @() }
+                'thinking' {
+                    Assert-ControlObjectKeys -Value $property.Value -Allowed @('type')
+                    if ($property.Value.GetProperty('type').GetString() -cne 'disabled') { throw 'capture_control_body_rejected' }
+                }
+                'stop_sequences' {
+                    if ($property.Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $property.Value.GetArrayLength() -ne 0) { throw 'capture_control_body_rejected' }
+                }
+                'system' {
+                    if ($property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                        if ($property.Value.GetString() -cne 'Reply with 2 only.') { throw 'capture_control_body_rejected' }
+                    } else {
+                        if ($property.Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $property.Value.GetArrayLength() -ne 1) { throw 'capture_control_body_rejected' }
+                        Assert-ControlTextBlock -Value $property.Value[0] -Text 'Reply with 2 only.' -System
+                    }
+                }
+            }
+        }
+        $messages = $value.GetProperty('messages')
+        if ($messages.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $messages.GetArrayLength() -ne 1) { throw 'capture_control_body_rejected' }
+        $message = $messages[0]
+        Assert-ControlObjectKeys -Value $message -Allowed @('role', 'content')
+        if ($message.GetProperty('role').GetString() -cne 'user') { throw 'capture_control_body_rejected' }
+        $content = $message.GetProperty('content')
+        $prompt = "1+1=? control:$Nonce"
+        if ($content.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+            if ($content.GetString() -cne $prompt) { throw 'capture_control_body_rejected' }
+        } else {
+            if ($content.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $content.GetArrayLength() -ne 1) { throw 'capture_control_body_rejected' }
+            Assert-ControlTextBlock -Value $content[0] -Text $prompt
+        }
+    } finally { $document.Dispose() }
+}
+
+function Get-ControlProtocolBetas {
+    # Keep the protocol vocabulary anchored in the same reviewed public native
+    # fixtures used by the production shape sanitizer, never in captured input.
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($name in @('prompt-caching-2024-07-31', 'token-counting-2024-11-01', 'fine-grained-tool-streaming-2025-05-14', 'output-128k-2025-02-19')) { [void]$known.Add($name) }
+    $builtin = Join-Path $PSScriptRoot '../internal/probe/builtin'
+    foreach ($file in Get-ChildItem -LiteralPath $builtin -Filter '*.json' -Recurse -File) {
+        $template = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $template.Contains('headers')) { continue }
+        foreach ($header in $template.headers) {
+            if ($header.name -ceq 'anthropic-beta') {
+                foreach ($value in $header.values) {
+                    foreach ($name in $value.Split(',')) { [void]$known.Add($name.Trim()) }
+                }
+            }
+        }
+    }
+    return ,$known
+}
+
+function Assert-ControlHeader {
+    param([string]$Name, [string[]]$Values, [int]$BodyBytes, $KnownBetas)
+    if ($Values.Count -eq 0) { throw 'capture_control_header_rejected' }
+    foreach ($value in $Values) {
+        if ($value.Length -gt 4096 -or $value.Contains("`r") -or $value.Contains("`n") -or $value.Contains('{{', [StringComparison]::Ordinal)) { throw 'capture_control_header_rejected' }
+        $valid = $false
+        switch ($Name.ToLowerInvariant()) {
+            'content-type' {
+                $media = [Net.Mime.ContentType]::new($value)
+                $valid = $media.MediaType -ceq 'application/json' -and ($media.Parameters.Count -eq 0 -or ($media.Parameters.Count -eq 1 -and $media.CharSet -ieq 'utf-8'))
+            }
+            'host' { $valid = $value -cmatch '^(127\.0\.0\.1|\[::1\]):([0-9]{1,5})$' -and [int]$Matches[2] -ge 1 -and [int]$Matches[2] -le 65535 }
+            'content-length' { $valid = $value -ceq ([string]$BodyBytes) }
+            'connection' { $valid = @('close', 'keep-alive') -ccontains $value }
+            'accept' { $valid = @('application/json', 'text/event-stream', '*/*') -ccontains $value }
+            'accept-encoding' {
+                $valid = $true
+                foreach ($coding in $value.Split(',')) { if (@('gzip', 'br', 'deflate', 'identity') -cnotcontains $coding.Trim()) { $valid = $false } }
+            }
+            'anthropic-version' { $valid = $value -ceq '2023-06-01' }
+            'anthropic-beta' {
+                $valid = $true
+                foreach ($beta in $value.Split(',')) { if (-not $KnownBetas.Contains($beta.Trim())) { $valid = $false } }
+            }
+            'user-agent' { $valid = $value -cmatch '^(claude-cli|cc-switch|OpenAI/Python|OpenAI/JS|anthropic-python|anthropic-typescript)/([0-9]{1,2})(\.[0-9]{1,4}){1,3}( \(external, (cli|sdk-cli|claude-vscode)\))?$' }
+            'x-app' { $valid = @('cli', 'claude-code', 'cc-switch') -ccontains $value }
+            'x-stainless-lang' { $valid = @('js', 'python', 'go', 'java', 'kotlin', 'csharp', 'ruby') -ccontains $value }
+            'x-stainless-os' { $valid = @('linux', 'windows', 'macos', 'android', 'ios', 'freebsd') -ccontains $value.ToLowerInvariant() }
+            'x-stainless-arch' { $valid = @('x64', 'arm64', 'x86', 'arm', 'other:unknown') -ccontains $value }
+            { $_ -in @('x-stainless-package-version', 'x-stainless-runtime-version') } { $valid = $value -cmatch '^v?[0-9]{1,3}(\.[0-9]{1,4}){1,3}$' }
+            'x-stainless-runtime' { $valid = @('node', 'deno', 'bun', 'python', 'go', 'jvm', 'dotnet', 'ruby') -ccontains $value }
+            'x-stainless-retry-count' { $valid = @('0', '1', '2', '3', '4', '5') -ccontains $value }
+            'anthropic-dangerous-direct-browser-access' { $valid = @('true', 'false') -ccontains $value }
+        }
+        if (-not $valid) { throw 'capture_control_header_rejected' }
+    }
+}
+
+function ConvertTo-VerifiedControlEnvelope {
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$FakeKey,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$SourceVersion,
+        [Parameter(Mandatory)][string]$CapturedAt,
+        [Parameter(Mandatory)][string]$CompletedAt
+    )
+    $safeHeaders = [Collections.Generic.List[object]]::new()
+    $authCount = 0
+    $knownBetas = Get-ControlProtocolBetas
+    foreach ($header in $Request.HeaderEntries) {
+        $name = $header.Name
+        $values = @($header.Values)
+        switch ($name.ToLowerInvariant()) {
+            'authorization' {
+                if ($values.Count -ne 1 -or $values[0] -cne "Bearer $FakeKey") { throw 'capture_unverified_authentication' }
+                $values = @('Bearer {{UPSTREAM_API_KEY}}')
+                $authCount++
+            }
+            { $_ -in @('x-api-key', 'api-key') } {
+                if ($values.Count -ne 1 -or $values[0] -cne $FakeKey) { throw 'capture_unverified_authentication' }
+                $values = @('{{UPSTREAM_API_KEY}}')
+                $authCount++
+            }
+            { $_ -in @('cookie', 'proxy-authorization', 'x-admin-password') } { throw 'capture_unsupported_authentication' }
+        }
+        foreach ($value in $values) {
+            if ($value.Contains($FakeKey, [StringComparison]::Ordinal)) { throw 'capture_credential_outside_auth' }
+        }
+        if ($name.ToLowerInvariant() -notin @('authorization', 'x-api-key', 'api-key')) {
+            Assert-ControlHeader -Name $name -Values $values -BodyBytes $Request.Body.Length -KnownBetas $knownBetas
+        }
+        $safeHeaders.Add([ordered]@{ name = $name; values = @($values) })
+    }
+    if ($authCount -ne 1) { throw 'capture_requires_single_authentication' }
+    [byte[]]$body = $Request.Body
+    if ([Text.Encoding]::UTF8.GetString($body).Contains($FakeKey, [StringComparison]::Ordinal)) { throw 'capture_credential_in_body' }
+    Assert-ControlRequestBody -Body $body -Nonce $Nonce -FakeKey $FakeKey
+    $requestParts = $Request.RequestLine -split ' '
+    if ($requestParts.Count -ne 3 -or $requestParts[0] -cne 'POST' -or $requestParts[2] -cne 'HTTP/1.1') { throw 'capture_invalid_request_line' }
+    if ($requestParts[1] -cne '/v1/messages' -and $requestParts[1] -cne '/v1/messages?beta=true') { throw 'capture_unverified_query' }
+    $headerJSON = ConvertTo-Json -InputObject @($safeHeaders.ToArray()) -Depth 8 -Compress
+    $headerBytes = [Text.Encoding]::UTF8.GetBytes($headerJSON)
+    $capture = [ordered]@{
+        format_version = 2
+        test_mode = ($env:RELAY_GATE_CAPTURE_TESTING -ceq '1')
+        source_version = $SourceVersion
+        source = 'claude-code-isolated'
+        protocol = 'anthropic'
+        endpoint = 'messages'
+        captured_at = $CapturedAt
+        completed_at = $CompletedAt
+        control_id = $Nonce
+        nonce = $Nonce
+        truncated = $false
+        isolation = [ordered]@{ configuration = $true; mcp = $true; hooks = $true; plugins = $true; environment = $true; temporary_workdir = $true }
+        method = $requestParts[0]
+        request_target = $requestParts[1]
+        request_line = $Request.RequestLine
+        headers = @($safeHeaders.ToArray())
+        header_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($headerBytes)).ToLowerInvariant()
+        body_base64 = [Convert]::ToBase64String($body)
+        body_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($body)).ToLowerInvariant()
+        body_bytes = $body.Length
+        secret_scan_version = '1'
+        authentication_verified = $true
+    }
+    return ,([Text.UTF8Encoding]::new($false).GetBytes(($capture | ConvertTo-Json -Depth 10 -Compress)))
+}
+
+function ConvertTo-ControlManifest {
+    param(
+        [Parameter(Mandatory)][byte[]]$ControlContent,
+        [Parameter(Mandatory)][string]$Alias,
+        [Parameter(Mandatory)][string]$FixtureFileName
+    )
+    if ($Alias -cnotmatch '^[\p{L}\p{Nd}_.-]{1,64}$' -or [IO.Path]::GetFileName($FixtureFileName) -cne $FixtureFileName) { throw 'capture_manifest_arguments_invalid' }
+    # Preserve the original RFC3339 strings. ConvertFrom-Json may coerce them
+    # to DateTime and silently change their offset/fraction on serialization.
+    $document = [Text.Json.JsonDocument]::Parse([Text.Encoding]::UTF8.GetString($ControlContent))
+    $capture = $document.RootElement
+    try { $entry = [ordered]@{
+        alias = $Alias
+        protocol = $capture.GetProperty('protocol').GetString()
+        endpoint = $capture.GetProperty('endpoint').GetString()
+        fixture_path = $FixtureFileName
+        control_id = $capture.GetProperty('control_id').GetString()
+        nonce = $capture.GetProperty('nonce').GetString()
+        captured_at = $capture.GetProperty('captured_at').GetString()
+        completed_at = $capture.GetProperty('completed_at').GetString()
+        header_sha256 = $capture.GetProperty('header_sha256').GetString()
+        body_sha256 = $capture.GetProperty('body_sha256').GetString()
+        body_bytes = $capture.GetProperty('body_bytes').GetInt32()
+        truncated = $capture.GetProperty('truncated').GetBoolean()
+        source = $capture.GetProperty('source').GetString()
+        secret_scan_version = $capture.GetProperty('secret_scan_version').GetString()
+    } } finally { $document.Dispose() }
+    $json = [ordered]@{ version = '1'; entries = @($entry) } | ConvertTo-Json -Depth 8 -Compress
+    return ,([Text.UTF8Encoding]::new($false).GetBytes($json))
 }
 
 function Invoke-ControlCapture {
@@ -627,6 +877,8 @@ function Invoke-ControlCapture {
     $cleanupError = $null
     $request = $null
     $nonce = $null
+    $capturedAt = $null
+    $completedAt = $null
     try {
         $workingDirectory = Join-Path $temporaryRoot 'cwd'
         $configDirectory = Join-Path $temporaryRoot 'config'
@@ -682,6 +934,7 @@ function Invoke-ControlCapture {
                 continue
             }
             $request = $exchange
+            $capturedAt = [DateTimeOffset]::UtcNow.ToString('O')
             Write-ControlResponse -Stream $stream
             $client.Close()
             $client = $null
@@ -696,6 +949,7 @@ function Invoke-ControlCapture {
         if ($process.ExitCode -ne 0) {
             throw "claude_process_failed"
         }
+        $completedAt = [DateTimeOffset]::UtcNow.ToString('O')
     } catch {
         $operationError = $_
     } finally {
@@ -736,19 +990,7 @@ function Invoke-ControlCapture {
         throw $cleanupError
     }
 
-    $capture = [ordered]@{
-        format_version = 1
-        test_mode = ($env:RELAY_GATE_CAPTURE_TESTING -ceq '1')
-        claude_version = $Claude.Version
-        captured_at_utc = [DateTimeOffset]::UtcNow.ToString('O')
-        control_id = $nonce
-        request_line = $request.RequestLine
-        headers = $request.Headers
-        body_base64 = [System.Convert]::ToBase64String($request.Body)
-        authentication_verified = $true
-    }
-    $json = $capture | ConvertTo-Json -Depth 8 -Compress
-    return ,([System.Text.UTF8Encoding]::new($false).GetBytes($json))
+    return ,(ConvertTo-VerifiedControlEnvelope -Request $request -FakeKey $fakeKey -Nonce $nonce -SourceVersion $Claude.Version -CapturedAt $capturedAt -CompletedAt $completedAt)
 }
 
 function Invoke-Main {
@@ -787,6 +1029,12 @@ function Invoke-Main {
     }
 
     $target = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $OutputPath
+    $manifestTarget = $null
+    if ($ManifestPath -or $Alias) {
+        if (-not $ManifestPath -or -not $Alias) { throw 'capture_manifest_requires_path_and_alias' }
+        $manifestTarget = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $ManifestPath
+        if ([IO.Path]::GetDirectoryName($manifestTarget) -cne [IO.Path]::GetDirectoryName($target) -or $manifestTarget -ceq $target) { throw 'capture_manifest_must_be_distinct_and_adjacent' }
+    }
     if ($ValidateTargetOnly) {
         Write-Output "capture_target_valid"
         return
@@ -801,6 +1049,11 @@ function Invoke-Main {
     [byte[]]$captureContent = Invoke-ControlCapture -Target $target -Claude $claude -SelectedModel $Model
     $target = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $OutputPath
     New-PrivateCaptureFile -Path $target -Content $captureContent
+    if ($manifestTarget) {
+        [byte[]]$manifestContent = ConvertTo-ControlManifest -ControlContent $captureContent -Alias $Alias -FixtureFileName ([IO.Path]::GetFileName($target))
+        $manifestTarget = Resolve-CaptureTarget -Repository $RepositoryRoot -Allowed $AllowedRoot -Target $ManifestPath
+        New-PrivateCaptureFile -Path $manifestTarget -Content $manifestContent
+    }
     Write-Output "capture_completed"
 }
 
