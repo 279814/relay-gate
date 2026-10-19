@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -285,11 +286,33 @@ func TestCommitCalibrationSuccess_RejectsLiteralManualHeaderAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = st.CommitCalibrationSuccess(ctx, model.CalibrationCommit{
+	commit := model.CalibrationCommit{
 		RunID: fresh.ID, ExpectedRunRevision: fresh.Revision, CandidateOrdinal: 0,
 		ExecutionID: execID, Endpoint: commitEP, ExpectedEndpointRevision: ep.Revision,
 		RecipeID: recipeID, ExpectedRecipeRevision: recipe.Revision, SelectedVersionID: version.ID,
-	})
+	}
+	beforeBundle, err := st.LoadConfigBundle(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`CREATE TRIGGER deny_calibration_audit BEFORE INSERT ON audit_event WHEN NEW.action='calibration_publish' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitCalibrationSuccess(ctx, commit); !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("publication did not reject unavailable audit: %v", err)
+	}
+	afterBundle, err := st.LoadConfigBundle(ctx)
+	if err != nil || !reflect.DeepEqual(beforeBundle, afterBundle) {
+		t.Fatal("calibration Auth/Recipe publication escaped its audit rollback", err)
+	}
+	afterRun, err := st.GetCalibrationRun(ctx, run.ID)
+	if err != nil || !reflect.DeepEqual(fresh, afterRun) {
+		t.Fatal("calibration terminal state escaped its audit rollback", err)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER deny_calibration_audit`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.CommitCalibrationSuccess(ctx, commit)
 	if err != nil {
 		t.Fatalf("placeholder manual auth must commit: %v", err)
 	}
@@ -300,5 +323,9 @@ func TestCommitCalibrationSuccess_RejectsLiteralManualHeaderAuth(t *testing.T) {
 	if len(got.AuthProfile.ManualHeaders) != 1 ||
 		got.AuthProfile.ManualHeaders[0].Values[0] != "{{UPSTREAM_API_KEY}}" {
 		t.Fatalf("placeholder not stored: %+v", got.AuthProfile.ManualHeaders)
+	}
+	page, err := st.ListAuditEventsPage(ctx, model.AuditEventFilter{Action: "calibration_publish", ResourceID: run.ID})
+	if err != nil || len(page.Items) != 2 || page.Items[0].Outcome != "succeeded" || page.Items[1].Outcome != "failed" || page.Items[1].ReasonCode != "validation" {
+		t.Fatalf("calibration audit lost success/failure facts: page=%+v err=%v", page, err)
 	}
 }

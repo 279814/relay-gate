@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
 )
 
@@ -84,30 +85,39 @@ func (s *Store) CountSecurityFindings() (int, error) {
 
 // SMTPConfig is the persisted alert mail settings (§13.6 / §14.6).
 type SMTPConfig struct {
-	Enabled     bool   `json:"enabled"`
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	UseSTARTTLS bool   `json:"use_starttls"`
-	UseSMTPS    bool   `json:"use_smtps"`
-	From        string `json:"from"`
-	Recipients  string `json:"recipients"` // comma-separated
-	Username    string `json:"username"`
-	HasPassword bool   `json:"has_password"`
-	MinSeverity string `json:"min_severity"`
-	UpdatedAt   int64  `json:"updated_at"`
+	Enabled              bool   `json:"enabled"`
+	Host                 string `json:"host"`
+	Port                 int    `json:"port"`
+	UseSTARTTLS          bool   `json:"use_starttls"`
+	UseSMTPS             bool   `json:"use_smtps"`
+	From                 string `json:"from"`
+	Recipients           string `json:"recipients"` // comma-separated
+	Username             string `json:"username"`
+	HasPassword          bool   `json:"has_password"`
+	MinSeverity          string `json:"min_severity"`
+	UpdatedAt            int64  `json:"updated_at"`
+	AggregationWindowSec int    `json:"aggregation_window_sec"`
+	RateLimitWindowSec   int    `json:"rate_limit_window_sec"`
+	Revision             int64  `json:"revision"`
 }
 
 // GetSMTPConfig returns the singleton SMTP config (password never returned).
 func (s *Store) GetSMTPConfig() (SMTPConfig, error) {
+	c, _, err := s.readSMTPConfig()
+	return c, err
+}
+
+// readSMTPConfig reads settings and their encrypted password in one SQLite snapshot.
+func (s *Store) readSMTPConfig() (SMTPConfig, string, error) {
 	var c SMTPConfig
 	var en, starttls, smtps int
 	var pw sql.NullString
 	err := s.db.QueryRow(`SELECT enabled, host, port, use_starttls, use_smtps, from_addr, recipients,
-		username, password_enc, min_severity, updated_at FROM smtp_config WHERE singleton=1`).
+		username, password_enc, min_severity, updated_at, aggregation_window_sec, rate_limit_window_sec, revision FROM smtp_config WHERE singleton=1`).
 		Scan(&en, &c.Host, &c.Port, &starttls, &smtps, &c.From, &c.Recipients,
-			&c.Username, &pw, &c.MinSeverity, &c.UpdatedAt)
+			&c.Username, &pw, &c.MinSeverity, &c.UpdatedAt, &c.AggregationWindowSec, &c.RateLimitWindowSec, &c.Revision)
 	if err != nil {
-		return c, err
+		return c, "", err
 	}
 	c.Enabled = en != 0
 	c.UseSTARTTLS = starttls != 0
@@ -116,11 +126,41 @@ func (s *Store) GetSMTPConfig() (SMTPConfig, error) {
 	if c.MinSeverity == "" {
 		c.MinSeverity = "critical"
 	}
-	return c, nil
+	return c, pw.String, nil
 }
 
-// SaveSMTPConfig upserts SMTP settings. passwordPlain empty keeps existing password.
+// SMTPMailerConfig returns one consistent runtime snapshot; never log the password.
+func (s *Store) SMTPMailerConfig() (security.MailConfig, error) {
+	c, encrypted, err := s.readSMTPConfig()
+	if err != nil {
+		return security.MailConfig{}, err
+	}
+	password := ""
+	if encrypted != "" {
+		password, err = s.cipher.DecryptEnvelope(encrypted)
+		if err != nil {
+			return security.MailConfig{}, err
+		}
+	}
+	recipients := make([]string, 0)
+	for _, recipient := range strings.Split(c.Recipients, ",") {
+		if recipient = strings.TrimSpace(recipient); recipient != "" {
+			recipients = append(recipients, recipient)
+		}
+	}
+	return security.MailConfig{
+		Enabled: c.Enabled, Host: c.Host, Port: c.Port, UseSTARTTLS: c.UseSTARTTLS, UseSMTPS: c.UseSMTPS,
+		From: c.From, Recipients: recipients, Username: c.Username, Password: password,
+		MinSeverity: security.Severity(c.MinSeverity), AggregationWindowSec: c.AggregationWindowSec,
+		RateLimitWindowSec: c.RateLimitWindowSec, Revision: c.Revision,
+	}, nil
+}
+
+// SaveSMTPConfig updates settings only at the supplied Revision. An empty password keeps its ciphertext.
 func (s *Store) SaveSMTPConfig(c SMTPConfig, passwordPlain string) error {
+	if c.Revision < 1 || c.AggregationWindowSec < 1 || c.AggregationWindowSec > security.MaxSMTPWindowSec || c.RateLimitWindowSec < 1 || c.RateLimitWindowSec > security.MaxSMTPWindowSec {
+		return fmt.Errorf("%w: SMTP revision 必须为正整数，聚合和限流窗口必须为 1–86400 秒", model.ErrValidation)
+	}
 	if c.Port == 0 {
 		c.Port = 587
 		if c.UseSMTPS {
@@ -129,7 +169,7 @@ func (s *Store) SaveSMTPConfig(c SMTPConfig, passwordPlain string) error {
 	}
 	if err := (security.MailConfig{Enabled: c.Enabled, Host: c.Host, Port: c.Port,
 		UseSTARTTLS: c.UseSTARTTLS, UseSMTPS: c.UseSMTPS, From: c.From,
-		Recipients: strings.Split(c.Recipients, ","), MinSeverity: security.Severity(c.MinSeverity)}).Validate(); err != nil {
+		Recipients: strings.Split(c.Recipients, ","), MinSeverity: security.Severity(c.MinSeverity), AggregationWindowSec: c.AggregationWindowSec, RateLimitWindowSec: c.RateLimitWindowSec}).Validate(); err != nil {
 		return err
 	}
 	var pwSQL any
@@ -156,16 +196,28 @@ func (s *Store) SaveSMTPConfig(c SMTPConfig, passwordPlain string) error {
 		c.MinSeverity = "critical"
 	}
 	now := nowMS()
+	var result sql.Result
+	var err error
 	if !keepPW {
-		_, err := s.db.Exec(`UPDATE smtp_config SET enabled=?, host=?, port=?, use_starttls=?, use_smtps=?,
-			from_addr=?, recipients=?, username=?, password_enc=?, min_severity=?, updated_at=? WHERE singleton=1`,
-			en, c.Host, c.Port, st, sm, c.From, c.Recipients, c.Username, pwSQL, c.MinSeverity, now)
+		result, err = s.db.Exec(`UPDATE smtp_config SET enabled=?, host=?, port=?, use_starttls=?, use_smtps=?,
+   from_addr=?, recipients=?, username=?, password_enc=?, min_severity=?, updated_at=?, aggregation_window_sec=?, rate_limit_window_sec=?, revision=revision+1 WHERE singleton=1 AND revision=?`,
+			en, c.Host, c.Port, st, sm, c.From, c.Recipients, c.Username, pwSQL, c.MinSeverity, now, c.AggregationWindowSec, c.RateLimitWindowSec, c.Revision)
+	} else {
+		result, err = s.db.Exec(`UPDATE smtp_config SET enabled=?, host=?, port=?, use_starttls=?, use_smtps=?,
+   from_addr=?, recipients=?, username=?, min_severity=?, updated_at=?, aggregation_window_sec=?, rate_limit_window_sec=?, revision=revision+1 WHERE singleton=1 AND revision=?`,
+			en, c.Host, c.Port, st, sm, c.From, c.Recipients, c.Username, c.MinSeverity, now, c.AggregationWindowSec, c.RateLimitWindowSec, c.Revision)
+	}
+	if err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE smtp_config SET enabled=?, host=?, port=?, use_starttls=?, use_smtps=?,
-		from_addr=?, recipients=?, username=?, min_severity=?, updated_at=? WHERE singleton=1`,
-		en, c.Host, c.Port, st, sm, c.From, c.Recipients, c.Username, c.MinSeverity, now)
-	return err
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrRevisionConflict
+	}
+	return nil
 }
 
 // SMTPPasswordDecrypt returns the decrypted SMTP password for sending (caller must not log it).

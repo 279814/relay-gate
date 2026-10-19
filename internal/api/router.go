@@ -110,6 +110,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("POST /admin/api/security/smtp/test", s.postSMTPTest)
 
 	mux.HandleFunc("GET /admin/api/credentials", s.getCredentialsStatus)
+	mux.HandleFunc("GET /admin/api/audit-events", s.listAuditEvents)
 	// §12.9：敏感查看和轮换只接受 Cookie 会话加当次管理员密码（body.password），
 	// 不能只凭通用 Bearer / X-Admin-Password。
 	mux.Handle("POST /admin/api/credentials/reveal-master", s.requireSession(s.postRevealMasterKey))
@@ -132,7 +133,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/transform-bindings", s.listTransformBindings)
 	mux.HandleFunc("GET /admin/api/transform-executions", s.listTransformExecutions)
 
-	guarded := s.requireAdmin(s.guardMutations(mux))
+	guarded := s.requireAdmin(s.guardMutations(s.auditAdmin(mux)))
 
 	// 会话端点挂在鉴权**之外**。
 	//
@@ -141,8 +142,8 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	// 而不是收到 401。logout 放外面是因为它对未登录请求也该是成功的空操作。
 	outer := http.NewServeMux()
 	outer.Handle("/admin/api/", guarded)
-	outer.HandleFunc("POST /admin/api/login", s.login)
-	outer.HandleFunc("POST /admin/api/logout", s.logout)
+	outer.Handle("POST /admin/api/login", s.auditAdmin(http.HandlerFunc(s.login)))
+	outer.Handle("POST /admin/api/logout", s.auditAdmin(http.HandlerFunc(s.logout)))
 	outer.HandleFunc("GET /admin/api/session", s.session)
 	return outer
 }
@@ -155,6 +156,7 @@ func (s *Server) Routes(adminPW string) http.Handler {
 // 两者校验的是同一个口令，不存在「改了口令还有一条路认旧的」。
 func (s *Server) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if !s.authenticated(r) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="relay-gate admin"`)
 			writeJSON(w, http.StatusUnauthorized, errBody{"未授权：需要管理口令"})

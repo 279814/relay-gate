@@ -72,13 +72,13 @@ func (s *Server) guardMutations(next http.Handler) http.Handler {
 		}
 		if s.runState != nil && s.runState.InMaintenance() {
 			httpbody.DiscardRejected(w, r)
-			writeJSON(w, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "maintenance 期间禁止管理写入"})
+			s.writeAuditedRejection(w, r, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "maintenance 期间禁止管理写入"})
 			return
 		}
 		leave, admitted := s.mutations.enter()
 		if !admitted {
 			httpbody.DiscardRejected(w, r)
-			writeJSON(w, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "管理写入正在等待安全轮换"})
+			s.writeAuditedRejection(w, r, http.StatusConflict, map[string]any{"code": runstate.MaintenanceActiveCode, "error": "管理写入正在等待安全轮换"})
 			return
 		}
 		defer leave()

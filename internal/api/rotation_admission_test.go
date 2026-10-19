@@ -234,6 +234,9 @@ func TestMasterRotation_DrainsAcceptedEncryptedWriteAndRejectsNewWrites(t *testi
 	if blocked.Code != http.StatusConflict {
 		t.Fatalf("new write entered during rotation drain: %d", blocked.Code)
 	}
+	if blocked.Header().Get("X-Audit-Status") != "unavailable" || s.auditMissed.Load() != 1 {
+		t.Fatalf("busy audit blocked rotation or hid the lost rejection record: headers=%v missed=%d", blocked.Header(), s.auditMissed.Load())
+	}
 	status, err := keys.Status()
 	if err != nil || status.Phase != keyring.PhaseIdle {
 		t.Fatalf("rotation prepared before the accepted write finished: %+v err=%v", status, err)
@@ -294,5 +297,9 @@ func TestMasterRotation_PostCommitFailureKeepsPendingKeyAndMaintenance(t *testin
 	}
 	if err := store.ValidateDatabaseEncryption(context.Background(), s.st.DatabasePath(), "old-master-for-rotation-fixture"); err == nil {
 		t.Fatal("committed data still depended on the old master")
+	}
+	event := latestAudit(t, s, "master_rotate", "unknown")
+	if event.ReasonCode != "forward_recovery_required" {
+		t.Fatalf("committed rotation falsely claimed rollback: %+v", event)
 	}
 }

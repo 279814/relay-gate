@@ -162,6 +162,7 @@ func TestRecipeHTTPTestAndPublishAreSeparateRealExecutions(t *testing.T) {
 	if published.Code != 200 {
 		t.Fatalf("publish tested version: %d %s", published.Code, published.Body.String())
 	}
+	latestAudit(t, s, "recipe_publish", "succeeded")
 	if calls.Load() != 1 {
 		t.Fatal("publish sent another probe")
 	}
@@ -170,6 +171,7 @@ func TestRecipeHTTPTestAndPublishAreSeparateRealExecutions(t *testing.T) {
 	if paused.Code != 503 || calls.Load() != 1 {
 		t.Fatalf("paused test was not rejected with zero sends: %d %s", paused.Code, paused.Body.String())
 	}
+	latestAudit(t, s, "recipe_test", "failed")
 }
 
 func TestClientProfileHTTPTestsExactCandidateAndEnablesOnlySuccess(t *testing.T) {
@@ -202,14 +204,17 @@ func TestClientProfileHTTPTestsExactCandidateAndEnablesOnlySuccess(t *testing.T)
 	if current.Status != model.ProfileTested || current.Revision != profile.Revision+1 {
 		t.Fatalf("successful candidate not atomically enabled: %+v", current)
 	}
+	latestAudit(t, s, "profile_test_activate", "succeeded")
 	stale := do(t, h, "POST", path+"/disable", fmt.Sprintf(`{"expected_revision":%d}`, profile.Revision), true)
 	if stale.Code != 409 {
 		t.Fatalf("profile stale disable=%d %s", stale.Code, stale.Body.String())
 	}
+	latestAudit(t, s, "profile_disable", "failed")
 	disabled := do(t, h, "POST", path+"/disable", fmt.Sprintf(`{"expected_revision":%d}`, current.Revision), true)
 	if disabled.Code != 200 {
 		t.Fatalf("profile disable=%d %s", disabled.Code, disabled.Body.String())
 	}
+	latestAudit(t, s, "profile_disable", "succeeded")
 	if calls.Load() != 1 {
 		t.Fatal("disable emitted another request")
 	}
@@ -398,10 +403,12 @@ func TestRecipeHTTPForceRequiresAnActualFailedExplicitTest(t *testing.T) {
 	if execution.Success || !execution.Final || execution.SentAtMS == 0 || calls.Load() != 1 {
 		t.Fatalf("not an actual completed failed test: %+v", execution)
 	}
+	latestAudit(t, s, "recipe_test", "failed")
 	ordinary := do(t, h, "POST", path+"/publish", fmt.Sprintf(`{"expected_revision":3,"test_execution_id":%q}`, execution.ID), true)
 	if ordinary.Code != 400 {
 		t.Fatalf("failed test published without Force: %d %s", ordinary.Code, ordinary.Body.String())
 	}
+	latestAudit(t, s, "recipe_publish", "failed")
 	forced := do(t, h, "POST", path+"/publish", fmt.Sprintf(`{"expected_revision":3,"test_execution_id":%q,"force":true}`, execution.ID), true)
 	if forced.Code != 200 {
 		t.Fatalf("explicit failed-test Force=%d %s", forced.Code, forced.Body.String())
@@ -410,6 +417,7 @@ func TestRecipeHTTPForceRequiresAnActualFailedExplicitTest(t *testing.T) {
 	if !row.LastPublishForced || row.PublishedVersionID != failedVersion.ID || calls.Load() != 1 {
 		t.Fatal("Force lost attribution or sent twice")
 	}
+	latestAudit(t, s, "recipe_force_publish", "succeeded")
 }
 
 func TestClientProfileHTTPFailureDoesNotEnableCandidate(t *testing.T) {
@@ -437,6 +445,7 @@ func TestClientProfileHTTPFailureDoesNotEnableCandidate(t *testing.T) {
 	if current.Status != model.ProfileCandidate || current.Revision != profile.Revision {
 		t.Fatal("failed test enabled or changed candidate")
 	}
+	latestAudit(t, s, "profile_test_activate", "failed")
 }
 
 func TestClientProfileHTTPRejectsSecretDeclarationsBeforeSanitizerDropsHeader(t *testing.T) {

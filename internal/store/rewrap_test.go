@@ -44,6 +44,7 @@ func TestRewrapDirectSecrets_NewMasterAloneDecrypts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.SaveSMTPConfig(SMTPConfig{
+		Revision: 1, AggregationWindowSec: 300, RateLimitWindowSec: 300,
 		Host: "mail.example.com", Port: 587, From: "a@example.com",
 		Recipients: "ops@example.com", Username: "smtp-user",
 	}, smtpPW); err != nil {
