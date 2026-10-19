@@ -448,9 +448,11 @@ func TestRequestReencodingAuthorizationIsFrozenAcrossPublishAndRollback(t *testi
 					publish(!initiallyEnabled)
 				}
 				resume()
-				wantOld, wantNew := 415, 200
+				// An unsent strict retry cannot replace the first station's actual
+				// 503. Its authorization is still frozen, so it must not be sent.
+				wantOld, wantNew := 503, 200
 				if initiallyEnabled {
-					wantOld, wantNew = 200, 415
+					wantOld, wantNew = 200, 503
 				}
 				if status := <-finished; status != wantOld {
 					t.Fatalf("in-flight authorization changed: got=%d want=%d", status, wantOld)

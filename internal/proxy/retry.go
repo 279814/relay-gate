@@ -117,6 +117,7 @@ type retryPlan struct {
 	// maxLocalSkips bounds route-local failures (§6.5): Transform / binding
 	// errors that never hit the wire. They do not consume maxAttempts.
 	maxLocalSkips int
+	localSkips    int
 }
 
 // dispatchStatus distinguishes fatal client errors from route-local skips (§6.5).
@@ -213,7 +214,17 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 	var observing *liveAttempt
 	defer func() { finishObserver(observing, health.AttemptFinish{ServiceCanceled: true}) }()
 	defer func() { closeSampleTrail(trail) }()
-	localSkips := 0
+	var ready *liveAttempt
+	defer func() {
+		if ready != nil {
+			ready.at.Discard()
+			finishObserver(ready, health.AttemptFinish{ServiceCanceled: true})
+			ready.cand.Release()
+			if ready.tee != nil {
+				ready.tee.Close()
+			}
+		}
+	}()
 	attempt := 0
 
 	for {
@@ -230,9 +241,14 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		}
 		plan.tried[cand.Route.ID] = true
 
-		la, status := h.dispatch(w, r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline))
+		la, status := ready, dispatchSent
+		ready = nil
+		if la == nil {
+			la, status = h.dispatch(r, proto, pre, cand, reqID, attempt+1, time.Until(plan.deadline), nil)
+		}
 		observing = la
 		if status == dispatchFatal {
+			writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 			cand.Release()
 			held = nil
 			return nil, false
@@ -244,9 +260,9 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			// next Route.
 			cand.Release()
 			held = nil
-			localSkips++
+			plan.localSkips++
 			h.log.Info("route-local 本地失败，跳过本 Route",
-				"route", cand.Route.ID, "local_skips", localSkips,
+				"route", cand.Route.ID, "local_skips", plan.localSkips,
 				"max_local_skips", plan.maxLocalSkips)
 			exhausted := func(selErr error) {
 				if status == dispatchRouteCompressedMapping {
@@ -269,7 +285,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				}
 				writeAPIError(w, http.StatusBadGateway, proto, "api_error", "请求转换失败（fail_closed）")
 			}
-			if localSkips >= plan.maxLocalSkips {
+			if plan.localSkips >= plan.maxLocalSkips {
 				exhausted(nil)
 				return nil, false
 			}
@@ -287,8 +303,20 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		}
 		attempt++
 
-		next := h.nextCandidate(r, pre, proto, plan, la, attempt)
-		if next == nil {
+		ready = h.nextPreparedAttempt(r, pre, proto, plan, la, reqID, attempt, func() {
+			// Discard completes the original response observation before releasing this attempt.
+			la.at.Discard()
+			// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
+			// （§5.4 / §16.3），留到收尾由 recordSample 落库。
+			trail = append(trail, la)
+			finishObserver(la, health.AttemptFinish{HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
+			h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
+			logs = append(logs, h.attemptLog(la, pre, proto, reqID,
+				attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
+			la.cand.Release()
+			held = nil
+		})
+		if ready == nil {
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
 				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
@@ -330,17 +358,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			return oc, true
 		}
 
-		// Discard completes the original response observation before releasing this attempt.
-		la.at.Discard()
-		// 这次尝试已经发给上游：它的出站请求与响应副本属于本 Sample Group
-		// （§5.4 / §16.3），留到收尾由 recordSample 落库。
-		trail = append(trail, la)
-		finishObserver(la, health.AttemptFinish{HalfOpen: armedHalfOpen(la.cand.Route.ID, attempt)})
-		h.logRetry(la, pre.inModel, attempt, plan.maxAttempts)
-		logs = append(logs, h.attemptLog(la, pre, proto, reqID,
-			attempt, armedHalfOpen(la.cand.Route.ID, attempt), true, la.at.Result(), recvAt))
-		la.cand.Release()
-		cand = next
+		cand = ready.cand
 		held = cand
 	}
 }
@@ -425,8 +443,8 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 只收入站原文与候选 —— 见文件头「为什么每次尝试都必须重建」。
 // budget 是本次请求剩余的总时长预算。
 //
-// dispatchFatal：错误响应已写好。这类失败是 request-global（非法 body、
-// 协议/全局配置），换站无意义。
+// dispatchFatal：未发上游的全局准备失败。调用方仍持有先前响应时保留它，
+// 首次准备失败则由调用方写固定配置错误。
 // dispatchRouteLocal：尚未写客户端、尚未发上游（§6.5 Transform fail_closed）；
 // 调用方应跳过本 Route 并选下一个，不消耗 retry_max_attempts。
 // dispatchRouteAuthConfig：同上，原因是本 Route 的 URL 或 Auth Secret 配置
@@ -434,9 +452,9 @@ func (h *Handler) wrapRecoveryIfNeeded(cand *router.Candidate) (*router.Candidat
 // 已把该 Route 当前 Endpoint 的 Capability 记为 config_error。
 // dispatchRouteCompressedTransform：同上，原因是压缩请求体遇上请求 body 转换（§6.7）。
 // dispatchSent：已发出上游请求，la 非空。
-func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
+func (h *Handler) dispatch(r *http.Request,
 	proto model.Protocol, pre *preambleResult, cand *router.Candidate,
-	reqID string, attempt int, budget time.Duration) (*liveAttempt, dispatchStatus) {
+	reqID string, attempt int, budget time.Duration, beforeSend func()) (*liveAttempt, dispatchStatus) {
 
 	settings := pre.settings
 
@@ -445,7 +463,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	kind, ok := proto.Endpoint()
 	if !ok {
 		h.log.Error("协议没有对应的 Endpoint", "proto", proto, "route", cand.Route.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 	instr := health.NoopInstrumentation()
@@ -481,7 +498,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("解析出站目标失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 	configFacts = &health.AttemptConfigFacts{EndpointID: target.EndpointID, EndpointRevision: target.EndpointRevision,
@@ -499,7 +515,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("改写出站认证失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 
@@ -520,7 +535,6 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 			return nil, dispatchRouteAuthConfig
 		}
 		h.log.Error("取连接池失败", "err", err, "upstream", cand.Upstream.ID)
-		writeAPIError(w, http.StatusInternalServerError, proto, "api_error", "配置错误")
 		return nil, dispatchFatal
 	}
 
@@ -569,6 +583,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 	if requestObserver, ok := instr.Observer.(health.AttemptRequestObserver); ok {
 		requestObserver.TryRequest(health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
 	}
+	// A replacement response is discarded only after this Route is fully
+	// prepared. Never hold the previous concurrency slot during the new send.
+	if beforeSend != nil {
+		if r.Context().Err() != nil {
+			return nil, dispatchFatal
+		}
+		beforeSend()
+	}
 	sendCtx := r.Context()
 	if instr.Trace != nil {
 		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
@@ -592,28 +614,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request,
 // countCandidateRoutes returns how many enabled Routes could be selected for
 // this model (§6.5 max local skip bound). Falls back to 1 when unknown.
 func countCandidateRoutes(snap *router.Snapshot, inModel string, proto model.Protocol) int {
-	if snap == nil {
-		return 1
-	}
-	mn, err := router.MatchModelName(snap, inModel, proto)
-	if err != nil || mn == nil {
-		return 1
-	}
-	n := 0
-	for _, rt := range snap.RoutesByModelName[mn.ID] {
-		if rt == nil || !rt.Enabled {
-			continue
-		}
-		up := snap.Upstreams[rt.UpstreamID]
-		if up == nil || !up.Enabled {
-			continue
-		}
-		n++
-	}
-	if n < 1 {
-		return 1
-	}
-	return n
+	return max(1, len(router.CandidateRouteIDs(snap, inModel, proto)))
 }
 
 // nextCandidate 判断这次尝试要不要换站重来，要的话选出下一个候选。
