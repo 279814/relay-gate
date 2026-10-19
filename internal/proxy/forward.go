@@ -577,7 +577,7 @@ func (at *Attempt) Discard() {
 
 	// Discarded attempts still deliver the original prefix/drain to the same
 	// bounded observer and sample sink. There is no second error-body parser.
-	if tee := at.respTee(); tee != nil && len(at.peeked) > 0 {
+	if tee := at.respTee(true); tee != nil && len(at.peeked) > 0 {
 		_, _ = tee.Write(at.peeked)
 	}
 	at.captureDrain()
@@ -591,22 +591,23 @@ const discardDrainLimit = 4 << 10
 
 // captureDrain reuses only the existing bounded connection-reuse drain.
 func (at *Attempt) captureDrain() {
-	var body io.Reader = observedUpstreamBody{ReadCloser: at.resp.Body, wire: at.wire, readError: &at.res.upstreamReadErr}
-	if tee := at.respTee(); tee != nil {
+	var source io.ReadCloser = observedUpstreamBody{ReadCloser: at.resp.Body, wire: at.wire, readError: &at.res.upstreamReadErr}
+	if at.f.upstreamSample != nil {
+		source = upstreamSampleBody{ReadCloser: source, capture: at.f.upstreamSample}
+	}
+	var body io.Reader = source
+	if tee := at.respTee(false); tee != nil {
 		body = io.TeeReader(body, lenientWriter{tee})
 	}
-	_, err := io.CopyN(io.Discard, body, discardDrainLimit)
-	if err == io.EOF && at.f.upstreamSample != nil {
-		at.f.upstreamSample.complete = true
-	}
+	_, _ = io.CopyN(io.Discard, body, discardDrainLimit)
 }
 
-func (at *Attempt) respTee() io.Writer {
+func (at *Attempt) respTee(includeSample bool) io.Writer {
 	if at.f == nil {
 		return nil
 	}
 	var writers []io.Writer
-	if at.f.upstreamSample != nil {
+	if includeSample && at.f.upstreamSample != nil {
 		writers = append(writers, at.f.upstreamSample)
 	}
 	if at.f.RespTee != nil {
@@ -639,6 +640,9 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 	var total int64
 	for {
 		n, err := src.Read(buf)
+		if err == io.EOF && !inputObserved && f.upstreamSample != nil {
+			f.upstreamSample.complete = true
+		}
 		if n > 0 {
 			if at.clientCtx.Err() != nil || at.ctx.Err() != nil || at.stageTimeout.Load() != 0 {
 				if !inputObserved && f.upstreamSample != nil {
@@ -672,9 +676,6 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 			}
 		}
 		if err != nil {
-			if err == io.EOF && !inputObserved && f.upstreamSample != nil {
-				f.upstreamSample.complete = true
-			}
 			if errors.Is(err, io.EOF) && !inputObserved {
 				at.wire.finish()
 			}

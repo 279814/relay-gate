@@ -2,14 +2,48 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
 )
+
+type finalEOFSampleReader struct{ body []byte }
+
+func (r *finalEOFSampleReader) Read(p []byte) (int, error) {
+	n := copy(p, r.body)
+	r.body = r.body[n:]
+	if len(r.body) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestOriginalSampleRecordsEOFReturnedWithExactDrainLimit(t *testing.T) {
+	capture := &upstreamSampleCapture{sink: sample.NewHeadTail(0, 0), status: 200}
+	at := &Attempt{f: &Forwarder{upstreamSample: capture}, res: &Result{}, resp: &http.Response{Body: io.NopCloser(&finalEOFSampleReader{body: bytes.Repeat([]byte("x"), discardDrainLimit)})}}
+	at.captureDrain()
+	if !capture.complete || capture.view() != "upstream_response" || len(capture.sink.Bytes()) != discardDrainLimit {
+		t.Fatalf("ignored an observed EOF at the exact drain boundary: complete=%v view=%s", capture.complete, capture.view())
+	}
+}
+
+func TestOriginalSampleRecordsObservedEOFWhenClientCancelsBeforeWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	capture := &upstreamSampleCapture{sink: sample.NewHeadTail(0, 0), status: 200}
+	at := &Attempt{f: &Forwarder{upstreamSample: capture}, res: &Result{}, clientCtx: ctx, ctx: ctx}
+	at.streamBody(httptest.NewRecorder(), &finalEOFSampleReader{body: []byte("original")}, false)
+	if !capture.complete || string(capture.sink.Bytes()) != "original" {
+		t.Fatal("client cancellation erased an already observed upstream EOF")
+	}
+}
 
 func TestSampleKeepsOriginalUpstreamStatusHeadersAndBodyAcrossTransform(t *testing.T) {
 	const original = `{"note":"before"}`
