@@ -485,7 +485,8 @@
                     <td class="num" x-text="ttft(s)"></td>
                     <td class="num" x-text="dur(s)"></td>
                     <td class="nowrap">
-                      <button class="sm" @click="openSample(s.id)">详情</button>
+                      <button class="sm" @click="openSampleMetadata(s.id)">尝试元数据</button>
+                      <button class="sm" @click="openSample(s.id)">正文（需认证）</button>
                       <button class="sm" @click="togglePin(s)"
                               x-text="s.pinned ? '取消置顶' : '置顶'"></button>
                     </td>
@@ -588,6 +589,7 @@
                       <td class="num" x-text="l.resp_status || '—'"></td>
                       <td class="num" x-text="l.ttft_ms ? l.ttft_ms + 'ms' : '—'"></td>
                       <td class="nowrap">
+                        <button class="sm" @click="openAttemptMetadata(l)">Attempt 事实</button>
                         <button class="sm" x-show="i === 0 && g.rows.length > 1"
                                 @click="toggleLog(g.req_id)"
                                 x-text="expandedLogs[g.req_id] ? '收起' : `展开 ${g.rows.length} 次`"></button>
@@ -2524,6 +2526,79 @@
         </div>
       </template>
 
+      <!-- Safe Attempt facts are read separately from sensitive sample bytes. -->
+      <template x-if="attemptMetadata.open">
+        <div class="mask" @click.self="closeAttemptMetadata()">
+          <div class="modal wide" x-ref="attemptMetadataDrawer" role="dialog" aria-modal="true" aria-labelledby="attempt-metadata-title">
+            <div class="bar">
+              <h3 id="attempt-metadata-title" style="margin:0" x-text="attemptMetadata.title"></h3>
+              <span class="grow"></span>
+              <button type="button" @click="closeAttemptMetadata()">关闭</button>
+            </div>
+            <p class="mono wrap" x-show="attemptMetadata.reqID" x-text="'ReqID ' + attemptMetadata.reqID"></p>
+            <p class="dim">这里只展示当次尝试记录的事实；不读取样本正文，也不使用当前配置补齐历史。</p>
+            <p class="dim" x-show="attemptMetadata.note" x-text="attemptMetadata.note"></p>
+            <div class="alert err" x-show="attemptMetadata.error" x-text="attemptMetadata.error"></div>
+            <p class="dim" x-show="attemptMetadata.loading">读取安全元数据中…</p>
+            <div class="bar" x-show="attemptMetadata.attempts.length">
+              <label>选择尝试
+                <select x-model.number="attemptMetadata.selected" @change="selectMetadataAttempt()">
+                  <template x-for="(a, idx) in attemptMetadata.attempts" :key="a.key">
+                    <option :value="idx" x-text="a.title"></option>
+                  </template>
+                </select>
+              </label>
+              <button type="button" x-show="attemptMetadata.sampleID" @click="openSampleMetadata(attemptMetadata.sampleID)" :disabled="attemptMetadata.loading">刷新元数据</button>
+            </div>
+            <template x-for="a in attemptMetadata.attempts.slice(attemptMetadata.selected, attemptMetadata.selected + 1)" :key="a.key">
+              <div>
+                <p class="alert warn" x-show="a.notice" x-text="a.notice"></p>
+                <div class="bar" style="margin:12px 0">
+                  <span class="tag unknown" x-text="'元数据版本：' + a.version"></span>
+                  <span class="dim" x-text="a.executionState"></span>
+                  <button type="button" @click="openMetadataExecution()" :disabled="!a.canOpenExecution || attemptMetadata.executionLoading">精确 Execution</button>
+                </div>
+                <p class="mono wrap" x-show="a.executionID" x-text="'Execution ID ' + a.executionID"></p>
+                <dl class="kv">
+                  <template x-for="f in a.identity" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <h3 style="margin-top:18px">阶段与写出</h3>
+                <p class="dim" x-text="'已保存响应的含义：' + a.responseView"></p>
+                <dl class="kv">
+                  <template x-for="f in a.timings" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <h3 style="margin-top:18px">重试、写入与实际结论</h3>
+                <dl class="kv">
+                  <template x-for="f in a.decisions" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <details class="blk">
+                  <summary>发送时的配置与转换版本</summary>
+                  <dl class="kv">
+                    <template x-for="f in a.revisions" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                  </dl>
+                </details>
+                <template x-for="d in a.diffs" :key="d.label">
+                  <details class="blk">
+                    <summary x-text="d.label"></summary>
+                    <p class="dim" x-text="d.reason"></p>
+                    <dl class="kv">
+                      <dt>正文是否变化</dt><dd x-text="d.body"></dd>
+                      <dt>头是否变化</dt><dd x-text="d.headers"></dd>
+                      <dt>输入正文 SHA-256</dt><dd class="mono wrap" style="overflow-wrap:anywhere" x-text="d.inputHash"></dd>
+                      <dt>输出正文 SHA-256</dt><dd class="mono wrap" style="overflow-wrap:anywhere" x-text="d.outputHash"></dd>
+                    </dl>
+                  </details>
+                </template>
+              </div>
+            </template>
+            <footer>
+              <button type="button" x-show="attemptMetadata.sampleID" @click="openMetadataSampleBody()">查看样本正文（重新认证）</button>
+              <button type="button" @click="closeAttemptMetadata()">关闭</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
       <!-- ── 样本详情 ─────────────────────────────────────── -->
       <template x-if="sample">
         <div class="mask" @click.self="sample = null">
@@ -2554,6 +2629,7 @@
             </div>
 
             <div class="bar" style="margin-top:14px">
+              <button @click="openSampleMetadata(sample.id)">逐次尝试元数据</button>
               <button @click="exportHeaders(sample.id)">生成安全配方草稿</button>
               <span class="dim">仅保留协议形状，正文使用探活占位符</span>
             </div>
@@ -2596,7 +2672,7 @@
               <pre class="body mono" x-text="JSON.stringify(sample.resp_headers, null, 2)"></pre>
             </details>
             <details class="blk" open>
-              <summary>响应 body</summary>
+              <summary>已保存的响应 body（视图含义见尝试元数据）</summary>
               <pre class="body mono" x-text="b64(sample.resp_body)"></pre>
             </details>
 
