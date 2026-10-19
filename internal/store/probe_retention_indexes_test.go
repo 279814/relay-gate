@@ -166,7 +166,7 @@ func TestRetentionIndexEnsureCanceledTransactionDoesNotCreatePartialSet(t *testi
 	st := testStore(t)
 	dropRetentionIndexes(t, st)
 	before, err := inspectSchemaState(context.Background(), st.db)
-	if err != nil || before.Version != 9 {
+	if err != nil || before.Version != developmentSchemaVersion {
 		t.Fatalf("schema9 without helper indexes: %+v %v", before, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

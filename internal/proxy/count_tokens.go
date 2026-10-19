@@ -15,8 +15,10 @@ import (
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	"github.com/279814/relay-gate/internal/protocol"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/security"
 )
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens（§3.1 / §10.3）。
@@ -228,6 +230,13 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 			},
 		}, health.AttemptRequestView{Header: outHeader, RawQuery: target.URL.RawQuery, Body: outBody})
 	}
+	var capture *security.Capture
+	if h.security != nil {
+		capture = h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: sample.NewReqID(), Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: model.EndpointCountTokens, Protocol: model.ProtoAnthropic}})
+		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
+		capture.TryRequest(outBody, false)
+		defer capture.Complete(false)
+	}
 	var readErr error
 	defer func() {
 		if instr.Observer != nil {
@@ -294,7 +303,11 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	// 而我们是一次性写出完整 body。照抄上游的值会与实际长度不符。
 	dst.Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(respBody)
+	n, writeErr := w.Write(respBody)
+	if writeErr != nil {
+		capture.Interrupted()
+	}
+	capture.Complete(n > 0)
 	return "", sent
 }
 

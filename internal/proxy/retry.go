@@ -4,15 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
+	"github.com/279814/relay-gate/internal/protocol"
 	"github.com/279814/relay-gate/internal/router"
 	"github.com/279814/relay-gate/internal/sample"
+	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -56,7 +57,6 @@ type forwardOutcome struct {
 	outHeader http.Header
 	outURL    string
 	respTee   *sample.HeadTail
-	secTee    *sample.HeadTail // passive security scan copy (§14.2); independent of sample switch
 	res       *Result
 	keys      []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
@@ -90,7 +90,6 @@ type liveAttempt struct {
 	cand        *router.Candidate
 	at          *Attempt
 	tee         *sample.HeadTail
-	secTee      *sample.HeadTail
 	keys        []string
 	body        []byte
 	header      http.Header
@@ -319,7 +318,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		if ready == nil {
 			oc := &forwardOutcome{
 				cand: la.cand, outBody: la.body, outHeader: la.header,
-				outURL: la.url, respTee: la.tee, secTee: la.secTee, keys: la.keys,
+				outURL: la.url, respTee: la.tee, keys: la.keys,
 				res: la.at.Result(), attempts: attempt,
 				halfOpen: armedHalfOpen(la.cand.Route.ID, attempt),
 				reqID:    reqID,
@@ -565,18 +564,12 @@ func (h *Handler) dispatch(r *http.Request,
 				settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
 		}
 	}
-	// 被动扫描副本与样本开关无关（§14.3：样本关闭时仍可扫描）。
-	var secTee *sample.HeadTail
-	if h.security != nil {
-		secTee = sample.NewHeadTail(256<<10, 256<<10)
-	}
-	switch {
-	case tee != nil && secTee != nil:
-		fwd.RespTee = io.MultiWriter(tee, secTee)
-	case tee != nil:
+	if tee != nil {
 		fwd.RespTee = tee
-	case secTee != nil:
-		fwd.RespTee = secTee
+	}
+	if h.security != nil {
+		capture := h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: kind, Protocol: proto}})
+		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
 	}
 	fwd.RespObserver = instr.Observer
 
@@ -603,7 +596,7 @@ func (h *Handler) dispatch(r *http.Request,
 	handedOff = true
 
 	return &liveAttempt{
-		cand: cand, at: at, tee: tee, secTee: secTee,
+		cand: cand, at: at, tee: tee,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
 		instr: instr, configFacts: configFacts,

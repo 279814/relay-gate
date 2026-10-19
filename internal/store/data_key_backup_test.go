@@ -16,7 +16,7 @@ func dataKeyBackupFixture(t *testing.T) (*Store, MigrationBackupResult, []byte) 
 }
 
 // Historical readers must be tested against an actual schema-8 database, not
-// a schema-9 file with an old number written into its backup manifest.
+// a newer file with an old number written into its backup manifest.
 func schemaEightDataKeyBackupFixture(t *testing.T) (*Store, MigrationBackupResult, []byte) {
 	return dataKeyBackupFixtureForSchema(t, 8)
 }
@@ -28,13 +28,17 @@ func dataKeyBackupFixtureForSchema(t *testing.T, schema int) (*Store, MigrationB
 	path := filepath.Join(dir, "relay.db")
 	var st *Store
 	var err error
-	if schema == 8 {
+	if schema == 8 || schema == 9 {
 		lock, lockErr := acquireInstanceLock(path)
 		if lockErr != nil {
 			t.Fatal(lockErr)
 		}
 		db := openDatabaseAtPath(t, path)
-		if err := initializeEmptySchemaEight(context.Background(), db, c); err != nil {
+		initialize := initializeEmptySchemaEight
+		if schema == 9 {
+			initialize = initializeEmptySchemaNine
+		}
+		if err := initialize(context.Background(), db, c); err != nil {
 			lock.Close()
 			t.Fatal(err)
 		}

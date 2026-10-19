@@ -62,6 +62,17 @@ type DecoderSpec struct {
 	Protocol model.Protocol
 }
 
+// PayloadView is an opt-in, ephemeral view for local content diagnostics.
+// It is valid only during the callback; callers must not mutate or retain its
+// slices/maps. Raw payloads never become part of ProtocolEvent or health state.
+type PayloadView struct {
+	EventName string
+	Object    map[string]json.RawMessage
+	Raw       []byte
+}
+
+type PayloadSink func(PayloadView)
+
 // Decoder 接收任意网络 chunk，并产出已经完整的 ProtocolEvent。
 type Decoder interface {
 	Feed(chunk []byte) ([]ProtocolEvent, error)
@@ -136,8 +147,9 @@ const defaultDecoderWorkMultiplier = int64(32)
 const maxAutoPrefixScan = 64
 
 type incrementalDecoder struct {
-	spec   DecoderSpec
-	format WireFormat
+	spec        DecoderSpec
+	format      WireFormat
+	payloadSink PayloadSink
 
 	maxEventBytes int64
 	maxTotalBytes int64
@@ -178,6 +190,13 @@ type incrementalDecoder struct {
 
 // NewDecoder 创建一个增量 Decoder。所有协议组合在读 body 前校验。
 func NewDecoder(spec DecoderSpec, format WireFormat, maxEventBytes, maxTotalBytes int64) (Decoder, error) {
+	return NewDecoderWithPayloadSink(spec, format, maxEventBytes, maxTotalBytes, nil)
+}
+
+// NewDecoderWithPayloadSink shares the normal decoder and budgets. The sink is
+// synchronous: only diagnostic worker instances may install one, never the
+// forwarding path. The default decoder does not expose response payloads.
+func NewDecoderWithPayloadSink(spec DecoderSpec, format WireFormat, maxEventBytes, maxTotalBytes int64, sink PayloadSink) (Decoder, error) {
 	if err := validateDecoderSpec(spec); err != nil {
 		return nil, err
 	}
@@ -193,6 +212,7 @@ func NewDecoder(spec DecoderSpec, format WireFormat, maxEventBytes, maxTotalByte
 	return &incrementalDecoder{
 		spec:          spec,
 		format:        format,
+		payloadSink:   sink,
 		maxEventBytes: maxEventBytes,
 		maxTotalBytes: maxTotalBytes,
 		maxWorkUnits:  maxTotalBytes * defaultDecoderWorkMultiplier,
@@ -680,6 +700,9 @@ func (d *incrementalDecoder) decodePayload(eventName string, payload []byte) ([]
 			}
 		}
 		return nil, makeDecoderError(ErrMalformedWire, d.format, d.offset, eventName, int64(len(payload)), 0)
+	}
+	if d.payloadSink != nil {
+		d.payloadSink(PayloadView{EventName: eventName, Object: object, Raw: payload})
 	}
 	return d.eventFromObject(eventName, object, payload)
 }

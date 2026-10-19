@@ -27,7 +27,7 @@ func TestSchemaEightHealthMigrationKeepsLegacyUnverifiedAndPairsItsReader(t *tes
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 9 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("schema9=%+v %v", state, err)
 	}
 	rows, err := current.LoadCurrentRouteHealth(context.Background())

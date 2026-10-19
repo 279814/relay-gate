@@ -49,7 +49,7 @@ func CurrentReaderBuildID(version string) (string, error) {
 }
 
 // OpenLockedWithReaderBuildID records startup's actual artifact identity for
-// rotation and new schema-9 migration backups. Earlier migration backups retain
+// rotation and new schema-9/schema-10 migration backups. Earlier migration backups retain
 // historical reader pins; identity never changes restore authorization.
 func OpenLockedWithReaderBuildID(dsn string, c *Cipher, held *InstanceLock, buildID string) (*Store, error) {
 	if strings.TrimSpace(buildID) == "" {
