@@ -85,7 +85,7 @@ test('sample metadata exposes recorded response truncation without loading any b
  const {shell,calls}=setup(async()=>({id:42,attempt_count:1,attempts:[value]}));
  await shell.openSampleMetadata(42);
  assert.deepEqual(calls,['/samples/42/metadata']);
- assert.equal(shell.attemptMetadata.attempts[0].decisions.find(f=>f.label==='样本响应正文截断')?.value,'是');
+ assert.equal(shell.attemptMetadata.attempts[0].decisions.find(f=>f.label==='响应正文截断标记')?.value,'已标记');
 });
 
 test('missing exact detail distinguishes pending observation from unavailable retained disposition', () => {
