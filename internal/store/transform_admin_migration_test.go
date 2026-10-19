@@ -43,7 +43,7 @@ func TestTransformAdminMigrationPairsFifteenAndPreservesDraft(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 16 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("transform admin schema=%+v %v", state, err)
 	}
 	var stored, lifecycle string
@@ -110,7 +110,7 @@ func TestTransformAdminSchemaRejectsPartialChangedUnknown(t *testing.T) {
 }
 
 func TestTransformAdminRotationPinsSixteenReaderAndRestoresState(t *testing.T) {
-	st := testStore(t)
+	st, _ := schemaSixteenFixture(t)
 	if _, err := st.db.Exec(`INSERT INTO transform_set(id,name,created_at,draft_json,revision,lifecycle_state) VALUES(1,'retained',1,'',5,'disabled')`); err != nil {
 		t.Fatal(err)
 	}
