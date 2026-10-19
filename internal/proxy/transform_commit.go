@@ -54,6 +54,12 @@ func (at *Attempt) CommitTransformed(w http.ResponseWriter, compiled *transform.
 	at.done = true
 	defer at.cancel()
 	defer at.resp.Body.Close()
+	if at.f.upstreamSample != nil {
+		if len(at.peeked) > 0 {
+			_, _ = at.f.upstreamSample.Write(at.peeked)
+		}
+		at.resp.Body = upstreamSampleBody{ReadCloser: at.resp.Body, capture: at.f.upstreamSample}
+	}
 	if at.failBeforeCommit() {
 		return at.res
 	}

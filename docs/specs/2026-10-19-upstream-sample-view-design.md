@@ -4,7 +4,7 @@
 
 ## 最小持久区分
 
-schema 12 的 metadata_version CHECK 固定为 1，不能无迁移升到 2；也不能从当前程序版本推断历史样本视图。按父任务自检建议，预留 schema 15，仅向 sample_attempt_metadata 追加 response_capture_view 固定 enum，默认 legacy，新值为 upstream_response、upstream_attempt_prefix、no_response。旧 Version 1 的 legacy 行永远按其原 Retried 事实显示 client_response/prefix；没有元数据的旧行仍 unknown。新原始样本在既有 sample 事务中显式写枚举。RequestLog 继续表达客户端状态和写入字节。
+schema 12 的 metadata_version CHECK 固定为 1，不能无迁移升到 2；也不能从当前程序版本推断历史样本视图。按父任务自检建议，预留 schema 15，仅向 sample_attempt_metadata 追加 response_capture_view 固定 enum，默认 legacy，新值为 upstream_response、upstream_attempt_prefix、no_response、omitted_secret、omitted_unverified。旧 Version 1 的 legacy 行永远按其原 Retried 事实显示 client_response/prefix；没有元数据的旧行仍 unknown。新原始样本在既有 sample 事务中显式写枚举。RequestLog 继续表达客户端状态和写入字节。
 
 迁移等待 Canary schema 14 稳定检查点，先生成 14 的配对备份，再执行确切 ALTER，最后提升版本。15 校验器只剥这一个精确追加列，恢复原 12 表声明后交给 14/13 既有物理指纹链。旧 12–14 DDL、reader 合同不变；部分列、未知索引和修改声明一律拒绝。
 
@@ -16,6 +16,8 @@ schema 12 的 metadata_version CHECK 固定为 1，不能无迁移升到 2；也
 
 ## 隐私、验证与风险
 
-样本关闭时不增加正文采集或快照。认证头、URL、正文继续使用已知凭据脱敏；SecretRef 和已知凭据污染的 hash/diff 省略。压缩响应仍保存原始编码字节，不能为了诊断改写客户端 wire；压缩/不完整样本的凭据检测能力必须实证，不能把编码后的污点当作安全内容。
+样本关闭时不增加正文采集或快照。认证头、URL、正文继续使用已知凭据脱敏；SecretRef 和已知凭据污染的 hash/diff 省略。压缩响应仍保存原始编码字节，不能为了诊断改写客户端 wire。既有 sample.Recorder writer 使用同一个 protocol.NewContentDecoder 与 BodyKeys 滑动窗口规则验证压缩捕获：最多 16 MiB 编码输入、64 MiB 解码输出、4096 次读取，单凭据长度超过 4096 字节也拒绝验证。安全流保留原编码字节；命中为 omitted_secret，不完整、未知编码、损坏、超限或无法读取为 omitted_unverified。两者都删除该样本响应 body/spill 并设置 TruncRespBody，保留请求和元数据，不能冒称完整响应。
+
+已知凭据仅在 Sample 的 json:"-" 短生命周期字段随既有队列进入 writer，不写 SQL/JSON；writer 开始验证时即清模型引用，成功、拒绝、配额跳过、写失败和队列丢弃路径都释放引用。扫描只使用有界窗口，不保留第二份解码后的响应正文，不加第二个队列。
 
 先用真实 HTTP 的 response status/header/body 改写、gzip/br SSE、synthetic、fail_closed、重试 discard、partial/取消及 spill/配额测试复现旧问题，再移动唯一采集点。存储验证覆盖 legacy 与 raw view 混存、坏 cipherbody metadata 读取、15 迁移备份恢复和严格指纹。最后检查普通 Flush 顺序、扫描 Observer 和请求日志语义未受影响。
