@@ -14,6 +14,12 @@ type PersistSink interface {
 	LoadTransformSnapshot() ([]Set, []Binding, error)
 }
 
+// TargetPersistSink checks the administrative publication target in the same
+// transaction as its snapshot. Trusted legacy setup remains available above.
+type TargetPersistSink interface {
+	SaveTransformSnapshotForTarget(sets []Set, bindings []Binding, routeID, endpointID int64) error
+}
+
 // WithPersist attaches durable storage; mutations rewrite the snapshot.
 func (r *Registry) WithPersist(p PersistSink) *Registry {
 	r.persist = p
@@ -31,8 +37,17 @@ func (r *Registry) LoadFromPersist() error {
 	if err != nil {
 		return err
 	}
+	limits := BudgetLimits{RequestMs: DefaultRequestBudgetMs, SSEEventMs: DefaultSSEBudgetMs}
+	revision := int64(1)
+	if sink, ok := r.persist.(BudgetPersistSink); ok {
+		limits, revision, err = sink.LoadTransformBudgets()
+		if err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.requestMs, r.sseMs, r.budgetRevision = limits.RequestMs, limits.SSEEventMs, revision
 	r.sets = make(map[int64]*Set)
 	r.bindings = make(map[string]*Binding)
 	var maxSet, maxVer int64

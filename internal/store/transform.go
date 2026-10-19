@@ -12,11 +12,28 @@ import (
 
 // SaveTransformSnapshot replaces all transform tables with the registry snapshot.
 func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform.Binding) error {
+	return s.saveTransformSnapshot(sets, bindings, 0, 0)
+}
+
+func (s *Store) SaveTransformSnapshotForTarget(sets []transform.Set, bindings []transform.Binding, routeID, endpointID int64) error {
+	return s.saveTransformSnapshot(sets, bindings, routeID, endpointID)
+}
+
+func (s *Store) saveTransformSnapshot(sets []transform.Set, bindings []transform.Binding, routeID, endpointID int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if routeID > 0 && endpointID > 0 {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM route r JOIN upstream_endpoint e ON e.upstream_id=r.upstream_id WHERE r.id=? AND e.id=?)`, routeID, endpointID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("%w: transform target missing or belongs to another upstream", transform.ErrRevisionConflict)
+		}
+	}
 	changed, err := liveTransformChanges(tx, sets, bindings)
 	if err != nil {
 		return err

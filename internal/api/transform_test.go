@@ -188,7 +188,7 @@ func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
 	h := s.Routes("pw")
 
 	raise := httptest.NewRequest(http.MethodPut, "/admin/api/transforms/budgets",
-		bytes.NewReader([]byte(`{"request_ms":80,"sse_event_ms":10,"confirm_raise":false}`)))
+		bytes.NewReader([]byte(`{"expected_revision":1,"request_ms":80,"sse_event_ms":10,"confirm_raise":false}`)))
 	raise.Header.Set("Authorization", "Bearer pw")
 	raise.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -198,7 +198,7 @@ func TestTransformAPI_BudgetsRaiseRequiresConfirm(t *testing.T) {
 	}
 
 	ok := httptest.NewRequest(http.MethodPut, "/admin/api/transforms/budgets",
-		bytes.NewReader([]byte(`{"request_ms":80,"sse_event_ms":10,"confirm_raise":true}`)))
+		bytes.NewReader([]byte(`{"expected_revision":1,"request_ms":80,"sse_event_ms":10,"confirm_raise":true}`)))
 	ok.Header.Set("Authorization", "Bearer pw")
 	ok.Header.Set("Content-Type", "application/json")
 	w = httptest.NewRecorder()

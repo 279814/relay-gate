@@ -157,20 +157,21 @@ type Compiled struct {
 // Registry holds in-process sets, bindings, and execution records.
 // Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
-	writerMu  sync.Mutex // serialize configuration writers without holding request readers over SQL
-	mu        sync.RWMutex
-	sets      map[int64]*Set
-	bindings  map[string]*Binding // key route:endpoint
-	execs     []ExecutionRecord
-	nextSet   atomic.Int64
-	nextVer   atomic.Int64
-	execSeq   atomic.Uint64
-	execCap   int
-	persist   PersistSink
-	requestMs int
-	sseMs     int
-	budgetLog []BudgetAudit
-	budgetCap int
+	writerMu       sync.Mutex // serialize configuration writers without holding request readers over SQL
+	mu             sync.RWMutex
+	sets           map[int64]*Set
+	bindings       map[string]*Binding // key route:endpoint
+	execs          []ExecutionRecord
+	nextSet        atomic.Int64
+	nextVer        atomic.Int64
+	execSeq        atomic.Uint64
+	execCap        int
+	persist        PersistSink
+	budgetRevision int64
+	requestMs      int
+	sseMs          int
+	budgetLog      []BudgetAudit
+	budgetCap      int
 }
 
 // BudgetLimits is the mutable execution time budget (§15.3).
@@ -195,12 +196,13 @@ func NewRegistry(execCap int) *Registry {
 		execCap = 200
 	}
 	r := &Registry{
-		sets:      make(map[int64]*Set),
-		bindings:  make(map[string]*Binding),
-		execCap:   execCap,
-		requestMs: DefaultRequestBudgetMs,
-		sseMs:     DefaultSSEBudgetMs,
-		budgetCap: 100,
+		sets:           make(map[int64]*Set),
+		bindings:       make(map[string]*Binding),
+		execCap:        execCap,
+		budgetRevision: 1,
+		requestMs:      DefaultRequestBudgetMs,
+		sseMs:          DefaultSSEBudgetMs,
+		budgetCap:      100,
 	}
 	r.nextSet.Store(1)
 	r.nextVer.Store(1)

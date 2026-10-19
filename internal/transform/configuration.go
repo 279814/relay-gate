@@ -29,6 +29,10 @@ type configuration struct {
 }
 
 func (r *Registry) changeConfiguration(change func(*configuration) (bool, error)) error {
+	return r.changeTargetConfiguration(0, 0, change)
+}
+
+func (r *Registry) changeTargetConfiguration(routeID, endpointID int64, change func(*configuration) (bool, error)) error {
 	r.writerMu.Lock()
 	defer r.writerMu.Unlock()
 	candidate := &configuration{sets: make(map[int64]*Set), bindings: make(map[string]*Binding)}
@@ -53,7 +57,13 @@ func (r *Registry) changeConfiguration(change func(*configuration) (bool, error)
 		for _, binding := range candidate.bindings {
 			bindings = append(bindings, *cloneBinding(binding))
 		}
-		if err := r.persist.SaveTransformSnapshot(sets, bindings); err != nil {
+		var err error
+		if sink, ok := r.persist.(TargetPersistSink); ok && routeID > 0 && endpointID > 0 {
+			err = sink.SaveTransformSnapshotForTarget(sets, bindings, routeID, endpointID)
+		} else {
+			err = r.persist.SaveTransformSnapshot(sets, bindings)
+		}
+		if err != nil {
 			return fmt.Errorf("%w: %w", ErrPersist, err)
 		}
 	}
@@ -175,7 +185,11 @@ func (r *Registry) publish(setID, routeID, endpointID int64, mode string, expect
 	if routeID < 1 || endpointID < 1 {
 		return nil, fmt.Errorf("route_id and endpoint_id must be positive")
 	}
-	err = r.changeConfiguration(func(c *configuration) (bool, error) {
+	guardRoute, guardEndpoint := int64(0), int64(0)
+	if expected != nil {
+		guardRoute, guardEndpoint = routeID, endpointID
+	}
+	err = r.changeTargetConfiguration(guardRoute, guardEndpoint, func(c *configuration) (bool, error) {
 		set := c.sets[setID]
 		if set == nil {
 			return false, ErrNotFound
@@ -250,7 +264,11 @@ func (r *Registry) ClearPublishedAtRevision(routeID, endpointID, expectedRevisio
 	return r.setPublished(routeID, endpointID, 0, &expectedRevision)
 }
 func (r *Registry) setPublished(routeID, endpointID, versionID int64, expected *int64) (result *Binding, err error) {
-	err = r.changeConfiguration(func(c *configuration) (bool, error) {
+	guardRoute, guardEndpoint := int64(0), int64(0)
+	if expected != nil {
+		guardRoute, guardEndpoint = routeID, endpointID
+	}
+	err = r.changeTargetConfiguration(guardRoute, guardEndpoint, func(c *configuration) (bool, error) {
 		binding := c.bindings[bindKey(routeID, endpointID)]
 		if binding == nil {
 			return false, ErrNotFound

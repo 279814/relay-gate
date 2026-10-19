@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/279814/relay-gate/internal/model"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
 )
@@ -35,11 +36,26 @@ func transformClientErr(err error) error {
 }
 
 func (s *Server) listTransformSets(w http.ResponseWriter, r *http.Request) {
-	if s.transforms == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"sets": []any{}})
+	if s.transforms == nil || s.st == nil {
+		writeJSON(w, 503, errBody{"transform store unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sets": s.transforms.ListSets()})
+	query, err := parseTransformQuery(r, "state", "name", "limit", "cursor")
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	pageRequest, err := transformPageRequest(query)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	page, err := s.st.ListTransformSetsPage(r.Context(), model.TransformSetFilter{PageRequest: pageRequest, State: query.Get("state"), Name: query.Get("name")})
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sets": page.Items, "total": page.Total, "next_cursor": page.NextCursor, "limit": page.Limit})
 }
 
 func (s *Server) createTransformSet(w http.ResponseWriter, r *http.Request) {
@@ -77,7 +93,12 @@ func (s *Server) getTransformSet(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, storeNotFound(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, set)
+	historyCount := len(set.History)
+	set.History = nil
+	writeJSON(w, http.StatusOK, struct {
+		*transform.Set
+		HistoryCount int `json:"history_count"`
+	}{set, historyCount})
 }
 
 func (s *Server) putTransformDraft(w http.ResponseWriter, r *http.Request) {
@@ -124,12 +145,13 @@ func (s *Server) postTransformPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Phase      string            `json:"phase"`
-		Body       string            `json:"body"`
-		Headers    map[string]string `json:"headers"`
-		Status     int               `json:"status"`
-		RespBody   string            `json:"resp_body"`
-		RespHeader map[string]string `json:"resp_headers"`
+		ExpectedRevision *int64            `json:"expected_revision"`
+		Phase            string            `json:"phase"`
+		Body             string            `json:"body"`
+		Headers          map[string]string `json:"headers"`
+		Status           int               `json:"status"`
+		RespBody         string            `json:"resp_body"`
+		RespHeader       map[string]string `json:"resp_headers"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
@@ -137,6 +159,18 @@ func (s *Server) postTransformPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Phase == "" {
 		body.Phase = "request"
+	}
+	if body.Phase != "request" && body.Phase != "response" && body.Phase != "sse" {
+		s.writeErr(w, model.WrapValidation("preview phase 无效"))
+		return
+	}
+	if body.ExpectedRevision != nil && *body.ExpectedRevision < 1 {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须为正整数"))
+		return
+	}
+	keys, ok := s.diagnosticKeys(w, r)
+	if !ok {
+		return
 	}
 	reqIn := transform.RequestInput{Header: http.Header{}, Body: []byte(body.Body)}
 	for k, v := range body.Headers {
@@ -149,9 +183,13 @@ func (s *Server) postTransformPreview(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body.RespHeader {
 		resIn.Header.Set(k, v)
 	}
-	out, err := s.transforms.Preview(id, body.Phase, reqIn, resIn)
+	out, err := s.transforms.PreviewSensitive(id, body.Phase, reqIn, resIn, keys, body.ExpectedRevision)
 	if err != nil {
-		s.writeErr(w, transformClientErr(err))
+		clientErr := transformClientErr(err)
+		if errors.Is(clientErr, model.ErrValidation) {
+			clientErr = model.WrapValidation("%s", sample.RedactDiagnosticText(err.Error(), keys))
+		}
+		s.writeErr(w, clientErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -252,11 +290,38 @@ func (s *Server) postTransformRollback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listTransformBindings(w http.ResponseWriter, r *http.Request) {
-	if s.transforms == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"bindings": []any{}})
+	if s.transforms == nil || s.st == nil {
+		writeJSON(w, 503, errBody{"transform store unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"bindings": s.transforms.ListBindings()})
+	query, err := parseTransformQuery(r, "set_id", "route_id", "endpoint_id", "version_id", "state", "limit", "cursor")
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	pageRequest, err := transformPageRequest(query)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	filter := model.TransformBindingFilter{PageRequest: pageRequest, State: query.Get("state")}
+	for _, field := range []struct {
+		name   string
+		target *int64
+	}{{"set_id", &filter.SetID}, {"route_id", &filter.RouteID}, {"endpoint_id", &filter.EndpointID}, {"version_id", &filter.VersionID}} {
+		id, err := optionalTransformID(query, field.name)
+		if err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		*field.target = id
+	}
+	page, err := s.st.ListTransformBindingsPage(r.Context(), filter)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"bindings": page.Items, "total": page.Total, "next_cursor": page.NextCursor, "limit": page.Limit})
 }
 
 func (s *Server) listTransformExecutions(w http.ResponseWriter, r *http.Request) {
@@ -282,10 +347,11 @@ func (s *Server) getTransformBudgets(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"transform registry unavailable"})
 		return
 	}
-	b := s.transforms.Budgets()
+	b, revision := s.transforms.BudgetSnapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"budgets": b,
-		"audit":   s.transforms.BudgetAudits(20),
+		"budgets":  b,
+		"revision": revision,
+		"audit":    s.transforms.BudgetAudits(20),
 	})
 }
 
@@ -295,22 +361,28 @@ func (s *Server) putTransformBudgets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		RequestMs    int  `json:"request_ms"`
-		SSEEventMs   int  `json:"sse_event_ms"`
-		ConfirmRaise bool `json:"confirm_raise"`
+		ExpectedRevision *int64 `json:"expected_revision"`
+		RequestMs        int    `json:"request_ms"`
+		SSEEventMs       int    `json:"sse_event_ms"`
+		ConfirmRaise     bool   `json:"confirm_raise"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	out, err := s.transforms.SetBudgets(body.RequestMs, body.SSEEventMs, body.ConfirmRaise)
+	if body.ExpectedRevision == nil || *body.ExpectedRevision < 1 {
+		s.writeErr(w, model.WrapValidation("expected_revision 必须为正整数"))
+		return
+	}
+	out, revision, err := s.transforms.SetBudgetsAtRevision(body.RequestMs, body.SSEEventMs, body.ConfirmRaise, *body.ExpectedRevision)
 	if err != nil {
 		s.writeErr(w, transformClientErr(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"budgets": out,
-		"audit":   s.transforms.BudgetAudits(20),
+		"budgets":  out,
+		"revision": revision,
+		"audit":    s.transforms.BudgetAudits(20),
 	})
 }
 

@@ -3,6 +3,7 @@ package transform
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,13 +31,21 @@ func (r *Registry) GetSet(id int64) (*Set, error) {
 
 // Preview compiles the draft and applies it in-memory (no binding change).
 func (r *Registry) Preview(setID int64, phase string, req RequestInput, res ResponseInput) (map[string]any, error) {
+	return r.PreviewSensitive(setID, phase, req, res, nil, nil)
+}
+func (r *Registry) PreviewSensitive(setID int64, phase string, req RequestInput, res ResponseInput, values []string, expected *int64) (map[string]any, error) {
 	r.mu.RLock()
 	s, ok := r.sets[setID]
 	if !ok || s.Draft == nil {
 		r.mu.RUnlock()
 		return nil, fmt.Errorf("transform set %d draft not found", setID)
 	}
+	if expected != nil && s.Revision != *expected {
+		r.mu.RUnlock()
+		return nil, ErrRevisionConflict
+	}
 	draft := *s.Draft
+	draft.Rules = append([]Rule(nil), s.Draft.Rules...)
 	r.mu.RUnlock()
 	if len(draft.Rules) == 0 {
 		return nil, fmt.Errorf("draft has no rules")
@@ -45,16 +54,24 @@ func (r *Registry) Preview(setID int64, phase string, req RequestInput, res Resp
 	if err != nil {
 		return nil, err
 	}
-	summary := c.ShadowDiff(phase, req, res)
+	summary := c.ShadowDiffSensitive(phase, req, res, values)
+	inputHash := ""
+	if !strings.Contains(summary, "diff=omitted(") {
+		body := req.Body
+		if phase != "request" {
+			body = res.Body
+		}
+		inputHash = HashBytes(body)
+	}
 	rec := r.record(ExecutionRecord{
 		RouteID:     0,
 		EndpointID:  0,
 		VersionID:   draft.ID,
 		Mode:        "preview",
 		Phase:       phase,
-		OK:          true,
+		OK:          strings.HasSuffix(summary, "err="),
 		DiffSummary: summary,
-		InputHash:   HashBytes(req.Body),
+		InputHash:   inputHash,
 	})
 	return map[string]any{"summary": summary, "execution": rec}, nil
 }
