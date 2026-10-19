@@ -2,6 +2,7 @@ package security
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -13,6 +14,20 @@ func TestPassiveMalformedUnicodeEscapeIsIncomplete(t *testing.T) {
 	for _, text := range []string{`payload \uZZZZ`, `payload \u12`, `payload %ZZ`} {
 		if fs := ScanText(text, "manual"); !reasonPresent(fs, "payload_decode_failed") {
 			t.Fatalf("malformed encoding claimed complete: %q %+v", text, fs)
+		}
+	}
+}
+
+func TestPassiveEncodedCredentialFragmentIsNotRetainedAsEvidence(t *testing.T) {
+	const credential = "synthetic-realistic-credential-for-test"
+	encoded := base64.StdEncoding.EncodeToString([]byte("metadata " + credential[:12] + " suffix"))
+	fs := ScanText(encoded, "manual", credential)
+	if !containsFinding(fs, "credential_fragment") {
+		t.Fatalf("encoded credential fragment missed: %+v", fs)
+	}
+	for _, f := range fs {
+		if strings.Contains(f.Detail, encoded) || strings.Contains(f.Detail, credential[:12]) {
+			t.Fatalf("encoded credential fragment retained: %+v", f)
 		}
 	}
 }

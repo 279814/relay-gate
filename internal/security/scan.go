@@ -196,7 +196,7 @@ func RedactSecrets(s string, keys []string) string {
 				s = strings.ReplaceAll(s, lower, masked)
 			}
 		}
-		if esc := jsonByteUnicodeEscape(k); esc != k {
+		if strings.Contains(s, `\u`) {
 			s = replaceJSONUnicodeEscapedSecret(s, k, masked)
 		}
 	}
@@ -207,70 +207,52 @@ func RedactSecrets(s string, keys []string) string {
 // JSON \u00XX-per-byte form of key with masked. Unrelated \u sequences are
 // left untouched; the surrounding text is never decoded.
 func replaceJSONUnicodeEscapedSecret(s, key, masked string) string {
-	n := len(key)
-	if n == 0 {
+	if key == "" || len(s) < len(key)*6 {
 		return s
 	}
-	patLen := n * 6
-	if len(s) < patLen {
-		return s
+	needle := jsonByteUnicodeEscape(key)
+	// KMP keeps repeated escaped prefixes linear in body + key length. Folding
+	// only A-F is sufficient: these letters occur only at hex positions in the
+	// needle, so surrounding text and the credential's letter case stay intact.
+	prefix := make([]int, len(needle))
+	for i, j := 1, 0; i < len(needle); i++ {
+		for j > 0 && needle[i] != needle[j] {
+			j = prefix[j-1]
+		}
+		if needle[i] == needle[j] {
+			j++
+		}
+		prefix[i] = j
 	}
-	var b strings.Builder
-	matched := false
-	for i := 0; i < len(s); {
-		if i+patLen <= len(s) && matchJSONByteUnicodeEscape(s[i:i+patLen], key) {
-			if !matched {
-				b.Grow(len(s))
-				b.WriteString(s[:i])
-				matched = true
-			}
-			b.WriteString(masked)
-			i += patLen
+	var out strings.Builder
+	last := 0
+	for i, j := 0, 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'F' {
+			c += 'a' - 'A'
+		}
+		for j > 0 && c != needle[j] {
+			j = prefix[j-1]
+		}
+		if c == needle[j] {
+			j++
+		}
+		if j != len(needle) {
 			continue
 		}
-		if matched {
-			b.WriteByte(s[i])
+		if last == 0 {
+			out.Grow(len(s))
 		}
-		i++
+		out.WriteString(s[last : i+1-len(needle)])
+		out.WriteString(masked)
+		last = i + 1
+		j = 0 // ReplaceAll semantics: matches do not overlap.
 	}
-	if !matched {
+	if last == 0 {
 		return s
 	}
-	return b.String()
-}
-
-// matchJSONByteUnicodeEscape reports whether chunk is key encoded as one
-// \u00XX per byte, with hex digits in either case.
-func matchJSONByteUnicodeEscape(chunk, key string) bool {
-	if len(chunk) != len(key)*6 {
-		return false
-	}
-	for i := 0; i < len(key); i++ {
-		off := i * 6
-		if chunk[off] != '\\' || chunk[off+1] != 'u' {
-			return false
-		}
-		c := key[i]
-		if hexDigitVal(chunk[off+2]) != 0 || hexDigitVal(chunk[off+3]) != 0 ||
-			hexDigitVal(chunk[off+4]) != c>>4 || hexDigitVal(chunk[off+5]) != c&0xf {
-			return false
-		}
-	}
-	return true
-}
-
-// hexDigitVal returns the 0–15 value of c, or 0xFF if c is not a hex digit.
-func hexDigitVal(c byte) byte {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0'
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10
-	default:
-		return 0xFF
-	}
+	out.WriteString(s[last:])
+	return out.String()
 }
 
 // jsonByteUnicodeEscape encodes each byte of s as \u00XX with lowercase hex

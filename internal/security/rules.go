@@ -177,6 +177,9 @@ func (r *scanRun) credentialSignals(text, evidence string, depth int) {
 	for _, key := range r.input.Keys {
 		if len(key) >= 24 && (strings.Contains(text, key[:12]) || strings.Contains(text, key[len(key)-12:])) {
 			r.add(SeverityHigh, "credential_fragment", "响应包含已知 Credential 片段", evidence)
+			if depth > 0 && RedactSecrets(evidence, r.input.Keys) == evidence {
+				r.hiddenCredential = true
+			}
 		}
 	}
 }
