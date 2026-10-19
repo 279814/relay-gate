@@ -88,6 +88,83 @@ func TestRouteHealthClearFailureRollsBackConfigurationTransaction(t *testing.T) 
 	}
 }
 
+func TestCalibrationHealthClearSharesTheSuccessfulPublishTransaction(t *testing.T) {
+	for _, rejectClear := range []bool{false, true} {
+		t.Run(map[bool]string{false: "clear", true: "rollback"}[rejectClear], func(t *testing.T) {
+			ctx := context.Background()
+			remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				drainBody(r)
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, anthropicSemanticBody())
+			}))
+			defer remote.Close()
+			st, _, _, route, row := boundNegativeSnapshot(t, func(st *store.Store, up *model.Upstream, _ *model.ModelName, _ *model.Route) {
+				up.BaseURL = remote.URL
+				if err := st.UpdateUpstreamWithRevision(ctx, up, up.Revision); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if err := st.SaveRouteHealth([]*store.RouteHealth{row}); err != nil {
+				t.Fatal(err)
+			}
+			cfg, admin := healthRestoreAdmin(t, st)
+			calibration := NewCalibrationService(st, admin.executor, WallClock(), discardLogger(), cfg.Settings, NewCapabilityRegistry(cfg)).WithConfigPublisher(cfg)
+			run, err := calibration.Plan(ctx, route.ID, model.EndpointMessages, CalibrationPlanOptions{Manual: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := calibration.Start(ctx, run.ID, run.Revision); err != nil {
+				t.Fatal(err)
+			}
+			var before *store.ConfigBundle
+			var beforeRun *model.CalibrationRun
+			calibration.crashAt = CrashAfterExecutionCommit
+			calibration.crashFn = func(CalibrationCrashPoint) {
+				before, err = st.LoadConfigBundle(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeRun, err = st.GetCalibrationRun(ctx, run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rejectClear {
+					if _, err := st.DB().Exec(`CREATE TRIGGER deny_calibration_health_clear BEFORE UPDATE OF state ON route_health BEGIN SELECT RAISE(ABORT,'health clear denied'); END`); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err = calibration.stepOnce(ctx)
+			if before == nil {
+				t.Fatal("calibration did not complete its real HTTP execution")
+			}
+			if !rejectClear {
+				if err != nil {
+					t.Fatal(err)
+				}
+				final, err := st.GetCalibrationRun(ctx, run.ID)
+				if err != nil || final.State != model.CalibrationSucceeded {
+					t.Fatalf("real calibration did not publish: run=%+v err=%v", final, err)
+				}
+				assertDurableHealthState(t, st, route.ID, false)
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "health clear denied") {
+				t.Fatalf("calibration did not reach the rejected health clear: %v", err)
+			}
+			after, err := st.LoadConfigBundle(ctx)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("calibration Auth/Recipe changes escaped the rolled-back transaction", err)
+			}
+			afterRun, err := st.GetCalibrationRun(ctx, run.ID)
+			if err != nil || !reflect.DeepEqual(beforeRun, afterRun) {
+				t.Fatal("calibration state escaped the rolled-back transaction", err)
+			}
+			assertDurableHealthState(t, st, route.ID, true)
+		})
+	}
+}
+
 func TestRouteHealthUnrelatedEndpointAndCandidateEditsKeepEvidence(t *testing.T) {
 	st, up, _, route, row := boundNegativeSnapshot(t)
 	if err := st.SaveRouteHealth([]*store.RouteHealth{row}); err != nil {
