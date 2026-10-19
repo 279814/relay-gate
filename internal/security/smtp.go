@@ -12,16 +12,38 @@ import (
 
 // MailConfig is runtime SMTP settings for alerts (§14.6).
 type MailConfig struct {
-	Enabled     bool
-	Host        string
-	Port        int
-	UseSTARTTLS bool
-	UseSMTPS    bool
-	From        string
-	Recipients  []string
-	Username    string
-	Password    string
-	MinSeverity Severity
+	Revision             int64
+	Enabled              bool
+	Host                 string
+	Port                 int
+	UseSTARTTLS          bool
+	UseSMTPS             bool
+	From                 string
+	Recipients           []string
+	Username             string
+	Password             string
+	MinSeverity          Severity
+	AggregationWindowSec int
+	RateLimitWindowSec   int
+}
+
+const DefaultSMTPWindowSec = 300
+const MaxSMTPWindowSec = 86400
+
+func (c MailConfig) withDefaults() MailConfig {
+	if c.Port == 0 {
+		c.Port = 587
+		if c.UseSMTPS {
+			c.Port = 465
+		}
+	}
+	if c.AggregationWindowSec == 0 {
+		c.AggregationWindowSec = DefaultSMTPWindowSec
+	}
+	if c.RateLimitWindowSec == 0 {
+		c.RateLimitWindowSec = DefaultSMTPWindowSec
+	}
+	return c
 }
 
 type digestItem struct {
@@ -39,7 +61,6 @@ type AlertMailer struct {
 	dial   func(addr string) (net.Conn, error)
 	send   func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
 	lastAt map[string]time.Time // finding identity → last notify/digest
-	window time.Duration
 
 	pending       map[string]digestItem
 	digestStarted time.Time
@@ -53,20 +74,32 @@ type AlertMailer struct {
 // NewAlertMailer constructs a mailer with bounded, certificate-verified TLS.
 func NewAlertMailer() *AlertMailer {
 	return &AlertMailer{
+		cfg:     (MailConfig{}).withDefaults(),
 		dial:    func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) },
 		lastAt:  map[string]time.Time{},
 		pending: map[string]digestItem{},
-		window:  5 * time.Minute,
 		now:     time.Now,
 		timeout: 10 * time.Second,
 	}
 }
 
 // SetConfig replaces SMTP settings (password held in memory only).
-func (m *AlertMailer) SetConfig(c MailConfig) {
+func (m *AlertMailer) SetConfig(c MailConfig) error {
+	c = c.withDefaults()
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	c.Recipients = append([]string(nil), c.Recipients...)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if c.Revision < m.cfg.Revision {
+		return nil // a slower reload must not replace a newer committed snapshot
+	}
 	m.cfg = c
+	if !m.digestStarted.IsZero() {
+		m.armDigestTimerLocked()
+	}
+	return nil
 }
 
 // Config returns a copy without password.
@@ -75,6 +108,7 @@ func (m *AlertMailer) Config() MailConfig {
 	defer m.mu.Unlock()
 	c := m.cfg
 	c.Password = ""
+	c.Recipients = append([]string(nil), c.Recipients...)
 	return c
 }
 
@@ -201,7 +235,7 @@ func (m *AlertMailer) MaybeNotify(f Finding, adminURL string) error {
 func (m *AlertMailer) notifyImmediate(cfg MailConfig, f Finding, adminURL, key string) error {
 	m.mu.Lock()
 	now := m.now()
-	if t, ok := m.lastAt[key]; ok && now.Sub(t) < m.window {
+	if t, ok := m.lastAt[key]; ok && now.Sub(t) < time.Duration(cfg.RateLimitWindowSec)*time.Second {
 		m.mu.Unlock()
 		return nil
 	}
@@ -221,7 +255,7 @@ func (m *AlertMailer) queueDigest(f Finding, adminURL, key string) error {
 		m.pending[key] = item
 		return nil
 	}
-	if t, ok := m.lastAt[key]; ok && now.Sub(t) < m.window {
+	if t, ok := m.lastAt[key]; ok && now.Sub(t) < time.Duration(m.cfg.RateLimitWindowSec)*time.Second {
 		return nil
 	}
 	m.pending[key] = digestItem{finding: f, count: 1, adminURL: adminURL}
@@ -240,9 +274,11 @@ func (m *AlertMailer) armDigestTimerLocked() {
 	if m.testClock {
 		return
 	}
-	delay := m.window
+	delay := max(time.Duration(0), m.digestStarted.Add(time.Duration(m.cfg.AggregationWindowSec)*time.Second).Sub(m.now()))
 	m.digestTimer = time.AfterFunc(delay, func() {
-		_ = m.FlushDigest()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		_ = m.flushDigestIfDueLocked(m.now())
 	})
 }
 
@@ -260,7 +296,7 @@ func (m *AlertMailer) flushDigestIfDueLocked(now time.Time) error {
 	if len(m.pending) == 0 || m.digestStarted.IsZero() {
 		return nil
 	}
-	if now.Sub(m.digestStarted) < m.window {
+	if now.Sub(m.digestStarted) < time.Duration(m.cfg.AggregationWindowSec)*time.Second {
 		return nil
 	}
 	return m.flushDigestLocked(now)

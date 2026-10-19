@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -9,7 +10,7 @@ import (
 
 func TestSMTPInvalidEnabledConfigurationDoesNotChangeSavedConfigOrSecret(t *testing.T) {
 	st := testStore(t)
-	valid := SMTPConfig{Enabled: true, Host: "smtp.example.test", Port: 587, UseSTARTTLS: true,
+	valid := SMTPConfig{Revision: 1, AggregationWindowSec: 300, RateLimitWindowSec: 300, Enabled: true, Host: "smtp.example.test", Port: 587, UseSTARTTLS: true,
 		From: "relay@example.test", Recipients: "ops@example.test", MinSeverity: "high"}
 	if err := st.SaveSMTPConfig(valid, "fixture-existing-password"); err != nil {
 		t.Fatal(err)
@@ -54,5 +55,60 @@ func TestSMTPInvalidEnabledConfigurationDoesNotChangeSavedConfigOrSecret(t *test
 				t.Fatal("rejected save changed encrypted SMTP password")
 			}
 		})
+	}
+}
+
+func TestSMTPConfigConcurrentCASHasExactlyOneWinner(t *testing.T) {
+	st := testStore(t)
+	cfg, err := st.GetSMTPConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, host := range []string{"first.example.test", "second.example.test"} {
+		wait.Add(1)
+		go func(host string) {
+			defer wait.Done()
+			<-start
+			candidate := cfg
+			candidate.Host = host
+			results <- st.SaveSMTPConfig(candidate, "fixture-new-password")
+		}(host)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	wins, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			wins++
+		} else if errors.Is(err, ErrRevisionConflict) {
+			conflicts++
+		} else {
+			t.Fatal(err)
+		}
+	}
+	if wins != 1 || conflicts != 1 {
+		t.Fatalf("CAS winners=%d conflicts=%d", wins, conflicts)
+	}
+	saved, err := st.GetSMTPConfig()
+	if err != nil || saved.Revision != 2 {
+		t.Fatalf("SMTP revision=%d err=%v", saved.Revision, err)
+	}
+	var before, after string
+	if err := st.db.QueryRow(`SELECT password_enc FROM smtp_config`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Host = "stale.example.test"
+	if err := st.SaveSMTPConfig(cfg, "fixture-stale-password"); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale save=%v", err)
+	}
+	if err := st.db.QueryRow(`SELECT password_enc FROM smtp_config`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("CAS conflict replaced password ciphertext")
 	}
 }

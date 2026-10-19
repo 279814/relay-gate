@@ -7,3 +7,5 @@ schema13只扩展既有SMTP单行表的两个秒数字段及单调revision；旧
 API只收可编辑字段和expected_revision，遗漏/错误revision不写入，旧草稿冲突409。UI发送显示的revision，保存后采用服务器返回版本；409保留当前编辑及输入密码，暂停再次保存，用户显式重载才覆盖。普通读取/重载及晚到写入仍受现会话身份隔离。密码、has_password和updated_at的既有读写边界保持。
 
 AlertMailer安装配置时复制Recipients，聚合定时器始终按当前窗口检查是否到期，旧回调不能提前发送或重复摘要。设置变化重算剩余等待时间；不用新epoch、队列或通知平台。保留原有限发现去重语义；不扩展主动诊断或改动真实模型转发。先以独立窗口、重配置/旧timer、重复critical、手动测试和recipient别名红绿，再验证真实SQLite CAS/密码保留、HTTP与Node/UI合约。
+
+配置与密码由同一个 SQLite 查询捕获，运行时按持久 revision 拒绝迟到的旧快照；启动注入 Mailer 时加载已保存配置。提交成功但读回/激活失败返回 persisted/activation-pending，页面保留草稿并禁止重放。测试覆盖已排队旧计时回调重新核对当前聚合截止时间、并发 CAS 单一胜者、SQL 写入拒绝时密码和运行配置均不变。
