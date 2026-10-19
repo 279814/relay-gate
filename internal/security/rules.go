@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -31,6 +32,7 @@ type Rule struct {
 	Severity                       Severity
 	re                             *regexp.Regexp
 	pattern                        string
+	workFactor                     int
 }
 
 func CompileRule(id, pattern, literal, category string, severity Severity) (Rule, error) {
@@ -47,6 +49,15 @@ func CompileRule(id, pattern, literal, category string, severity Severity) (Rule
 		if err != nil {
 			return Rule{}, errors.New("invalid security RE2 expression")
 		}
+		parsed, err := syntax.Parse(pattern, syntax.Perl)
+		if err != nil {
+			return Rule{}, errors.New("invalid security RE2 expression")
+		}
+		program, err := syntax.Compile(parsed.Simplify())
+		if err != nil {
+			return Rule{}, errors.New("invalid security RE2 expression")
+		}
+		r.workFactor = len(program.Inst)
 	}
 	return r, nil
 }
@@ -123,6 +134,12 @@ func (r *scanRun) inspectTextVisible(text, evidence string, depth int, visible s
 	for _, rule := range r.scanner.rules {
 		if !r.available() {
 			return
+		}
+		// RE2 is linear, but its program size is the constant factor. Refuse
+		// a large NFA/window product before starting an uninterruptible Match.
+		if rule.re != nil && rule.workFactor > maxRegexWorkUnits/max(1, len(text)) {
+			r.incomplete("regex_work_budget", true)
+			continue
 		}
 		if rule.re != nil && rule.re.MatchString(text) || rule.Literal != "" && strings.Contains(text, rule.Literal) {
 			r.add(rule.Severity, rule.Category, rule.Summary, evidence)

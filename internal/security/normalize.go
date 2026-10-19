@@ -65,7 +65,7 @@ func decodedVariants(text string) []decodedValue {
 	}, text)
 	value = norm.NFKC.String(value)
 	add(value, hidden)
-	for _, token := range reBase64.FindAllString(text, 32) {
+	for _, token := range reBase64.FindAllString(text, -1) {
 		var data []byte
 		var err error
 		switch {

@@ -28,12 +28,10 @@ func (o *Observer) Wrap(job ObserveJob) *Capture {
 	c.observer = o
 	job.Body = nil
 	job.input = ScanInput{Spec: job.Spec, Source: "traffic"}
-	for i, key := range job.Keys {
-		if i >= 64 || len(key) > 4096 {
-			job.input.IncompleteReason = "credential_context_limit"
-			break
-		}
-		job.input.Keys = append(job.input.Keys, key)
+	var limited bool
+	job.input.Keys, limited = boundedCredentials(job.Keys)
+	if limited {
+		job.input.IncompleteReason = "credential_context_limit"
 	}
 	job.Keys = nil
 	c.job = job
@@ -59,7 +57,7 @@ func (c *Capture) TryHeaders(header http.Header) {
 		value := header.Get(field.name)
 		if len(value) > 1024 {
 			value = value[:1024]
-			c.job.input.IncompleteReason = "header_context_limit"
+			c.job.input.IncompleteReason = appendIncomplete(c.job.input.IncompleteReason, "header_context_limit")
 		}
 		*field.target = value
 	}
@@ -165,4 +163,18 @@ func appendIncomplete(existing, reason string) string {
 		return existing
 	}
 	return existing + "," + reason
+}
+
+func boundedCredentials(keys []string) (out []string, limited bool) {
+	for i, key := range keys {
+		if i >= 64 {
+			return out, true
+		}
+		if len(key) > 4096 {
+			limited = true
+			continue
+		}
+		out = append(out, key)
+	}
+	return out, limited
 }

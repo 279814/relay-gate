@@ -15,13 +15,14 @@ import (
 )
 
 const (
-	MaxEventBytes    = 256 << 10
-	MaxExpandedBytes = 4 << 20
-	MaxDecodeDepth   = 2
-	MaxPatternBytes  = 4 << 10
-	ScanBudget       = 100 * time.Millisecond
-	scanWindow       = 32 << 10
-	scanOverlap      = 4 << 10
+	MaxEventBytes     = 256 << 10
+	MaxExpandedBytes  = 4 << 20
+	MaxDecodeDepth    = 2
+	MaxPatternBytes   = 4 << 10
+	maxRegexWorkUnits = 1 << 20
+	ScanBudget        = 100 * time.Millisecond
+	scanWindow        = 32 << 10
+	scanOverlap       = 4 << 10
 )
 
 // Segment preserves wire offsets. A missing interval is never concatenated
@@ -75,13 +76,21 @@ type scanRun struct {
 	textTails        map[string]string
 	textFences       map[string]bool
 	nonceSeen        bool
+	toolNames        map[string]string
+	toolOrder        []string
 }
 
 func (s *Scanner) Scan(input ScanInput) []Finding {
 	if s == nil {
 		s = defaultScanner
 	}
-	r := &scanRun{scanner: s, input: input, started: time.Now(), reasons: map[string]bool{}, found: map[string]Finding{}}
+	started := time.Now()
+	var limited bool
+	input.Keys, limited = boundedCredentials(input.Keys)
+	r := &scanRun{scanner: s, input: input, started: started, reasons: map[string]bool{}, found: map[string]Finding{}}
+	if limited {
+		r.incomplete("credential_context_limit", true)
+	}
 	if input.IncompleteReason != "" {
 		r.incomplete(input.IncompleteReason, true)
 	}
@@ -285,7 +294,11 @@ func (r *scanRun) spend(n int) bool {
 }
 
 func (r *scanRun) incomplete(reason string, truncated bool) {
-	r.reasons[reason] = true
+	for _, part := range strings.Split(reason, ",") {
+		if part != "" {
+			r.reasons[part] = true
+		}
+	}
 	r.truncated = r.truncated || truncated
 }
 
@@ -298,6 +311,14 @@ func (r *scanRun) add(severity Severity, category, summary, detail string) {
 }
 
 func (r *scanRun) finish() []Finding {
+	for _, channel := range r.toolOrder {
+		if len(r.reasons) > 0 {
+			r.incomplete("tool_name_unverified", false)
+			break
+		}
+		r.tool(r.toolNames[channel])
+	}
+	_ = r.available() // Include work performed by the final operation in the budget.
 	if nonce := r.input.Context.ExpectedNonce; nonce != "" {
 		if len(nonce) > 128 {
 			r.incomplete("nonce_context_limit", true)
@@ -326,7 +347,10 @@ func (r *scanRun) finish() []Finding {
 		f.Truncated = r.truncated
 		f.DecodeDepth = r.depth
 		f.IncompleteReason = strings.Join(reasons, ",")
-		if r.hiddenCredential && f.Detail != "" {
+		if r.reasons["credential_context_limit"] && f.Detail != "" {
+			f.Summary = "扫描发现风险；凭据上下文超限"
+			f.Detail = "凭据上下文超限；原始证据不保存"
+		} else if r.hiddenCredential && f.Detail != "" {
 			f.Detail = "编码载荷中的 Credential 已脱敏；原始证据不保存"
 		}
 		hash := sha256.Sum256([]byte(f.Detail))

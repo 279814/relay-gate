@@ -29,6 +29,7 @@ func (r *scanRun) object(object map[string]json.RawMessage, path string, depth i
 		r.incomplete("structure_depth", true)
 		return
 	}
+	path = r.indexedPath(object, path)
 	var role, kind, name string
 	_ = json.Unmarshal(object["role"], &role)
 	_ = json.Unmarshal(object["type"], &kind)
@@ -43,7 +44,7 @@ func (r *scanRun) object(object map[string]json.RawMessage, path string, depth i
 	if kind == "tool_use" || kind == "function_call" || kind == "custom_tool_call" {
 		r.tool(name)
 	}
-	for _, field := range []string{"text", "output_text", "completion", "partial_json"} {
+	for _, field := range []string{"text", "output_text", "completion", "partial_json", "delta"} {
 		var text string
 		if json.Unmarshal(object[field], &text) == nil && text != "" {
 			r.protocolText(path+"/"+field, text)
@@ -68,17 +69,25 @@ func (r *scanRun) object(object map[string]json.RawMessage, path string, depth i
 	}
 	var tools []map[string]json.RawMessage
 	if json.Unmarshal(object["tool_calls"], &tools) == nil {
-		for _, tool := range tools {
+		for i, tool := range tools {
+			toolPath := path + "/tool_arguments/" + strconv.Itoa(i)
+			if _, indexed := tool["index"]; indexed {
+				toolPath = r.indexedPath(tool, path+"/tool_arguments")
+			}
 			var function struct {
 				Name      string `json:"name"`
 				Arguments string `json:"arguments"`
 			}
 			if json.Unmarshal(tool["function"], &function) == nil {
 				if function.Name != "" {
-					r.tool(function.Name)
+					if strings.Contains(path, "/delta") {
+						r.toolFragment(toolPath, function.Name)
+					} else {
+						r.tool(function.Name)
+					}
 				}
 				if function.Arguments != "" {
-					r.protocolText(path+"/tool_arguments", function.Arguments)
+					r.protocolText(toolPath, function.Arguments)
 				}
 			}
 		}
@@ -87,9 +96,55 @@ func (r *scanRun) object(object map[string]json.RawMessage, path string, depth i
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}
-	if json.Unmarshal(object["function_call"], &function) == nil && function.Name != "" {
-		r.tool(function.Name)
+	if json.Unmarshal(object["function_call"], &function) == nil {
+		if function.Name != "" {
+			if strings.Contains(path, "/delta") {
+				r.toolFragment(path+"/function_call", function.Name)
+			} else {
+				r.tool(function.Name)
+			}
+		}
+		if function.Arguments != "" {
+			r.protocolText(path+"/function_call_arguments", function.Arguments)
+		}
 	}
+}
+
+func (r *scanRun) indexedPath(object map[string]json.RawMessage, path string) string {
+	for _, field := range []string{"index", "output_index", "content_index"} {
+		if raw, ok := object[field]; ok {
+			var index int
+			if json.Unmarshal(raw, &index) != nil || index < 0 || index >= 256 {
+				r.incomplete("protocol_index_invalid", false)
+			} else {
+				path += "/" + field + ":" + strconv.Itoa(index)
+			}
+		}
+	}
+	return path
+}
+
+func (r *scanRun) toolFragment(channel, name string) {
+	if !r.input.Context.ToolsKnown {
+		r.incomplete("request_tool_context_unknown", false)
+		return
+	}
+	if r.toolNames == nil {
+		r.toolNames = map[string]string{}
+	}
+	previous, exists := r.toolNames[channel]
+	if !exists {
+		if len(r.toolNames) >= 16 {
+			r.incomplete("tool_name_channels", true)
+			return
+		}
+		r.toolOrder = append(r.toolOrder, channel)
+	}
+	if len(previous)+len(name) > 128 {
+		r.incomplete("tool_name_limit", true)
+		return
+	}
+	r.toolNames[channel] = previous + name
 }
 
 func (r *scanRun) objects(raw json.RawMessage, path string, depth int) {
@@ -105,7 +160,11 @@ func (r *scanRun) objects(raw json.RawMessage, path string, depth int) {
 			r.incomplete("structure_items", true)
 			return
 		}
-		r.object(item, path+"/"+strconv.Itoa(i), depth)
+		childPath := path + "/" + strconv.Itoa(i)
+		if _, indexed := item["index"]; indexed {
+			childPath = path
+		}
+		r.object(item, childPath, depth)
 	}
 }
 
@@ -126,6 +185,13 @@ func (r *scanRun) protocolText(channel, text string) {
 	r.windowsWithFence(text, 0, initiallyFenced)
 	if len(text) > scanOverlap {
 		cut := len(text) - scanOverlap
+		// A one/two-character prefix is not yet a complete Markdown fence.
+		// Keep it with the tail so the next event sees the original marker.
+		lineStart := strings.LastIndex(text[:cut], "\n") + 1
+		prefix := strings.TrimSpace(text[lineStart:cut])
+		if prefix == "`" || prefix == "``" || prefix == "~" || prefix == "~~" {
+			cut -= len(prefix)
+		}
 		_, r.textFences[channel] = codeVisibility(text[:cut], initiallyFenced)
 		text = text[cut:]
 	}
@@ -173,7 +239,21 @@ func (r *scanRun) credentialsInValue(value any, depth int) {
 // Unknown protocol fields cannot establish role/tool facts, but must not hide
 // known credentials by placing them in an encoded metadata string.
 func (r *scanRun) credentialValue(text string, depth int) {
-	if len(r.input.Keys) == 0 || text == "" || !r.spend(len(text)) {
+	if len(r.input.Keys) == 0 || text == "" {
+		return
+	}
+	if len(text) > scanWindow {
+		for offset := 0; offset < len(text) && r.available(); {
+			end := min(offset+scanWindow, len(text))
+			r.credentialValue(text[offset:end], depth)
+			if end == len(text) {
+				break
+			}
+			offset = end - scanOverlap
+		}
+		return
+	}
+	if !r.spend(len(text)) {
 		return
 	}
 	r.depth = max(r.depth, depth)

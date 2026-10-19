@@ -38,9 +38,9 @@ type Finding struct {
 	RouteID          int64    `json:"route_id,omitempty"`
 	ReqID            string   `json:"req_id,omitempty"`
 	Source           string   `json:"source"` // passive | canary | smtp_test
-	ScannerVersion   string   `json:"scanner_version,omitempty"`
-	RuleVersion      string   `json:"rule_version,omitempty"`
-	BytesScanned     int64    `json:"bytes_scanned,omitempty"`
+	ScannerVersion   string   `json:"scanner_version"`
+	RuleVersion      string   `json:"rule_version"`
+	BytesScanned     int64    `json:"bytes_scanned"`
 	Truncated        bool     `json:"truncated"`
 	DecodeDepth      int      `json:"decode_depth"`
 	EvidenceHash     string   `json:"evidence_hash"` // SHA-256 of finite redacted Detail, not the response body

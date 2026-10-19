@@ -9,10 +9,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/security"
 	"github.com/279814/relay-gate/internal/transform"
 )
@@ -26,6 +28,53 @@ func attachPassiveScanner(t *testing.T, h *Handler, size int) (*security.Observe
 	h.WithSecurityObserver(o)
 	t.Cleanup(o.Close)
 	return o, center
+}
+
+type passiveFlowObserver struct {
+	countAttemptObserver
+	request       []byte
+	progress      health.ResponseProgress
+	changes       chan struct{}
+	progressCalls atomic.Int32
+	trace         *outbound.AttemptTrace
+}
+
+func (o *passiveFlowObserver) PrepareAttempt(context.Context, health.AttemptTarget, health.AttemptRequestView) health.AttemptInstrumentation {
+	return health.AttemptInstrumentation{Observer: o, Retry: health.KeepAttemptDecider{}, Trace: o.trace}
+}
+func (o *passiveFlowObserver) TryRequest(view health.AttemptRequestView) {
+	o.request = append([]byte(nil), view.Body...)
+}
+func (o *passiveFlowObserver) ResponseProgress() health.ResponseProgress {
+	o.progressCalls.Add(1)
+	return o.progress
+}
+func (o *passiveFlowObserver) ProgressChanges() <-chan struct{} { return o.changes }
+
+func TestPassiveCapturePreservesActualHealthRequestProgressAndTrace(t *testing.T) {
+	plain := []byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"` + passiveRisk + `"}]}`)
+	wire := gzipBody(t, plain)
+	hs := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(wire)
+	})
+	healthObserver := &passiveFlowObserver{trace: &outbound.AttemptTrace{}, changes: make(chan struct{}), progress: health.ResponseProgress{FirstSemanticAt: time.Now(), LastSemanticAt: time.Now()}}
+	hs.h.WithObservers(healthObserver)
+	o, center := attachPassiveScanner(t, hs.h, 4)
+	rec := hs.serve(hs.anthropicRequest(`{"model":"claude-opus-5","messages":[],"max_tokens":1}`))
+	if rec.Code != 200 || !bytes.Equal(rec.Body.Bytes(), wire) {
+		t.Fatalf("observer changed compressed response: %d", rec.Code)
+	}
+	if !bytes.Equal(healthObserver.body, wire) || len(healthObserver.request) == 0 || healthObserver.progressCalls.Load() == 0 || healthObserver.finished != 1 || !healthObserver.finish.ClientCommitted || healthObserver.finish.ReadErr != nil {
+		t.Fatalf("health optional semantics changed: %+v", healthObserver.finish)
+	}
+	if trace := healthObserver.trace.Snapshot(); trace.SentAt.IsZero() || trace.GotConnAt.IsZero() {
+		t.Fatalf("transport trace detached: %+v", trace)
+	}
+	if len(passiveFindings(t, o, center, "data_exfiltration")) != 1 {
+		t.Fatal("health instrumentation prevented passive scan")
+	}
 }
 
 func passiveFindings(t *testing.T, o *security.Observer, center *security.Center, category string) []security.Finding {
