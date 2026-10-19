@@ -266,8 +266,10 @@ func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult
 		validator, contract = "schema-9-route-health-v1", "schema-9-route-health-v1-reader"
 	case 10:
 		validator, contract = "schema-10-security-scan-v1", "schema-10-security-scan-v1-reader"
+	case 11:
+		validator, contract = "schema-11-audit-v1", "schema-11-audit-v1-reader"
 	default:
-		return MigrationBackupResult{}, fmt.Errorf("rotation backup requires schema 8, 9 or 10")
+		return MigrationBackupResult{}, fmt.Errorf("rotation backup requires schema 8, 9, 10 or 11")
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -278,7 +280,7 @@ func (s *Store) CreateRotationBackup(ctx context.Context) (MigrationBackupResult
 }
 
 func rotationBackupBoundary(source, target int, validator string) bool {
-	return source == target && ((source == 8 && validator == "schema-8-data-key-v2") || (source == 9 && validator == "schema-9-route-health-v1") || (source == 10 && validator == "schema-10-security-scan-v1"))
+	return source == target && ((source == 8 && validator == "schema-8-data-key-v2") || (source == 9 && validator == "schema-9-route-health-v1") || (source == 10 && validator == "schema-10-security-scan-v1") || (source == 11 && validator == "schema-11-audit-v1"))
 }
 
 func syncDirectory(path string) error {
