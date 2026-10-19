@@ -42,4 +42,3 @@ CREATE TABLE canary_cost_daily (
     PRIMARY KEY (day_utc,source,endpoint,route_id,upstream_id)
 );
 ALTER TABLE probe_cost_event ADD COLUMN canary_source TEXT NOT NULL DEFAULT '' CHECK (canary_source IN ('','manual','periodic'));
-
