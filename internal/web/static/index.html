@@ -934,6 +934,7 @@
                 <input type="number" min="1" max="5000" x-model.number="transforms.budgetSSEMs">
               </div>
               <button @click="saveTransformBudgets()">保存预算</button>
+              <button @click="reloadTransformBudgets()">重新加载预算（丢弃编辑）</button>
               <span class="dim">提高需二次确认并审计</span>
             </div>
             <div class="row" style="align-items:flex-start;gap:16px">
@@ -950,8 +951,16 @@
                     <tr x-show="!(transforms.sets || []).length"><td colspan="2" class="empty">暂无</td></tr>
                   </tbody>
                 </table>
+                <span class="dim" x-text="'共 ' + transforms.setTotal + ' 个转换集'"></span>
+                <button :disabled="transforms.loading || !transforms.setNextCursor" @click="nextTransformPage('sets')">下一页</button>
               </div>
               <div style="flex:1" x-show="transforms.selected">
+                <button @click="selectTransformSet({id: transforms.selectedId})">重新加载草稿（丢弃编辑）</button>
+                <span class="dim" x-text="'版本 ' + (transforms.selected?.revision || '未知') + ' · ' + (transforms.selected?.state || '未知')"></span>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="changeTransformLifecycle('disable')">停用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'disabled'" @click="changeTransformLifecycle('enable')">启用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state === 'archived'" @click="changeTransformLifecycle('archive')">归档（不可恢复）</button>
+                <p class="err" x-show="transforms.activationPending">修改已保存，配置激活待处理；请检查服务状态，勿重复提交。</p>
                 <div class="field">
                   <label>草稿规则（JSON 数组）</label>
                   <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
@@ -992,6 +1001,8 @@
                     <label>Endpoint ID</label>
                     <input x-model="transforms.endpointId">
                   </div>
+                  <button @click="loadTransformBinding()">加载目标绑定</button>
+                  <span class="dim" x-text="transforms.bindingTarget ? ('已读取 ' + transforms.bindingTarget + ' 版本 ' + transforms.bindingRevision) : '尚未读取目标绑定'"></span>
                   <button @click="publishTransform()">Publish</button>
                   <button @click="shadowTransform()">Shadow</button>
                 </div>
@@ -1007,6 +1018,16 @@
                   </div>
                   <pre class="mono wrap" style="margin-top:8px;white-space:pre-wrap" x-text="transforms.previewResult"></pre>
                 </div>
+                <button @click="loadTransformVersions(false)">读取版本历史</button>
+                <span class="dim" x-text="'共 ' + transforms.versionTotal + ' 个历史版本'"></span>
+                <table>
+                  <thead><tr><th>版本</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead>
+                  <tbody><template x-for="version in transforms.versions" :key="version.id"><tr>
+                    <td x-text="version.id"></td><td x-text="fmtTime(version.created_at)"></td><td x-text="version.note + (version.note_truncated ? '…' : '')"></td>
+                    <td><button :disabled="transforms.activationPending || !transforms.bindingRevision" @click="rollbackTransform(version.id)">将目标绑定回滚到此版本</button></td>
+                  </tr></template></tbody>
+                </table>
+                <button :disabled="!transforms.versionNextCursor" @click="loadTransformVersions(true)">下一页版本</button>
               </div>
             </div>
             <h3 style="font-size:13px;margin:18px 0 8px">Bindings</h3>
@@ -1025,7 +1046,9 @@
                 <tr x-show="!(transforms.bindings || []).length"><td colspan="5" class="empty">暂无绑定</td></tr>
               </tbody>
             </table>
-            <h3 style="font-size:13px;margin:18px 0 8px">Executions（脱敏）</h3>
+            <span class="dim" x-text="'共 ' + transforms.bindingTotal + ' 个绑定'"></span>
+            <button :disabled="transforms.loading || !transforms.bindingNextCursor" @click="nextTransformPage('bindings')">下一页绑定</button>
+            <h3 style="font-size:13px;margin:18px 0 8px">Executions（脱敏，本次运行最近 50 条）</h3>
             <table>
               <thead><tr><th>时间</th><th>Phase</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
               <tbody>

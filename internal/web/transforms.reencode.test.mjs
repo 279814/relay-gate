@@ -20,10 +20,10 @@ test('saving uses the explicit opt-in once, and clearing it removes authorizatio
   const sent = [];
   const shell = {};
   createTransformsFeature(shell, {
-    async put(path, body) { sent.push({ path, body }); return { draft: { revision: 2 } }; },
+    async put(path, body) { sent.push({ path, body }); return { id:7, revision:sent.length+1, state:'active', draft: { revision: sent.length+1, rules:body.rules } }; },
   });
   shell.loadTransforms = async () => {};
-  shell.selectTransformSet({ id: 7, draft: { rules: [plain] } });
+  shell.selectTransformSet({ id: 7, revision:1, state:'active', draft: { rules: [plain] } });
   shell.transforms.requestReencode = true;
   await shell.saveTransformDraft();
   assert.deepEqual(sent[0].body.rules, [{ kind: 'request_reencode' }, plain]);
@@ -33,4 +33,5 @@ test('saving uses the explicit opt-in once, and clearing it removes authorizatio
   shell.transforms.requestReencode = false;
   await shell.saveTransformDraft();
   assert.deepEqual(sent[2].body.rules, [plain]);
+  assert.deepEqual(sent.map(call=>call.body.expected_revision),[1,2,3]);
 });
