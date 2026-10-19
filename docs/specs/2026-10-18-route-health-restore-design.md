@@ -6,6 +6,8 @@ schema 9 扩展既有 `route_health` 快照。Report 保存发送前捕获的配
 
 Transform 的 live 发布指针变化在其既有保存事务内递增受影响 Route 的 capability_revision 并清除持久健康；仅 shadow 变化不改变该语义 counter。这样沿用现有语义身份即可拒绝旧转换配置的健康证明。
 
-schema 8 的旧 `route_health` 没有可验证身份。只有明确已不属于当前生命周期的时间/父子关系或停用证据才排除；毫秒相等不证明旧 incarnation。仍可能属于当前 Route 的旧负状态恢复为零计数的 recovering，必须经过 RecoveryGate；不复制旧失败原因、旧计数或猜测不存在的 cooldown，并提供 legacy 来源诊断。后续真实或合成的受控恢复按原状态机执行。
+其他配置写入也在原事务内按保存的证明核对更新后的当前事实，只清除已经过期的健康。Route/ModelName/Upstream 语义修改或重新启用会清理本生命周期及无身份旧快照；Endpoint、Recipe、tested Profile、Secret 和阶段策略编辑不清理仍由高层绑定或无关端点证明的状态。旧无身份证据无法判断具体模板依赖时仍保守要求 RecoveryGate；明确的生命周期或健康阈值策略重置才清除此类旧证据。清理失败使配置及其语义版本一起回滚，不新增后台队列或配置缓存。
+
+schema 8 的旧 `route_health` 没有可验证身份。只有明确已不属于当前生命周期的时间/父子关系或停用证据才排除；毫秒相等不证明旧 incarnation。仍可能属于当前 Route 的旧负状态恢复为零计数的 recovering，必须经过 RecoveryGate；不复制旧失败原因、旧计数或猜测不存在的 cooldown，并提供 legacy 来源诊断。恢复出的无身份证据不重新刷写既有持久行，避免已经捕获的 legacy 状态在语义事务清理后迟到复活；取得新证据后才按其发送前身份正常持久化。后续真实或合成的受控恢复按原状态机执行。
 
 验证使用真实 SQLite 冷启动、当前/旧 policy 与 Recipe/Transform/Secret、三类重新启用/删除复用、disabled、相等毫秒、正状态降级和冷却时间；提交前后延迟及 CAS 防止旧快照覆盖新配置。schema 8→9 先配对备份，失败不启动半迁移库；历史 schema 7/8 reader 验证保持只读，schema 9 备份使用新的准确 reader 合同。最后运行相关包、重复目标、构建和静态检查。
