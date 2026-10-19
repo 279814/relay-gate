@@ -53,6 +53,7 @@ type LogSink interface {
 // 与响应副本留在 trail 里，供样本把整个 Sample Group 落下来（§5.4：
 // 一个客户端请求 = 一条 sample_request + 每次实际发送的 sample_attempt）。
 type forwardOutcome struct {
+	finalAttempt       *liveAttempt
 	localResponseError bool
 	cand               *router.Candidate
 	outBody            []byte
@@ -89,6 +90,7 @@ func closeSampleTrail(trail []*liveAttempt) {
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
 type liveAttempt struct {
+	capture     *upstreamSampleCapture
 	metadata    model.AttemptMetadata
 	trace       *outbound.AttemptTrace
 	cand        *router.Candidate
@@ -321,7 +323,8 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 		})
 		if ready == nil {
 			oc := &forwardOutcome{
-				cand: la.cand, outBody: la.body, outHeader: la.header,
+				finalAttempt: la,
+				cand:         la.cand, outBody: la.body, outHeader: la.header,
 				outURL: la.url, respTee: la.tee, keys: la.keys,
 				res: la.at.Result(), attempts: attempt,
 				halfOpen: armedHalfOpen(la.cand.Route.ID, attempt),
@@ -572,8 +575,10 @@ func (h *Handler) dispatch(r *http.Request,
 				settings.SampleRespHeadBytes, settings.SampleRespTailBytes)
 		}
 	}
+	var upstreamCapture *upstreamSampleCapture
 	if tee != nil {
-		fwd.RespTee = tee
+		upstreamCapture = &upstreamSampleCapture{sink: tee}
+		fwd.upstreamSample = upstreamCapture
 	}
 	if h.security != nil {
 		capture := h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: kind, Protocol: proto}})
@@ -600,12 +605,17 @@ func (h *Handler) dispatch(r *http.Request,
 	sendCtx = outbound.WithAttemptTrace(sendCtx, trace)
 	trace.MarkSent(time.Now())
 	at := fwd.Send(sendCtx, r.Method, target.RawURL, outHeader, outBody)
+	if upstreamCapture != nil && at.resp != nil {
+		upstreamCapture.status = at.resp.StatusCode
+		upstreamCapture.header = at.resp.Header.Clone()
+	}
 	if instr.Observer != nil && at.Result() != nil && at.Result().Status > 0 {
 		instr.Observer.TryHeaders(at.Result().Status, at.Result().RespHeaders, time.Now())
 	}
 	handedOff = true
 
 	return &liveAttempt{
+		capture:  upstreamCapture,
 		metadata: preparedAttemptMetadata(pre, cand, target, prepared, executionID, instr.ObservationPrepared), trace: trace,
 		cand: cand, at: at, tee: tee,
 		keys: redactKeys,

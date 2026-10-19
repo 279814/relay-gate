@@ -70,6 +70,16 @@ test('response view explains client bytes and discarded upstream prefixes withou
   assert.equal(shell.attemptMetadata.attempts[0].responseView, '未知');
 });
 
+test('schema 15 persisted original and omitted views have explicit labels while historical rows remain unknown',()=>{
+ const {shell}=setup();const value=row();
+ for(const [view,label] of Object.entries({upstream_response:/原始上游响应/,no_response:/未收到上游/,omitted_secret:/Secret.*省略/,omitted_unverified:/无法.*安全.*省略/})){
+  value.metadata.response_view=view;shell.openAttemptMetadata(value);
+  assert.match(shell.attemptMetadata.attempts[0].responseView,label);
+ }
+ value.metadata.version=0;value.metadata.response_view='upstream_response';shell.openAttemptMetadata(value);
+ assert.equal(shell.attemptMetadata.attempts[0].responseView,'未知');
+});
+
 test('missing exact detail distinguishes pending observation from unavailable retained disposition', () => {
   const {shell} = setup(); const value = row(); value.metadata.execution_stored = false; value.metadata.capability_effect = 'pending';
   shell.openAttemptMetadata(value); assert.match(shell.attemptMetadata.attempts[0].executionState, /待.*持久化/);

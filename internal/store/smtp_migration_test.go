@@ -46,7 +46,7 @@ func TestSMTPMigrationPreservesCredentialsAndPairsSchemaTwelve(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 13 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("smtp schema=%+v err=%v", state, err)
 	}
 	var host string
@@ -75,7 +75,7 @@ func TestSMTPMigrationPreservesCredentialsAndPairsSchemaTwelve(t *testing.T) {
 }
 
 func TestSMTPRotationBackupPinsReaderAndRestoresPolicy(t *testing.T) {
-	st := testStore(t)
+	st, _ := schemaThirteenCanaryFixture(t)
 	if _, err := st.db.Exec(`UPDATE smtp_config SET aggregation_window_sec=7,rate_limit_window_sec=13,revision=5`); err != nil {
 		t.Fatal(err)
 	}

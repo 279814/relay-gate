@@ -77,21 +77,25 @@ func (r *Registry) UpdateDraft(setID int64, rules []Rule, reqPolicy, resPolicy, 
 	if !ok {
 		return nil, fmt.Errorf("transform set %d not found", setID)
 	}
-	if s.Draft == nil {
-		s.Draft = &Version{SetID: setID}
+	previous := s.Draft
+	draft := Version{SetID: setID}
+	if previous != nil {
+		draft = *previous
 	}
-	s.Draft.ID = r.nextVer.Add(1) - 1
-	s.Draft.Revision++
-	s.Draft.CreatedAt = time.Now().UTC()
-	s.Draft.Rules = append([]Rule(nil), rules...)
+	draft.ID = r.nextVer.Add(1) - 1
+	draft.Revision++
+	draft.CreatedAt = time.Now().UTC()
+	draft.Rules = append([]Rule(nil), rules...)
 	if reqPolicy != "" {
-		s.Draft.ReqFailPolicy = reqPolicy
+		draft.ReqFailPolicy = reqPolicy
 	}
 	if resPolicy != "" {
-		s.Draft.ResFailPolicy = resPolicy
+		draft.ResFailPolicy = resPolicy
 	}
-	s.Draft.Note = note
+	draft.Note = note
+	s.Draft = &draft
 	if err := r.flushLocked(); err != nil {
+		s.Draft = previous
 		return nil, err
 	}
 	return cloneSet(s), nil
@@ -140,6 +144,11 @@ func (r *Registry) PublishSnapshot(setID, routeID, endpointID int64) (*Binding, 
 	if _, err := Compile(*s.Draft); err != nil {
 		return nil, nil, err
 	}
+	key := bindKey(routeID, endpointID)
+	b := r.bindings[key]
+	if b != nil && b.SetID != 0 && b.SetID != setID {
+		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
+	}
 	snap := *s.Draft
 	snap.ID = r.nextVer.Add(1) - 1
 	snap.CreatedAt = time.Now().UTC()
@@ -147,15 +156,10 @@ func (r *Registry) PublishSnapshot(setID, routeID, endpointID int64) (*Binding, 
 	prevHistory := len(s.History)
 	s.History = append(s.History, snap)
 
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
 	created := b == nil
 	if created {
 		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
 		r.bindings[key] = b
-	}
-	if b.SetID != 0 && b.SetID != setID {
-		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
 	}
 	prev := *b
 	b.SetID = setID
@@ -179,6 +183,11 @@ func (r *Registry) ShadowSnapshot(setID, routeID, endpointID int64) (*Binding, *
 	if _, err := Compile(*s.Draft); err != nil {
 		return nil, nil, err
 	}
+	key := bindKey(routeID, endpointID)
+	b := r.bindings[key]
+	if b != nil && b.SetID != 0 && b.SetID != setID {
+		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
+	}
 	snap := *s.Draft
 	snap.ID = r.nextVer.Add(1) - 1
 	snap.CreatedAt = time.Now().UTC()
@@ -186,15 +195,10 @@ func (r *Registry) ShadowSnapshot(setID, routeID, endpointID int64) (*Binding, *
 	prevHistory := len(s.History)
 	s.History = append(s.History, snap)
 
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
 	created := b == nil
 	if created {
 		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
 		r.bindings[key] = b
-	}
-	if b.SetID != 0 && b.SetID != setID {
-		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
 	}
 	prev := *b
 	b.SetID = setID
