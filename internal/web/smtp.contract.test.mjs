@@ -65,11 +65,13 @@ test('SMTP conflict keeps draft and password, blocks replay until explicit reloa
  });
  shell.security.smtp={enabled:false,host:'draft.example.test',revision:4,aggregation_window_sec:7,rate_limit_window_sec:13};
  shell.security.smtpPassword='draft-fixture-password';
+ shell.msg='SMTP 已保存';
  await shell.saveSMTP();
  assert.equal(writes,1);
  assert.equal(shell.security.smtp.host,'draft.example.test');
  assert.equal(shell.security.smtpPassword,'draft-fixture-password');
  assert.equal(shell.security.smtpConflict,true);
+ assert.equal(shell.msg,'','old success must not accompany a conflict');
  await shell.saveSMTP();
  assert.equal(writes,1,'conflicted form must require explicit reload');
  await shell.loadSMTP();
@@ -78,6 +80,7 @@ test('SMTP conflict keeps draft and password, blocks replay until explicit reloa
  assert.equal(shell.security.smtp.revision,5);
  assert.equal(shell.security.smtpConflict,false);
  assert.equal(shell.security.smtpPassword,'');
+ assert.equal(shell.err,'','explicit reload must clear the resolved conflict');
 });
 
 test('SMTP invalid windows never send, and loading after logout cannot replace the new session',async()=>{
