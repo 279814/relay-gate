@@ -49,7 +49,7 @@ func TestSampleCaptureMigrationPairsFourteenAndPreservesLegacy(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 15 {
+	if err != nil || state.Version != developmentSchemaVersion {
 		t.Fatalf("sample capture schema=%+v err=%v", state, err)
 	}
 	var marker string
@@ -114,7 +114,7 @@ func TestSampleCaptureSchemaRejectsPartialChangedUnknown(t *testing.T) {
 }
 
 func TestSampleCaptureRotationPinsFifteenReaderAndRestoresMarker(t *testing.T) {
-	st := testStore(t)
+	st, _ := schemaFifteenTransformFixture(t)
 	smp := &model.Sample{Attempts: []*model.SampleAttempt{{Metadata: model.AttemptMetadata{Version: 1}}}}
 	if err := st.InsertSample(smp); err != nil {
 		t.Fatal(err)
