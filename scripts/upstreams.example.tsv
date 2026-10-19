@@ -13,7 +13,7 @@
 #   # 若重放 control fixture，另加：
 #   #   --control-manifest .local/p0/controls/manifest.json --accept-control-replay
 #
-# 或：bash scripts/probe-all.sh scripts/upstreams.tsv
+# 或：bash scripts/probe-all.sh --online --accept-probe-cost --input scripts/upstreams.tsv
 #
 # 1 名称        中转站 alias（唯一）。**一个物理站一行**
 # 2 base_url    根地址，不要带 /v1

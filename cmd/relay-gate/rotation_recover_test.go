@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -63,6 +64,7 @@ func TestRecoverMasterRotation_PreparedAfterDBCommitRollsForward(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeRecovery, _ := kr.Status()
 	hold, ks, err := recoverMasterRotation(dataDir, dbPath)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -87,6 +89,13 @@ func TestRecoverMasterRotation_PreparedAfterDBCommitRollsForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
+	if err := recordRotationRecoveryAudit(st2, beforeRecovery, ks); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st2.ListAuditEventsPage(context.Background(), model.AuditEventFilter{Action: "master_recovery"})
+	if err != nil || len(page.Items) != 1 || page.Items[0].Outcome != "succeeded" {
+		t.Fatal("completed local rotation recovery was not audited", err)
+	}
 	got, err := st2.GetUpstream(u.ID)
 	if err != nil {
 		t.Fatalf("upstream must decrypt under the surviving key: %v", err)
@@ -139,6 +148,7 @@ func TestRecoverMasterRotation_PreparedWithoutDBCommitAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeRecovery, _ := kr.Status()
 	hold, ks, err := recoverMasterRotation(dataDir, dbPath)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -155,6 +165,13 @@ func TestRecoverMasterRotation_PreparedWithoutDBCommitAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
+	if err := recordRotationRecoveryAudit(st2, beforeRecovery, ks); err != nil {
+		t.Fatal(err)
+	}
+	page, err := st2.ListAuditEventsPage(context.Background(), model.AuditEventFilter{Action: "master_rotation_rollback"})
+	if err != nil || len(page.Items) != 1 || page.Items[0].Outcome != "succeeded" {
+		t.Fatal("completed local rollback was not audited", err)
+	}
 	got, err := st2.GetUpstream(u.ID)
 	if err != nil || got.APIKey != apiKey {
 		t.Fatalf("upstream must still decrypt under old active: err=%v", err)

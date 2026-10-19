@@ -299,3 +299,54 @@ func TestPassiveCaptureSaturationDoesNotDelayResponseOrFlush(t *testing.T) {
 		t.Fatal("saturated response capture was neither bounded nor counted")
 	}
 }
+
+func TestPassiveCaptureActualStreamCancellationIsIncomplete(t *testing.T) {
+	event := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"" + passiveRisk + "\"}}\n\n"
+	upstreamCanceled, stop := make(chan struct{}), make(chan struct{})
+	hs := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, event)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(upstreamCanceled)
+		case <-stop:
+		}
+	})
+	o, center := attachPassiveScanner(t, hs.h, 2)
+	mux := http.NewServeMux()
+	hs.h.Routes(mux)
+	done := make(chan struct{})
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer close(done); mux.ServeHTTP(w, r) }))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); close(stop); gate.CloseClientConnections(); gate.Close() }()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gate.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-5","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = claudeCodeHeaders()
+	req.Header.Set("X-Api-Key", hs.relayPW)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	first := make([]byte, len(event))
+	if _, err := io.ReadFull(response.Body, first); err != nil || string(first) != event {
+		t.Fatalf("first flushed event changed: %q %v", first, err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled client stranded gateway handler")
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client cancellation did not release upstream")
+	}
+	if len(passiveFindings(t, o, center, "data_exfiltration")) != 1 || len(passiveFindings(t, o, center, "incomplete")) != 1 {
+		t.Fatalf("committed canceled stream claimed complete: %+v", center.List("", 100))
+	}
+}

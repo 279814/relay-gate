@@ -137,7 +137,7 @@ func (h *trafficPrivacyHarness) assertDurablePrivacy(t *testing.T, attempts int,
 	}
 	wantSamples, wantLogs := 1, attempts
 	if page.Items[0].Endpoint == model.EndpointCountTokens {
-		wantSamples, wantLogs = 0, 0
+		wantSamples = 0 // count_tokens retains actual-send metadata logs, never body samples
 	}
 	if len(rows) != wantSamples {
 		t.Fatalf("persisted sample groups=%d want %d", len(rows), wantSamples)
@@ -158,6 +158,17 @@ func (h *trafficPrivacyHarness) assertDurablePrivacy(t *testing.T, attempts int,
 	}
 	if len(logs) != wantLogs {
 		t.Fatalf("persisted request logs=%d want %d", len(logs), wantLogs)
+	}
+	if page.Items[0].Endpoint == model.EndpointCountTokens {
+		executionIDs := make(map[string]bool, len(page.Items))
+		for _, execution := range page.Items {
+			executionIDs[execution.ID] = true
+		}
+		for _, row := range logs {
+			if row.Endpoint != "/v1/messages/count_tokens" || row.ReqID == "" || !executionIDs[row.Metadata.ExecutionID] {
+				t.Fatalf("count_tokens log lacks actual-send correlation: %+v", row.Metadata)
+			}
+		}
 	}
 	assertPrivateValuesAbsent(t, "request logs", logs, private...)
 	assertPrivateValuesAbsent(t, "application logs", h.text.String(), private...)

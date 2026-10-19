@@ -78,7 +78,7 @@ jobs:
           node --test internal/web/recipe_admin.contract.test.mjs
 
       - name: 前端模块契约测试
-        run: node --test internal/web/modules.contract.test.mjs internal/web/credentials.contract.test.mjs internal/web/recent_errors.contract.test.mjs internal/web/attempt_metadata.contract.test.mjs
+        run: node --test internal/web/modules.contract.test.mjs internal/web/credentials.contract.test.mjs internal/web/recent_errors.contract.test.mjs internal/web/audit.contract.test.mjs internal/web/attempt_metadata.contract.test.mjs
 
       - name: Settings and service-state revision contracts
         run: node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/privacy.contract.test.mjs
@@ -132,6 +132,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
       - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
@@ -139,6 +142,11 @@ jobs:
         run: python scripts/deploy.contract.test.py
       - name: 公网安装脚本离线行为回归
         run: python scripts/deploy-public.contract.test.py
+      - name: Probe CLI wrapper authorization and private stdin contracts
+        run: python scripts/probe-cli.contract.test.py
+      - name: Isolated native capture with disposable fake client
+        if: runner.os == 'Windows'
+        run: go test ./internal/probe -run='^TestClaudeCaptureScriptFailsClosedAndProtectsOutput$' -count=1 -timeout=3m
 
   runtime:
     strategy:

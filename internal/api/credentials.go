@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/279814/relay-gate/internal/credential"
@@ -54,11 +55,20 @@ func (s *Server) masterRotationAvailability() (bool, string) {
 }
 
 func (s *Server) getCredentialsStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Audit-Missed-Count", strconv.FormatUint(s.auditMissed.Load(), 10))
 	if s.creds == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"credentials 未装配"})
 		return
 	}
 	out := s.creds.Status()
+	out["audit_missed_count"] = s.auditMissed.Load()
+	page, err := s.st.ListAuditEventsPage(r.Context(), model.AuditEventFilter{PageRequest: model.PageRequest{Limit: 20}})
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"持久审计历史暂不可用"})
+		return
+	}
+	out["audit"], out["audit_next_cursor"] = page.Items, page.NextCursor
 	out["rotation_allowed"], out["blocked_reason"] = s.masterRotationAvailability()
 	if s.keyring != nil {
 		if st, err := s.keyring.Status(); err == nil {
@@ -304,6 +314,10 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer releaseRuntime()
+	if err := s.startAuditOperation(r, r.Context(), "current"); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"审计暂不可用，轮换未开始"})
+		return
+	}
 	_, oldMaster, err := s.keyring.LoadActive()
 	if err != nil {
 		s.writeErr(w, err)
@@ -331,7 +345,11 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		s.writeErr(w, err)
 		return
 	}
-	s.creds.Note("master_rotation_backup", "backup="+filepath.Base(backup.Directory))
+	if err := s.recordAuditStep(r, "master_rotation_backup"); err != nil {
+		s.auditUnavailable(w, "master_rotation_backup", "step")
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"备份已创建，审计确认失败，轮换未开始"})
+		return
+	}
 	rid, err := s.keyring.BeginRotation(body.NewMaster)
 	if err != nil {
 		status, statusErr := s.keyring.Status()
@@ -345,8 +363,12 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 		committedID, inspectErr := store.CommittedMasterRotation(s.st.DatabasePath())
 		if inspectErr != nil || committedID == rid {
 			exitMaintenance = false
+			setAuditResult(r, "unknown", "forward_recovery_required")
 		} else if abortErr := s.keyring.AbortPrepared(rid); abortErr != nil {
 			exitMaintenance = false
+			setAuditResult(r, "failed", "rollback_failed")
+		} else {
+			setAuditResult(r, "failed", "rollback_completed")
 		}
 		s.writeErr(w, err)
 		return
@@ -354,6 +376,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 	// From this point the database is committed under pending. Every failure
 	// keeps maintenance and its journal; recovery may only roll forward.
 	exitMaintenance = false
+	setAuditResult(r, "unknown", "forward_recovery_required")
 	if err := store.ValidateDatabaseEncryption(r.Context(), s.st.DatabasePath(), body.NewMaster); err != nil {
 		s.writeErr(w, err)
 		return
@@ -396,6 +419,7 @@ func (s *Server) postBeginMasterRotation(w http.ResponseWriter, r *http.Request)
 	}
 	s.st.ForgetRetiredMasterKeys()
 	exitMaintenance = true
+	setAuditResult(r, "succeeded", "")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rotation_id":     rid,
 		"new_key_id":      newID,

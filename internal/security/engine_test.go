@@ -258,6 +258,10 @@ func TestPassiveComplexRE2CannotEscapeWorkBudgetSilently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Isolate the deterministic RE2 work gate from the independent wall-clock
+	// gate: race instrumentation or scheduler delay may exhaust 100ms first.
+	// Production keeps ScanBudget; dedicated CPU-budget tests cover that gate.
+	s.budget = time.Hour
 	body := strings.Repeat("a", 32768)
 	fs := s.Scan(ScanInput{Segments: []Segment{{Body: []byte(body)}}, TotalBytes: int64(len(body))})
 	if !reasonPresent(fs, "regex_work_budget") {

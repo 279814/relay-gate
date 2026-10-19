@@ -12,19 +12,19 @@ import (
 )
 
 // sampleAuditActions 从 GET /admin/api/credentials 的 audit 里取出 sample_* 记录（新的在前）。
-func sampleAuditActions(t *testing.T, h http.Handler) []credential.AuditEvent {
+func sampleAuditActions(t *testing.T, h http.Handler) []*model.AuditEvent {
 	t.Helper()
 	rec := do(t, h, "GET", "/admin/api/credentials", "", true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("credentials status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var out struct {
-		Audit []credential.AuditEvent `json:"audit"`
+		Audit []*model.AuditEvent `json:"audit"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
-	var got []credential.AuditEvent
+	var got []*model.AuditEvent
 	for _, ev := range out.Audit {
 		if strings.HasPrefix(ev.Action, "sample_") {
 			got = append(got, ev)
@@ -33,10 +33,9 @@ func sampleAuditActions(t *testing.T, h http.Handler) []credential.AuditEvent {
 	return got
 }
 
-// TestSampleActions_WriteAuditOnSuccessOnly covers §5.4: viewing, pinning and
-// bulk-deleting unredacted samples write an audit record on success; failed
-// re-auth writes none, and the record never carries the sample body.
-func TestSampleActions_WriteAuditOnSuccessOnly(t *testing.T) {
+// Failed re-auth and completed sensitive operations share the durable history.
+// Neither path may record the request password, sample body or free detail.
+func TestSampleActionsPersistSuccessAndFailureWithoutSensitiveContent(t *testing.T) {
 	s, h := newTestServer(t)
 	s.WithCredentials(credential.New(), nil)
 
@@ -74,8 +73,8 @@ func TestSampleActions_WriteAuditOnSuccessOnly(t *testing.T) {
 	if rec := do(t, h, "DELETE", "/admin/api/samples", badPW, true); rec.Code != http.StatusForbidden {
 		t.Fatalf("clear wrong password want 403, got %d", rec.Code)
 	}
-	if got := sampleAuditActions(t, h); len(got) != 0 {
-		t.Fatalf("failed re-auth must not write audit, got %+v", got)
+	if got := sampleAuditActions(t, h); len(got) != 3 {
+		t.Fatalf("failed re-auth must be audited, got %+v", got)
 	}
 
 	if rec := do(t, h, "GET", "/admin/api/samples/"+id, "{"+goodPW+"}", true); rec.Code != http.StatusOK {
@@ -89,19 +88,23 @@ func TestSampleActions_WriteAuditOnSuccessOnly(t *testing.T) {
 	}
 
 	got := sampleAuditActions(t, h)
-	want := []struct{ action, detail string }{
-		{"sample_bulk_delete", "deleted=1 keep_pinned=false"},
-		{"sample_pin", "id=" + id + " pinned=true"},
-		{"sample_view", "id=" + id},
+	want := []struct{ action, outcome, resourceID string }{
+		{"sample_bulk_delete", "succeeded", ""},
+		{"sample_pin", "succeeded", id},
+		{"sample_view", "succeeded", id},
+		{"sample_bulk_delete", "failed", ""},
+		{"sample_pin", "failed", id},
+		{"sample_view", "failed", id},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("audit rows=%+v, want %d sample rows", got, len(want))
 	}
 	for i, w := range want {
-		if got[i].Action != w.action || got[i].Detail != w.detail {
-			t.Fatalf("audit[%d]=%+v, want action=%q detail=%q", i, got[i], w.action, w.detail)
+		if got[i].Action != w.action || got[i].Outcome != w.outcome || got[i].ResourceID != w.resourceID {
+			t.Fatalf("audit[%d]=%+v, want %+v", i, got[i], w)
 		}
-		if strings.Contains(got[i].Detail, secret) || strings.Contains(got[i].Detail, testAdminPW) {
+		encoded, _ := json.Marshal(got[i])
+		if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), testAdminPW) {
 			t.Fatalf("audit[%d] leaks body or password: %+v", i, got[i])
 		}
 	}
