@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/279814/relay-gate/internal/model"
@@ -69,6 +72,7 @@ func TestTransformAPI_PublishPreview(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.WithTransformRegistry(reg)
 	h := s.Routes("pw")
+	h = freshTransformFixtureHandler(t, reg, h)
 
 	create := httptest.NewRequest(http.MethodPost, "/admin/api/transforms", bytes.NewReader([]byte(`{"name":"t1"}`)))
 	create.Header.Set("Authorization", "Bearer pw")
@@ -107,8 +111,10 @@ func TestTransformAPI_PublishPreview(t *testing.T) {
 func TestTransformAPI_PublishRollback(t *testing.T) {
 	reg := transform.NewRegistry(20)
 	s, _ := newTestServer(t)
+	seedConfig(t, s, 1, 1)
 	s.WithTransformRegistry(reg)
 	h := s.Routes("pw")
+	h = freshTransformFixtureHandler(t, reg, h)
 
 	create := httptest.NewRequest(http.MethodPost, "/admin/api/transforms", bytes.NewReader([]byte(`{"name":"rb"}`)))
 	create.Header.Set("Authorization", "Bearer pw")
@@ -220,6 +226,7 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	s, _ := newTestServer(t)
 	reg := transform.NewRegistry(20).WithPersist(s.st)
 	h := s.WithTransformRegistry(reg).Routes(testAdminPW)
+	h = freshTransformFixtureHandler(t, reg, h)
 
 	upID := mkUpstreamViaAPI(t, h, `{"name":"xform-reuse-u","base_url":"https://x.example.com","api_key":"sk-xxxxxxxxxxxx"}`)
 	upSibling := mkUpstreamViaAPI(t, h, `{"name":"xform-reuse-u2","base_url":"https://y.example.com","api_key":"sk-yyyyyyyyyyyy"}`)
@@ -244,6 +251,11 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	}
 	siblingID := int64(decodeBody[map[string]any](t, rec)["id"].(float64))
 
+	siblingEndpoint, err := s.st.Endpoint(t.Context(), upSibling, model.EndpointMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingEndpointID := siblingEndpoint.ID
 	const endpointID int64 = 1
 	rec = do(t, h, "POST", "/admin/api/transforms", `{"name":"reuse-set"}`, true)
 	if rec.Code != http.StatusCreated {
@@ -261,7 +273,7 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("publish: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
-		`{"route_id":`+itoa(siblingID)+`,"endpoint_id":`+itoa(endpointID)+`}`, true)
+		`{"route_id":`+itoa(siblingID)+`,"endpoint_id":`+itoa(siblingEndpointID)+`}`, true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sibling publish: %d %s", rec.Code, rec.Body.String())
 	}
@@ -291,7 +303,7 @@ func TestDeleteRoute_DetachesTransformBindingForReusedID(t *testing.T) {
 	if err != nil || c != nil || vid != 0 {
 		t.Fatalf("deleted route binding must be gone: c=%v id=%d err=%v", c != nil, vid, err)
 	}
-	cSibling, _, err := reg.PublishedCompiled(siblingID, endpointID)
+	cSibling, _, err := reg.PublishedCompiled(siblingID, siblingEndpointID)
 	if err != nil || cSibling == nil {
 		t.Fatalf("live sibling binding must remain: c=%v err=%v", cSibling != nil, err)
 	}
@@ -338,6 +350,7 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 	reg := transform.NewRegistry(20).WithPersist(s.st)
 	h := s.WithProbeAdmin(probe.NewService(s.st, nil, nil, nil, nil, nil)).
 		WithTransformRegistry(reg).Routes(testAdminPW)
+	h = freshTransformFixtureHandler(t, reg, h)
 
 	upID := mkUpstreamViaAPI(t, h,
 		`{"name":"xform-ep-u","base_url":"https://ep-x.example.com","api_key":"sk-xxxxxxxxxxxx"}`)
@@ -360,6 +373,8 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("missing endpoints: target=%d sibling=%d", target.ID, sibling.ID)
 	}
 
+	// Legacy bindings may refer to a deleted Route. Build those historical
+	// rows through the trusted fixture entry; the strict admin API rejects them.
 	const routeID int64 = 1
 	rec = do(t, h, "POST", "/admin/api/transforms", `{"name":"ep-reuse-set"}`, true)
 	if rec.Code != http.StatusCreated {
@@ -371,15 +386,11 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("draft: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
-		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(target.ID)+`}`, true)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish target: %d %s", rec.Code, rec.Body.String())
+	if _, _, err := reg.PublishSnapshot(setID, routeID, target.ID); err != nil {
+		t.Fatalf("publish target legacy binding: %v", err)
 	}
-	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
-		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(sibling.ID)+`}`, true)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish sibling: %d %s", rec.Code, rec.Body.String())
+	if _, _, err := reg.PublishSnapshot(setID, routeID, sibling.ID); err != nil {
+		t.Fatalf("publish sibling legacy binding: %v", err)
 	}
 
 	// Failed delete (upstream still enabled) must keep bindings.
@@ -443,10 +454,8 @@ func TestDeleteEndpoint_DetachesTransformBindingForReusedID(t *testing.T) {
 		t.Fatalf("forced reuse failed: new id=%d old=%d", reused.ID, target.ID)
 	}
 
-	rec = do(t, h, "POST", "/admin/api/transforms/"+itoa(setID)+"/publish",
-		`{"route_id":`+itoa(routeID)+`,"endpoint_id":`+itoa(reused.ID)+`}`, true)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish reused: %d %s", rec.Code, rec.Body.String())
+	if _, _, err := reg.PublishSnapshot(setID, routeID, reused.ID); err != nil {
+		t.Fatalf("publish reused legacy binding: %v", err)
 	}
 	c, _, err = reg.PublishedCompiled(routeID, reused.ID)
 	if err != nil || c == nil {
@@ -461,4 +470,57 @@ func itoa64(v int64) string {
 func jsonNumber(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// Existing non-CAS scenarios prepare a fresh client view explicitly. Version
+// conflict/missing-version tests use the raw handler and supply their own values.
+func freshTransformFixtureHandler(t *testing.T, registry *transform.Registry, next http.Handler) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		mutate := r.Method == http.MethodPut && strings.HasSuffix(path, "/draft") || r.Method == http.MethodPost && (strings.HasSuffix(path, "/publish") || strings.HasSuffix(path, "/shadow") || path == "/admin/api/transforms/rollback")
+		if !strings.HasPrefix(path, "/admin/api/transforms/") || !mutate {
+			next.ServeHTTP(w, r)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]json.RawMessage
+		if json.Unmarshal(raw, &body) == nil && body != nil {
+			var routeID, endpointID int64
+			_ = json.Unmarshal(body["route_id"], &routeID)
+			_ = json.Unmarshal(body["endpoint_id"], &endpointID)
+			bindingRevision := int64(0)
+			if binding, ok := registry.GetBinding(routeID, endpointID); ok {
+				bindingRevision = binding.Revision
+			}
+			if _, ok := body["expected_revision"]; !ok {
+				revision := bindingRevision
+				if path != "/admin/api/transforms/rollback" {
+					parts := strings.Split(strings.Trim(path, "/"), "/")
+					if len(parts) >= 5 {
+						id, _ := strconv.ParseInt(parts[3], 10, 64)
+						if set, err := registry.GetSet(id); err == nil {
+							revision = set.Revision
+						}
+					}
+				}
+				body["expected_revision"], _ = json.Marshal(revision)
+			}
+			if strings.HasSuffix(path, "/publish") || strings.HasSuffix(path, "/shadow") {
+				if _, ok := body["expected_binding_revision"]; !ok {
+					body["expected_binding_revision"], _ = json.Marshal(bindingRevision)
+				}
+			}
+			raw, err = json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		next.ServeHTTP(w, r)
+	})
 }

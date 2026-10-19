@@ -17,7 +17,7 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	changed, err := liveTransformChanges(tx, bindings)
+	changed, err := liveTransformChanges(tx, sets, bindings)
 	if err != nil {
 		return err
 	}
@@ -39,8 +39,8 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 			}
 			draftJSON = string(b)
 		}
-		if _, err := tx.Exec(`INSERT INTO transform_set (id, name, created_at, draft_json) VALUES (?,?,?,?)`,
-			set.ID, set.Name, set.CreatedAt.UnixMilli(), draftJSON); err != nil {
+		if _, err := tx.Exec(`INSERT INTO transform_set (id, name, created_at, draft_json, revision, lifecycle_state) VALUES (?,?,?,?,?,?)`,
+			set.ID, set.Name, set.CreatedAt.UnixMilli(), draftJSON, set.Revision, string(set.State)); err != nil {
 			return err
 		}
 		for _, ver := range set.History {
@@ -77,10 +77,10 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 
 // Shadow and draft edits do not change live request semantics. Compare the
 // published pointers in this transaction, before replacing their tables.
-func liveTransformChanges(tx *sql.Tx, bindings []transform.Binding) (map[int64]bool, error) {
+func liveTransformChanges(tx *sql.Tx, sets []transform.Set, bindings []transform.Binding) (map[int64]bool, error) {
 	type target struct{ route, endpoint int64 }
 	before := map[target]int64{}
-	rows, err := tx.Query(`SELECT route_id,endpoint_id,published_id FROM transform_binding WHERE published_id<>0`)
+	rows, err := tx.Query(`SELECT b.route_id,b.endpoint_id,b.published_id FROM transform_binding b JOIN transform_set s ON s.id=b.set_id WHERE b.published_id<>0 AND s.lifecycle_state='active'`)
 	if err != nil {
 		return nil, err
 	}
@@ -98,10 +98,18 @@ func liveTransformChanges(tx *sql.Tx, bindings []transform.Binding) (map[int64]b
 		return nil, err
 	}
 	rows.Close()
+	states := make(map[int64]transform.LifecycleState, len(sets))
+	for _, set := range sets {
+		states[set.ID] = set.State
+	}
 	changed := map[int64]bool{}
 	for _, binding := range bindings {
 		key := target{binding.RouteID, binding.EndpointID}
-		if before[key] != binding.PublishedID {
+		effective := binding.PublishedID
+		if states[binding.SetID] != transform.LifecycleActive {
+			effective = 0
+		}
+		if before[key] != effective {
 			changed[binding.RouteID] = true
 		}
 		delete(before, key)
@@ -114,7 +122,7 @@ func liveTransformChanges(tx *sql.Tx, bindings []transform.Binding) (map[int64]b
 
 // LoadTransformSnapshot reads all transform sets/versions/bindings.
 func (s *Store) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, error) {
-	rows, err := s.db.Query(`SELECT id, name, created_at, draft_json FROM transform_set ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, name, created_at, draft_json, revision, lifecycle_state FROM transform_set ORDER BY id`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -125,7 +133,7 @@ func (s *Store) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, e
 		var set transform.Set
 		var created int64
 		var draftJSON string
-		if err := rows.Scan(&set.ID, &set.Name, &created, &draftJSON); err != nil {
+		if err := rows.Scan(&set.ID, &set.Name, &created, &draftJSON, &set.Revision, &set.State); err != nil {
 			return nil, nil, err
 		}
 		set.CreatedAt = time.UnixMilli(created).UTC()

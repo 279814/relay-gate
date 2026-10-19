@@ -348,7 +348,7 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 			if parts[2] == "draft" && r.Method == "PUT" {
 				action = "transform_draft_update"
 			} else if r.Method == "POST" {
-				action = map[string]string{"publish": "transform_publish", "shadow": "transform_shadow"}[parts[2]]
+				action = map[string]string{"publish": "transform_publish", "shadow": "transform_shadow", "disable": "transform_disable", "enable": "transform_enable", "archive": "transform_archive"}[parts[2]]
 			}
 		}
 	}

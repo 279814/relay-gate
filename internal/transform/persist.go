@@ -2,7 +2,6 @@ package transform
 
 import (
 	"errors"
-	"fmt"
 )
 
 // ErrPersist marks a PersistSink failure. The wrapped text is raw driver
@@ -26,6 +25,8 @@ func (r *Registry) LoadFromPersist() error {
 	if r == nil || r.persist == nil {
 		return nil
 	}
+	r.writerMu.Lock()
+	defer r.writerMu.Unlock()
 	sets, bindings, err := r.persist.LoadTransformSnapshot()
 	if err != nil {
 		return err
@@ -38,6 +39,12 @@ func (r *Registry) LoadFromPersist() error {
 	for i := range sets {
 		s := sets[i]
 		cp := cloneSet(&s)
+		if cp.State == "" {
+			cp.State = LifecycleActive
+		}
+		if cp.Revision < 1 {
+			cp.Revision = 1
+		}
 		r.sets[cp.ID] = cp
 		if cp.ID > maxSet {
 			maxSet = cp.ID
@@ -63,23 +70,5 @@ func (r *Registry) LoadFromPersist() error {
 	}
 	r.nextSet.Store(maxSet + 1)
 	r.nextVer.Store(maxVer + 1)
-	return nil
-}
-
-func (r *Registry) flushLocked() error {
-	if r.persist == nil {
-		return nil
-	}
-	sets := make([]Set, 0, len(r.sets))
-	for _, s := range r.sets {
-		sets = append(sets, *cloneSet(s))
-	}
-	bindings := make([]Binding, 0, len(r.bindings))
-	for _, b := range r.bindings {
-		bindings = append(bindings, *cloneBinding(b))
-	}
-	if err := r.persist.SaveTransformSnapshot(sets, bindings); err != nil {
-		return fmt.Errorf("%w: %w", ErrPersist, err)
-	}
 	return nil
 }

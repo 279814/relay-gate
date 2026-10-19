@@ -108,11 +108,13 @@ type Version struct {
 
 // Set is a named transform configuration container.
 type Set struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Draft     *Version  `json:"draft,omitempty"`
-	History   []Version `json:"history,omitempty"` // immutable published/shadow snapshots
+	Revision  int64          `json:"revision"`
+	State     LifecycleState `json:"state"`
+	ID        int64          `json:"id"`
+	Name      string         `json:"name"`
+	CreatedAt time.Time      `json:"created_at"`
+	Draft     *Version       `json:"draft,omitempty"`
+	History   []Version      `json:"history,omitempty"` // immutable published/shadow snapshots
 }
 
 // Binding attaches at most one published and one shadow version to Route+Endpoint.
@@ -155,6 +157,7 @@ type Compiled struct {
 // Registry holds in-process sets, bindings, and execution records.
 // Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
+	writerMu  sync.Mutex // serialize configuration writers without holding request readers over SQL
 	mu        sync.RWMutex
 	sets      map[int64]*Set
 	bindings  map[string]*Binding // key route:endpoint

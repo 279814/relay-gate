@@ -37,6 +37,10 @@ func (r *Registry) CaptureRoutes(routeIDs []int64) *RequestView {
 		if !wanted[b.RouteID] {
 			continue
 		}
+		if set := r.sets[b.SetID]; set != nil && (set.State == LifecycleDisabled || set.State == LifecycleArchived) {
+			view.bindings[key] = requestBinding{revision: b.Revision}
+			continue
+		}
 		view.bindings[key] = requestBinding{revision: b.Revision, published: r.captureVersionLocked(b.SetID, b.PublishedID), shadow: r.captureVersionLocked(b.SetID, b.ShadowID)}
 	}
 	return view

@@ -15,6 +15,7 @@ func TestLiveTransformPublishActivatesItsHealthCounterBeforeSuccess(t *testing.T
 	seedConfig(t, s, 1, 1)
 	registry := transform.NewRegistry(8).WithPersist(s.st)
 	s.WithTransformRegistry(registry)
+	h = freshTransformFixtureHandler(t, registry, h)
 	set, err := registry.CreateSet("publish-health")
 	if err != nil {
 		t.Fatal(err)
