@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -53,7 +54,7 @@ func TestReaderBuildIDLabelsAreDiagnosticAndDoNotClaimARelease(t *testing.T) {
 }
 
 func TestRotationBackupCarriesStartupIdentityAndOldMarkerRemainsReadable(t *testing.T) {
-	st, old, _ := dataKeyBackupFixture(t)
+	st, old, _ := schemaEightDataKeyBackupFixture(t)
 	path := st.path
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
@@ -73,11 +74,19 @@ func TestRotationBackupCarriesStartupIdentityAndOldMarkerRemainsReadable(t *test
 		t.Fatal(err)
 	}
 	defer opened.Close()
+	migrations, err := filepath.Glob(filepath.Join(filepath.Dir(path), "backups", "schema-8-to-9-*", "manifest.json"))
+	if err != nil || len(migrations) != 1 {
+		t.Fatalf("schema9 migration backup=%v err=%v", migrations, err)
+	}
+	migrated, err := CheckBackup(context.Background(), path, migrations[0], cipher)
+	if err != nil || migrated.PairedBuildID != identity || migrated.ReaderContract != "schema-8-data-key-v2-reader" {
+		t.Fatalf("schema9 migration lost actual startup reader: %+v err=%v", migrated, err)
+	}
 	backup, err := opened.CreateRotationBackup(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if backup.Manifest.PairedBuildID != identity || backup.Manifest.ReaderContract != "schema-8-data-key-v2-reader" {
+	if backup.Manifest.PairedBuildID != identity || backup.Manifest.ReaderContract != "schema-9-route-health-v1-reader" {
 		t.Fatalf("startup identity lost: %+v", backup.Manifest)
 	}
 	checked, err := CheckBackup(context.Background(), path, backup.ManifestPath, cipher)

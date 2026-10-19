@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -15,6 +17,10 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	changed, err := liveTransformChanges(tx, bindings)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM transform_binding`); err != nil {
 		return err
 	}
@@ -58,7 +64,52 @@ func (s *Store) SaveTransformSnapshot(sets []transform.Set, bindings []transform
 			return err
 		}
 	}
+	for routeID := range changed {
+		if _, err := tx.Exec(`UPDATE route SET capability_revision=capability_revision+1 WHERE id=?`, routeID); err != nil {
+			return err
+		}
+		if err := resetRouteHealthTx(context.Background(), tx, routeID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+// Shadow and draft edits do not change live request semantics. Compare the
+// published pointers in this transaction, before replacing their tables.
+func liveTransformChanges(tx *sql.Tx, bindings []transform.Binding) (map[int64]bool, error) {
+	type target struct{ route, endpoint int64 }
+	before := map[target]int64{}
+	rows, err := tx.Query(`SELECT route_id,endpoint_id,published_id FROM transform_binding WHERE published_id<>0`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var key target
+		var version int64
+		if err := rows.Scan(&key.route, &key.endpoint, &version); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		before[key] = version
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	changed := map[int64]bool{}
+	for _, binding := range bindings {
+		key := target{binding.RouteID, binding.EndpointID}
+		if before[key] != binding.PublishedID {
+			changed[binding.RouteID] = true
+		}
+		delete(before, key)
+	}
+	for key := range before {
+		changed[key.route] = true
+	}
+	return changed, nil
 }
 
 // LoadTransformSnapshot reads all transform sets/versions/bindings.

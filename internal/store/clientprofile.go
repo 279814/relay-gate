@@ -353,6 +353,9 @@ func (store *Store) MarkClientProfileTested(ctx context.Context, id int64, execu
 	if err = replaceClientProfileSecretRefs(ctx, tx, profile); err != nil {
 		return err
 	}
+	if err = clearStaleRouteHealthTx(ctx, tx, `route_id IN (SELECT id FROM route WHERE upstream_id=?)`, false, profile.UpstreamID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -434,6 +437,9 @@ func (store *Store) DisableClientProfile(ctx context.Context, id, expectedRevisi
 	}
 	if _, err = tx.ExecContext(ctx,
 		`DELETE FROM client_profile_active_secret_ref WHERE client_profile_id=?`, id); err != nil {
+		return err
+	}
+	if err = clearStaleRouteHealthTx(ctx, tx, `route_id IN (SELECT r.id FROM route r JOIN client_probe_profile p ON p.upstream_id=r.upstream_id WHERE p.id=?)`, false, id); err != nil {
 		return err
 	}
 	return tx.Commit()

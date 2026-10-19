@@ -48,9 +48,14 @@ func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []
 	if expectedRevision < 1 {
 		return nil, model.WrapValidation("Secret value/expected revision 无效")
 	}
+	tx, err := store.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	var enc, currentMasked string
 	var currentRev int64
-	err := store.db.QueryRow(`SELECT value_enc,masked,revision FROM probe_secret WHERE id=?`, id).
+	err = tx.QueryRow(`SELECT value_enc,masked,revision FROM probe_secret WHERE id=?`, id).
 		Scan(&enc, &currentMasked, &currentRev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -72,9 +77,12 @@ func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []
 	}
 	if keep {
 		var secret model.ProbeSecret
-		if err := store.db.QueryRow(`SELECT id,name,masked,fingerprint,revision,created_at,updated_at
+		if err := tx.QueryRow(`SELECT id,name,masked,fingerprint,revision,created_at,updated_at
 			FROM probe_secret WHERE id=?`, id).Scan(&secret.ID, &secret.Name, &secret.Masked,
 			&secret.Fingerprint, &secret.Revision, &secret.CreatedAt, &secret.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
 		return &secret, nil
@@ -86,7 +94,7 @@ func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []
 	masked := MaskKey(string(plain))
 	fingerprint := store.cipher.Fingerprint("probe-secret", plain)
 	now := nowMS()
-	result, err := store.db.Exec(`UPDATE probe_secret SET value_enc=?,masked=?,fingerprint=?,
+	result, err := tx.Exec(`UPDATE probe_secret SET value_enc=?,masked=?,fingerprint=?,
 		revision=revision+1,updated_at=? WHERE id=? AND revision=?`,
 		encrypted, masked, fingerprint, now, id, expectedRevision)
 	if err != nil {
@@ -95,10 +103,19 @@ func (store *Store) UpdateProbeSecret(id int64, expectedRevision int64, plain []
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return nil, ErrRevisionConflict
 	}
+	// The saved proof lists the actual bound Secret revisions. Checking those
+	// proofs avoids invalidating routes that never used this Secret, including
+	// routes served by a higher-priority Recipe.
+	if err := clearStaleRouteHealthTx(context.Background(), tx, `identity_json!=''`, false); err != nil {
+		return nil, err
+	}
 	var secret model.ProbeSecret
-	if err := store.db.QueryRow(`SELECT id,name,masked,fingerprint,revision,created_at,updated_at
+	if err := tx.QueryRow(`SELECT id,name,masked,fingerprint,revision,created_at,updated_at
 		FROM probe_secret WHERE id=?`, id).Scan(&secret.ID, &secret.Name, &secret.Masked,
 		&secret.Fingerprint, &secret.Revision, &secret.CreatedAt, &secret.UpdatedAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &secret, nil
@@ -567,6 +584,9 @@ func (store *Store) retireRecipe(ctx context.Context, recipeID, expectedRevision
 	// 而失败重试的话又可能停在「释放了 ref 但状态没变」。
 	if _, err = tx.ExecContext(ctx,
 		`DELETE FROM recipe_active_secret_ref WHERE recipe_id=?`, recipeID); err != nil {
+		return err
+	}
+	if err = clearRecipeScopeHealthTx(ctx, tx, recipeID); err != nil {
 		return err
 	}
 	return tx.Commit()

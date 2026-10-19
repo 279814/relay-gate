@@ -1,6 +1,9 @@
 package health
 
-import "time"
+import (
+	"github.com/279814/relay-gate/internal/model"
+	"time"
+)
 
 // Verdict 是一次探测或一次真实请求的判定结果（§4.3）。
 //
@@ -59,8 +62,9 @@ func (v Verdict) String() string {
 
 // Report 是一次判定的完整输入。
 type Report struct {
-	RouteID int64
-	Verdict Verdict
+	RouteID  int64
+	Verdict  Verdict
+	Identity *model.RouteHealthIdentity
 
 	// Generation 是 Claim / TryAcquire 时绑定的 RouteHealth 世代。
 	// >0 时与当前条目不一致（含 Forget 后同 id 复用）则丢弃本次判定。

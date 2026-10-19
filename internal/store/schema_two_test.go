@@ -171,7 +171,7 @@ func TestOpenUsesVersionedRunnerAndKeepsLifecycleLock(t *testing.T) {
 	}
 }
 
-func TestKnownLegacyVariantsReachSchemaSeven(t *testing.T) {
+func TestKnownLegacyVariantsReachCurrentSchema(t *testing.T) {
 	for _, variant := range []legacySchemaVariant{
 		legacySchemaM2,
 		legacySchemaM6PreColumn,
@@ -205,8 +205,8 @@ func TestKnownLegacyVariantsReachSchemaSeven(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(manifests) != 8 {
-				t.Fatalf("backup manifests = %d, want one per boundary (0→1,1→2,2→3,3→4,4→5,5→6,6→7,7→8)", len(manifests))
+			if len(manifests) != 9 {
+				t.Fatalf("backup manifests = %d, want one per boundary through 8→9", len(manifests))
 			}
 		})
 	}
