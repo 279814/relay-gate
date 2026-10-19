@@ -408,7 +408,7 @@ func insertSampleAttemptRow(tx *sql.Tx, requestID int64, a *model.SampleAttempt,
 		return err
 	}
 	a.RequestID = requestID
-	if err := insertAttemptMetadata(tx, "sample_attempt_metadata", a.ID, a.Metadata); err != nil {
+	if err := insertSampleCaptureMetadata(tx, a); err != nil {
 		return err
 	}
 	if f == nil {
