@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/279814/relay-gate/internal/security"
 	"net/http"
 	"strconv"
 	"strings"
@@ -729,10 +730,10 @@ func unescapePointer(s string) string {
 }
 
 func shadowContainsSecret(body []byte, secrets SecretMap) bool {
+	keys := make([]string, 0, len(secrets))
 	for _, value := range secrets {
-		if len(value) > 0 && bytes.Contains(body, value) {
-			return true
-		}
+		keys = append(keys, string(value))
 	}
-	return false
+	text := string(body)
+	return security.RedactSecrets(text, keys) != text
 }
