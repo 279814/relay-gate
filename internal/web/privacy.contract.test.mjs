@@ -13,6 +13,7 @@ import * as runtimeModule from './static/js/runtime.mjs';
 import * as countModule from './static/js/count_tokens.mjs';
 import * as recipeModule from './static/js/recipe_admin.mjs';
 import * as settingsModule from './static/js/settings.mjs';
+import * as attemptMetadataModule from './static/js/attempt_metadata.mjs';
 
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 const httpJSON=(status,data)=>({status,ok:status>=200&&status<300,text:async()=>JSON.stringify(data)});
@@ -22,7 +23,7 @@ async function fullBoot(t,fetchResponse,configure=()=>{}) {
   globalThis.fetch=fetchResponse;
   t.after(()=>{globalThis.fetch=before;});
   const context={window:{},console,URLSearchParams,setTimeout,clearTimeout,setInterval,clearInterval};
-  for(const module of [apiModule,probesModule,errorsModule,migrationModule,credentialsModule,securityModule,transformsModule,runtimeModule,countModule,recipeModule,settingsModule])Object.assign(context,module);
+  for(const module of [apiModule,probesModule,errorsModule,migrationModule,credentialsModule,securityModule,transformsModule,runtimeModule,countModule,recipeModule,settingsModule,attemptMetadataModule])Object.assign(context,module);
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(new URL('./static/app.js',import.meta.url),'utf8'),context);
   const base=context.app();base.boot=async()=>{};base.authed=true;
@@ -42,6 +43,7 @@ test('full boot logout clears credentials, evidence, drafts, probe data and moda
   for(const key of ['endpoints','secrets','recipes','executions','capabilities','reachability','calibrations','probeCostDaily'])shell[key].items=[{value:'synthetic-private'}];
   shell.executionDrawer={detail:'synthetic-private'};shell.endpointForm={fixed_query_template:'synthetic-private'};shell.secretForm={value:'synthetic-private'};shell.recipeForm={note:'synthetic-private'};
   shell.profileFilters.client_family='synthetic-private';shell.profileView={profile:{body:'synthetic-private'}};
+  shell.attemptMetadata.open=true;shell.attemptMetadata.reqID='synthetic-private';shell.attemptMetadata.attempts=[{executionID:'synthetic-private'}];
   let modalReleased=0; shell._modalUnlock=()=>{modalReleased++;};
   shell.reset();
   assert.equal(shell.authed,false);

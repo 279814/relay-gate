@@ -149,9 +149,19 @@ func recordAttemptObservationTx(ctx context.Context, tx *sql.Tx, execution *mode
 
 func scanAttemptMetadata(scanner interface{ Scan(...any) error }) (int64, model.AttemptMetadata, error) {
 	var ownerID int64
+	var captureView string
 	m := model.UnknownAttemptMetadata()
-	err := scanner.Scan(&ownerID, &m.Version, &m.ExecutionID, &m.Attempt, &m.Attempts, &m.ConfigGeneration, &m.SettingsRevision, &m.EndpointID, &m.EndpointRevision, &m.AuthProfileRevision, &m.UpstreamNetworkRevision, &m.UpstreamCredentialRevision, &m.RouteRevision, &m.RouteCapabilityRevision, &m.ModelRevision, &m.ModelCapabilityRevision, &m.TransformVersionID, &m.RequestTransformRevision, &m.ResponseHeaderAtMS, &m.FirstEventAtMS, &m.FirstSemanticAtMS, &m.RetryPolicy, &m.RetryReason, &m.RequestWriteState, &m.CapabilityEffect, &m.ErrorClass, &m.Retried, &m.HalfOpen, &m.DuplicateRisk, &m.SyntheticCompletion, &m.RequestInputHash, &m.RequestOutputHash, &m.RequestBodyChanged, &m.RequestHeadersChanged, &m.RequestDiffReason, &m.ResponseInputHash, &m.ResponseOutputHash, &m.ResponseBodyChanged, &m.ResponseHeadersChanged, &m.ResponseDiffReason, &m.ExecutionStored)
+	err := scanner.Scan(&ownerID, &m.Version, &m.ExecutionID, &m.Attempt, &m.Attempts, &m.ConfigGeneration, &m.SettingsRevision, &m.EndpointID, &m.EndpointRevision, &m.AuthProfileRevision, &m.UpstreamNetworkRevision, &m.UpstreamCredentialRevision, &m.RouteRevision, &m.RouteCapabilityRevision, &m.ModelRevision, &m.ModelCapabilityRevision, &m.TransformVersionID, &m.RequestTransformRevision, &m.ResponseHeaderAtMS, &m.FirstEventAtMS, &m.FirstSemanticAtMS, &m.RetryPolicy, &m.RetryReason, &m.RequestWriteState, &m.CapabilityEffect, &m.ErrorClass, &m.Retried, &m.HalfOpen, &m.DuplicateRisk, &m.SyntheticCompletion, &m.RequestInputHash, &m.RequestOutputHash, &m.RequestBodyChanged, &m.RequestHeadersChanged, &m.RequestDiffReason, &m.ResponseInputHash, &m.ResponseOutputHash, &m.ResponseBodyChanged, &m.ResponseHeadersChanged, &m.ResponseDiffReason, &m.ExecutionStored, &captureView)
+	if err != nil {
+		return ownerID, m, err
+	}
 	m.DescribeResponseView()
+	if !validSampleCaptureView(captureView) {
+		return ownerID, m, model.WrapValidation("sample capture view 无效")
+	}
+	if captureView != "legacy" {
+		m.ResponseView = captureView
+	}
 	return ownerID, m, err
 }
 
@@ -178,7 +188,11 @@ func loadAttemptMetadata(ctx context.Context, db schemaQuerier, table string, id
 	for i, id := range ids {
 		args[i] = id
 	}
-	rows, err := db.QueryContext(ctx, "SELECT m.owner_id,"+strings.Join(columns, ",")+",p.id IS NOT NULL FROM "+table+" m LEFT JOIN probe_execution p ON p.id=m.execution_id WHERE m.owner_id IN ("+strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")+")", args...)
+	captureView := "'legacy'"
+	if table == "sample_attempt_metadata" {
+		captureView = "m.response_capture_view"
+	}
+	rows, err := db.QueryContext(ctx, "SELECT m.owner_id,"+strings.Join(columns, ",")+",p.id IS NOT NULL,"+captureView+" FROM "+table+" m LEFT JOIN probe_execution p ON p.id=m.execution_id WHERE m.owner_id IN ("+strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")+")", args...)
 	if err != nil {
 		return nil, err
 	}

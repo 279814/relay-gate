@@ -786,20 +786,28 @@ func (h *Handler) sampleAttempt(cand *router.Candidate, outBody []byte, outHeade
 	var respSafe []byte
 	var respSpill string
 	var flags model.TruncFlags
+	// Encoded original bytes must reach the existing background validation
+	// intact. Replacing a visible key inside gzip would corrupt its checksum.
+	encodedResponse := normalizeContentEncoding(res.RespHeaders.Get("Content-Encoding")) != ""
 	if outCut {
 		flags |= model.TruncOutBody
 	}
 	if tee != nil {
 		if tee.SpillBytes() > 0 {
 			_, respSpill = tee.DetachBody()
-			if err := sample.RedactBodyFile(respSpill, keys); err != nil {
-				h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
-					"err", err, "route", cand.Route.ID)
-				model.RemoveSpillFile(respSpill)
-				respSpill = ""
+			if !encodedResponse {
+				if err := sample.RedactBodyFile(respSpill, keys); err != nil {
+					h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
+						"err", err, "route", cand.Route.ID)
+					model.RemoveSpillFile(respSpill)
+					respSpill = ""
+				}
 			}
 		} else {
-			respSafe = sample.RedactBodyKeys(tee.Bytes(), keys)
+			respSafe = tee.Bytes()
+			if !encodedResponse {
+				respSafe = sample.RedactBodyKeys(respSafe, keys)
+			}
 		}
 		if tee.Truncated() {
 			flags |= model.TruncRespBody
