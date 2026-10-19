@@ -1141,13 +1141,22 @@ func main() {
 	if len(arguments) == 1 && arguments[0] == "--help" {
 		fmt.Println("--bare skip hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery")
 		fmt.Println("--safe-mode --strict-mcp-config --settings --no-session-persistence")
-		fmt.Println("--disable-slash-commands --tools --no-chrome --max-budget-usd")
+		fmt.Println("--disable-slash-commands --tools --system-prompt --no-chrome --max-budget-usd")
 		return
 	}
 	if len(arguments) == 0 {
 		os.Exit(2)
 	}
 	prompt := arguments[len(arguments)-1]
+	system := ""
+	for index, argument := range arguments {
+		if argument == "--system-prompt" && index+1 < len(arguments) {
+			system = arguments[index+1]
+		}
+	}
+	if system != "Reply with 2 only." {
+		os.Exit(5)
+	}
 	base := strings.TrimRight(os.Getenv("ANTHROPIC_BASE_URL"), "/")
 	hello, err := http.NewRequest(http.MethodHead, base+"/api/hello", nil)
 	if err != nil {
@@ -1160,12 +1169,13 @@ func main() {
 	}
 	_, _ = io.Copy(io.Discard, helloResponse.Body)
 	_ = helloResponse.Body.Close()
-	body := []byte(fmt.Sprintf(` + "`" + `{"model":"fixture","max_tokens":1,"stream":true,"messages":[{"role":"user","content":%q}]}` + "`" + `, prompt))
+	body := []byte(fmt.Sprintf(` + "`" + `{"model":"fixture","max_tokens":1,"stream":true,"system":%q,"messages":[{"role":"user","content":%q}]}` + "`" + `, system, prompt))
 	request, err := http.NewRequest(http.MethodPost, base+"/v1/messages?beta=true", bytes.NewReader(body))
 	if err != nil {
 		panic(err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", "claude-cli/2.1.220 (external, sdk-cli)")
 	request.Header.Set("x-api-key", os.Getenv("ANTHROPIC_API_KEY"))
 	request.Header.Set("anthropic-version", "2023-06-01")
 	client := &http.Client{Timeout: 10 * time.Second}

@@ -32,6 +32,9 @@ if (typeof base !== 'function') {
       onUnauthorized: () => {
         if (typeof receiver.reset === 'function') receiver.reset();
       },
+      onAuditPending: ({eventId}) => {
+        receiver.auditWarning = '操作已完成，审计记录待确认（#' + (eventId || '—') + '），请勿重复操作。';
+      },
     });
 
     // 业务网络改走 api.mjs；保留原 api(method,path,body) 形状。
@@ -147,6 +150,7 @@ if (typeof base !== 'function') {
         this.loadProfiles(true);
       } else if (tab === 'credentials') {
         this.loadCredentials();
+        this.loadAuditEvents(true);
       } else if (tab === 'security') {
         this.loadSecurityFindings();
         this.loadSMTP();

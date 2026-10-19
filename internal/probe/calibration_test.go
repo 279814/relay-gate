@@ -119,6 +119,10 @@ func TestCalibration_SuccessInvalidatesRouteHealth(t *testing.T) {
 	if final.State != model.CalibrationSucceeded {
 		t.Fatalf("state=%s", final.State)
 	}
+	var publishedAudit int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM audit_event WHERE action='calibration_publish' AND outcome='succeeded'`).Scan(&publishedAudit); err != nil || publishedAudit != 1 {
+		t.Fatalf("calibration Auth/Recipe publication escaped formal audit: count=%d err=%v", publishedAudit, err)
+	}
 	if len(inv.routes) == 0 || inv.routes[len(inv.routes)-1] != rt.ID {
 		t.Fatalf("§9.2: calibration success must InvalidateRoute(%d), got %v", rt.ID, inv.routes)
 	}
