@@ -31,3 +31,5 @@ schema 14 严格 inspector 移除精确的三张表/索引和追加列后必须�
 
 先冻结完整 14 DDL/inspect/reader/backup/restore 检查点供后续 15/16/17 编译；此检查点只证明迁移，不宣称 Canary 行为完成。真实合成 SQLite 红绿覆盖 13→14 凭据/历史不变、backup 先于 DDL、backup 失败不写、当前 reader restore、部分/改约束/额外结构拒绝。随后严格输出矩阵覆盖三协议、分片和工具索引、nonce 复用/错误/额外输出、取消/超限/incomplete，真实 loopback 验证恰好一次、Lazy manual、Active 周期、暂停/切 Lazy、费用幂等/保留。最后 HTTP/Node/必要浏览器、相关全包、build/vet 和 committed history 检查。只使用合成 fixture 与 loopback，不调用线上模型、不读 .local、不更改时长或候选 soak 证据。
 
+迁移检查点已实测：原 schema13→期望14 失败后变绿；SQLite 的 TEXT PRIMARY KEY 允许 NULL 导致未关联执行的回归再次真实失败，补显式 NOT NULL 后变绿。Canary 迁移/约束/严格 catalog/rotation restore 五个测试入口（含多个变体）通过；历史 schema/reader/SMTP/metadata 门禁、build/vet 与真实 binary runtime 验证通过。历史13的 rotation 测试固定使用13 fixture，仍精确断言原 reader 合同。
+
