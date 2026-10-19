@@ -42,4 +42,4 @@ Certbot 的账户、lineage 与续期配置持久化保存；每 12 小时尝试
 
 实现固定使用官方 Certbot 5.8.0 镜像 digest，并在运行时探测 `--ip-address`、webroot 插件和 profile 参数。优先使用禁止回退的 `--required-profile shortlived`；仅在该参数不存在而 `--preferred-profile` 存在时使用后者，且仍拒绝长于 192 小时的候选。官方要求 IP 的 webroot 支持为 Certbot 5.4+，IP 短期证书通常有效 160 小时。依据：[Let’s Encrypt 的 Certbot IP 指南](https://letsencrypt.org/2026/03/11/shorter-certs-certbot/)、[短期 IP 证书正式可用说明](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability/)、[Certbot 官方使用文档](https://eff-certbot.readthedocs.io/en/stable/using.html)。
 
-离线验证包含实际 Bash 安装脚本、实际子进程 Certbot/Nginx 双桩和本地 HTTP/TLS 校验。`public-edge` CI 构建真实镜像，使用真实 Nginx、本地测试 CA 和实际 Certbot 能力探测验证握手、SSE、重定向、续期故障及到期关闭；不会联系公共 CA。本次开发环境无 Docker、公网主机或真实签发凭据，因此不能将本地结果表述为已完成公网签发、外部网络验收、35 分钟真实长连接或多日生产验证。首次公网部署后仍须在真实环境记录这些验收证据。
+离线验证包含实际 Bash 安装脚本、实际子进程 Certbot/Nginx 双桩和本地 HTTP/TLS 校验。`public-edge` CI 构建真实镜像，使用真实 Nginx、本地测试 CA 和实际 Certbot 能力探测验证握手、SSE、重定向、续期故障及到期关闭；不会联系公共 CA。候选bcaec87的真实Nginx/本地CA长连接已运行35分5秒通过，详见[实际时长验收](15-实际时长验收.md)。现已取得可控公网ECS并完成只读检查，存在旧版网关和占用80/443的Caddy，尚未替换服务或联系公共CA。须先准备原服务及数据备份/回退，再记录真实签发和外部网络验收；候选长流结果不能替代公网ACME或最终版本多日验证。

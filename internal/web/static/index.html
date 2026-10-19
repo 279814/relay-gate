@@ -74,50 +74,81 @@
                 <div class="sub">丢弃是静默的：队列满时宁可丢样本也不阻塞转发</div>
               </div>
               <div class="card" style="cursor:pointer" @click="openRecentErrors && openRecentErrors()">
-                <h3>最近错误</h3>
+                <h3 x-text="(recentErrors.upstream_id || recentErrors.route_id || recentErrors.protocol || recentErrors.outcome || recentErrors.from_time || recentErrors.to_time)
+                  ? '最近错误（筛选后）' : '最近错误'"></h3>
                 <div class="v" x-text="recentErrors?.failed_count ?? 0"></div>
                 <div class="sub" x-text="recentErrors?.latest?.error
                   ? ((recentErrors.latest.error.length > 80
                       ? recentErrors.latest.error.slice(0, 80) + '…'
                       : recentErrors.latest.error))
                   : '点击查看全部'"></div>
+                <div class="sub" x-text="fmtTime(recentErrors?.latest?.ts_recv)"></div>
+                <button type="button" @click.stop="openRecentErrors()">查看全部</button>
               </div>
             </div>
 
             <div class="mask" x-show="recentErrors?.open" @click.self="closeRecentErrors && closeRecentErrors()"
                  @keydown.escape.window="closeRecentErrors && closeRecentErrors()">
-              <div class="modal wide" @click.stop>
+              <div class="modal wide" style="max-height:85vh;overflow:auto" @click.stop>
                 <div class="bar">
                   <h3 style="margin:0">最近错误</h3>
                   <span class="grow"></span>
                   <button type="button" @click="closeRecentErrors && closeRecentErrors()">关闭</button>
                 </div>
-                <p class="dim">完整脱敏文本；禁止 HTML。筛选与分页基于 request_log 失败行。</p>
+                <p class="dim">完整脱敏文本；按请求接收时间筛选失败的 Attempt。Capability 是当前同路由能力，Execution 是同路由相关执行，尚无精确请求关联。</p>
                 <div class="bar">
                   <label>Upstream ID
-                    <input type="number" x-model="recentErrors.upstream_id" @change="refreshRecentErrors && refreshRecentErrors()">
+                    <input type="number" min="1" style="width:7rem" x-model="recentErrors.upstream_id" @change="applyRecentErrorFilters()">
                   </label>
-                  <button type="button" @click="refreshRecentErrors && refreshRecentErrors()">刷新</button>
+                  <label>Route ID
+                    <input type="number" min="1" style="width:7rem" x-model="recentErrors.route_id" @change="applyRecentErrorFilters()">
+                  </label>
+                  <label>协议
+                    <select x-model="recentErrors.protocol" @change="applyRecentErrorFilters()">
+                      <option value="">全部</option><option value="anthropic">Anthropic</option>
+                      <option value="openai-responses">OpenAI Responses</option><option value="openai-chat">OpenAI Chat</option>
+                    </select>
+                  </label>
+                  <label>失败类别（Outcome）
+                    <select x-model="recentErrors.outcome" @change="applyRecentErrorFilters()">
+                      <option value="">全部失败</option><option value="upstream_error">上游错误</option>
+                      <option value="timeout">超时</option><option value="fake_alive">假活</option><option value="client_abort">客户端取消</option>
+                    </select>
+                  </label>
+                  <label>接收时间从<input type="datetime-local" x-model="recentErrors.from_time" @change="applyRecentErrorFilters()"></label>
+                  <label>至<input type="datetime-local" x-model="recentErrors.to_time" @change="applyRecentErrorFilters()"></label>
+                  <button type="button" :disabled="recentErrors.loading" @click="refreshRecentErrors(true)">刷新</button>
                 </div>
+                <p class="alert err" x-show="err" x-text="err"></p>
+                <div style="overflow:auto">
                 <table>
                   <thead>
-                    <tr><th>时间</th><th>上游</th><th>端点</th><th>模型</th><th>错误</th><th></th></tr>
+                    <tr><th>时间</th><th>上游 / Route</th><th>协议 / 端点</th><th>类别</th><th>模型</th><th>错误</th><th>关联</th></tr>
                   </thead>
                   <tbody>
                     <template x-for="row in (recentErrors?.logs || [])" :key="row.id">
                       <tr>
                         <td x-text="fmtTime(row.ts_recv)"></td>
-                        <td x-text="row.upstream_name"></td>
-                        <td x-text="row.endpoint"></td>
+                        <td><div x-text="row.upstream_name"></div><span x-text="row.route_id"></span></td>
+                        <td><div x-text="row.protocol || '未记录'"></div><span x-text="row.endpoint"></span></td>
+                        <td x-text="row.outcome"></td>
                         <td x-text="row.model_in"></td>
-                        <td><pre class="err-pre" x-text="row.error || ''"></pre></td>
-                        <td><button type="button" @click="copyRecentError && copyRecentError(row.error)">复制</button></td>
+                        <td><pre class="err-pre" style="overflow-wrap:anywhere;word-break:break-word" x-text="row.error || ''"></pre></td>
+                        <td>
+                          <button type="button" @click="copyRecentError(row.error)">复制</button>
+                          <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorCapabilities(row)">当前 Capability</button>
+                          <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorExecutions(row)">相关 Execution</button>
+                          <button type="button" :disabled="!row.req_id" @click="openRecentErrorRequestLogs(row)">RequestLog</button>
+                          <button type="button" :disabled="!row.sample_id" @click="openRecentErrorSample(row)">Sample</button>
+                        </td>
                       </tr>
                     </template>
                   </tbody>
                 </table>
+                </div>
                 <div class="bar">
-                  <button type="button" @click="loadMoreRecentErrors && loadMoreRecentErrors()">加载更多</button>
+                  <span class="dim" x-text="'已显示 ' + recentErrors.logs.length + ' / ' + recentErrors.failed_count"></span>
+                  <button type="button" :disabled="recentErrors.loading || !recentErrors.next_cursor" @click="loadMoreRecentErrors()">加载更多</button>
                 </div>
               </div>
             </div>
@@ -874,6 +905,10 @@
                 <div class="field">
                   <label>草稿规则（JSON 数组）</label>
                   <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
+                </div>
+                <div class="field">
+                  <label><input type="checkbox" x-model="transforms.requestReencode"> 允许压缩请求改写（gzip/br）</label>
+                  <small>仅发布后生效。此绑定退出严格字节透传：重编码会改变原始压缩字节，正文上限 8 MiB。</small>
                 </div>
                 <div class="row">
                   <div class="field">

@@ -512,6 +512,11 @@ func TestRouteHealthSnapshotRejectsIdentityChangesBeforeOrAfterPersistence(t *te
 						t.Fatal(err)
 					}
 				}
+				// Reading through the current-identity filter is insufficient: the
+				// configuration transaction itself must retire obsolete evidence.
+				if change.name != "disabled route" && change.name != "disabled upstream" && change.name != "disabled model" {
+					assertDurableHealthState(t, st, route.ID, change.keeps)
+				}
 				cfg, _ := restoreTestDeps(st)
 				tracker := health.NewTracker(cfg)
 				count, err := RestoreRouteHealth(context.Background(), tracker, st, cfg)
@@ -528,6 +533,28 @@ func TestRouteHealthSnapshotRejectsIdentityChangesBeforeOrAfterPersistence(t *te
 			})
 		}
 	}
+}
+
+func assertDurableHealthState(t *testing.T, st *store.Store, routeID int64, retained bool) {
+	t.Helper()
+	rows, err := st.ListRouteHealth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.RouteID != routeID {
+			continue
+		}
+		if retained {
+			if row.State != model.StateDead || row.Identity == nil || row.ConsecutiveFail == 0 {
+				t.Fatalf("unrelated edit erased current negative: %+v", row)
+			}
+		} else if row.State != model.StateUnknown || row.Identity != nil || row.ConsecutiveFail != 0 || row.ConsecutiveOK != 0 || row.LastError != "" || row.CooldownUntil != 0 || row.RecoveryRequired {
+			t.Fatalf("configuration commit left obsolete durable health: %+v", row)
+		}
+		return
+	}
+	t.Fatal("route health row disappeared")
 }
 
 func TestRealHTTPNegativeHealthRetainsCurrentIdentityAndCooldownAcrossColdRestart(t *testing.T) {

@@ -29,6 +29,23 @@ func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candid
 	if c == nil {
 		return
 	}
+	if encoding := normalizeContentEncoding(header.Get("Content-Encoding")); encoding != "" &&
+		(c.HasRequestBodyRules() || c.AllowsRequestReencoding()) {
+		var decodeErr error
+		if c.AllowsRequestReencoding() {
+			body, decodeErr = decodeTransformBody(encoding, body, transform.MaxBodyBuffer)
+		}
+		if !c.AllowsRequestReencoding() || decodeErr != nil {
+			h.transforms.RecordExecution(transform.ExecutionRecord{
+				RouteID: cand.Route.ID, EndpointID: endpointID, VersionID: verID,
+				Mode: "shadow", Phase: "request", OK: false,
+				Error: "压缩请求的 shadow 正文转换不可用", InputHash: transform.HashBytes(body),
+			})
+			return
+		}
+		header = header.Clone()
+		header.Del("Content-Encoding")
+	}
 	var secrets transform.SecretMap
 	if key := cand.Upstream.APIKey; key != "" && !model.APIKeyTooShortForOutbound(key) {
 		secrets = transform.SecretMap{"upstream_api_key": []byte(key)}

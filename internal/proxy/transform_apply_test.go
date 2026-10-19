@@ -62,7 +62,7 @@ func TestRequestTransform_ReusedRouteIDPassthroughAfterDetach(t *testing.T) {
 		t.Fatal(err)
 	}
 	rules := []transform.Rule{
-		{Kind: transform.KindReplaceBytes, From: `"model":"claude-opus-5"`, To: `"model":"rewritten"`},
+		{Kind: transform.KindReplaceBytes, From: `"max_tokens":1`, To: `"max_tokens":2`},
 	}
 	if _, err := reg.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestRequestTransform_ReusedRouteIDPassthroughAfterDetach(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(string(hs.gotReq.body), `"model":"rewritten"`) {
+	if !strings.Contains(string(hs.gotReq.body), `"max_tokens":2`) {
 		t.Fatalf("setup: transform did not apply, upstream body=%s", hs.gotReq.body)
 	}
 
