@@ -9,6 +9,26 @@ import (
 	"github.com/279814/relay-gate/internal/security"
 )
 
+const securityFindingColumns = `id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
+	scanner_version, rule_version, bytes_scanned, incomplete_reason, truncated, decode_depth, evidence_hash`
+
+func (s *Store) scanSecurityFinding(row interface{ Scan(...any) error }) (security.Finding, error) {
+	var f security.Finding
+	if err := row.Scan(&f.ID, &f.AtMS, &f.Severity, &f.Category, &f.Summary, &f.Detail,
+		&f.Upstream, &f.RouteID, &f.ReqID, &f.Source, &f.ScannerVersion, &f.RuleVersion, &f.BytesScanned,
+		&f.IncompleteReason, &f.Truncated, &f.DecodeDepth, &f.EvidenceHash); err != nil {
+		return f, err
+	}
+	if f.Detail != "" {
+		plain, err := s.cipher.decryptDataBlob(securityKeyPurpose, []byte(f.Detail))
+		if err != nil {
+			return f, fmt.Errorf("security evidence 解密失败")
+		}
+		f.Detail = string(plain)
+	}
+	return f, nil
+}
+
 // InsertSecurityFinding seals Detail under the independent Security Data Key.
 // Callers still redact known credentials before this persistence boundary.
 func (s *Store) InsertSecurityFinding(f security.Finding) error {
@@ -39,9 +59,7 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 	if err != nil {
 		return nil, err
 	}
-	q := `SELECT id, at_ms, severity, category, summary, detail, upstream, route_id, req_id, source,
-		scanner_version, rule_version, bytes_scanned, incomplete_reason, truncated, decode_depth, evidence_hash
-		FROM security_finding`
+	q := `SELECT ` + securityFindingColumns + ` FROM security_finding`
 	args := []any{}
 	if severity != "" {
 		q += ` WHERE severity=?`
@@ -56,20 +74,9 @@ func (s *Store) ListSecurityFindings(severity string, limit int) ([]security.Fin
 	defer rows.Close()
 	var out []security.Finding
 	for rows.Next() {
-		var f security.Finding
-		var sev string
-		if err := rows.Scan(&f.ID, &f.AtMS, &sev, &f.Category, &f.Summary, &f.Detail,
-			&f.Upstream, &f.RouteID, &f.ReqID, &f.Source,
-			&f.ScannerVersion, &f.RuleVersion, &f.BytesScanned, &f.IncompleteReason, &f.Truncated, &f.DecodeDepth, &f.EvidenceHash); err != nil {
+		f, err := s.scanSecurityFinding(rows)
+		if err != nil {
 			return nil, err
-		}
-		f.Severity = security.Severity(sev)
-		if f.Detail != "" {
-			plain, err := s.cipher.decryptDataBlob(securityKeyPurpose, []byte(f.Detail))
-			if err != nil {
-				return nil, fmt.Errorf("security evidence 解密失败")
-			}
-			f.Detail = string(plain)
 		}
 		out = append(out, f)
 	}

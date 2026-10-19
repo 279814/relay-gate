@@ -36,38 +36,36 @@ func (s *Server) WithAlertMailer(m *security.AlertMailer) *Server {
 }
 
 func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
-	sev := security.Severity(r.URL.Query().Get("severity"))
-	limit, err := queryInt64(r.URL.Query().Get("limit"))
+	filter, err := securityFindingFilter(r)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: limit", model.ErrValidation))
+		s.writeErr(w, err)
 		return
 	}
-	pageLimit, err := store.NormalizePageLimit(int(limit))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
-		return
-	}
-	// Prefer durable store when available; fall back to in-memory center.
 	if s.st != nil {
-		list, err := s.st.ListSecurityFindings(string(sev), pageLimit)
-		if err == nil {
-			total, _ := s.st.CountSecurityFindings()
-			keys, ok := s.diagnosticKeys(w, r)
-			if !ok {
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"findings": redactFindingsForAPI(list, keys),
-				"total":    total,
-			})
+		page, err := s.st.ListSecurityFindingsPage(r.Context(), filter)
+		if err != nil {
+			s.writeErr(w, err)
 			return
 		}
+		keys, ok := s.diagnosticKeys(w, r)
+		if !ok {
+			return
+		}
+		page.Findings = redactFindingsForAPI(page.Findings, keys)
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
+	// Preserve the limited ring-only diagnostic adapter, but never silently
+	// ignore a filter or cursor that requires the durable authority.
+	if filter.RouteID != 0 || filter.Category != "" || filter.FromMS != 0 || filter.ToMS != 0 || filter.Cursor != "" {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"persistent security findings unavailable"})
+		return
 	}
 	if s.security == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"findings": []any{}, "total": 0})
 		return
 	}
-	list := s.security.List(sev, pageLimit)
+	list := s.security.List(filter.Severity, filter.Limit)
 	keys, ok := s.diagnosticKeys(w, r)
 	if !ok {
 		return
@@ -76,6 +74,46 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		"findings": redactFindingsForAPI(list, keys),
 		"total":    s.security.Count(),
 	})
+}
+
+func securityFindingFilter(r *http.Request) (store.SecurityFindingFilter, error) {
+	var f store.SecurityFindingFilter
+	q := r.URL.Query()
+	for key, values := range q {
+		switch key {
+		case "severity", "route_id", "category", "from_ms", "to_ms", "limit", "cursor":
+		default:
+			return f, model.WrapValidation("未知的安全发现筛选字段")
+		}
+		if len(values) != 1 {
+			return f, model.WrapValidation("安全发现筛选字段不可重复")
+		}
+	}
+	f.Severity = security.Severity(q.Get("severity"))
+	f.Category = q.Get("category")
+	f.Cursor = q.Get("cursor")
+	if len(f.Cursor) > 4096 {
+		return f, model.WrapValidation("安全发现游标无效")
+	}
+	for _, item := range []struct {
+		name   string
+		target *int64
+	}{{"route_id", &f.RouteID}, {"from_ms", &f.FromMS}, {"to_ms", &f.ToMS}} {
+		n, err := queryInt64(q.Get(item.name))
+		if err != nil {
+			return f, model.WrapValidation("安全发现数字筛选无效")
+		}
+		*item.target = n
+	}
+	limit, err := queryInt64(q.Get("limit"))
+	if err != nil || limit < 0 || limit > store.MaximumPageLimit {
+		return f, model.WrapValidation("安全发现分页大小无效")
+	}
+	f.Limit, err = store.NormalizePageLimit(int(limit))
+	if err != nil {
+		return f, err
+	}
+	return f, f.Validate()
 }
 
 // redactFindingsForAPI masks known upstream credentials in free-text finding
