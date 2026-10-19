@@ -6,6 +6,7 @@
 
 import { bindEscape, focusFirst, openModalLock } from './modal.mjs';
 import { field, parseProbeHeadersJSON } from './api.mjs';
+import { createProbeStatisticsFeature } from './probe_statistics.mjs';
 
 export { parseProbeHeadersJSON, field };
 
@@ -13,6 +14,7 @@ const PROBE_TABS = [
   { id: 'capabilities', name: '能力' },
   { id: 'recipes', name: '配方' },
   { id: 'executions', name: '执行' },
+  { id: 'probe-statistics', name: '探测统计' },
   { id: 'calibrations', name: '校准' },
   { id: 'probe-runtime', name: '探活诊断' },
 ];
@@ -524,6 +526,7 @@ export function createProbeFeature(shell, api) {
     return originalReset?.call(this);
   };
 
+  createProbeStatisticsFeature(shell, api);
   return shell;
 }
 
