@@ -256,6 +256,9 @@ func (s *Server) publishRecipeVersion(w http.ResponseWriter, r *http.Request) {
 		s.writeRecipeErr(w, err)
 		return
 	}
+	if body.Force {
+		setAuditAction(r, "recipe_force_publish")
+	}
 	recipe, err := s.probeAdmin.Publish(r.Context(), version.RecipeID, version.ID, body.TestExecutionID, body.ExpectedRevision, body.Force)
 	if err != nil {
 		s.writeRecipeErr(w, err)

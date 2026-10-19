@@ -11,6 +11,10 @@ const initialState = () => ({
   new_master: '',
   loading: false,
   rotating_master: false,
+  audit: {
+    items: [], nextCursor: '', loading: false, loaded: false, error: '', applied: '',
+    filter: {category: '', action: '', outcome: '', resource_type: '', resource_id: '', after: '', before: ''},
+  },
 });
 
 export function createCredentialsFeature(shell, api) {
@@ -19,6 +23,13 @@ export function createCredentialsFeature(shell, api) {
   let statusRequest = {};
   let revealTimer = null;
   let graceTimer = null;
+  let auditRequest = {};
+  shell.auditWarning = '';
+
+  function noteAuditPending(receiver, data) {
+    if (data?.audit_pending) receiver.auditWarning = '操作已完成，审计记录待确认（#' +
+      (data.audit_event_id || '—') + '），请勿重复操作。';
+  }
 
   function beginAction(receiver) {
     clearTimeout(revealTimer);
@@ -63,12 +74,57 @@ export function createCredentialsFeature(shell, api) {
       if (!current()) return;
       state.status = status;
       updateGrace(this, state, status?.relay_grace_seconds_left);
+      if (state.audit.loaded) await this.loadAuditEvents(true);
     } catch (e) {
       if (!current()) return;
       this.err = e && e.message ? e.message : String(e);
     } finally {
       if (current()) state.loading = false;
     }
+  };
+
+  shell.loadAuditEvents = async function loadAuditEvents(reset = true) {
+    const state = this.credentials;
+    const audit = state.audit;
+    const params = new URLSearchParams({limit: '25'});
+    for (const name of ['category', 'action', 'outcome', 'resource_type', 'resource_id']) {
+      if (audit.filter[name]) params.set(name, audit.filter[name]);
+    }
+    for (const [name, value] of [['after_ms', audit.filter.after], ['before_ms', audit.filter.before]]) {
+      if (!value) continue;
+      const milliseconds = new Date(value).getTime();
+      if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+        audit.error = '审计时间范围无效';
+        return;
+      }
+      params.set(name, String(milliseconds));
+    }
+    const applied = params.toString();
+    if (applied !== audit.applied) reset = true;
+    if (!reset && !audit.nextCursor) return;
+    if (!reset) params.set('cursor', audit.nextCursor);
+    const request = {};
+    auditRequest = request;
+    const current = () => this.credentials === state && auditRequest === request;
+    audit.loading = true;
+    audit.error = '';
+    try {
+      const page = await api.get('/audit-events?' + params.toString());
+      if (!current()) return;
+      if (!Array.isArray(page?.items)) throw new Error('审计历史返回无效');
+      audit.items = reset ? page.items : audit.items.concat(page.items);
+      audit.nextCursor = page.next_cursor || '';
+      audit.applied = applied;
+      audit.loaded = true;
+    } catch (error) {
+      if (current()) audit.error = error?.message || String(error);
+    } finally {
+      if (current()) audit.loading = false;
+    }
+  };
+
+  shell.auditOutcomeLabel = function auditOutcomeLabel(outcome) {
+    return {pending: '等待确认', succeeded: '已完成', failed: '未完成', unknown: '结果待核实'}[outcome] || outcome;
   };
 
   shell.revealMasterKey = async function revealMasterKey() {
@@ -118,6 +174,7 @@ export function createCredentialsFeature(shell, api) {
       });
       if (!current()) return;
       state.relay_key = data.relay_key || '';
+      noteAuditPending(this, data);
       updateGrace(this, state, data.grace_seconds);
       this.msg = 'Relay Key 已轮换；grace=' + (data.grace_seconds || 0) + 's';
       await this.loadCredentials();
@@ -132,10 +189,11 @@ export function createCredentialsFeature(shell, api) {
     const request = beginAction(this);
     const current = () => this.credentials === state && action === request;
     try {
-      await api.post('/credentials/revoke-relay-grace', {
+      const data = await api.post('/credentials/revoke-relay-grace', {
         password: state.password,
       });
       if (!current()) return;
+      noteAuditPending(this, data);
       updateGrace(this, state, 0);
       this.msg = '旧 Relay Key grace 已撤销';
       await this.loadCredentials();
@@ -154,6 +212,7 @@ export function createCredentialsFeature(shell, api) {
         password: state.password,
       });
       if (!current()) return;
+      noteAuditPending(this, data);
       this.credentials.admin_password = data.admin_password || '';
       this.credentials.password = data.admin_password || '';
       this.msg = '管理员密码已重置（仅此一次明文）';
@@ -183,6 +242,7 @@ export function createCredentialsFeature(shell, api) {
         new_master: state.new_master,
       });
       if (!current()) return;
+      noteAuditPending(this, data);
       this.msg = 'Master Key 已轮换至 ' + (data.new_key_id || '') + '（' + (data.phase || '') + '）';
       this.credentials.new_master = '';
       this.credentials.master_key = '';
@@ -216,6 +276,8 @@ export function createCredentialsFeature(shell, api) {
     beginAction(this);
     clearTimeout(graceTimer);
     graceTimer = null;
+    auditRequest = {};
+    this.auditWarning = '';
     this.credentials = initialState();
     return originalReset?.call(this);
   };

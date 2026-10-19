@@ -51,6 +51,7 @@
       <main>
         <div class="alert err" x-show="err" x-text="err" @click="err = ''"></div>
         <div class="alert done" x-show="msg" x-text="msg" @click="msg = ''"></div>
+        <div class="alert warn" x-show="auditWarning" x-text="auditWarning" @click="auditWarning = ''"></div>
         <div class="alert err" x-show="probeModuleError" x-text="probeModuleError"></div>
         <div class="alert warn" x-show="probeModuleReady === false && !probeModuleError">Probe 模块加载中…</div>
 
@@ -726,7 +727,7 @@
               <span class="dim">查看/轮换需再次输入管理员密码；Cache-Control: no-store</span>
               <span class="grow"></span>
               <span class="tag warn" x-show="displayState === 'maintenance'" x-text="'维护中：' + (maintenanceReason || 'credential')"></span>
-              <button @click="loadCredentials()">刷新</button>
+              <button @click="loadCredentials(); loadAuditEvents(true)">刷新</button>
             </div>
             <div class="row" style="margin-bottom:12px">
               <div class="field" style="max-width:280px">
@@ -768,20 +769,51 @@
                 <div class="mono wrap" x-show="credentials.admin_password" x-text="credentials.admin_password"></div>
               </div>
             </div>
-            <h3 style="font-size:13px;margin:18px 0 8px">审计</h3>
+            <h3 style="font-size:13px;margin:18px 0 8px">持久审计历史</h3>
+            <p class="sub" x-text="'本次运行审计写入失败：' + (credentials.status?.audit_missed_count || 0)"></p>
+            <p class="dim">等待确认或结果待核实表示没有完成记录；请先核实当前配置和轮换阶段，勿直接重复操作。</p>
+            <div class="bar" style="flex-wrap:wrap;align-items:end">
+              <label class="field">类别
+                <select x-model="credentials.audit.filter.category">
+                  <option value="">全部</option><option value="credential">凭据</option><option value="sample">样本</option>
+                  <option value="probe">配方与探活</option><option value="route">路由</option><option value="transform">转换</option>
+                  <option value="security">安全</option><option value="configuration">配置</option><option value="session">会话</option><option value="backup">备份</option>
+                </select>
+              </label>
+              <label class="field">结果
+                <select x-model="credentials.audit.filter.outcome">
+                  <option value="">全部</option><option value="succeeded">已完成</option><option value="failed">未完成</option>
+                  <option value="pending">等待确认</option><option value="unknown">结果待核实</option>
+                </select>
+              </label>
+              <label class="field">动作<input x-model="credentials.audit.filter.action" maxlength="64" placeholder="如 route_disable"></label>
+              <label class="field">资源类型<input x-model="credentials.audit.filter.resource_type" maxlength="40" placeholder="如 route、recipe"></label>
+              <label class="field">资源 ID<input x-model="credentials.audit.filter.resource_id" maxlength="128"></label>
+              <label class="field">开始时间<input type="datetime-local" x-model="credentials.audit.filter.after"></label>
+              <label class="field">结束时间<input type="datetime-local" x-model="credentials.audit.filter.before"></label>
+              <button @click="loadAuditEvents(true)" :disabled="credentials.audit.loading">筛选 / 刷新</button>
+            </div>
+            <div class="alert err" x-show="credentials.audit.error" x-text="credentials.audit.error"></div>
             <table>
-              <thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead>
+              <thead><tr><th>时间</th><th>类别 / 动作</th><th>资源</th><th>结果</th><th>原因码</th></tr></thead>
               <tbody>
-                <template x-for="(ev, idx) in (credentials.status?.audit || [])" :key="idx">
+                <template x-for="ev in credentials.audit.items" :key="ev.id">
                   <tr>
-                    <td class="mono" x-text="ev.at"></td>
-                    <td x-text="ev.action"></td>
-                    <td class="wrap" x-text="ev.detail"></td>
+                    <td class="mono" x-text="new Date(ev.at_ms).toLocaleString()"></td>
+                    <td class="wrap" x-text="ev.category + ' / ' + ev.action"></td>
+                    <td class="mono wrap" x-text="ev.resource_type + (ev.resource_id ? ' #' + ev.resource_id : '')"></td>
+                    <td x-text="auditOutcomeLabel(ev.outcome)"></td>
+                    <td class="wrap" x-text="ev.reason_code || '—'"></td>
                   </tr>
                 </template>
-                <tr x-show="!(credentials.status?.audit || []).length"><td colspan="3" class="empty">暂无审计</td></tr>
+                <tr x-show="!credentials.audit.items.length"><td colspan="5" class="empty" x-text="credentials.audit.loading ? '加载中…' : '暂无匹配审计'"></td></tr>
               </tbody>
             </table>
+            <div class="bar" style="margin-top:10px">
+              <span class="dim" x-text="'已载入 ' + credentials.audit.items.length + ' 条'"></span>
+              <span class="grow"></span>
+              <button @click="loadAuditEvents(false)" :disabled="credentials.audit.loading || !credentials.audit.nextCursor">下一页</button>
+            </div>
           </div>
         </template>
 
@@ -837,7 +869,7 @@
             <h3 style="font-size:13px;margin:18px 0 8px">SMTP 告警</h3>
             <template x-if="security.smtp">
             <div class="cards">
-              <div class="card">
+              <fieldset class="card" style="min-width:0" :disabled="security.smtpSaving || security.smtpLoading">
                 <label><input type="checkbox" x-model="security.smtp.enabled"> 启用</label>
                 <div class="field"><label>Host</label><input x-model="security.smtp.host"></div>
                 <div class="field"><label>Port</label><input type="number" x-model.number="security.smtp.port"></div>
@@ -859,11 +891,16 @@
                     <option value="medium">medium</option>
                   </select>
                 </div>
+                <div class="field"><label>聚合窗口（秒）</label><input type="number" min="1" max="86400" step="1" x-model.number="security.smtp.aggregation_window_sec"></div>
+                <div class="field"><label>相同告警限流窗口（秒）</label><input type="number" min="1" max="86400" step="1" x-model.number="security.smtp.rate_limit_window_sec"></div>
+                <p class="dim">普通告警按聚合窗口汇总；critical 立即发送并按限流窗口去重。默认各 300 秒。</p>
+                <p class="dim" x-show="security.smtpConflict">配置已变化或激活待确认。草稿已保留，请重新加载后再编辑。</p>
                 <div class="bar" style="margin-top:8px">
-                  <button class="primary" @click="saveSMTP()">保存</button>
+                  <button class="primary" :disabled="security.smtpConflict" @click="saveSMTP()">保存</button>
+                  <button @click="loadSMTP(true)">重新加载配置</button>
                   <button @click="testSMTP()">测试已保存配置</button>
                 </div>
-              </div>
+              </fieldset>
             </div>
             </template>
           </div>
@@ -1002,7 +1039,8 @@
                 <tr x-show="!(transforms.executions || []).length"><td colspan="5" class="empty">暂无执行记录</td></tr>
               </tbody>
             </table>
-            <h3 style="font-size:13px;margin:18px 0 8px">预算审计</h3>
+            <h3 style="font-size:13px;margin:18px 0 8px">本次运行预算调整</h3>
+            <p class="dim">这里保留本次运行的调整细节；完整持久审计历史见凭据页。</p>
             <table>
               <thead><tr><th>时间</th><th>动作</th><th>详情</th><th>确认提高</th></tr></thead>
               <tbody>

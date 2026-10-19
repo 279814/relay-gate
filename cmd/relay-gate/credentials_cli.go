@@ -151,13 +151,14 @@ func runCredentialsResetAdmin(args []string, stdout, stderr io.Writer) int {
 		return exitFail
 	}
 	defer lock.Close()
-	_, err = credential.ResetAdmin(dataDir, stdout)
+	dbPath := instanceDBPath(dataDir, os.Getenv("RELAY_DB"))
+	st, err := openCredentialAuditStore(dataDir, dbPath, lock.db)
 	if err != nil {
-		fmt.Fprintf(stderr, "credentials reset-admin 失败: %v\n", err)
+		fmt.Fprintln(stderr, "credentials reset-admin 未执行：无法打开持久审计，请先检查数据库和 Master Key")
 		return exitFail
 	}
-	fmt.Fprintf(stderr, "credentials reset-admin 完成（新密码仅上方显示一次）。\n")
-	return exitOK
+	defer st.Close()
+	return runAuditedAdminReset(st, dataDir, stdout, stderr)
 }
 
 // acquireDataDirLock 取得服务端持有的同一把数据目录锁（见 lockDataDir）。
