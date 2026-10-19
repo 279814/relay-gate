@@ -1,11 +1,175 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
 )
+
+// RecentErrorFilter selects failed attempts using only recorded metadata.
+// Time bounds are inclusive Unix milliseconds of the incoming request.
+type RecentErrorFilter struct {
+	model.PageRequest
+	UpstreamID int64
+	RouteID    int64
+	Protocol   model.Protocol
+	Outcome    model.Outcome
+	FromMS     int64
+	ToMS       int64
+}
+
+type RecentError struct {
+	*model.RequestLog
+	SampleID     int64              `json:"sample_id,omitempty"`
+	Protocol     model.Protocol     `json:"protocol,omitempty"`
+	EndpointKind model.EndpointKind `json:"endpoint_kind,omitempty"`
+}
+
+type RecentErrorPage struct {
+	Logs        []RecentError `json:"logs"`
+	FailedCount int64         `json:"failed_count"`
+	NextCursor  string        `json:"next_cursor"`
+}
+
+// ListRecentErrors uses one read transaction for count, keyset page and exact
+// sample IDs. It never reads sample ciphertext, business text or credentials.
+func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (RecentErrorPage, error) {
+	page := RecentErrorPage{Logs: []RecentError{}}
+	limit, err := normalizePageLimit(f.Limit)
+	if err != nil {
+		return page, err
+	}
+	if f.UpstreamID < 0 || f.RouteID < 0 || f.FromMS < 0 || f.ToMS < 0 ||
+		(f.FromMS > 0 && f.ToMS > 0 && f.FromMS > f.ToMS) ||
+		(f.Protocol != "" && !f.Protocol.Valid()) ||
+		(f.Outcome != "" && (!f.Outcome.Valid() || f.Outcome == model.OutcomeOK)) {
+		return page, model.WrapValidation("最近错误筛选无效")
+	}
+	cursorFilter := f
+	cursorFilter.PageRequest = model.PageRequest{}
+	keys, err := decodePageCursor(f.Cursor, "recent-errors", cursorFilter, 1)
+	if err != nil {
+		return page, err
+	}
+	where := `outcome <> ?`
+	args := []any{model.OutcomeOK}
+	if f.UpstreamID > 0 {
+		where += ` AND upstream_id=?`
+		args = append(args, f.UpstreamID)
+	}
+	if f.RouteID > 0 {
+		where += ` AND route_id=?`
+		args = append(args, f.RouteID)
+	}
+	if f.Protocol != "" {
+		where += ` AND endpoint=?`
+		args = append(args, f.Protocol.Path())
+	}
+	if f.Outcome != "" {
+		where += ` AND outcome=?`
+		args = append(args, f.Outcome)
+	}
+	if f.FromMS > 0 {
+		where += ` AND ts_recv>=?`
+		args = append(args, f.FromMS)
+	}
+	if f.ToMS > 0 {
+		where += ` AND ts_recv<=?`
+		args = append(args, f.ToMS)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return page, err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM request_log WHERE `+where, args...).Scan(&page.FailedCount); err != nil {
+		return page, err
+	}
+	if len(keys) > 0 {
+		id, err := cursorID(keys[0])
+		if err != nil {
+			return page, err
+		}
+		where += ` AND id<?`
+		args = append(args, id)
+	}
+	args = append(args, limit+1)
+	rows, err := tx.QueryContext(ctx, `SELECT `+requestLogCols+` FROM request_log WHERE `+where+` ORDER BY id DESC LIMIT ?`, args...)
+	if err != nil {
+		return page, err
+	}
+	for rows.Next() {
+		log, err := scanRequestLog(rows)
+		if err != nil {
+			rows.Close()
+			return page, err
+		}
+		row := RecentError{RequestLog: log}
+		for _, protocol := range []model.Protocol{model.ProtoAnthropic, model.ProtoOpenAIResponses, model.ProtoOpenAIChat} {
+			if log.Endpoint == protocol.Path() {
+				row.Protocol = protocol
+				row.EndpointKind, _ = protocol.Endpoint()
+				break
+			}
+		}
+		page.Logs = append(page.Logs, row)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return page, err
+	}
+	if len(page.Logs) > limit {
+		page.Logs = page.Logs[:limit]
+		page.NextCursor, err = encodePageCursor("recent-errors", cursorFilter, strconv.FormatInt(page.Logs[len(page.Logs)-1].ID, 10))
+		if err != nil {
+			return page, err
+		}
+	}
+	// One bounded metadata query handles the page, avoiding a per-row lookup.
+	reqIDs := map[string]bool{}
+	var sampleArgs []any
+	for _, row := range page.Logs {
+		if row.ReqID != "" && !reqIDs[row.ReqID] {
+			reqIDs[row.ReqID] = true
+			sampleArgs = append(sampleArgs, row.ReqID)
+		}
+	}
+	if len(sampleArgs) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sampleArgs)), ",")
+		rows, err = tx.QueryContext(ctx, `SELECT req_id,MIN(id) FROM sample_request WHERE req_id IN (`+placeholders+`) GROUP BY req_id`, sampleArgs...)
+		if err != nil {
+			return page, err
+		}
+		samples := map[string]int64{}
+		for rows.Next() {
+			var reqID string
+			var id int64
+			if err := rows.Scan(&reqID, &id); err != nil {
+				rows.Close()
+				return page, err
+			}
+			samples[reqID] = id
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return page, err
+		}
+		for i := range page.Logs {
+			page.Logs[i].SampleID = samples[page.Logs[i].ReqID]
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return page, err
+	}
+	return page, nil
+}
 
 // InsertRequestLog 写入一次尝试的日志（M6，§3.5）。
 //
