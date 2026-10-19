@@ -812,6 +812,9 @@ func (h *Handler) sampleAttempt(cand *router.Candidate, outBody []byte, outHeade
 		if tee.Truncated() {
 			flags |= model.TruncRespBody
 		}
+		if tee.WriteIncomplete() {
+			h.log.Warn("样本响应写盘失败，已保存的响应不完整", "route", cand.Route.ID)
+		}
 		if tee.QuotaOverflow() {
 			// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。
 			// 采集是旁路，只记日志，绝不回写或中断已完成的转发。

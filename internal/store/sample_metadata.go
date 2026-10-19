@@ -23,14 +23,14 @@ func (s *Store) GetSampleMetadata(ctx context.Context, id int64) (*model.SampleM
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,ts_recv,ts_sent,ts_first_byte,ts_done,route_id,upstream_id,model_name_id,model_out,resp_status,outcome FROM sample_attempt WHERE request_id=? ORDER BY id`, id)
+	rows, err := tx.QueryContext(ctx, `SELECT id,ts_recv,ts_sent,ts_first_byte,ts_done,route_id,upstream_id,model_name_id,model_out,resp_status,outcome,truncated FROM sample_attempt WHERE request_id=? ORDER BY id`, id)
 	if err != nil {
 		return nil, err
 	}
 	var ids []int64
 	for rows.Next() {
 		var a model.SampleAttemptMetadata
-		if err := rows.Scan(&a.ID, &a.TSRecv, &a.TSSent, &a.TSFirstByte, &a.TSDone, &a.RouteID, &a.UpstreamID, &a.ModelNameID, &a.ModelOut, &a.RespStatus, &a.Outcome); err != nil {
+		if err := rows.Scan(&a.ID, &a.TSRecv, &a.TSSent, &a.TSFirstByte, &a.TSDone, &a.RouteID, &a.UpstreamID, &a.ModelNameID, &a.ModelOut, &a.RespStatus, &a.Outcome, &a.Truncated); err != nil {
 			rows.Close()
 			return nil, err
 		}

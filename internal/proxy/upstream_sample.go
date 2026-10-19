@@ -6,13 +6,12 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/model"
-	"github.com/279814/relay-gate/internal/sample"
 )
 
 // One existing HeadTail owns the original upstream bytes. Client shadow output
 // remains on RespTee; the sample never receives transformed or synthetic bytes.
 type upstreamSampleCapture struct {
-	sink     *sample.HeadTail
+	sink     io.Writer
 	status   int
 	header   http.Header
 	complete bool

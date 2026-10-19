@@ -70,9 +70,10 @@ type HeadTail struct {
 	quotaOverflow bool // 是否因配额从完整模式切到了头尾
 
 	// spill：完整模式超出 fullSpillAt 后的落盘。只在 full 时使用。
-	spill     *os.File
-	spillPath string
-	spillSize int64
+	spill           *os.File
+	spillPath       string
+	spillSize       int64
+	writeIncomplete bool // a side spill write lost bytes; survives DetachBody
 }
 
 // NewHeadTail 构造收集器。headMax 与 tailMax **同时为 0** 表示完整保留；
@@ -293,6 +294,7 @@ func (h *HeadTail) appendSpill(p []byte) {
 	h.spillSize += int64(n)
 	if err != nil || n < len(p) {
 		// 旁路：写盘失败不回传；已写入的前缀仍可留档。
+		h.writeIncomplete = true
 		return
 	}
 }
@@ -468,11 +470,16 @@ func (h *HeadTail) Total() int64 { return h.total }
 // 那种情况下全文都在手上，只是分散在两个缓冲里（见 Bytes）。
 // 完整模式（含 spill）永不截断 —— 全文都在 spill 和/或 head 里。
 func (h *HeadTail) Truncated() bool {
+	if h.writeIncomplete {
+		return true
+	}
 	if h.full {
 		return false
 	}
 	return h.total > int64(len(h.head))+int64(h.tailLen)
 }
+
+func (h *HeadTail) WriteIncomplete() bool { return h != nil && h.writeIncomplete }
 
 // tailBytes 按写入顺序还原尾缓冲。
 // 环形缓冲绕回后 tailPos 指向最老的字节，要从那里接起。
