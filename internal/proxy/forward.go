@@ -67,6 +67,7 @@ func RealTimeouts(s model.Settings) Timeouts {
 
 // Result 是一次转发的结果，供健康判定与样本记录使用。
 type Result struct {
+	responseDiff        bodyDiffFacts
 	ResponseHeaderAt    time.Time
 	FirstEventAt        time.Time
 	SyntheticCompletion bool
@@ -118,7 +119,8 @@ func (r *Result) TTFT() time.Duration {
 // 需要在读 body 的循环里切换 deadline，ReverseProxy 的 io.Copy 拿不到这个控制点。
 // 逐跳头与 Host 由 PrepareOutboundHeaders 处理，不依赖 ReverseProxy 的实现。
 type Forwarder struct {
-	Protocol model.Protocol
+	CaptureMetadata bool
+	Protocol        model.Protocol
 	// Transport 是这次转发用的连接池。由 outbound.Manager 按网络身份提供 ——
 	// 各建一套的话，探活与真实请求就各有一份空闲连接，而共享连接池正是
 	// 「探活顺带把连接热着」这份收益的来源。

@@ -8,6 +8,11 @@ import (
 	"github.com/279814/relay-gate/internal/transform"
 )
 
+type bodyDiffFacts struct {
+	inputHash, outputHash, reason string
+	bodyChanged, headersChanged   bool
+}
+
 func preparedAttemptMetadata(pre *preambleResult, cand *router.Candidate, target outbound.ResolvedTarget, prepared preparedRequest, executionID string, observed bool) model.AttemptMetadata {
 	m := prepared.metadata
 	m.Version = 1
@@ -47,6 +52,22 @@ func safeAttemptBodyHashes(before, after []byte, keys []string, tainted bool) (s
 		}
 	}
 	return transform.HashBytes(before), transform.HashBytes(after), "recorded"
+}
+
+func containsAttemptSecret(body []byte, keys []string) bool {
+	for _, key := range keys {
+		if key != "" && bytes.Contains(body, []byte(key)) {
+			return true
+		}
+	}
+	return false
+}
+
+func safeAttemptBodyHash(body []byte, keys []string) string {
+	if containsAttemptSecret(body, keys) {
+		return ""
+	}
+	return transform.HashBytes(body)
 }
 func attemptRequestWriteState(la *liveAttempt) string {
 	if la.trace == nil {

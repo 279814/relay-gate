@@ -51,6 +51,9 @@ func TestSecretRef_InjectsAndTaintsDiagnostics(t *testing.T) {
 	if strings.Contains(sum, secret) {
 		t.Fatalf("shadow summary leaked secret: %s", sum)
 	}
+	if strings.Contains(sum, HashBytes(out.Body)) || strings.Contains(sum, HashBytes([]byte(`{"model":"m","token":"old"}`))) || !strings.Contains(sum, "secret_taint") {
+		t.Fatalf("shadow hashed secret-tainted apply: %s", sum)
+	}
 }
 
 // Short needles (< MinRedactableKeyLen, including "") must not be ReplaceAll

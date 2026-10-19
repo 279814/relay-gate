@@ -80,6 +80,7 @@ func normalizedAttemptMetadata(m model.AttemptMetadata) (model.AttemptMetadata, 
 	if m.ResponseDiffReason != "recorded" && (m.ResponseInputHash != "" || m.ResponseOutputHash != "" || m.ResponseBodyChanged || m.ResponseHeadersChanged) {
 		return m, model.WrapValidation("omitted response diff cannot contain facts")
 	}
+	m.DescribeResponseView()
 	return m, nil
 }
 
@@ -150,6 +151,7 @@ func scanAttemptMetadata(scanner interface{ Scan(...any) error }) (int64, model.
 	var ownerID int64
 	m := model.UnknownAttemptMetadata()
 	err := scanner.Scan(&ownerID, &m.Version, &m.ExecutionID, &m.Attempt, &m.Attempts, &m.ConfigGeneration, &m.SettingsRevision, &m.EndpointID, &m.EndpointRevision, &m.AuthProfileRevision, &m.UpstreamNetworkRevision, &m.UpstreamCredentialRevision, &m.RouteRevision, &m.RouteCapabilityRevision, &m.ModelRevision, &m.ModelCapabilityRevision, &m.TransformVersionID, &m.RequestTransformRevision, &m.ResponseHeaderAtMS, &m.FirstEventAtMS, &m.FirstSemanticAtMS, &m.RetryPolicy, &m.RetryReason, &m.RequestWriteState, &m.CapabilityEffect, &m.ErrorClass, &m.Retried, &m.HalfOpen, &m.DuplicateRisk, &m.SyntheticCompletion, &m.RequestInputHash, &m.RequestOutputHash, &m.RequestBodyChanged, &m.RequestHeadersChanged, &m.RequestDiffReason, &m.ResponseInputHash, &m.ResponseOutputHash, &m.ResponseBodyChanged, &m.ResponseHeadersChanged, &m.ResponseDiffReason, &m.ExecutionStored)
+	m.DescribeResponseView()
 	return ownerID, m, err
 }
 

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"time"
 
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -33,6 +35,8 @@ func (h *Handler) commitLiveBytes(w http.ResponseWriter, la *liveAttempt) *Resul
 		rec.EndpointID = la.endpointID
 		rec.VersionID = la.verID
 		rec.Mode = "published"
+		rec.Error = sample.RedactDiagnosticText(rec.Error, la.keys)
+		rec.DiffSummary = sample.RedactDiagnosticText(rec.DiffSummary, la.keys)
 		h.transforms.RecordExecution(rec)
 	})
 }
@@ -124,7 +128,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 			if record != nil {
 				record(transform.ExecutionRecord{
 					Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
-					InputHash: transform.HashBytes(body),
+					DiffSummary: "omitted: incomplete",
 				})
 			}
 			if policy == transform.FailClosed {
@@ -142,7 +146,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 			if record != nil {
 				record(transform.ExecutionRecord{
 					Phase: "response", OK: false, Error: derr.Error(), FailPolicyUsed: policy,
-					InputHash: transform.HashBytes(body),
+					DiffSummary: "omitted: incomplete",
 				})
 			}
 			if policy == transform.FailClosed {
@@ -171,6 +175,15 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		Body:   body,
 	}
 	out := compiled.ApplyResponse(in)
+	tainted := out.Taint != nil && len(out.Taint.Secrets()) > 0
+	inputHash, outputHash, diffReason := safeAttemptBodyHashes(body, out.Body, f.RedactSecrets, tainted)
+	if f.CaptureMetadata {
+		res.responseDiff = bodyDiffFacts{reason: diffReason, inputHash: inputHash, outputHash: outputHash}
+		if diffReason == "recorded" {
+			res.responseDiff.bodyChanged = inputHash != outputHash
+			res.responseDiff.headersChanged = !reflect.DeepEqual(inHdr, out.Header)
+		}
+	}
 	if at.failBeforeCommit() {
 		return res
 	}
@@ -180,7 +193,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 			record(transform.ExecutionRecord{
 				Phase: "response", OK: false, Error: out.Err.Error(),
 				FailPolicyUsed: out.PolicyUsed, HitRules: out.HitRules,
-				InputHash: transform.HashBytes(body),
+				InputHash: inputHash,
 			})
 		}
 		return res
@@ -194,7 +207,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 			record(transform.ExecutionRecord{
 				Phase: "response", OK: out.Err == nil, Error: errText,
 				FailPolicyUsed: out.PolicyUsed, HitRules: out.HitRules,
-				InputHash: transform.HashBytes(body), OutputHash: transform.HashBytes(out.Body),
+				InputHash: inputHash, OutputHash: outputHash,
 			})
 		}
 	}
@@ -237,7 +250,7 @@ func (at *Attempt) commitBuffered(w http.ResponseWriter, compiled *transform.Com
 		res.FirstByteAt = now
 	}
 	if werr != nil && res.Err == nil {
-		res.Err = werr
+		res.Err = fmt.Errorf("%w: %v", ErrClientGone, werr)
 	}
 	res.DoneAt = now
 	return res
@@ -259,7 +272,7 @@ func (at *Attempt) commitBodyOverLimit(w http.ResponseWriter, compiled *transfor
 	if record != nil {
 		record(transform.ExecutionRecord{
 			Phase: "response", OK: false, Error: err.Error(), FailPolicyUsed: policy,
-			InputHash: transform.HashBytes(nil),
+			DiffSummary: "omitted: incomplete",
 		})
 	}
 	if policy == transform.FailClosed {
@@ -468,6 +481,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 			return nil
 		}
 		wn, werr := w.Write(ev.Raw)
+		if werr == nil && wn < len(ev.Raw) {
+			werr = io.ErrShortWrite
+		}
 		total += int64(wn)
 		if canFlush {
 			flusher.Flush()
@@ -480,7 +496,10 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		if res.FirstByteAt.IsZero() && wn > 0 {
 			res.FirstByteAt = time.Now()
 		}
-		return werr
+		if werr != nil {
+			return fmt.Errorf("%w: %v", ErrClientGone, werr)
+		}
+		return nil
 	}
 
 	// passthrough is set once an event overflows under fail_open: the rest of
@@ -511,7 +530,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 				}
 			}
 			for _, ev := range events {
-				out, hits, _, aerr := compiled.ApplySSEEvent(ev)
+				out, hits, synthetic, aerr := compiled.ApplySSEEvent(ev)
 				if aerr != nil {
 					if record != nil {
 						record(transform.ExecutionRecord{
@@ -531,6 +550,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 					res.Err = werr
 					res.BytesWritten = total
 					return res
+				}
+				if aerr == nil && synthetic {
+					res.SyntheticCompletion = true
 				}
 			}
 			var limitErr *transform.SSELimitError
@@ -553,7 +575,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		}
 	}
 	if ev, ok := scanner.Flush(); ok {
-		out, hits, _, aerr := compiled.ApplySSEEvent(ev)
+		out, hits, synthetic, aerr := compiled.ApplySSEEvent(ev)
 		if aerr != nil && record != nil {
 			record(transform.ExecutionRecord{
 				Phase: "sse", OK: false, Error: aerr.Error(),
@@ -567,7 +589,9 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 		}
 		if aerr == nil {
 			hitAll = append(hitAll, hits...)
-			_ = writeEv(out)
+			if err := writeEv(out); err == nil && synthetic {
+				res.SyntheticCompletion = true
+			}
 		} else {
 			_ = writeEv(ev)
 		}
@@ -581,6 +605,7 @@ func (at *Attempt) commitSSE(w http.ResponseWriter, compiled *transform.Compiled
 	if len(hitAll) > 0 && record != nil {
 		record(transform.ExecutionRecord{
 			Phase: "sse", OK: true, HitRules: hitAll, FailPolicyUsed: policy,
+			Synthetic: res.SyntheticCompletion,
 		})
 	}
 	res.BytesWritten = total

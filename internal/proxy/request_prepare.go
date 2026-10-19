@@ -118,7 +118,7 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 
 	}
 	edge.StripForwardingHeaders(out.header)
-	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody)
+	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody, out.keys)
 	if reencode {
 		out.body, err = encodeRequestBody(pre.encoding, out.body, transform.MaxBodyBuffer)
 		if err != nil {
@@ -131,6 +131,9 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 		out.header.Set("Content-Encoding", pre.encoding)
 	}
 	if h.samples != nil && pre.settings.SampleEnabled {
+		if pre.encoding != "" && containsAttemptSecret(pre.decoded, out.keys) {
+			out.tainted = true
+		}
 		inHash, outHash, reason := safeAttemptBodyHashes(pre.body, out.body, out.keys, out.tainted)
 		out.metadata.RequestInputHash, out.metadata.RequestOutputHash, out.metadata.RequestDiffReason = inHash, outHash, reason
 		if reason == "recorded" {

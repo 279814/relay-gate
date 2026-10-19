@@ -3,6 +3,7 @@ package model
 // AttemptMetadata contains bounded facts captured for an actual send. Version 0
 // means these facts were not recorded; zero revisions never mean today's config.
 type AttemptMetadata struct {
+	ResponseView               string      `json:"response_view"`
 	Version                    int         `json:"version"`
 	ExecutionID                string      `json:"execution_id"`
 	Attempt                    int         `json:"attempt"`
@@ -47,6 +48,21 @@ type AttemptMetadata struct {
 
 // UnknownAttemptMetadata does not infer historical data from current settings.
 func UnknownAttemptMetadata() AttemptMetadata {
-	return AttemptMetadata{RetryPolicy: "unknown", RequestWriteState: "unknown",
+	return AttemptMetadata{ResponseView: "unknown", RetryPolicy: "unknown", RequestWriteState: "unknown",
 		CapabilityEffect: "unknown", ErrorClass: "unknown", RequestDiffReason: "unknown", ResponseDiffReason: "unknown"}
+}
+
+// DescribeResponseView derives the existing capture position from persisted
+// facts. It never claims that a transformed client response is original wire.
+func (m *AttemptMetadata) DescribeResponseView() {
+	switch {
+	case m.Version == 0:
+		m.ResponseView = "unknown"
+	case m.RequestDiffReason == "sample_disabled":
+		m.ResponseView = "not_sampled"
+	case m.Retried:
+		m.ResponseView = "upstream_attempt_prefix"
+	default:
+		m.ResponseView = "client_response"
+	}
 }

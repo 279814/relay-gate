@@ -538,7 +538,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, proto model.Prot
 		if oc.halfOpen {
 			w.Header().Set("X-Relay-Half-Open", "1")
 		}
-		h.writeForwardError(w, res.Err, proto, oc.cand, keys)
+		if oc.localResponseError {
+			writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
+		} else {
+			h.writeForwardError(w, res.Err, proto, oc.cand, keys)
+		}
 	}
 
 	if oc.respTee != nil {
