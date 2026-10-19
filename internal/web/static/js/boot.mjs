@@ -139,6 +139,8 @@ if (typeof base !== 'function') {
       } else if (tab === 'executions') {
         this.loadExecutions(true);
         this.loadProbeCostDaily(true);
+      } else if (tab === 'probe-statistics') {
+        this.loadProbeStatistics();
       } else if (tab === 'calibrations') {
         this.loadCalibrations(true);
       } else if (tab === 'probe-runtime') {
