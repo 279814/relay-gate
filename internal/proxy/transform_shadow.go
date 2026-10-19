@@ -18,7 +18,7 @@ import (
 // bytes to the caller: the live request stays whatever published/passthrough
 // produced, shadow errors never fail the attempt, and no upstream call is made.
 func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candidate, endpointID int64,
-	header http.Header, body []byte, keys []string) {
+	header http.Header, body []byte, keys []string, sensitiveInput bool) {
 	if h.transforms == nil || endpointID == 0 {
 		return
 	}
@@ -52,11 +52,11 @@ func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candid
 		secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
 	}
 	summary := "request diff=omitted(secret_taint) err=not_evaluated"
-	if !containsAttemptSecret(body, keys) {
+	if !sensitiveInput && !containsAttemptSecret(body, keys) {
 		summary = c.ShadowDiffSecrets("request", transform.RequestInput{Header: header, Body: body}, transform.ResponseInput{}, secrets)
 	}
 	inputHash := safeAttemptBodyHash(body, keys)
-	if containsAttemptSecret(body, keys) || strings.Contains(summary, "secret_taint") {
+	if sensitiveInput || containsAttemptSecret(body, keys) || strings.Contains(summary, "secret_taint") {
 		inputHash = ""
 	}
 	h.transforms.RecordExecution(transform.ExecutionRecord{
@@ -161,6 +161,10 @@ func (s *responseShadow) finish(res *Result) {
 	header := s.w.Header().Clone()
 	if !s.sse {
 		body := s.body
+		if encoding := normalizeContentEncoding(header.Get("Content-Encoding")); encoding != "" && !responseRulesTouchBody(s.c) {
+			s.record("response", "response diff=omitted(incomplete) err=not_evaluated", false, nil)
+			return
+		}
 		if enc := normalizeContentEncoding(header.Get("Content-Encoding")); enc != "" &&
 			responseRulesTouchBody(s.c) && len(body) <= transform.MaxBodyBuffer {
 			var err error
@@ -172,7 +176,7 @@ func (s *responseShadow) finish(res *Result) {
 				header.Del("ETag")
 			}
 			if err != nil {
-				s.record("response", "response err="+err.Error(), false, s.body)
+				s.record("response", "response diff=omitted(incomplete) err=decode_unavailable", false, nil)
 				return
 			}
 		}
@@ -200,11 +204,18 @@ func (s *responseShadow) finish(res *Result) {
 		DiffSummary: sample.RedactDiagnosticText(s.acc.Summary(), s.la.keys),
 		InputHash:   s.acc.InputHash(),
 	}
+	if s.stopped {
+		rec.InputHash = ""
+		rec.DiffSummary = "sse diff=omitted(incomplete) err=decode_unavailable"
+	}
 	s.h.transforms.RecordExecution(rec)
 }
 
 func (s *responseShadow) record(phase, summary string, ok bool, input []byte) {
 	inputHash := safeAttemptBodyHash(input, s.la.keys)
+	if strings.Contains(summary, "omitted(") {
+		inputHash = ""
+	}
 	if containsAttemptSecret(input, s.la.keys) || strings.Contains(summary, "secret_taint") {
 		summary = phase + " diff=omitted(secret_taint) err="
 		if !ok {
