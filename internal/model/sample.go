@@ -55,8 +55,11 @@ func (f TruncFlags) Has(x TruncFlags) bool { return f&x != 0 }
 // 的视图；Attempts 按发送顺序列出全部尝试（含最终那次）。写入时 Attempts
 // 为空则把平铺字段当作唯一一次尝试。
 type Sample struct {
-	Metadata AttemptMetadata `json:"metadata"`
-	ID       int64           `json:"id"`
+	// ResponsePrivacyKeys only lives until the existing sample writer validates
+	// original encoded responses; it is never serialized or persisted.
+	ResponsePrivacyKeys []string        `json:"-"`
+	Metadata            AttemptMetadata `json:"metadata"`
+	ID                  int64           `json:"id"`
 	// LegacySampleID 非零表示本组由 schema 7 之前的 sample 行迁移而来（§5.7）：
 	// 只有旧的最终尝试，历史上未保存的重试不存在。
 	LegacySampleID int64 `json:"legacy_sample_id,omitempty"`
@@ -117,9 +120,10 @@ type Sample struct {
 // SampleAttempt 是一次实际发给上游的尝试（§5.4 sample_attempt）。
 // 本地跳过（没有联系上游）的 Route 不产生尝试。
 type SampleAttempt struct {
-	Metadata  AttemptMetadata `json:"metadata"`
-	ID        int64           `json:"id"`
-	RequestID int64           `json:"request_id"`
+	ResponseCaptureView string          `json:"-"`
+	Metadata            AttemptMetadata `json:"metadata"`
+	ID                  int64           `json:"id"`
+	RequestID           int64           `json:"request_id"`
 
 	TSRecv      int64 `json:"ts_recv"`
 	TSSent      int64 `json:"ts_sent"`
@@ -151,6 +155,7 @@ func (s *Sample) ReleaseTempFiles() {
 	if s == nil {
 		return
 	}
+	s.ResponsePrivacyKeys = nil
 	if s.RespBodyFile != "" {
 		RemoveSpillFile(s.RespBodyFile)
 		s.RespBodyFile = ""

@@ -39,7 +39,7 @@ type releaseReloader struct{}
 
 func (releaseReloader) Reload() error { return nil }
 
-func TestEmptyDBOpensAsSchema13(t *testing.T) {
+func TestEmptyDBOpensAsSchema15(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "relay.db")
 	cipher, err := store.NewCipher("test-passphrase-at-least-16-chars")
@@ -55,8 +55,8 @@ func TestEmptyDBOpensAsSchema13(t *testing.T) {
 	if err := st.DB().QueryRow(`SELECT version FROM schema_version WHERE singleton = 1`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 13 {
-		t.Fatalf("schema_version=%d want 13", version)
+	if version != 15 {
+		t.Fatalf("schema_version=%d want 15", version)
 	}
 	var n int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='security_finding'`).Scan(&n); err != nil || n != 1 {
