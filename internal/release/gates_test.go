@@ -39,7 +39,7 @@ type releaseReloader struct{}
 
 func (releaseReloader) Reload() error { return nil }
 
-func TestEmptyDBOpensAsSchema9(t *testing.T) {
+func TestEmptyDBOpensAsSchema10(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "relay.db")
 	cipher, err := store.NewCipher("test-passphrase-at-least-16-chars")
