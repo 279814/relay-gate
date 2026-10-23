@@ -1,6 +1,7 @@
 /* Bounded Security Center management. Evidence stays in the existing Sample. */
 export const securityManagementState = () => ({
   review: null, routeTarget: null, ignoreDraft: null, rules: [], ruleTotal: 0, ruleCursor: '', ruleNext: '',
+  diagnostics: [], diagnosticTotal: 0, diagnosticNext: '', diagnosticSource: '', diagnosticVerdict: '', diagnosticLoading: false,
   ruleScope: '', ruleActive: '', busy: false, conflict: false, error: '', evidence: null, alertStatus: null,
 });
 const findingPath = id => '/security/findings/' + encodeURIComponent(id);
@@ -13,7 +14,7 @@ const reasonText = reason => ({untrusted_finding: '发现未记录可信扫描�
   original_upstream_response: '已关联完整的原上游响应，读取须再次认证'})[reason] || '原始证据状态未知';
 
 export function createSecurityManagement(shell, api) {
-  let ruleRead = {}, routeRead = {};
+  let ruleRead = {}, routeRead = {}, diagnosticRead = {};
   const fail = (state, error) => { state.management.error = error?.message || '安全管理操作失败'; if (error?.data?.persisted === true && error?.data?.code === 'config_activation_pending') {state.management.conflict = true; state.management.error = '操作已保存，激活待确认；请重新载入核对，勿重复提交。';} else if (error?.status === 409) {state.management.conflict = true; state.management.error = '版本冲突，编辑已保留；请关闭后重新载入，勿重复提交。';} };
   shell.inspectSecurityRoute = async function(finding) {
     const state = this.security, m = state.management, token = {}; if (m.busy) return; routeRead = token; m.routeTarget = null; m.error = ''; m.conflict = false;
@@ -28,6 +29,21 @@ export function createSecurityManagement(shell, api) {
       if (result?.persisted === true && result?.activation_pending === true) {m.conflict = true; m.error = 'Route 已保存，激活待确认；请重新载入后核对，勿重复提交。'; return;}
       m.routeTarget = result;
     } catch(error) {if (this.security === state) fail(state, error);} finally {m.busy = false;}
+  };
+  shell.loadSecurityDiagnostics = async function(cursor = '') {
+    const state = this.security, m = state.management, token = {}; diagnosticRead = token; m.diagnosticLoading = true; m.diagnostics = []; m.diagnosticTotal = 0; m.diagnosticNext = ''; m.error = '';
+    try { const route = Number(state.routeID), upstream = Number(state.upstreamID);
+      if (![route, upstream].every(id => Number.isSafeInteger(id) && id >= 0)) throw new Error('诊断 Route 或 Upstream ID 无效');
+      const query = new URLSearchParams({limit: '25'}); if (cursor) query.set('cursor', cursor); if (route) query.set('route_id', String(route)); if (upstream) query.set('upstream_id', String(upstream)); if (m.diagnosticSource) query.set('source', m.diagnosticSource); if (m.diagnosticVerdict) query.set('verdict', m.diagnosticVerdict);
+      const page = await api.get('/security/diagnostics?' + query); if (this.security !== state || diagnosticRead !== token) return;
+      if (!Array.isArray(page.items) || page.items.length > 25 || !Number.isSafeInteger(page.total) || page.total < 0) throw new Error('安全诊断分页响应无效');
+      m.diagnostics = page.items; m.diagnosticTotal = page.total; m.diagnosticNext = page.next_cursor || '';
+    } catch(error) {if (this.security === state && diagnosticRead === token) fail(state, error);} finally {if (this.security === state && diagnosticRead === token) m.diagnosticLoading = false;}
+  };
+  shell.inspectSecurityDiagnostic = async function(execution) {
+    const state = this.security, token = {}; diagnosticRead = token; this.executionDrawer = null;
+    try {const detail = await api.get('/security/diagnostics/' + encodeURIComponent(execution.ID)); if (this.security !== state || diagnosticRead !== token) return; this.executionDrawer = detail;}
+    catch(error) {if (this.security === state && diagnosticRead === token) fail(state, error);}
   };
   shell.editSecurityReview = function(finding) { const m = this.security.management; if (m.busy) return; m.review = {findingID: finding.id, status: finding.review?.status || 'open', revision: finding.review?.revision || 1}; m.ignoreDraft = null; m.conflict = false; m.error = ''; };
   shell.closeSecurityManagement = function() { const m = this.security.management; if (m.busy) return; m.review = null; m.ignoreDraft = null; m.conflict = false; m.error = ''; };
@@ -71,7 +87,8 @@ export function createSecurityManagement(shell, api) {
     catch(error) { if (this.security === state) fail(state, error); } finally { m.busy = false; }
   };
   shell.openSecurityEvidence = async function(finding) {
-    const state = this.security, evidence = {findingID: finding.id, password: '', busy: true, available: false, reason: '', error: '', body: '', format: '', status: 0}; state.management.evidence = evidence;
+    const state = this.security; state.management.evidence = {findingID: finding.id, password: '', busy: true, available: false, reason: '', error: '', body: '', format: '', status: 0};
+    const evidence = state.management.evidence;
     try { const result = await api.get(findingPath(finding.id) + '/evidence-metadata'); if (this.security !== state || state.management.evidence !== evidence) return; evidence.available = result.available === true; evidence.reason = reasonText(result.reason); }
     catch(error) { if (this.security === state && state.management.evidence === evidence) evidence.error = error?.message || '证据关联读取失败'; }
     finally { evidence.busy = false; }

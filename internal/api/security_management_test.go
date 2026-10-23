@@ -246,3 +246,10 @@ func TestSecurityAlertStatusExposesFiniteOperationalCounters(t *testing.T) {
 		t.Fatalf("missing alert status: %d %s", response.Code, response.Body.String())
 	}
 }
+
+func TestSecurityDiagnosticsResourceIsDurableReadOnlyAndStrict(t *testing.T){
+ _,h:=newTestServer(t)
+ rec:=do(t,h,"GET","/admin/api/security/diagnostics?limit=1&source=manual&verdict=passed","",true)
+ if rec.Code!=200||!strings.Contains(rec.Body.String(),`"total":0`)||!strings.Contains(rec.Body.String(),`"items":[]`){t.Fatalf("diagnostics missing: %d %s",rec.Code,rec.Body.String())}
+ for _,q:=range []string{"?unknown=1","?source=scheduled","?verdict=success","?limit=-1","?source=manual&source=periodic","?route_id=-1"}{if got:=do(t,h,"GET","/admin/api/security/diagnostics"+q,"",true);got.Code!=400{t.Fatalf("invalid diagnostic filter %s=%d",q,got.Code)}}
+}

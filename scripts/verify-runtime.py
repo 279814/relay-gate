@@ -191,7 +191,7 @@ def verify(binary):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         try:
             runtime.start()
-            assert runtime.sql("SELECT version FROM schema_version") == [(16,)]
+            assert runtime.sql("SELECT version FROM schema_version") == [(17,)]
             assert runtime.request("GET", "/admin/api/upstreams", auth=False)[0] == 401
             upstream, body = runtime.seed(remote.server_port)
             for mode, expected in (("complete", SEMANTIC + END), ("partial", SEMANTIC), ("gzip", gzip.compress(SEMANTIC + END, mtime=0))):

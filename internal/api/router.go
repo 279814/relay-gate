@@ -103,6 +103,8 @@ func (s *Server) Routes(adminPW string) http.Handler {
 	mux.HandleFunc("GET /admin/api/probe-costs", s.listProbeCosts)
 	mux.HandleFunc("GET /admin/api/probe-statistics", s.getProbeStatistics)
 
+	mux.HandleFunc("GET /admin/api/security/diagnostics", s.listSecurityDiagnostics)
+	mux.HandleFunc("GET /admin/api/security/diagnostics/{id}", s.getSecurityDiagnostic)
 	mux.HandleFunc("GET /admin/api/security/findings", s.listSecurityFindings)
 	mux.HandleFunc("GET /admin/api/security/findings/{id}/evidence-metadata", s.getSecurityEvidenceMetadata)
 	mux.HandleFunc("POST /admin/api/security/findings/{id}/evidence", s.viewSecurityEvidence)

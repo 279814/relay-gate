@@ -28,3 +28,13 @@ test('manual route disable uses previously displayed current Route revision with
  await shell.inspectSecurityRoute({route_id:7,upstream_id:42});await shell.disableSecurityRoute();await shell.disableSecurityRoute();
  assert.equal(calls.length,2);assert.deepEqual(calls[1],{path:'/routes/7',body:{expected_revision:8,enabled:false}});assert.equal(shell.security.management.routeTarget.revision,8);
 });
+test('reactive evidence remains current after assigning a wrapped nested object',async()=>{
+ const shell=fixture({async get(){return {available:true,reason:'original_upstream_response'};}});
+ const cache=new WeakMap();const reactive=value=>{if(!value||typeof value!=='object')return value;if(cache.has(value))return cache.get(value);const proxy=new Proxy(value,{get(target,key){return reactive(Reflect.get(target,key));}});cache.set(value,proxy);return proxy;};
+ shell.security=reactive(shell.security);await shell.openSecurityEvidence({id:'trusted'});assert.equal(shell.security.management.evidence.available,true);assert.match(shell.security.management.evidence.reason,/已关联/);
+});
+test('diagnostics reads bounded typed Canary pages and exact persisted execution only',async()=>{
+ const paths=[];const shell=fixture({async get(path){paths.push(path);return path.includes('?')?{items:[{ID:'canary-1',canary:{source:'manual',verdict:'passed'}}],total:1,next_cursor:''}:{ID:'canary-1',canary:{execution_id:'canary-1'}};}});
+ shell.security.upstreamID='42';shell.security.routeID='7';await shell.loadSecurityDiagnostics();await shell.inspectSecurityDiagnostic({ID:'canary-1'});
+ const q=new URL('http://local'+paths[0]).searchParams;assert.equal(q.get('limit'),'25');assert.equal(q.get('route_id'),'7');assert.equal(q.get('upstream_id'),'42');assert.equal(paths[1],'/security/diagnostics/canary-1');assert.equal(shell.executionDrawer.ID,'canary-1');
+});
