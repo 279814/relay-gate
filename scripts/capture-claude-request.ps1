@@ -832,7 +832,8 @@ function ConvertTo-ControlManifest {
     param(
         [Parameter(Mandatory)][byte[]]$ControlContent,
         [Parameter(Mandatory)][string]$Alias,
-        [Parameter(Mandatory)][string]$FixtureFileName
+        [Parameter(Mandatory)][string]$FixtureFileName,
+        [string]$Profile
     )
     if ($Alias -cnotmatch '^[\p{L}\p{Nd}_.-]{1,64}$' -or [IO.Path]::GetFileName($FixtureFileName) -cne $FixtureFileName) { throw 'capture_manifest_arguments_invalid' }
     # Preserve the original RFC3339 strings. ConvertFrom-Json may coerce them
@@ -855,7 +856,9 @@ function ConvertTo-ControlManifest {
         source = $capture.GetProperty('source').GetString()
         secret_scan_version = $capture.GetProperty('secret_scan_version').GetString()
     } } finally { $document.Dispose() }
-    $json = [ordered]@{ version = '1'; entries = @($entry) } | ConvertTo-Json -Depth 8 -Compress
+    $version = '1'
+    if ($Profile) { $version = '2'; $entry.profile = $Profile }
+    $json = [ordered]@{ version = $version; entries = @($entry) } | ConvertTo-Json -Depth 8 -Compress
     return ,([Text.UTF8Encoding]::new($false).GetBytes($json))
 }
 
