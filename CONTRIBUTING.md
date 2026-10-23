@@ -19,7 +19,7 @@
 
 ## 开发环境
 
-需要 `go.mod` 指定的 Go 版本（当前 1.27.2）。不需要 CGO（SQLite 驱动是纯 Go 的）；Linux CI 的竞态检测需要 CGO。
+需要 `go.mod` 指定的 Go 版本（当前 1.27.3）。不需要 CGO（SQLite 驱动是纯 Go 的）；Linux CI 的竞态检测需要 CGO。
 
 ```bash
 go build ./...
