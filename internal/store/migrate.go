@@ -496,7 +496,7 @@ func normalizeLegacyToSchemaOne(ctx context.Context, db *sql.DB, databasePath st
 		return result, fmt.Errorf("关闭 migration 备份连接: %w", closeBackupErr)
 	}
 
-	for _, statement := range legacyNormalizationStatements(state.Variant) {
+	for _, statement := range legacyNormalizationStatements(state) {
 		if _, err = conn.ExecContext(ctx, statement); err != nil {
 			return result, fmt.Errorf("normalize %s: %w", state.Variant, err)
 		}
@@ -559,7 +559,8 @@ func validateForeignKeys(ctx context.Context, db schemaQuerier) error {
 	return nil
 }
 
-func legacyNormalizationStatements(variant legacySchemaVariant) []string {
+func legacyNormalizationStatements(state inspectedSchemaState) []string {
+	variant := state.Variant
 	statements := make([]string, 0, 8)
 	if variant == legacySchemaM2 {
 		statements = append(statements,
@@ -576,10 +577,20 @@ func legacyNormalizationStatements(variant legacySchemaVariant) []string {
 	if variant != legacySchemaM6Current {
 		statements = append(statements, `CREATE INDEX idx_sample_req ON sample (req_id)`)
 	}
-	statements = append(statements, `CREATE TABLE schema_version (
+	versionTable := `CREATE TABLE schema_version (
 		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
 		version INTEGER NOT NULL
-	)`)
+	)`
+	if state.Fingerprint == legacyM6PreIndexFreshFingerprint || state.Fingerprint == legacyM6CurrentFreshFingerprint {
+		// Catalog fingerprints include the stored DDL spelling. Fresh M6 uses
+		// the canonical schema-1 lineage; keep its version-table DDL identical
+		// to frozen 0001_legacy.sql. Preserve the older upgrade spelling above.
+		versionTable = `CREATE TABLE schema_version (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version   INTEGER NOT NULL
+)`
+	}
+	statements = append(statements, versionTable)
 	return statements
 }
 
