@@ -3,15 +3,19 @@ package proxy
 import (
 	"fmt"
 	"net/http"
+	"reflect"
 
 	"github.com/279814/relay-gate/internal/edge"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
 type preparedRequest struct {
+	metadata model.AttemptMetadata
+	tainted  bool
 	body     []byte
 	header   http.Header
 	compiled *transform.Compiled
@@ -26,6 +30,9 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 	cand *router.Candidate, target outbound.ResolvedTarget, header http.Header) (preparedRequest, dispatchStatus) {
 
 	out := preparedRequest{header: header, keys: append(h.credentialsOf(r, cand), target.ResolvedSecrets()...)}
+	if pre.encoding != "" {
+		out.tainted = containsAttemptSecret(pre.decoded, out.keys)
+	}
 	if target.EndpointID != 0 {
 		var err error
 		out.compiled, out.version, err = pre.transforms.PublishedCompiled(cand.Route.ID, target.EndpointID)
@@ -68,6 +75,7 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 			secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
 		}
 		beforeBody := out.body
+		beforeHeader := out.header
 		tr := c.ApplyRequestSecrets(transform.RequestInput{Header: out.header, Body: beforeBody}, secrets)
 		// §15.3: rules cannot finally select a different model. Do not insert a
 		// removed field or repair duplicate/non-string model keys: those use the
@@ -87,28 +95,33 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 				tr.Changed, tr.HitRules = false, nil
 			}
 		}
+		if tr.Taint != nil {
+			secrets := tr.Taint.Secrets()
+			out.keys = append(out.keys, secrets...)
+			out.tainted = out.tainted || len(secrets) > 0
+		}
+		out.metadata.RequestHeadersChanged = !reflect.DeepEqual(beforeHeader, tr.Header)
 		if tr.Changed || tr.Err != nil {
 			errText := ""
 			if tr.Err != nil {
 				errText = tr.Err.Error()
 			}
+			inputHash, outputHash, _ := safeAttemptBodyHashes(beforeBody, tr.Body, out.keys, out.tainted)
 			h.transforms.RecordExecution(transform.ExecutionRecord{
 				RouteID: cand.Route.ID, EndpointID: target.EndpointID, VersionID: out.version,
 				Mode: "published", Phase: "request", OK: tr.Err == nil,
 				HitRules: tr.HitRules, FailPolicyUsed: tr.PolicyUsed,
-				InputHash: transform.HashBytes(beforeBody), OutputHash: transform.HashBytes(tr.Body), Error: errText,
+				InputHash: inputHash, OutputHash: outputHash, Error: sample.RedactDiagnosticText(errText, out.keys),
 			})
 		}
 		if tr.Err != nil && tr.PolicyUsed == transform.FailClosed {
 			return out, dispatchRouteLocal
 		}
 		out.header, out.body = tr.Header, tr.Body
-		if tr.Taint != nil {
-			out.keys = append(out.keys, tr.Taint.Secrets()...)
-		}
+
 	}
 	edge.StripForwardingHeaders(out.header)
-	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody)
+	h.shadowRequest(pre.transforms, cand, target.EndpointID, shadowHeader, shadowBody, out.keys, out.tainted)
 	if reencode {
 		out.body, err = encodeRequestBody(pre.encoding, out.body, transform.MaxBodyBuffer)
 		if err != nil {
@@ -119,6 +132,21 @@ func (h *Handler) prepareOutboundRequest(r *http.Request, pre *preambleResult,
 	if pre.encoding != "" {
 		// A header rule cannot describe different bytes from the actual encoder.
 		out.header.Set("Content-Encoding", pre.encoding)
+	}
+	if h.samples != nil && pre.settings.SampleEnabled {
+		if pre.encoding != "" && containsAttemptSecret(pre.decoded, out.keys) {
+			out.tainted = true
+		}
+		inHash, outHash, reason := safeAttemptBodyHashes(pre.body, out.body, out.keys, out.tainted)
+		out.metadata.RequestInputHash, out.metadata.RequestOutputHash, out.metadata.RequestDiffReason = inHash, outHash, reason
+		if reason == "recorded" {
+			out.metadata.RequestBodyChanged = inHash != outHash
+		} else {
+			out.metadata.RequestHeadersChanged = false
+		}
+	} else {
+		out.metadata.RequestHeadersChanged = false
+		out.metadata.RequestDiffReason = "sample_disabled"
 	}
 	return out, dispatchSent
 }

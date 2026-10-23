@@ -813,7 +813,7 @@ func insertProbeExecutionTx(ctx context.Context, tx *sql.Tx, execution *model.Pr
 		}
 		return err
 	}
-	return nil
+	return recordAttemptObservationTx(ctx, tx, execution)
 }
 
 func recordExecutionCostTx(ctx context.Context, tx *sql.Tx, execution model.ProbeExecution) (bool, error) {

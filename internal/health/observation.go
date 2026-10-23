@@ -13,6 +13,7 @@ import (
 
 // AttemptTarget 标识一次即将发出的真实 Attempt。
 type AttemptTarget struct {
+	ExecutionID      string
 	ReqID            string
 	Attempt          int
 	Protocol         model.Protocol
@@ -81,6 +82,7 @@ type AttemptRequestObserver interface{ TryRequest(AttemptRequestView) }
 // Incomplete means semantic timing is unavailable; it never proves an upstream
 // failure. A compressed response uses the existing observer worker to decode.
 type ResponseProgress struct {
+	FirstEventAt    time.Time
 	FirstSemanticAt time.Time
 	LastSemanticAt  time.Time
 	Incomplete      model.ObserverIncompleteReason
@@ -93,9 +95,10 @@ type AttemptResponseProgress interface {
 
 // AttemptInstrumentation 捆绑 Observer、同步 RetryDecider 与共享 Trace。
 type AttemptInstrumentation struct {
-	Observer AttemptObserver
-	Retry    RetryDecider
-	Trace    *outbound.AttemptTrace
+	ObservationPrepared bool
+	Observer            AttemptObserver
+	Retry               RetryDecider
+	Trace               *outbound.AttemptTrace
 }
 
 // NoopInstrumentation 在准备失败时返回：KeepAttempt、nil Trace。

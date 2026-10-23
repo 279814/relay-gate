@@ -9,6 +9,7 @@ import (
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -17,7 +18,7 @@ import (
 // bytes to the caller: the live request stays whatever published/passthrough
 // produced, shadow errors never fail the attempt, and no upstream call is made.
 func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candidate, endpointID int64,
-	header http.Header, body []byte) {
+	header http.Header, body []byte, keys []string, sensitiveInput bool) {
 	if h.transforms == nil || endpointID == 0 {
 		return
 	}
@@ -39,7 +40,7 @@ func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candid
 			h.transforms.RecordExecution(transform.ExecutionRecord{
 				RouteID: cand.Route.ID, EndpointID: endpointID, VersionID: verID,
 				Mode: "shadow", Phase: "request", OK: false,
-				Error: "压缩请求的 shadow 正文转换不可用", InputHash: transform.HashBytes(body),
+				Error: "压缩请求的 shadow 正文转换不可用", DiffSummary: "omitted: incomplete",
 			})
 			return
 		}
@@ -50,14 +51,20 @@ func (h *Handler) shadowRequest(view *transform.RequestView, cand *router.Candid
 	if key := cand.Upstream.APIKey; key != "" && !model.APIKeyTooShortForOutbound(key) {
 		secrets = transform.SecretMap{"upstream_api_key": []byte(key)}
 	}
-	summary := c.ShadowDiffSecrets("request",
-		transform.RequestInput{Header: header, Body: body}, transform.ResponseInput{}, secrets)
+	summary := "request diff=omitted(secret_taint) err=not_evaluated"
+	if !sensitiveInput && !containsAttemptSecret(body, keys) {
+		summary = c.ShadowDiffSecrets("request", transform.RequestInput{Header: header, Body: body}, transform.ResponseInput{}, secrets)
+	}
+	inputHash := safeAttemptBodyHash(body, keys)
+	if sensitiveInput || containsAttemptSecret(body, keys) || strings.Contains(summary, "secret_taint") {
+		inputHash = ""
+	}
 	h.transforms.RecordExecution(transform.ExecutionRecord{
 		RouteID: cand.Route.ID, EndpointID: endpointID, VersionID: verID,
 		Mode: "shadow", Phase: "request",
 		OK:          strings.HasSuffix(summary, " err="),
-		DiffSummary: summary,
-		InputHash:   transform.HashBytes(body),
+		DiffSummary: sample.RedactDiagnosticText(summary, keys),
+		InputHash:   inputHash,
 	})
 }
 
@@ -100,7 +107,7 @@ func (h *Handler) attachResponseShadow(w http.ResponseWriter, la *liveAttempt) *
 	s := &responseShadow{h: h, la: la, w: w, c: c, verID: verID,
 		sse: transform.IsSSEContentType(la.at.resp.Header.Get("Content-Type"))}
 	if s.sse {
-		s.acc = c.NewSSEShadow()
+		s.acc = c.NewSSEShadow().WithSensitiveValues(la.keys)
 	}
 	if f := la.at.f; f.RespTee != nil {
 		f.RespTee = io.MultiWriter(f.RespTee, s)
@@ -154,6 +161,10 @@ func (s *responseShadow) finish(res *Result) {
 	header := s.w.Header().Clone()
 	if !s.sse {
 		body := s.body
+		if encoding := normalizeContentEncoding(header.Get("Content-Encoding")); encoding != "" && !responseRulesTouchBody(s.c) {
+			s.record("response", "response diff=omitted(incomplete) err=not_evaluated", false, nil)
+			return
+		}
 		if enc := normalizeContentEncoding(header.Get("Content-Encoding")); enc != "" &&
 			responseRulesTouchBody(s.c) && len(body) <= transform.MaxBodyBuffer {
 			var err error
@@ -165,9 +176,13 @@ func (s *responseShadow) finish(res *Result) {
 				header.Del("ETag")
 			}
 			if err != nil {
-				s.record("response", "response err="+err.Error(), false, s.body)
+				s.record("response", "response diff=omitted(incomplete) err=decode_unavailable", false, nil)
 				return
 			}
+		}
+		if containsAttemptSecret(body, s.la.keys) {
+			s.record("response", "response diff=omitted(secret_taint) err=", true, body)
+			return
 		}
 		summary := s.c.ShadowDiffSecrets("response", transform.RequestInput{},
 			transform.ResponseInput{Status: res.Status, Header: header, Body: body}, nil)
@@ -186,18 +201,33 @@ func (s *responseShadow) finish(res *Result) {
 		RouteID: s.la.cand.Route.ID, EndpointID: s.la.endpointID, VersionID: s.verID,
 		Mode: "shadow", Phase: "sse",
 		OK:          s.acc.Err() == "",
-		DiffSummary: s.acc.Summary(),
+		DiffSummary: sample.RedactDiagnosticText(s.acc.Summary(), s.la.keys),
 		InputHash:   s.acc.InputHash(),
+	}
+	if s.stopped {
+		rec.InputHash = ""
+		rec.DiffSummary = "sse diff=omitted(incomplete) err=decode_unavailable"
 	}
 	s.h.transforms.RecordExecution(rec)
 }
 
 func (s *responseShadow) record(phase, summary string, ok bool, input []byte) {
+	inputHash := safeAttemptBodyHash(input, s.la.keys)
+	if strings.Contains(summary, "omitted(") {
+		inputHash = ""
+	}
+	if containsAttemptSecret(input, s.la.keys) || strings.Contains(summary, "secret_taint") {
+		summary = phase + " diff=omitted(secret_taint) err="
+		if !ok {
+			summary += "transform_failed"
+		}
+		inputHash = ""
+	}
 	s.h.transforms.RecordExecution(transform.ExecutionRecord{
 		RouteID: s.la.cand.Route.ID, EndpointID: s.la.endpointID, VersionID: s.verID,
 		Mode: "shadow", Phase: phase,
 		OK:          ok,
-		DiffSummary: summary,
-		InputHash:   transform.HashBytes(input),
+		DiffSummary: sample.RedactDiagnosticText(summary, s.la.keys),
+		InputHash:   inputHash,
 	})
 }

@@ -16,6 +16,7 @@ import { createRuntimeStateFeature } from './runtime.mjs';
 import { createCountTokensFeature } from './count_tokens.mjs';
 import { createRecipeAdminFeature } from './recipe_admin.mjs';
 import { createSettingsFeature } from './settings.mjs';
+import { createAttemptMetadataFeature } from './attempt_metadata.mjs';
 
 const base = window.app;
 if (typeof base !== 'function') {
@@ -45,6 +46,7 @@ if (typeof base !== 'function') {
 
     try {
       createProbeFeature(shell, api);
+      createAttemptMetadataFeature(shell, api);
       mergeProbeTabs(shell);
       createRecentErrorsFeature(shell, api);
       createMigrationFeature(shell, api);

@@ -330,6 +330,9 @@ func validateBackupPaths(databasePath, manifestPath string) (absDB, absManifest,
 	if m.SourceSchema == 11 && m.ReaderContract != "schema-11-audit-v1-reader" {
 		return "", "", "", nil, fmt.Errorf("%w: schema 11 backup requires schema-11-audit-v1-reader", ErrRestoreRejected)
 	}
+	if m.SourceSchema == 12 && m.ReaderContract != "schema-12-attempt-metadata-v1-reader" {
+		return "", "", "", nil, fmt.Errorf("%w: schema 12 backup requires schema-12-attempt-metadata-v1-reader", ErrRestoreRejected)
+	}
 	if m.SourceSchema < 0 || (m.TargetSchema != m.SourceSchema+1 && !rotationBackupBoundary(m.SourceSchema, m.TargetSchema, m.SourceValidator)) {
 		return "", "", "", nil, fmt.Errorf("%w: manifest schema 边界无效 source=%d target=%d", ErrRestoreRejected, m.SourceSchema, m.TargetSchema)
 	}

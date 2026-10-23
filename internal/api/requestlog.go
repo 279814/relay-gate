@@ -83,14 +83,15 @@ func (s *Server) recentErrors(w http.ResponseWriter, r *http.Request) {
 	q := &probeListQuery{r: r}
 	for name := range r.URL.Query() {
 		switch name {
-		case "limit", "cursor", "upstream_id", "route_id", "protocol", "outcome", "from_ms", "to_ms":
+		case "limit", "cursor", "upstream_id", "route_id", "protocol", "outcome", "error_class", "from_ms", "to_ms":
 		default:
 			q.err = model.WrapValidation("最近错误含未知筛选参数")
 		}
 	}
 	f := store.RecentErrorFilter{PageRequest: q.page(), UpstreamID: q.id("upstream_id"), RouteID: q.id("route_id"),
-		Protocol: probeEnum(q, "protocol", model.Protocol.Valid),
-		Outcome:  model.Outcome(q.oneOf("outcome", string(model.OutcomeUpstreamError), string(model.OutcomeTimeout), string(model.OutcomeFakeAlive), string(model.OutcomeClientAbort)))}
+		ErrorClass: probeEnum(q, "error_class", func(class model.ErrorClass) bool { return class == "unknown" || class.Valid() }),
+		Protocol:   probeEnum(q, "protocol", model.Protocol.Valid),
+		Outcome:    model.Outcome(q.oneOf("outcome", string(model.OutcomeUpstreamError), string(model.OutcomeTimeout), string(model.OutcomeFakeAlive), string(model.OutcomeClientAbort)))}
 	millis := func(name string) int64 {
 		raw := q.text(name)
 		if _, present := r.URL.Query()[name]; !present {

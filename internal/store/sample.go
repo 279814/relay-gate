@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -105,7 +106,8 @@ func normalizeSampleAttempts(smp *model.Sample) {
 		return
 	}
 	smp.Attempts = []*model.SampleAttempt{{
-		TSRecv: smp.TSRecv, TSSent: smp.TSSent, TSFirstByte: smp.TSFirstByte, TSDone: smp.TSDone,
+		Metadata: smp.Metadata,
+		TSRecv:   smp.TSRecv, TSSent: smp.TSSent, TSFirstByte: smp.TSFirstByte, TSDone: smp.TSDone,
 		ModelOut: smp.ModelOut, ModelNameID: smp.ModelNameID,
 		RouteID: smp.RouteID, UpstreamID: smp.UpstreamID,
 		OutURL: smp.OutURL, OutHeaders: smp.OutHeaders, OutBody: smp.OutBody,
@@ -125,6 +127,7 @@ func syncSampleFinalView(smp *model.Sample) {
 		return
 	}
 	a := smp.Attempts[len(smp.Attempts)-1]
+	smp.Metadata = a.Metadata
 	smp.TSSent, smp.TSFirstByte, smp.TSDone = a.TSSent, a.TSFirstByte, a.TSDone
 	smp.ModelOut, smp.ModelNameID = a.ModelOut, a.ModelNameID
 	smp.RouteID, smp.UpstreamID = a.RouteID, a.UpstreamID
@@ -405,6 +408,9 @@ func insertSampleAttemptRow(tx *sql.Tx, requestID int64, a *model.SampleAttempt,
 		return err
 	}
 	a.RequestID = requestID
+	if err := insertAttemptMetadata(tx, "sample_attempt_metadata", a.ID, a.Metadata); err != nil {
+		return err
+	}
 	if f == nil {
 		return nil
 	}
@@ -516,7 +522,7 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 		r.in_method, r.in_path, r.in_query,
 		COALESCE(a.resp_status, 0), COALESCE(a.outcome, ''), COALESCE(a.error, ''),
 		r.truncated | COALESCE(a.truncated, 0), r.pinned,
-		(SELECT COUNT(*) FROM sample_attempt c WHERE c.request_id = r.id)
+		(SELECT COUNT(*) FROM sample_attempt c WHERE c.request_id = r.id), COALESCE(a.id,0)
 		FROM sample_request r
 		LEFT JOIN sample_attempt a ON a.id = (
 			SELECT MAX(m.id) FROM sample_attempt m WHERE m.request_id = r.id)
@@ -552,8 +558,11 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 	defer rows.Close()
 
 	out := []*model.Sample{}
+	var metadataIDs []int64
 	for rows.Next() {
 		var smp model.Sample
+		var metadataID int64
+		smp.Metadata = model.UnknownAttemptMetadata()
 		var outcome string
 		var trunc int
 		if err := rows.Scan(&smp.ID, &smp.LegacySampleID, &smp.ReqID, &smp.TSRecv,
@@ -561,14 +570,28 @@ func (s *Store) ListSamples(f SampleFilter) ([]*model.Sample, error) {
 			&smp.Endpoint, &smp.ModelIn, &smp.ModelOut, &smp.ModelNameID, &smp.RouteID,
 			&smp.UpstreamID, &smp.InMethod, &smp.InPath, &smp.InQuery,
 			&smp.RespStatus, &outcome, &smp.Error, &trunc, &smp.Pinned,
-			&smp.AttemptCount); err != nil {
+			&smp.AttemptCount, &metadataID); err != nil {
 			return nil, err
 		}
 		smp.Outcome = model.Outcome(outcome)
 		smp.Truncated = model.TruncFlags(trunc)
 		out = append(out, &smp)
+		metadataIDs = append(metadataIDs, metadataID)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	metadata, err := loadAttemptMetadata(context.Background(), s.db, "sample_attempt_metadata", metadataIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i, row := range out {
+		if m, ok := metadata[metadataIDs[i]]; ok {
+			row.Metadata = m
+		}
+	}
+	return out, nil
 }
 
 // GetSample 取一个 Sample Group：入站请求 + 按发送顺序的全部尝试。
@@ -596,6 +619,21 @@ func (s *Store) GetSample(id int64) (*model.Sample, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	rows.Close()
+	ids := make([]int64, len(smp.Attempts))
+	for i, a := range smp.Attempts {
+		ids[i] = a.ID
+		a.Metadata = model.UnknownAttemptMetadata()
+	}
+	metadata, err := loadAttemptMetadata(context.Background(), s.db, "sample_attempt_metadata", ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range smp.Attempts {
+		if m, ok := metadata[a.ID]; ok {
+			a.Metadata = m
+		}
 	}
 	syncSampleFinalView(smp)
 	return smp, nil

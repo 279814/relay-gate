@@ -19,6 +19,7 @@ type RecentErrorFilter struct {
 	RouteID    int64
 	Protocol   model.Protocol
 	Outcome    model.Outcome
+	ErrorClass model.ErrorClass
 	FromMS     int64
 	ToMS       int64
 }
@@ -50,13 +51,25 @@ func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (Rece
 		(f.Outcome != "" && (!f.Outcome.Valid() || f.Outcome == model.OutcomeOK)) {
 		return page, model.WrapValidation("最近错误筛选无效")
 	}
+	if f.ErrorClass != "" && f.ErrorClass != "unknown" && !f.ErrorClass.Valid() {
+		return page, model.WrapValidation("最近错误 ErrorClass 无效")
+	}
 	cursorFilter := f
 	cursorFilter.PageRequest = model.PageRequest{}
 	keys, err := decodePageCursor(f.Cursor, "recent-errors", cursorFilter, 1)
 	if err != nil {
 		return page, err
 	}
-	where := `outcome <> ?`
+	// A successful HTTP exchange can still carry a canonical protocol failure.
+	// Only the exact committed observation may add such a row. After retention,
+	// the disposition copied atomically into metadata proves it was committed.
+	where := `(outcome <> ? OR EXISTS (
+		SELECT 1 FROM request_log_metadata m LEFT JOIN probe_execution p ON p.id=m.execution_id
+		WHERE m.owner_id=request_log.id AND m.execution_id<>''
+		AND COALESCE(p.error_class,m.error_class) IN
+		('unreachable','auth_rejected','request_shape_rejected','config_error','unsupported','model_not_found','rate_limited','transient_error','fake_alive','partial_failure')
+		AND ((p.id IS NOT NULL AND p.trigger='real_traffic' AND p.success=0)
+		OR (p.id IS NULL AND m.capability_effect IN ('applied','config_stale','superseded','not_applicable')))))`
 	args := []any{model.OutcomeOK}
 	if f.UpstreamID > 0 {
 		where += ` AND upstream_id=?`
@@ -73,6 +86,10 @@ func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (Rece
 	if f.Outcome != "" {
 		where += ` AND outcome=?`
 		args = append(args, f.Outcome)
+	}
+	if f.ErrorClass != "" {
+		where += ` AND COALESCE((SELECT COALESCE(p.error_class,m.error_class) FROM request_log_metadata m LEFT JOIN probe_execution p ON p.id=m.execution_id WHERE m.owner_id=request_log.id),'unknown')=?`
+		args = append(args, f.ErrorClass)
 	}
 	if f.FromMS > 0 {
 		where += ` AND ts_recv>=?`
@@ -131,6 +148,13 @@ func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (Rece
 			return page, err
 		}
 	}
+	logs := make([]*model.RequestLog, len(page.Logs))
+	for i := range page.Logs {
+		logs[i] = page.Logs[i].RequestLog
+	}
+	if err := attachRequestLogMetadata(ctx, tx, logs); err != nil {
+		return page, err
+	}
 	// One bounded metadata query handles the page, avoiding a per-row lookup.
 	reqIDs := map[string]bool{}
 	var sampleArgs []any
@@ -175,7 +199,12 @@ func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (Rece
 //
 // 调用方（sample.LogRecorder）已在后台单 goroutine 里，不必再考虑并发。
 func (s *Store) InsertRequestLog(l *model.RequestLog) error {
-	res, err := s.db.Exec(`INSERT INTO request_log (
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO request_log (
 		req_id, attempt, attempts,
 		ts_recv, ts_sent, ts_first_byte, ts_done,
 		endpoint, model_in, model_out, model_name_id, route_id, upstream_id, upstream_name,
@@ -191,7 +220,13 @@ func (s *Store) InsertRequestLog(l *model.RequestLog) error {
 		return fmt.Errorf("写入请求日志: %w", err)
 	}
 	l.ID, err = res.LastInsertId()
-	return err
+	if err != nil {
+		return err
+	}
+	if err := insertAttemptMetadata(tx, "request_log_metadata", l.ID, l.Metadata); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const requestLogCols = `id, req_id, attempt, attempts,
@@ -295,7 +330,14 @@ func (s *Store) ListRequestLogs(f RequestLogFilter) ([]*model.RequestLog, error)
 		}
 		out = append(out, l)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := attachRequestLogMetadata(context.Background(), s.db, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // PruneRequestLogs 按条数与天数清理**无对应 sample 的孤儿日志**，两者取**先到者**。

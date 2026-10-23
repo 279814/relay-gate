@@ -75,14 +75,14 @@
                 <div class="sub">丢弃是静默的：队列满时宁可丢样本也不阻塞转发</div>
               </div>
               <div class="card" style="cursor:pointer" @click="openRecentErrors && openRecentErrors()">
-                <h3 x-text="(recentErrors.upstream_id || recentErrors.route_id || recentErrors.protocol || recentErrors.outcome || recentErrors.from_time || recentErrors.to_time)
+                <h3 x-text="(recentErrors.upstream_id || recentErrors.route_id || recentErrors.protocol || recentErrors.outcome || recentErrors.error_class || recentErrors.from_time || recentErrors.to_time)
                   ? '最近错误（筛选后）' : '最近错误'"></h3>
                 <div class="v" x-text="recentErrors?.failed_count ?? 0"></div>
                 <div class="sub" x-text="recentErrors?.latest?.error
                   ? ((recentErrors.latest.error.length > 80
                       ? recentErrors.latest.error.slice(0, 80) + '…'
                       : recentErrors.latest.error))
-                  : '点击查看全部'"></div>
+                  : (recentErrors?.latest?.metadata?.error_class || '点击查看全部')"></div>
                 <div class="sub" x-text="fmtTime(recentErrors?.latest?.ts_recv)"></div>
                 <button type="button" @click.stop="openRecentErrors()">查看全部</button>
               </div>
@@ -96,7 +96,7 @@
                   <span class="grow"></span>
                   <button type="button" @click="closeRecentErrors && closeRecentErrors()">关闭</button>
                 </div>
-                <p class="dim">完整脱敏文本；按请求接收时间筛选失败的 Attempt。Capability 是当前同路由能力，Execution 是同路由相关执行，尚无精确请求关联。</p>
+                <p class="dim">完整脱敏文本；按请求接收时间筛选失败的 Attempt。Capability 显示当前能力；Execution 打开该 Attempt 的精确记录。历史缺失或已清理的详情不可打开。</p>
                 <div class="bar">
                   <label>Upstream ID
                     <input type="number" min="1" style="width:7rem" x-model="recentErrors.upstream_id" @change="applyRecentErrorFilters()">
@@ -116,6 +116,17 @@
                       <option value="timeout">超时</option><option value="fake_alive">假活</option><option value="client_abort">客户端取消</option>
                     </select>
                   </label>
+                  <label>错误类别（ErrorClass）
+                    <select x-model="recentErrors.error_class" @change="applyRecentErrorFilters()">
+                      <option value="">全部类别</option><option value="auth_rejected">认证拒绝</option>
+                      <option value="request_shape_rejected">请求结构拒绝</option><option value="config_error">配置错误</option>
+                      <option value="unsupported">不支持</option><option value="model_not_found">模型不存在</option>
+                      <option value="rate_limited">限流</option><option value="unreachable">不可达</option>
+                      <option value="transient_error">暂时错误</option><option value="fake_alive">假活</option>
+                      <option value="partial_failure">部分失败</option><option value="ignored">未采用</option>
+                      <option value="none">无上游错误</option><option value="unknown">历史未记录</option>
+                    </select>
+                  </label>
                   <label>接收时间从<input type="datetime-local" x-model="recentErrors.from_time" @change="applyRecentErrorFilters()"></label>
                   <label>至<input type="datetime-local" x-model="recentErrors.to_time" @change="applyRecentErrorFilters()"></label>
                   <button type="button" :disabled="recentErrors.loading" @click="refreshRecentErrors(true)">刷新</button>
@@ -132,13 +143,13 @@
                         <td x-text="fmtTime(row.ts_recv)"></td>
                         <td><div x-text="row.upstream_name"></div><span x-text="row.route_id"></span></td>
                         <td><div x-text="row.protocol || '未记录'"></div><span x-text="row.endpoint"></span></td>
-                        <td x-text="row.outcome"></td>
+                        <td><div x-text="row.metadata?.error_class || 'unknown'"></div><span class="dim" x-text="row.outcome"></span></td>
                         <td x-text="row.model_in"></td>
                         <td><pre class="err-pre" style="overflow-wrap:anywhere;word-break:break-word" x-text="row.error || ''"></pre></td>
                         <td>
                           <button type="button" @click="copyRecentError(row.error)">复制</button>
                           <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorCapabilities(row)">当前 Capability</button>
-                          <button type="button" :disabled="!row.route_id || !row.endpoint_kind" @click="openRecentErrorExecutions(row)">相关 Execution</button>
+                          <button type="button" :disabled="!row.metadata?.execution_id || !row.metadata?.execution_stored" @click="openRecentErrorExecutions(row)">精确 Execution</button>
                           <button type="button" :disabled="!row.req_id" @click="openRecentErrorRequestLogs(row)">RequestLog</button>
                           <button type="button" :disabled="!row.sample_id" @click="openRecentErrorSample(row)">Sample</button>
                         </td>
@@ -474,7 +485,8 @@
                     <td class="num" x-text="ttft(s)"></td>
                     <td class="num" x-text="dur(s)"></td>
                     <td class="nowrap">
-                      <button class="sm" @click="openSample(s.id)">详情</button>
+                      <button class="sm" @click="openSampleMetadata(s.id)">尝试元数据</button>
+                      <button class="sm" @click="openSample(s.id)">正文（需认证）</button>
                       <button class="sm" @click="togglePin(s)"
                               x-text="s.pinned ? '取消置顶' : '置顶'"></button>
                     </td>
@@ -577,6 +589,7 @@
                       <td class="num" x-text="l.resp_status || '—'"></td>
                       <td class="num" x-text="l.ttft_ms ? l.ttft_ms + 'ms' : '—'"></td>
                       <td class="nowrap">
+                        <button class="sm" @click="openAttemptMetadata(l)">Attempt 事实</button>
                         <button class="sm" x-show="i === 0 && g.rows.length > 1"
                                 @click="toggleLog(g.req_id)"
                                 x-text="expandedLogs[g.req_id] ? '收起' : `展开 ${g.rows.length} 次`"></button>
@@ -2508,6 +2521,79 @@
         </div>
       </template>
 
+      <!-- Safe Attempt facts are read separately from sensitive sample bytes. -->
+      <template x-if="attemptMetadata.open">
+        <div class="mask" @click.self="closeAttemptMetadata()">
+          <div class="modal wide" x-ref="attemptMetadataDrawer" role="dialog" aria-modal="true" aria-labelledby="attempt-metadata-title">
+            <div class="bar">
+              <h3 id="attempt-metadata-title" style="margin:0" x-text="attemptMetadata.title"></h3>
+              <span class="grow"></span>
+              <button type="button" @click="closeAttemptMetadata()">关闭</button>
+            </div>
+            <p class="mono wrap" x-show="attemptMetadata.reqID" x-text="'ReqID ' + attemptMetadata.reqID"></p>
+            <p class="dim">这里只展示当次尝试记录的事实；不读取样本正文，也不使用当前配置补齐历史。</p>
+            <p class="dim" x-show="attemptMetadata.note" x-text="attemptMetadata.note"></p>
+            <div class="alert err" x-show="attemptMetadata.error" x-text="attemptMetadata.error"></div>
+            <p class="dim" x-show="attemptMetadata.loading">读取安全元数据中…</p>
+            <div class="bar" x-show="attemptMetadata.attempts.length">
+              <label>选择尝试
+                <select x-model.number="attemptMetadata.selected" @change="selectMetadataAttempt()">
+                  <template x-for="(a, idx) in attemptMetadata.attempts" :key="a.key">
+                    <option :value="idx" x-text="a.title"></option>
+                  </template>
+                </select>
+              </label>
+              <button type="button" x-show="attemptMetadata.sampleID" @click="openSampleMetadata(attemptMetadata.sampleID)" :disabled="attemptMetadata.loading">刷新元数据</button>
+            </div>
+            <template x-for="a in attemptMetadata.attempts.slice(attemptMetadata.selected, attemptMetadata.selected + 1)" :key="a.key">
+              <div>
+                <p class="alert warn" x-show="a.notice" x-text="a.notice"></p>
+                <div class="bar" style="margin:12px 0">
+                  <span class="tag unknown" x-text="'元数据版本：' + a.version"></span>
+                  <span class="dim" x-text="a.executionState"></span>
+                  <button type="button" @click="openMetadataExecution()" :disabled="!a.canOpenExecution || attemptMetadata.executionLoading">精确 Execution</button>
+                </div>
+                <p class="mono wrap" x-show="a.executionID" x-text="'Execution ID ' + a.executionID"></p>
+                <dl class="kv">
+                  <template x-for="f in a.identity" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <h3 style="margin-top:18px">阶段与写出</h3>
+                <p class="dim" x-text="'已保存响应的含义：' + a.responseView"></p>
+                <dl class="kv">
+                  <template x-for="f in a.timings" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <h3 style="margin-top:18px">重试、写入与实际结论</h3>
+                <dl class="kv">
+                  <template x-for="f in a.decisions" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="wrap" x-text="f.value"></dd></div></template>
+                </dl>
+                <details class="blk">
+                  <summary>发送时的配置与转换版本</summary>
+                  <dl class="kv">
+                    <template x-for="f in a.revisions" :key="f.label"><div style="display:contents"><dt x-text="f.label"></dt><dd class="mono wrap" x-text="f.value"></dd></div></template>
+                  </dl>
+                </details>
+                <template x-for="d in a.diffs" :key="d.label">
+                  <details class="blk">
+                    <summary x-text="d.label"></summary>
+                    <p class="dim" x-text="d.reason"></p>
+                    <dl class="kv">
+                      <dt>正文是否变化</dt><dd x-text="d.body"></dd>
+                      <dt>头是否变化</dt><dd x-text="d.headers"></dd>
+                      <dt>输入正文 SHA-256</dt><dd class="mono wrap" style="overflow-wrap:anywhere" x-text="d.inputHash"></dd>
+                      <dt>输出正文 SHA-256</dt><dd class="mono wrap" style="overflow-wrap:anywhere" x-text="d.outputHash"></dd>
+                    </dl>
+                  </details>
+                </template>
+              </div>
+            </template>
+            <footer>
+              <button type="button" x-show="attemptMetadata.sampleID" @click="openMetadataSampleBody()">查看样本正文（重新认证）</button>
+              <button type="button" @click="closeAttemptMetadata()">关闭</button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
       <!-- ── 样本详情 ─────────────────────────────────────── -->
       <template x-if="sample">
         <div class="mask" @click.self="sample = null">
@@ -2538,6 +2624,7 @@
             </div>
 
             <div class="bar" style="margin-top:14px">
+              <button @click="openSampleMetadata(sample.id)">逐次尝试元数据</button>
               <button @click="exportHeaders(sample.id)">生成安全配方草稿</button>
               <span class="dim">仅保留协议形状，正文使用探活占位符</span>
             </div>
@@ -2580,7 +2667,7 @@
               <pre class="body mono" x-text="JSON.stringify(sample.resp_headers, null, 2)"></pre>
             </details>
             <details class="blk" open>
-              <summary>响应 body</summary>
+              <summary>已保存的响应 body（视图含义见尝试元数据）</summary>
               <pre class="body mono" x-text="b64(sample.resp_body)"></pre>
             </details>
 

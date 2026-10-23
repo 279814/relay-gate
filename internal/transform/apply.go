@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/279814/relay-gate/internal/security"
 	"net/http"
 	"strconv"
 	"strings"
@@ -492,6 +493,12 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		if r.Taint != nil {
 			errMsg = r.Taint.Redact(errMsg)
 		}
+		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(req.Body, secrets) || shadowContainsSecret(r.Body, secrets) {
+			if r.Err != nil {
+				return "request diff=omitted(secret_taint) err=transform_failed"
+			}
+			return "request diff=omitted(secret_taint) err="
+		}
 		return fmt.Sprintf("request changed=%v hits=%v in=%s out=%s err=%v",
 			r.Changed, r.HitRules, HashBytes(req.Body), HashBytes(r.Body), errMsg)
 	case "response":
@@ -502,6 +509,12 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		}
 		if r.Taint != nil {
 			errMsg = r.Taint.Redact(errMsg)
+		}
+		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(res.Body, secrets) || shadowContainsSecret(r.Body, secrets) {
+			if r.Err != nil {
+				return "response diff=omitted(secret_taint) err=transform_failed"
+			}
+			return "response diff=omitted(secret_taint) err="
 		}
 		return fmt.Sprintf("response changed=%v hits=%v status %d→%d in=%s out=%s err=%v",
 			r.Changed, r.HitRules, res.Status, r.Status, HashBytes(res.Body), HashBytes(r.Body), errMsg)
@@ -714,4 +727,13 @@ func unescapePointer(s string) string {
 	s = strings.ReplaceAll(s, "~1", "/")
 	s = strings.ReplaceAll(s, "~0", "~")
 	return s
+}
+
+func shadowContainsSecret(body []byte, secrets SecretMap) bool {
+	keys := make([]string, 0, len(secrets))
+	for _, value := range secrets {
+		keys = append(keys, string(value))
+	}
+	text := string(body)
+	return security.RedactSecrets(text, keys) != text
 }

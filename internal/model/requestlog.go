@@ -13,7 +13,8 @@ package model
 // 刻意**不含任何 body 与头**：那是 Sample 的职责。重复存一份只会让磁盘
 // 翻倍，还多一处需要脱敏的地方 —— 而漏一处就是明文 key 落库。
 type RequestLog struct {
-	ID int64 `json:"id"`
+	Metadata AttemptMetadata `json:"metadata"`
+	ID       int64           `json:"id"`
 
 	// ReqID 把同一次客户端请求的多次尝试串起来。
 	ReqID string `json:"req_id"`

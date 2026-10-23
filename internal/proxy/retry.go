@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/279814/relay-gate/internal/health"
+	"github.com/279814/relay-gate/internal/livecfg"
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/protocol"
@@ -52,13 +53,14 @@ type LogSink interface {
 // 与响应副本留在 trail 里，供样本把整个 Sample Group 落下来（§5.4：
 // 一个客户端请求 = 一条 sample_request + 每次实际发送的 sample_attempt）。
 type forwardOutcome struct {
-	cand      *router.Candidate
-	outBody   []byte
-	outHeader http.Header
-	outURL    string
-	respTee   *sample.HeadTail
-	res       *Result
-	keys      []string
+	localResponseError bool
+	cand               *router.Candidate
+	outBody            []byte
+	outHeader          http.Header
+	outURL             string
+	respTee            *sample.HeadTail
+	res                *Result
+	keys               []string
 	// attempts 是实际发出的尝试次数。1 = 没有重试。
 	attempts int
 	// halfOpen 表示最终这次尝试是 §4.4c 半开试探（且 Route 即闸持有者）。
@@ -87,6 +89,8 @@ func closeSampleTrail(trail []*liveAttempt) {
 
 // liveAttempt 是一次已发出、**尚未提交**的尝试，连同它的出站产物。
 type liveAttempt struct {
+	metadata    model.AttemptMetadata
+	trace       *outbound.AttemptTrace
 	cand        *router.Candidate
 	at          *Attempt
 	tee         *sample.HeadTail
@@ -330,12 +334,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 				// fail_closed response transform before any client byte.
 				if oc.res != nil && oc.res.Err != nil && !oc.res.HeadersSent &&
 					la.compiled != nil && !isForwardError(oc.res.Err) {
-					writeAPIError(w, http.StatusBadGateway, proto, "api_error", "响应转换失败（fail_closed）")
-					finishObserver(la, health.AttemptFinish{})
-					la.cand.Release()
-					held = nil
-					closeSampleTrail(oc.trail)
-					return nil, false
+					oc.localResponseError = true
 				}
 			} else {
 				la.at.Discard()
@@ -353,6 +352,7 @@ func (h *Handler) forwardWithRetry(w http.ResponseWriter, r *http.Request,
 			// 猜的值 —— 而列表页正是靠它显示「这次试了 3 个站」。
 			for _, l := range oc.logs {
 				l.Attempts = attempt
+				l.Metadata.Attempts = attempt
 			}
 			return oc, true
 		}
@@ -465,9 +465,15 @@ func (h *Handler) dispatch(r *http.Request,
 		return nil, dispatchFatal
 	}
 	instr := health.NoopInstrumentation()
+	executionID := sample.NewReqID()
+	observeCtx := r.Context()
+	if pre.published != nil {
+		observeCtx = livecfg.WithCapturedProbeSnapshot(observeCtx, pre.published.Probe)
+	}
 	if h.observers != nil {
-		instr = prepareInstrumentation(h.observers, r.Context(), health.AttemptTarget{
-			ReqID: reqID, Attempt: attempt,
+		instr = prepareInstrumentation(h.observers, observeCtx, health.AttemptTarget{
+			ExecutionID: executionID,
+			ReqID:       reqID, Attempt: attempt,
 			Protocol: proto, Endpoint: kind, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, HealthGeneration: cand.HealthGeneration,
 			Config: health.AttemptConfigFacts{
 				Generation:                 pre.snapshot.Generation,
@@ -487,7 +493,7 @@ func (h *Handler) dispatch(r *http.Request,
 			})
 		}
 	}()
-	target, err := h.resolveTarget(r, cand, kind)
+	target, err := h.resolveTarget(r, pre, cand, kind)
 	if err != nil {
 		if (errors.Is(err, outbound.ErrUpstreamAPIKeyEmpty) || errors.Is(err, outbound.ErrURLConfig)) &&
 			r.Context().Err() == nil {
@@ -523,6 +529,7 @@ func (h *Handler) dispatch(r *http.Request,
 	}
 	outHeader, outBody := prepared.header, prepared.body
 	compiled, verID, redactKeys := prepared.compiled, prepared.version, prepared.keys
+	configFacts.RequestTransformRevision = pre.transforms.BindingRevision(cand.Route.ID, target.EndpointID)
 
 	realBudget := outbound.RealBudget(settings).CapTotal(budget)
 	tr, err := h.transports.Transport(outbound.NetworkFor(cand.Upstream.ProbeConfig(), realBudget.Connect))
@@ -542,7 +549,8 @@ func (h *Handler) dispatch(r *http.Request,
 		to = to.WithAggressivePeek(time.Duration(settings.RealFirstByteSec) * time.Second)
 	}
 	fwd := &Forwarder{Transport: tr, Timeouts: to, Protocol: proto,
-		RequestHost: target.RequestHost, RedactSecrets: redactKeys}
+		CaptureMetadata: h.samples != nil && settings.SampleEnabled,
+		RequestHost:     target.RequestHost, RedactSecrets: redactKeys}
 
 	// 每次尝试各用一个新 tee。共用一个的话，被丢弃的那次尝试的响应字节会
 	// 混进最终样本的 resp_body —— 样本就变成了两个站的响应拼起来的东西。
@@ -585,10 +593,12 @@ func (h *Handler) dispatch(r *http.Request,
 		beforeSend()
 	}
 	sendCtx := r.Context()
-	if instr.Trace != nil {
-		sendCtx = outbound.WithAttemptTrace(sendCtx, instr.Trace)
-		instr.Trace.MarkSent(time.Now())
+	trace := instr.Trace
+	if trace == nil {
+		trace = &outbound.AttemptTrace{}
 	}
+	sendCtx = outbound.WithAttemptTrace(sendCtx, trace)
+	trace.MarkSent(time.Now())
 	at := fwd.Send(sendCtx, r.Method, target.RawURL, outHeader, outBody)
 	if instr.Observer != nil && at.Result() != nil && at.Result().Status > 0 {
 		instr.Observer.TryHeaders(at.Result().Status, at.Result().RespHeaders, time.Now())
@@ -596,6 +606,7 @@ func (h *Handler) dispatch(r *http.Request,
 	handedOff = true
 
 	return &liveAttempt{
+		metadata: preparedAttemptMetadata(pre, cand, target, prepared, executionID, instr.ObservationPrepared), trace: trace,
 		cand: cand, at: at, tee: tee,
 		keys: redactKeys,
 		body: outBody, header: outHeader, url: target.RawURL,
@@ -842,7 +853,8 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 	}
 
 	l := &model.RequestLog{
-		ReqID: reqID, Attempt: attempt,
+		Metadata: la.metadata,
+		ReqID:    reqID, Attempt: attempt,
 		TSRecv:      recvAt.UnixMilli(),
 		TSSent:      msOrZero(res.SentAt),
 		TSFirstByte: msOrZero(res.FirstByteAt),
@@ -878,6 +890,23 @@ func (h *Handler) attemptLog(la *liveAttempt, pre *preambleResult,
 		// 而错误文本里可能带出站 URL —— FixedQueryTemplate / legacy_exact
 		// 可能把 key 放在 query 里（§7.1）。
 		l.Error = sample.RedactDiagnosticText(res.Err.Error(), la.keys)
+	}
+	l.Metadata.Attempt = attempt
+	l.Metadata.Retried, l.Metadata.HalfOpen, l.Metadata.DuplicateRisk = l.Retried, l.HalfOpen, l.DuplicateRisk
+	l.Metadata.RetryReason = l.RetryReason
+	l.Metadata.ResponseHeaderAtMS = msOrZero(res.ResponseHeaderAt)
+	l.Metadata.FirstEventAtMS = msOrZero(res.FirstEventAt)
+	l.Metadata.FirstSemanticAtMS = msOrZero(res.FirstSemanticAt)
+	l.Metadata.SyntheticCompletion = res.SyntheticCompletion
+	l.Metadata.RequestWriteState = attemptRequestWriteState(la)
+	l.Metadata.DescribeResponseView()
+	if diff := res.responseDiff; diff.reason != "" {
+		if diff.reason == "recorded" && res.Err != nil {
+			diff = bodyDiffFacts{reason: "incomplete"}
+		}
+		l.Metadata.ResponseInputHash, l.Metadata.ResponseOutputHash = diff.inputHash, diff.outputHash
+		l.Metadata.ResponseBodyChanged, l.Metadata.ResponseHeadersChanged = diff.bodyChanged, diff.headersChanged
+		l.Metadata.ResponseDiffReason = diff.reason
 	}
 	return l
 }
