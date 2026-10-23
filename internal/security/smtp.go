@@ -281,26 +281,37 @@ func (m *AlertMailer) MaybeNotify(f Finding, adminURL string) error {
 	}
 	m.mu.Lock()
 	now := m.now()
-	err := m.flushDigestIfDueLocked(now)
+	flushErr := m.flushDigestIfDueLocked(now)
 	cfg := m.cfg
 	m.mu.Unlock()
+	if !mailEnabled(cfg) || !severityAtLeast(f.Severity, cfg.MinSeverity) {
+		return flushErr
+	}
+	ignored, err := m.ignored(f, now)
+	key := findingKey(f)
+	if err != nil {
+		// A transient policy failure cannot discard this newly discovered identity.
+		// Reuse the same bounded pending map; the eventual flush rechecks SQLite.
+		_ = m.queueDigest(f, adminURL, key)
+		return err
+	}
+	if ignored {
+		return flushErr
+	}
+	if f.Severity == SeverityCritical {
+		err = m.notifyImmediate(cfg, f, adminURL, key)
+	} else {
+		err = m.queueDigest(f, adminURL, key)
+	}
 	if err != nil {
 		return err
 	}
-	if !mailEnabled(cfg) || !severityAtLeast(f.Severity, cfg.MinSeverity) {
-		return nil
-	}
-	ignored, err := m.ignored(f, now)
-	if err != nil || ignored {
-		return err
-	}
-	key := findingKey(f)
-	if f.Severity == SeverityCritical {
-		return m.notifyImmediate(cfg, f, adminURL, key)
-	}
+	return flushErr
+}
+func (m *AlertMailer) queueDigest(f Finding, adminURL, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now = m.now()
+	now := m.now()
 	if !m.admitLocked(key, now) {
 		return errAlertCapacity
 	}
@@ -382,11 +393,13 @@ func (m *AlertMailer) flushDigestLocked(now time.Time) error {
 	cfg := m.cfg
 	captured := make(map[string]digestItem, len(m.pending))
 	keys := make([]string, 0, len(m.pending))
+	covered := map[string]bool{}
 	for k, v := range m.pending {
 		if m.inFlight[k] {
 			continue
 		}
 		m.inFlight[k] = true
+		covered[k] = !m.lastAt[k].IsZero() && now.Sub(m.lastAt[k]) < time.Duration(cfg.RateLimitWindowSec)*time.Second
 		captured[k] = v
 		keys = append(keys, k)
 	}
@@ -399,10 +412,13 @@ func (m *AlertMailer) flushDigestLocked(now time.Time) error {
 	sort.Strings(keys)
 	m.mu.Unlock()
 	items := make([]digestItem, 0, len(keys))
-	ignoredKeys := map[string]bool{}
+	ignoredKeys := covered
 	var err error
 	if mailEnabled(cfg) {
 		for _, k := range keys {
+			if covered[k] {
+				continue
+			}
 			ignored, policyErr := m.ignored(captured[k].finding, now)
 			if policyErr != nil {
 				err = policyErr

@@ -186,3 +186,59 @@ func TestAlertDigestAndImmediateShareOneInflightIdentity(t *testing.T) {
 		t.Fatalf("same in-flight identity delivered twice: %d", deliveries)
 	}
 }
+
+func TestAlertPolicyFailureKeepsNewFindingForLaterDelivery(t *testing.T) {
+	now := time.Unix(100, 0)
+	failed := true
+	deliveries := 0
+	m := NewAlertMailer().WithNowForTest(func() time.Time { return now }).WithSendForTest(func(string, smtp.Auth, string, []string, []byte) error { deliveries++; return nil })
+	m.SetConfig(smtpPolicyFixture(t))
+	m.SetIgnorePolicy(func(Finding, int64) (bool, error) {
+		if failed {
+			return false, errors.New("policy failed")
+		}
+		return false, nil
+	})
+	if err := m.MaybeNotify(Finding{Severity: SeverityCritical, RuleID: "custom:a", UpstreamID: 1, RouteID: 1}, ""); err == nil {
+		t.Fatal("missing policy failure")
+	}
+	if len(m.pending) != 1 {
+		t.Fatal("transient policy failure permanently lost a new finding")
+	}
+	failed = false
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 || len(m.pending) != 0 {
+		t.Fatal("retained finding not delivered after policy recovered")
+	}
+}
+func TestAlertOldDigestFailureStillAdmitsNewFinding(t *testing.T) {
+	now := time.Unix(100, 0)
+	m := NewAlertMailer().WithNowForTest(func() time.Time { return now }).WithSendForTest(func(string, smtp.Auth, string, []string, []byte) error { return errors.New("transport failed") })
+	m.SetConfig(smtpPolicyFixture(t))
+	m.MaybeNotify(Finding{Severity: SeverityMedium, Category: "first"}, "")
+	now = now.Add(7 * time.Second)
+	if err := m.MaybeNotify(Finding{Severity: SeverityMedium, Category: "second"}, ""); err == nil {
+		t.Fatal("missing old delivery failure")
+	}
+	if len(m.pending) != 2 {
+		t.Fatal("old digest failure lost new finding")
+	}
+}
+func TestAlertCriticalSuccessCoversAlreadyPendingSameIdentity(t *testing.T) {
+	now := time.Unix(100, 0)
+	deliveries := 0
+	m := NewAlertMailer().WithNowForTest(func() time.Time { return now }).WithSendForTest(func(string, smtp.Auth, string, []string, []byte) error { deliveries++; return nil })
+	m.SetConfig(smtpPolicyFixture(t))
+	f := Finding{Severity: SeverityMedium, RuleID: "custom:a", UpstreamID: 1, RouteID: 1}
+	m.MaybeNotify(f, "")
+	f.Severity = SeverityCritical
+	m.MaybeNotify(f, "")
+	if err := m.FlushDigest(); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("successful critical repeated in same-identity digest: %d", deliveries)
+	}
+}
