@@ -1,0 +1,12 @@
+{
+  "scope": "real Nginx and local CA; not public ACME",
+  "source_revision": "d90ed2590a01be207282b063093abedb1d9d19f7",
+  "workflow": "https://github.com/279814/relay-gate/actions/runs/39952000502",
+  "image_id": "sha256:5a60efc4febe135507d84f5e5e8fd5b6ec9bbc7ed7f939832f5d33d84c7b4f2b",
+  "requested_seconds": 2105,
+  "elapsed_seconds": 2105.006351037,
+  "heartbeats": 421,
+  "exact_wire": true,
+  "long_duration_gate": true,
+  "conclusion": "success"
+}

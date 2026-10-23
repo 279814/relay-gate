@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "mode": "soak",
+  "source_revision": "d90ed2590a01be207282b063093abedb1d9d19f7",
+  "binary_sha256": "84fea46fb75d9836edbfaeccf26ba084c1ab7d790df68ece145f7b64efa1ca6f",
+  "requested_seconds": 172800.0,
+  "elapsed_seconds": 4519.531,
+  "requests": 8878,
+  "errors": 0,
+  "status": "interrupted",
+  "duration_gate_passed": false,
+  "source_reported_status": "running",
+  "source_report_sha256": "7c070a5eef7235aa1cd1911fc970d29ff45121966ef621cd25be0ca8ce06accc",
+  "source_report_last_modified_utc": "2026-10-23T13:26:15.699236+00:00",
+  "inspected_at_utc": "2026-10-23T13:49:15.990579+00:00",
+  "inspection": {
+    "driver_process_present": false,
+    "gateway_process_present": false,
+    "host_boot_utc": "2026-10-23T13:37:03.5000000Z",
+    "host_reboot_after_last_report": true,
+    "terminal_report_present": false
+  },
+  "sample_count": 76,
+  "scope": "loopback fixture; partial observations only; no completed 48-hour duration or resource gate"
+}

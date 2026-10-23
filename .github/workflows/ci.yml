@@ -173,6 +173,14 @@ jobs:
         run: |
           go build -o "$RUNNER_TEMP/relay-runtime-check.exe" ./cmd/relay-gate
           python scripts/verify-runtime.py --binary "$RUNNER_TEMP/relay-runtime-check.exe"
+      - name: Process resource counter contracts
+        run: python scripts/verify-duration.contract.test.py
+      - name: Linux proc sampler with a real process (short contract only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python scripts/verify-duration.py --binary "$RUNNER_TEMP/relay-runtime-check.exe" \
+            --mode soak --seconds 3 --source-revision dev --report "$RUNNER_TEMP/duration-short.json"
 
   fuzz:
     runs-on: ubuntu-latest

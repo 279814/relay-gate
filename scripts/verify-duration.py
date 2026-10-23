@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run actual-duration loopback acceptance; short runs never count as long/soak.
 
-Requires PowerShell 7 for process resource samples. Reports contain no credentials.
+Uses Linux /proc or PowerShell 7 for process samples. Reports contain no credentials.
 Examples:
   python scripts/verify-duration.py --binary /abs/relay-gate --mode long --seconds 2105 --report /abs/long.json
   python scripts/verify-duration.py --binary /abs/relay-gate --mode soak --seconds 172800 --report /abs/soak.json
@@ -14,9 +14,11 @@ import http.server
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -50,7 +52,39 @@ class LongUpstream(runtime_verify.MockUpstream):
         self.wfile.flush()
 
 
+def sample_linux_process(pid, started, proc_root=pathlib.Path('/proc')):
+    process = proc_root / str(pid)
+
+    def stat_fields():
+        # comm can contain spaces and parentheses; fields start after its final ).
+        return (process / 'stat').read_text().rpartition(')')[2].split()
+
+    before = stat_fields()
+    status = dict(line.split(':', 1) for line in (process / 'status').read_text().splitlines() if ':' in line)
+    rss = status['VmRSS'].split()
+    if len(rss) != 2 or rss[1] != 'kB':
+        raise ValueError('unsupported Linux RSS unit')
+    private = 0
+    for line in (process / 'smaps').read_text().splitlines():
+        if line.startswith(('Private_Clean:', 'Private_Dirty:')):
+            parts = line.split()
+            if len(parts) != 3 or parts[2] != 'kB':
+                raise ValueError('unsupported Linux private-memory unit')
+            private += int(parts[1]) * 1024
+    descriptors = len(list((process / 'fd').iterdir()))
+    after = stat_fields()
+    if before[19] != after[19]:
+        raise RuntimeError('resource sample crossed a process generation')
+    return {'rss_bytes': int(rss[0]) * 1024, 'private_bytes': private,
+            'private_bytes_kind': 'private_resident', 'handles': descriptors,
+            'handle_kind': 'file_descriptors', 'threads': int(status['Threads']),
+            'cpu_seconds': (int(after[11]) + int(after[12])) / os.sysconf('SC_CLK_TCK'),
+            'elapsed_seconds': round(time.monotonic() - started, 3), 'pid': pid}
+
+
 def sample_process(pwsh, pid, started):
+    if sys.platform == 'linux':
+        return sample_linux_process(pid, started)
     command = f"$taskProcess = Get-Process -Id {pid}; [pscustomobject]@{{rss_bytes=$taskProcess.WorkingSet64;private_bytes=$taskProcess.PrivateMemorySize64;handles=$taskProcess.HandleCount;threads=$taskProcess.Threads.Count;cpu_seconds=$taskProcess.CPU}} | ConvertTo-Json -Compress"
     raw = subprocess.check_output([pwsh, "-NoProfile", "-NonInteractive", "-Command", command], text=True, timeout=10)
     sample = json.loads(raw)
@@ -72,9 +106,10 @@ def resource_bounds(samples, minimum_window):
 
 def run(args):
     pwsh = shutil.which("pwsh")
-    if not pwsh:
+    if sys.platform != 'linux' and not pwsh:
         raise RuntimeError("PowerShell 7 is required for resource sampling")
     report = {"format_version": 1, "mode": args.mode, "requested_seconds": args.seconds, "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(), "source_revision": args.source_revision, "status": "running", "samples": [], "requests": 0, "errors": 0, "upstream": "loopback fixture only", "duration_gate_passed": False}
+    report['resource_sampler'] = 'linux_proc' if sys.platform == 'linux' else 'powershell'
     args.report.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
