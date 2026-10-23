@@ -28,6 +28,35 @@ func TestRunMain_DispatchesProbeBeforeServer(t *testing.T) {
 	}
 }
 
+func TestRunMainRejectsUnknownArgumentsBeforeServer(t *testing.T) {
+	for _, argument := range []string{"probe-matric", "--unknown=SYNTHETIC_ARGUMENT_DO_NOT_ECHO", "unknown"} {
+		t.Run(argument, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "must-remain-absent")
+			t.Setenv("RELAY_DB", filepath.Join(dataDir, "relay.db"))
+			t.Setenv("ADMIN_PASSWORD", "synthetic-admin-for-dispatch")
+			t.Setenv("RELAY_KEYS", "synthetic-relay-for-dispatch")
+			t.Setenv("ENCRYPTION_KEY", "synthetic-master-for-dispatch")
+			// Bound the old fall-through without starting a real listener.
+			t.Setenv("RELAY_ADDR", "invalid-listen-address")
+			t.Setenv("RELAY_TRUSTED_PROXY_IPS", "not-an-ip")
+			t.Setenv("RELAY_PUBLIC_ORIGIN", "")
+			t.Setenv("RELAY_PUBLIC_HTTPS_STATUS_FILE", "")
+			var stdout, stderr bytes.Buffer
+			code := runMain([]string{"relay-gate", argument, "--output", filepath.Join(dataDir, "report.json")},
+				strings.NewReader("SYNTHETIC_STDIN_DO_NOT_READ"), &stdout, &stderr)
+			if code != exitUsage {
+				t.Errorf("exit code = %d, want %d", code, exitUsage)
+			}
+			if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+				t.Error("unknown arguments entered server startup and created the data directory")
+			}
+			if stdout.Len() != 0 || strings.Contains(stderr.String(), "SYNTHETIC_") || strings.Contains(stderr.String(), dataDir) {
+				t.Error("usage handling exposed arguments, stdin, or an input path")
+			}
+		})
+	}
+}
+
 func TestProbeCLI_RequiresOnlineAndCost(t *testing.T) {
 	trips := 0
 	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
