@@ -5,6 +5,7 @@ import (
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/outbound"
 	"github.com/279814/relay-gate/internal/router"
+	"github.com/279814/relay-gate/internal/sample"
 	"github.com/279814/relay-gate/internal/transform"
 )
 
@@ -43,24 +44,14 @@ func preparedAttemptMetadata(pre *preambleResult, cand *router.Candidate, target
 	return m
 }
 func safeAttemptBodyHashes(before, after []byte, keys []string, tainted bool) (string, string, string) {
-	if tainted {
+	if tainted || containsAttemptSecret(before, keys) || containsAttemptSecret(after, keys) {
 		return "", "", "secret_taint"
-	}
-	for _, key := range keys {
-		if key != "" && (bytes.Contains(before, []byte(key)) || bytes.Contains(after, []byte(key))) {
-			return "", "", "secret_taint"
-		}
 	}
 	return transform.HashBytes(before), transform.HashBytes(after), "recorded"
 }
 
 func containsAttemptSecret(body []byte, keys []string) bool {
-	for _, key := range keys {
-		if key != "" && bytes.Contains(body, []byte(key)) {
-			return true
-		}
-	}
-	return false
+	return !bytes.Equal(sample.RedactBodyKeys(body, keys), body)
 }
 
 func safeAttemptBodyHash(body []byte, keys []string) string {

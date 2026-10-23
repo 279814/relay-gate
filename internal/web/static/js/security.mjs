@@ -53,6 +53,7 @@ export function createSecurityFeature(shell, api) {
     const state = this.security;
     if (state.smtpSaving || state.smtpLoading || (state.smtp && !force)) return;
     state.smtpLoading = true;
+    if (force) { this.err = ''; this.msg = ''; }
     try {
       const smtp = await api.get('/security/smtp');
       if (this.security !== state) return;
@@ -70,6 +71,8 @@ export function createSecurityFeature(shell, api) {
   shell.saveSMTP = async function saveSMTP() {
     const state = this.security;
     if (state.smtpSaving || state.smtpLoading || state.smtpConflict) return;
+    this.err = '';
+    this.msg = '';
     const config = state.smtp;
     const modeCount = Number(config?.use_starttls === true) + Number(config?.use_smtps === true);
     if (!config || modeCount > 1 || (config.enabled === true && modeCount !== 1)) {
