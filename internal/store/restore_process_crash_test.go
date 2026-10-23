@@ -31,6 +31,9 @@ func TestRestoreProcessCrashKeepsDatabaseAndSecretGenerationPaired(t *testing.T)
 			if err := ResumePendingRestore(path); err != nil {
 				t.Fatal(err)
 			}
+			if err := ResumePendingRestore(path); err != nil {
+				t.Fatalf("paired restore resume is not idempotent: %v", err)
+			}
 			got, err := os.ReadFile(secret)
 			if err != nil || !bytes.Equal(got, credentials) {
 				t.Fatalf("mixed credential generation: %v", err)
