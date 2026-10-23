@@ -85,3 +85,24 @@ func TestSecurityRawEvidenceRequiresTrustedUniqueCompleteRelationAndCookieReauth
 		t.Fatalf("audit failure released raw=%d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestSecurityEvidenceEncodedIDCannotBypassFirstByteAudit(t *testing.T) {
+	s, h := newTestServer(t)
+	securityRawFixture(t, s, "escaped-exact")
+	f := security.Finding{ID: "legacy/encoded-finding", Source: "passive", ReqID: "escaped-exact", RouteID: 7, UpstreamID: 42, ScannerVersion: security.ScannerVersion, RuleVersion: security.RuleVersion, BytesScanned: 25}
+	if err := s.st.InsertSecurityFinding(f); err != nil {
+		t.Fatal(err)
+	}
+	session := loginSession(t, h)
+	if _, err := s.st.DB().Exec(`CREATE TRIGGER block_encoded_raw_audit BEFORE UPDATE ON audit_event WHEN OLD.action='security_evidence_view' BEGIN SELECT RAISE(ABORT,'audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "/admin/api/security/findings/legacy%2Fencoded-finding/evidence", strings.NewReader(`{"password":"`+testAdminPW+`"}`))
+	request.AddCookie(session)
+	request.Header.Set("Origin", "http://example.com")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != 503 || strings.Contains(response.Body.String(), `"body"`) {
+		t.Fatalf("encoded finding ID bypassed durable first-byte gate: %d %s", response.Code, response.Body.String())
+	}
+}

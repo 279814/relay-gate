@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -266,10 +267,24 @@ func (w *auditResponseWriter) auditPayload(payload any) {
 // Match only fixed management routes. Raw path text, query values and bodies
 // never become action codes, resource types, actor identity or audit details.
 func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRead bool) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/"), "/")
-	if len(parts) == 0 {
+	// ServeMux unescapes each segment independently. Split before unescaping
+	// so an encoded slash inside a string ID cannot change route structure and
+	// bypass the audit action (or the sensitive first-byte completion gate).
+	parts := strings.Split(strings.TrimPrefix(r.URL.EscapedPath(), "/"), "/")
+	if len(parts) < 3 {
 		return
 	}
+	for i, part := range parts {
+		decoded, err := url.PathUnescape(part)
+		if err != nil {
+			return
+		}
+		parts[i] = decoded
+	}
+	if parts[0] != "admin" || parts[1] != "api" {
+		return
+	}
+	parts = parts[2:]
 	if len(parts) > 1 {
 		if id, err := strconv.ParseInt(parts[1], 10, 64); err == nil && id > 0 {
 			resourceID = strconv.FormatInt(id, 10)
