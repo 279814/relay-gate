@@ -35,6 +35,9 @@ func (store *Store) InsertProbeExecution(ctx context.Context, execution *model.P
 		if existing != copyValue.EvidenceHash {
 			return ErrIdempotencyConflict
 		}
+		if err := verifyCanaryReplayTx(ctx, tx, copyValue); err != nil {
+			return err
+		}
 		if _, err := recordStoredExecutionCostTx(ctx, tx, copyValue.ID); err != nil {
 			return err
 		}
@@ -57,6 +60,9 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 		return result, model.WrapValidation("observation/reducer 不能为空")
 	}
 	execution := value.Execution
+	if execution.Canary != nil && (value.ReachabilityExpectation != nil || value.CapabilityExpectation != nil) {
+		return result, model.WrapValidation("Canary 不能携带普通 Probe 健康写入期望")
+	}
 	if err := validateProbeExecutionEnvelope(execution); err != nil {
 		return result, err
 	}
@@ -74,6 +80,9 @@ func (store *Store) CommitProbeObservation(ctx context.Context, value *model.Pro
 	if existingErr == nil {
 		if existingEvidence != execution.EvidenceHash {
 			return result, ErrIdempotencyConflict
+		}
+		if err := verifyCanaryReplayTx(ctx, tx, execution); err != nil {
+			return result, err
 		}
 		result, err = loadStoredApplyResult(ctx, tx, execution)
 		if err != nil {
@@ -813,6 +822,9 @@ func insertProbeExecutionTx(ctx context.Context, tx *sql.Tx, execution *model.Pr
 		}
 		return err
 	}
+	if err := insertCanaryExecutionTx(ctx, tx, execution); err != nil {
+		return err
+	}
 	return recordAttemptObservationTx(ctx, tx, execution)
 }
 
@@ -820,17 +832,33 @@ func recordExecutionCostTx(ctx context.Context, tx *sql.Tx, execution model.Prob
 	if execution.Trigger == model.TriggerRealTraffic {
 		return false, nil
 	}
+	canary, err := loadCanaryExecution(ctx, tx, execution.ID)
+	if err != nil {
+		return false, err
+	}
+	if canary != nil && execution.SentAtMS <= 0 {
+		return false, nil
+	}
 	evidence, err := revisioncodec.CostEvidenceFromExecution(execution)
 	if err != nil {
 		return false, err
 	}
-	return recordProbeCostEvidenceTx(ctx, tx, "execution:"+execution.ID, evidence)
+	return recordCostEvidenceTx(ctx, tx, "execution:"+execution.ID, evidence, canary)
 }
 
 func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, evidence model.ProbeCostEvidenceV1) (bool, error) {
+	return recordCostEvidenceTx(ctx, tx, eventID, evidence, nil)
+}
+
+func recordCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, evidence model.ProbeCostEvidenceV1, canary *model.CanaryExecution) (bool, error) {
 	hash, err := revisioncodec.NewProbeCostEvidenceHash(evidence)
 	if err != nil {
 		return false, err
+	}
+	source, version := "", 1
+	if canary != nil {
+		source, version = string(canary.Source), 2
+		hash = canaryCostHash(hash, canary)
 	}
 	var closedThrough string
 	if err := tx.QueryRowContext(ctx, `SELECT closed_through_day_utc FROM probe_cost_retention_watermark WHERE singleton=1`).Scan(&closedThrough); err != nil {
@@ -840,8 +868,8 @@ func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, 
 		return false, nil
 	}
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO probe_cost_event
-		(event_id,day_utc,event_kind,evidence_version,cost_evidence_hash) VALUES (?,?,?,1,?)`,
-		eventID, evidence.DayUTC, evidence.Kind, hash)
+		(event_id,day_utc,event_kind,evidence_version,cost_evidence_hash,canary_source) VALUES (?,?,?,?,?,?)`,
+		eventID, evidence.DayUTC, evidence.Kind, version, hash, source)
 	if err != nil {
 		return false, err
 	}
@@ -850,14 +878,20 @@ func recordProbeCostEvidenceTx(ctx context.Context, tx *sql.Tx, eventID string, 
 		return false, err
 	}
 	if inserted == 0 {
-		var storedDay, storedKind, storedHash string
+		var storedDay, storedKind, storedHash, storedSource string
 		var storedVersion int
-		if err := tx.QueryRowContext(ctx, `SELECT day_utc,event_kind,evidence_version,cost_evidence_hash
-			FROM probe_cost_event WHERE event_id=?`, eventID).Scan(&storedDay, &storedKind, &storedVersion, &storedHash); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT day_utc,event_kind,evidence_version,cost_evidence_hash,canary_source
+			FROM probe_cost_event WHERE event_id=?`, eventID).Scan(&storedDay, &storedKind, &storedVersion, &storedHash, &storedSource); err != nil {
 			return false, err
 		}
-		if storedDay != evidence.DayUTC || storedKind != string(evidence.Kind) || storedVersion != 1 || storedHash != hash {
+		if storedDay != evidence.DayUTC || storedKind != string(evidence.Kind) || storedVersion != version || storedHash != hash || storedSource != source {
 			return false, ErrIdempotencyConflict
+		}
+		return true, nil
+	}
+	if canary != nil {
+		if err := rollupCanaryCostTx(ctx, tx, evidence, canary); err != nil {
+			return false, err
 		}
 		return true, nil
 	}

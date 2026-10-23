@@ -90,6 +90,14 @@ func NewProbeEvidenceHash(observation model.ProbeObservation) (string, error) {
 	encoder.optionalSemanticExpectation(observation.CapabilityExpectation)
 	encoder.optionalReachabilityPolicy(observation.ReachabilityPolicy)
 	encoder.optionalCapabilityPolicy(observation.CapabilityPolicy)
+	if execution.Canary != nil {
+		hash, err := NewCanaryEvidenceHash(*execution.Canary)
+		if err != nil {
+			return "", err
+		}
+		encoder.string("canary/v1")
+		encoder.string(hash)
+	}
 	return encoder.digest(), nil
 }
 
