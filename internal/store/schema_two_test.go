@@ -172,21 +172,48 @@ func TestOpenUsesVersionedRunnerAndKeepsLifecycleLock(t *testing.T) {
 }
 
 func TestKnownLegacyVariantsReachCurrentSchema(t *testing.T) {
-	for _, variant := range []legacySchemaVariant{
-		legacySchemaM2,
-		legacySchemaM6PreColumn,
-		legacySchemaM6PreIndex,
-		legacySchemaM6Current,
+	for _, tc := range []struct {
+		name    string
+		variant legacySchemaVariant
+		fresh   bool
+	}{
+		{string(legacySchemaM2), legacySchemaM2, false},
+		{string(legacySchemaM6PreColumn), legacySchemaM6PreColumn, false},
+		{string(legacySchemaM6PreIndex), legacySchemaM6PreIndex, false},
+		{string(legacySchemaM6Current), legacySchemaM6Current, false},
+		{"m6_preindex_fresh", legacySchemaM6PreIndex, true},
+		{"m6_current_fresh", legacySchemaM6Current, true},
 	} {
-		t.Run(string(variant), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "legacy.db")
 			legacy := openDatabaseAtPath(t, path)
-			loadLegacyVariantFixture(t, legacy, variant)
-			if err := legacy.Close(); err != nil {
-				t.Fatal(err)
+			if tc.fresh {
+				loadLegacySchema(t, legacy)
+				if tc.variant == legacySchemaM6Current {
+					if _, err := legacy.Exec(`CREATE INDEX idx_sample_req ON sample (req_id)`); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				loadLegacyVariantFixture(t, legacy, tc.variant)
 			}
 			cipher, err := NewCipher("test-passphrase-at-least-16-chars")
 			if err != nil {
+				t.Fatal(err)
+			}
+			encrypted, err := cipher.Encrypt("synthetic-legacy-migration-value")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := legacy.Exec(`INSERT INTO upstream (id,name,base_url,api_key_enc,created_at,updated_at)
+				VALUES (7,'synthetic-legacy','https://legacy.invalid',?,1,1)`, encrypted); err != nil {
+				t.Fatal(err)
+			}
+			before, err := inspectSchemaState(context.Background(), legacy)
+			if err != nil || before.Variant != tc.variant {
+				t.Fatalf("source state = %+v, err = %v", before, err)
+			}
+			if err := legacy.Close(); err != nil {
 				t.Fatal(err)
 			}
 			st, err := Open(path, cipher)
@@ -201,12 +228,41 @@ func TestKnownLegacyVariantsReachCurrentSchema(t *testing.T) {
 			if state.Version != developmentSchemaVersion {
 				t.Fatalf("state = %+v", state)
 			}
+			var stored string
+			if err := st.db.QueryRow(`SELECT api_key_enc FROM upstream WHERE id=7`).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored != encrypted {
+				t.Fatal("migration changed the legacy encrypted credential")
+			}
 			manifests, err := filepath.Glob(filepath.Join(filepath.Dir(path), "backups", "schema-*-to-*", "manifest.json"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(manifests) != developmentSchemaVersion {
 				t.Fatalf("backup manifests = %d, want one per boundary through schema %d", len(manifests), developmentSchemaVersion)
+			}
+			seenBoundaries := make(map[int]bool)
+			for _, path := range manifests {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var manifest BackupManifest
+				if err := json.Unmarshal(data, &manifest); err != nil {
+					t.Fatal(err)
+				}
+				if manifest.SourceSchema < 0 || manifest.SourceSchema >= developmentSchemaVersion ||
+					manifest.TargetSchema != manifest.SourceSchema+1 || seenBoundaries[manifest.SourceSchema] {
+					t.Fatalf("backup chain has an invalid or repeated boundary: %+v", manifest)
+				}
+				seenBoundaries[manifest.SourceSchema] = true
+				if manifest.SourceSchema == 0 && (manifest.SourceFingerprint != before.Fingerprint || manifest.SourceVariant != string(tc.variant)) {
+					t.Fatalf("source backup identifies the wrong lineage: %+v", manifest)
+				}
+				if tc.fresh && manifest.SourceSchema == 1 && manifest.SourceFingerprint != schemaV1FreshFingerprint {
+					t.Fatalf("fresh legacy normalization did not reach the frozen canonical schema 1: %+v", manifest)
+				}
 			}
 		})
 	}
