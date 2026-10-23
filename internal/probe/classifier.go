@@ -118,6 +118,9 @@ type ResponseClassifier struct {
 	firstErrorAfter bool
 
 	decision *Decision
+	// Strict Canary consumes the whole bounded response before concluding; a
+	// protocol-end prefix must not hide extra output or a later read failure.
+	waitForEOF bool
 }
 
 // NewResponseClassifier 按已收到的响应头构造分类器。
@@ -190,7 +193,7 @@ func (classifier *ResponseClassifier) Observe(event ProtocolEvent) (Decision, bo
 	// 后果是 §5.2d 的成本核算长期少算 —— 一个会骗人的计数器比没有更糟。
 	classifier.addTokens(event)
 
-	if classifier.readyToFinish() {
+	if !classifier.waitForEOF && classifier.readyToFinish() {
 		decision := classifier.conclude(nil, nil)
 		return decision, true
 	}

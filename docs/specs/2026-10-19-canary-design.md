@@ -33,3 +33,7 @@ schema 14 严格 inspector 移除精确的三张表/索引和追加列后必须�
 
 迁移检查点已实测：原 schema13→期望14 失败后变绿；SQLite 的 TEXT PRIMARY KEY 允许 NULL 导致未关联执行的回归再次真实失败，补显式 NOT NULL 后变绿。Canary 迁移/约束/严格 catalog/rotation restore 五个测试入口（含多个变体）通过；历史 schema/reader/SMTP/metadata 门禁、build/vet 与真实 binary runtime 验证通过。历史13的 rotation 测试固定使用13 fixture，仍精确断言原 reader 合同。
 
+2026-10-23 收口：周期策略 API、Scheduler 装配、默认关闭与 Active/Lazy/暂停门禁、发送前策略 CAS 复查已贯通。UI 明确提示会发一次模型请求，保留真实 execution_id/期待/结论，冲突保留草稿并要求显式重载，迟到响应不能覆盖新目标或新登录。统计复用现有同事务计数/keyset 的 `basis=canary`，来源只取持久事实，排除普通 Recipe 分母，零值与 unknown presence 分开。
+
+真实 loopback 红测发现正常结束事件前缀后仍可能追加输出：现仅 Canary 延迟统一 Classifier 定稿到响应 EOF，仍受原总时长、idle、事件和总字节限制；普通 Probe 首语义立即取消不变。三协议正数 usage 测试又复现 Messages/Responses 非流式 output usage 漏计，补在同一 Decoder 原生协议映射中，避免把已观测成本写为 0。全仓 Go、build/vet、82 项 Node、1198 个绑定与隔离二进制 runtime 已通过；真实浏览器已验证 Lazy 手动、匹配结果、周期默认关和独立成本页面。无真实模型、SMTP 邮件或公网请求，Linux race 与最终发布树仍以 CI 和最终组合验收为准。
+

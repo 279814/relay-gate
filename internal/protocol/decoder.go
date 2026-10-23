@@ -882,6 +882,10 @@ func classifyAnthropic(event *ProtocolEvent, name string, object map[string]json
 	// 非流式 message 正文：text 在 content 块数组里，不是字符串字段。
 	// 所有流量共用 semanticevidence.AnthropicContentSemantic。
 	if name == "message" || name == "" {
+		var usage map[string]json.RawMessage
+		if json.Unmarshal(object["usage"], &usage) == nil {
+			event.OutputTokens = tokenCount(usage, "output_tokens")
+		}
 		if kind, ok := semanticevidence.AnthropicContentSemantic(object["content"]); ok {
 			event.Semantic = true
 			event.SemanticKind = kind
@@ -921,6 +925,10 @@ func classifyResponses(event *ProtocolEvent, name string, object map[string]json
 	// 非流式响应：text 在 output[].content[] 里。与真实流量共用
 	// semanticevidence.ResponsesOutputSemantic，避免数组正文被当成「无语义」。
 	if name == "response" || name == "" {
+		var usage map[string]json.RawMessage
+		if json.Unmarshal(object["usage"], &usage) == nil {
+			event.OutputTokens = tokenCount(usage, "output_tokens")
+		}
 		if kind, ok := semanticevidence.ResponsesOutputSemantic(object["output"]); ok {
 			event.Semantic = true
 			event.SemanticKind = kind
@@ -974,11 +982,11 @@ func classifyChat(event *ProtocolEvent, name string, object map[string]json.RawM
 				break
 			}
 		}
-		if nonEmptyToolArguments(delta["tool_calls"]) {
+		if nonEmptyToolArguments(delta["tool_calls"]) || nonEmptyToolArguments(message["tool_calls"]) {
 			event.Semantic = true
 			event.SemanticKind = "tool"
 		}
-		if nonEmptyCallArguments(delta["function_call"]) {
+		if nonEmptyCallArguments(delta["function_call"]) || nonEmptyCallArguments(message["function_call"]) {
 			event.Semantic = true
 			event.SemanticKind = "function_args"
 		}

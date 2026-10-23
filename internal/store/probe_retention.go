@@ -212,6 +212,16 @@ func (s *Store) PruneProbeCostHistory(ctx context.Context, nowUTC time.Time, lim
 	if err != nil {
 		return 0, err
 	}
+	result, err = tx.ExecContext(ctx, `DELETE FROM canary_cost_daily WHERE rowid IN
+		(SELECT rowid FROM canary_cost_daily WHERE day_utc<=? ORDER BY day_utc,rowid LIMIT ?)`, closed, limit-int(n))
+	if err != nil {
+		return 0, err
+	}
+	canaryRows, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	n += canaryRows
 	result, err = tx.ExecContext(ctx, `DELETE FROM probe_cost_event WHERE event_id IN
 		(SELECT event_id FROM probe_cost_event WHERE day_utc<=? ORDER BY day_utc,event_id LIMIT ?)`, closed, limit-int(n))
 	if err != nil {

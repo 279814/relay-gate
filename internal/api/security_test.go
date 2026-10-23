@@ -203,7 +203,7 @@ func TestAPI_SecurityCanary_CapsNoteInDetail(t *testing.T) {
 	if err := s.st.CreateRoute(rt); err != nil {
 		t.Fatal(err)
 	}
-	h := s.WithSecurityCenter(security.NewCenter(50)).Routes(testAdminPW)
+	h := s.WithSecurityCenter(security.NewCenter(50)).WithProbeAdmin(&canaryAdminFixture{}).Routes(testAdminPW)
 
 	longNote := strings.Repeat("n", maxFindingClientField+120)
 	payload := fmt.Sprintf(`{"route_id":%d,"note":%q}`, rt.ID, longNote)
