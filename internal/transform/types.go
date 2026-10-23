@@ -108,11 +108,13 @@ type Version struct {
 
 // Set is a named transform configuration container.
 type Set struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Draft     *Version  `json:"draft,omitempty"`
-	History   []Version `json:"history,omitempty"` // immutable published/shadow snapshots
+	Revision  int64          `json:"revision"`
+	State     LifecycleState `json:"state"`
+	ID        int64          `json:"id"`
+	Name      string         `json:"name"`
+	CreatedAt time.Time      `json:"created_at"`
+	Draft     *Version       `json:"draft,omitempty"`
+	History   []Version      `json:"history,omitempty"` // immutable published/shadow snapshots
 }
 
 // Binding attaches at most one published and one shadow version to Route+Endpoint.
@@ -127,6 +129,7 @@ type Binding struct {
 
 // ExecutionRecord is a redacted apply/shadow diagnostic (§15.7 / §16.3).
 type ExecutionRecord struct {
+	sequence       uint64    // existing process-local insertion order, never a durable history ID
 	ID             string    `json:"id"`
 	At             time.Time `json:"at"`
 	RouteID        int64     `json:"route_id"`
@@ -155,19 +158,21 @@ type Compiled struct {
 // Registry holds in-process sets, bindings, and execution records.
 // Optional PersistSink mirrors mutations into SQLite.
 type Registry struct {
-	mu        sync.RWMutex
-	sets      map[int64]*Set
-	bindings  map[string]*Binding // key route:endpoint
-	execs     []ExecutionRecord
-	nextSet   atomic.Int64
-	nextVer   atomic.Int64
-	execSeq   atomic.Uint64
-	execCap   int
-	persist   PersistSink
-	requestMs int
-	sseMs     int
-	budgetLog []BudgetAudit
-	budgetCap int
+	writerMu       sync.Mutex // serialize configuration writers without holding request readers over SQL
+	mu             sync.RWMutex
+	sets           map[int64]*Set
+	bindings       map[string]*Binding // key route:endpoint
+	execs          []ExecutionRecord
+	nextSet        atomic.Int64
+	nextVer        atomic.Int64
+	execSeq        atomic.Uint64
+	execCap        int
+	persist        PersistSink
+	budgetRevision int64
+	requestMs      int
+	sseMs          int
+	budgetLog      []BudgetAudit
+	budgetCap      int
 }
 
 // BudgetLimits is the mutable execution time budget (§15.3).
@@ -192,12 +197,13 @@ func NewRegistry(execCap int) *Registry {
 		execCap = 200
 	}
 	r := &Registry{
-		sets:      make(map[int64]*Set),
-		bindings:  make(map[string]*Binding),
-		execCap:   execCap,
-		requestMs: DefaultRequestBudgetMs,
-		sseMs:     DefaultSSEBudgetMs,
-		budgetCap: 100,
+		sets:           make(map[int64]*Set),
+		bindings:       make(map[string]*Binding),
+		execCap:        execCap,
+		budgetRevision: 1,
+		requestMs:      DefaultRequestBudgetMs,
+		sseMs:          DefaultSSEBudgetMs,
+		budgetCap:      100,
 	}
 	r.nextSet.Store(1)
 	r.nextVer.Store(1)

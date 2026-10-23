@@ -1,0 +1,22 @@
+{
+  "source_commit": "35099c25a460e37f80ebfb741707824872f5a0f7",
+  "binary_sha256": "ecb35cd670924307c748352c5dfed3275da3901fb73f84fac746b44d5777389f",
+  "date": "2026-10-19",
+  "environment": "Windows Chromium, disposable SQLite, loopback only, synthetic credentials",
+  "draft": {
+    "first_save_status": 200,
+    "stale_page_save_status": 409,
+    "unsaved_rules_preserved": true,
+    "explicit_reload_restores_saved_rules": true
+  },
+  "lifecycle_ui": ["disabled", "active", "archived"],
+  "budgets": {
+    "save_status": 200,
+    "stale_page_save_status": 409,
+    "unsaved_budget_preserved": true,
+    "explicit_reload": true,
+    "confirmed_raise_status": 200
+  },
+  "sets": {"total": 56, "page_sizes": [50, 6], "last_page_has_no_cursor": true},
+  "not_covered": ["browser publication and rollback", "execution diagnostic filters and cursors", "public ACME", "real model compatibility", "final duration acceptance"]
+}

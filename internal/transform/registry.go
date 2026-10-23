@@ -7,37 +7,6 @@ import (
 	"time"
 )
 
-// CreateSet adds a named empty transform set with an empty draft shell.
-func (r *Registry) CreateSet(name string) (*Set, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil, fmt.Errorf("name required")
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	id := r.nextSet.Add(1) - 1
-	s := &Set{
-		ID:        id,
-		Name:      name,
-		CreatedAt: time.Now().UTC(),
-		Draft: &Version{
-			ID:            r.nextVer.Add(1) - 1,
-			SetID:         id,
-			Revision:      1,
-			CreatedAt:     time.Now().UTC(),
-			Rules:         nil,
-			ReqFailPolicy: FailClosed,
-			ResFailPolicy: FailOpen,
-		},
-	}
-	r.sets[id] = s
-	if err := r.flushLocked(); err != nil {
-		delete(r.sets, id)
-		return nil, err
-	}
-	return cloneSet(s), nil
-}
-
 // ListSets returns all sets (newest id last).
 func (r *Registry) ListSets() []Set {
 	r.mu.RLock()
@@ -60,56 +29,23 @@ func (r *Registry) GetSet(id int64) (*Set, error) {
 	return cloneSet(s), nil
 }
 
-// UpdateDraft replaces draft rules after compile validation.
-func (r *Registry) UpdateDraft(setID int64, rules []Rule, reqPolicy, resPolicy, note string) (*Set, error) {
-	v := Version{
-		Rules:         append([]Rule(nil), rules...),
-		ReqFailPolicy: reqPolicy,
-		ResFailPolicy: resPolicy,
-		Note:          note,
-	}
-	if _, err := Compile(v); err != nil && len(rules) > 0 {
-		return nil, err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, ok := r.sets[setID]
-	if !ok {
-		return nil, fmt.Errorf("transform set %d not found", setID)
-	}
-	previous := s.Draft
-	draft := Version{SetID: setID}
-	if previous != nil {
-		draft = *previous
-	}
-	draft.ID = r.nextVer.Add(1) - 1
-	draft.Revision++
-	draft.CreatedAt = time.Now().UTC()
-	draft.Rules = append([]Rule(nil), rules...)
-	if reqPolicy != "" {
-		draft.ReqFailPolicy = reqPolicy
-	}
-	if resPolicy != "" {
-		draft.ResFailPolicy = resPolicy
-	}
-	draft.Note = note
-	s.Draft = &draft
-	if err := r.flushLocked(); err != nil {
-		s.Draft = previous
-		return nil, err
-	}
-	return cloneSet(s), nil
-}
-
 // Preview compiles the draft and applies it in-memory (no binding change).
 func (r *Registry) Preview(setID int64, phase string, req RequestInput, res ResponseInput) (map[string]any, error) {
+	return r.PreviewSensitive(setID, phase, req, res, nil, nil)
+}
+func (r *Registry) PreviewSensitive(setID int64, phase string, req RequestInput, res ResponseInput, values []string, expected *int64) (map[string]any, error) {
 	r.mu.RLock()
 	s, ok := r.sets[setID]
 	if !ok || s.Draft == nil {
 		r.mu.RUnlock()
 		return nil, fmt.Errorf("transform set %d draft not found", setID)
 	}
+	if expected != nil && s.Revision != *expected {
+		r.mu.RUnlock()
+		return nil, ErrRevisionConflict
+	}
 	draft := *s.Draft
+	draft.Rules = append([]Rule(nil), s.Draft.Rules...)
 	r.mu.RUnlock()
 	if len(draft.Rules) == 0 {
 		return nil, fmt.Errorf("draft has no rules")
@@ -118,204 +54,26 @@ func (r *Registry) Preview(setID int64, phase string, req RequestInput, res Resp
 	if err != nil {
 		return nil, err
 	}
-	summary := c.ShadowDiff(phase, req, res)
+	summary := c.ShadowDiffSensitive(phase, req, res, values)
+	inputHash := ""
+	if !strings.Contains(summary, "diff=omitted(") {
+		body := req.Body
+		if phase != "request" {
+			body = res.Body
+		}
+		inputHash = HashBytes(body)
+	}
 	rec := r.record(ExecutionRecord{
 		RouteID:     0,
 		EndpointID:  0,
 		VersionID:   draft.ID,
 		Mode:        "preview",
 		Phase:       phase,
-		OK:          true,
+		OK:          strings.HasSuffix(summary, "err="),
 		DiffSummary: summary,
-		InputHash:   HashBytes(req.Body),
+		InputHash:   inputHash,
 	})
 	return map[string]any{"summary": summary, "execution": rec}, nil
-}
-
-// PublishSnapshot freezes the current draft into an immutable history version
-// and optionally points the binding's published pointer at it.
-func (r *Registry) PublishSnapshot(setID, routeID, endpointID int64) (*Binding, *Version, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, ok := r.sets[setID]
-	if !ok || s.Draft == nil || len(s.Draft.Rules) == 0 {
-		return nil, nil, fmt.Errorf("draft empty or set missing")
-	}
-	if _, err := Compile(*s.Draft); err != nil {
-		return nil, nil, err
-	}
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
-	if b != nil && b.SetID != 0 && b.SetID != setID {
-		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
-	}
-	snap := *s.Draft
-	snap.ID = r.nextVer.Add(1) - 1
-	snap.CreatedAt = time.Now().UTC()
-	snap.Rules = append([]Rule(nil), s.Draft.Rules...)
-	prevHistory := len(s.History)
-	s.History = append(s.History, snap)
-
-	created := b == nil
-	if created {
-		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
-		r.bindings[key] = b
-	}
-	prev := *b
-	b.SetID = setID
-	b.PublishedID = snap.ID
-	b.Revision++
-	if err := r.flushLocked(); err != nil {
-		r.undoSnapshotLocked(s, prevHistory, key, b, prev, created)
-		return nil, nil, err
-	}
-	return cloneBinding(b), &snap, nil
-}
-
-// ShadowSnapshot points shadow at a frozen draft copy (bypass live traffic).
-func (r *Registry) ShadowSnapshot(setID, routeID, endpointID int64) (*Binding, *Version, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, ok := r.sets[setID]
-	if !ok || s.Draft == nil || len(s.Draft.Rules) == 0 {
-		return nil, nil, fmt.Errorf("draft empty or set missing")
-	}
-	if _, err := Compile(*s.Draft); err != nil {
-		return nil, nil, err
-	}
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
-	if b != nil && b.SetID != 0 && b.SetID != setID {
-		return nil, nil, fmt.Errorf("binding already uses set %d", b.SetID)
-	}
-	snap := *s.Draft
-	snap.ID = r.nextVer.Add(1) - 1
-	snap.CreatedAt = time.Now().UTC()
-	snap.Rules = append([]Rule(nil), s.Draft.Rules...)
-	prevHistory := len(s.History)
-	s.History = append(s.History, snap)
-
-	created := b == nil
-	if created {
-		b = &Binding{RouteID: routeID, EndpointID: endpointID, SetID: setID}
-		r.bindings[key] = b
-	}
-	prev := *b
-	b.SetID = setID
-	b.ShadowID = snap.ID
-	b.Revision++
-	if err := r.flushLocked(); err != nil {
-		r.undoSnapshotLocked(s, prevHistory, key, b, prev, created)
-		return nil, nil, err
-	}
-	return cloneBinding(b), &snap, nil
-}
-
-// undoSnapshotLocked reverts a Publish/Shadow snapshot whose flush failed so
-// memory matches the durable snapshot: a returned error means the binding
-// did not change.
-func (r *Registry) undoSnapshotLocked(s *Set, prevHistory int, key string, b *Binding, prev Binding, created bool) {
-	s.History = s.History[:prevHistory]
-	if created {
-		delete(r.bindings, key)
-		return
-	}
-	*b = prev
-}
-
-// Rollback sets published pointer to a prior history version id.
-func (r *Registry) Rollback(routeID, endpointID, versionID int64) (*Binding, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
-	if b == nil {
-		return nil, fmt.Errorf("binding not found")
-	}
-	s := r.sets[b.SetID]
-	if s == nil {
-		return nil, fmt.Errorf("set missing")
-	}
-	found := false
-	for _, h := range s.History {
-		if h.ID == versionID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, fmt.Errorf("version %d not in history", versionID)
-	}
-	prev := *b
-	b.PublishedID = versionID
-	b.Revision++
-	if err := r.flushLocked(); err != nil {
-		*b = prev
-		return nil, err
-	}
-	return cloneBinding(b), nil
-}
-
-// ClearPublished disables live transforms for the binding (passthrough).
-func (r *Registry) ClearPublished(routeID, endpointID int64) (*Binding, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	key := bindKey(routeID, endpointID)
-	b := r.bindings[key]
-	if b == nil {
-		return nil, fmt.Errorf("binding not found")
-	}
-	prev := *b
-	b.PublishedID = 0
-	b.Revision++
-	if err := r.flushLocked(); err != nil {
-		*b = prev
-		return nil, err
-	}
-	return cloneBinding(b), nil
-}
-
-// RemoveBindingsForRoute drops every binding for routeID (published and shadow).
-// Call on Route delete so a later row that reuses the same numeric id cannot
-// inherit the old published transform (§15 binding lifetime / id reuse).
-func (r *Registry) RemoveBindingsForRoute(routeID int64) error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	removed := false
-	for key, b := range r.bindings {
-		if b != nil && b.RouteID == routeID {
-			delete(r.bindings, key)
-			removed = true
-		}
-	}
-	if !removed {
-		return nil
-	}
-	return r.flushLocked()
-}
-
-// RemoveBindingsForEndpoint drops every binding for endpointID.
-// Call on Endpoint delete so a reused endpoint id cannot inherit an old binding.
-func (r *Registry) RemoveBindingsForEndpoint(endpointID int64) error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	removed := false
-	for key, b := range r.bindings {
-		if b != nil && b.EndpointID == endpointID {
-			delete(r.bindings, key)
-			removed = true
-		}
-	}
-	if !removed {
-		return nil
-	}
-	return r.flushLocked()
 }
 
 // DetachEndpointBindingsAround removes in-memory bindings for endpointID, runs
@@ -329,6 +87,8 @@ func (r *Registry) DetachEndpointBindingsAround(endpointID int64, fn func() erro
 	if fn == nil {
 		return nil
 	}
+	r.writerMu.Lock()
+	defer r.writerMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	saved := make(map[string]*Binding)
@@ -372,6 +132,8 @@ func (r *Registry) DetachRouteBindingsAround(routeIDs []int64, fn func() error) 
 	if len(want) == 0 {
 		return fn()
 	}
+	r.writerMu.Lock()
+	defer r.writerMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	saved := make(map[string]*Binding)
@@ -428,9 +190,14 @@ func (r *Registry) PublishedCompiled(routeID, endpointID int64) (*Compiled, int6
 	if s == nil {
 		return nil, 0, fmt.Errorf("set missing")
 	}
+	if s.State != LifecycleActive {
+		return nil, 0, nil
+	}
 	for i := range s.History {
 		if s.History[i].ID == b.PublishedID {
-			c, err := Compile(s.History[i])
+			version := s.History[i]
+			version.Rules = append([]Rule(nil), version.Rules...)
+			c, err := Compile(version)
 			if c != nil {
 				c.reqBudget = time.Duration(r.requestMs) * time.Millisecond
 				c.sseBudget = time.Duration(r.sseMs) * time.Millisecond
@@ -453,9 +220,14 @@ func (r *Registry) ShadowCompiled(routeID, endpointID int64) (*Compiled, int64, 
 	if s == nil {
 		return nil, 0, fmt.Errorf("set missing")
 	}
+	if s.State != LifecycleActive {
+		return nil, 0, nil
+	}
 	for i := range s.History {
 		if s.History[i].ID == b.ShadowID {
-			c, err := Compile(s.History[i])
+			version := s.History[i]
+			version.Rules = append([]Rule(nil), version.Rules...)
+			c, err := Compile(version)
 			if c != nil {
 				c.reqBudget = time.Duration(r.requestMs) * time.Millisecond
 				c.sseBudget = time.Duration(r.sseMs) * time.Millisecond
@@ -475,6 +247,7 @@ func (r *Registry) record(rec ExecutionRecord) ExecutionRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	seq := r.execSeq.Add(1)
+	rec.sequence = seq
 	if rec.ID == "" {
 		rec.ID = time.Now().UTC().Format("20060102T150405") + "-" + strconv.FormatUint(seq, 10)
 	}

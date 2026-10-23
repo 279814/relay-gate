@@ -60,7 +60,16 @@ func (s *Store) ListRecentErrors(ctx context.Context, f RecentErrorFilter) (Rece
 	if err != nil {
 		return page, err
 	}
-	where := `outcome <> ?`
+	// A successful HTTP exchange can still carry a canonical protocol failure.
+	// Only the exact committed observation may add such a row. After retention,
+	// the disposition copied atomically into metadata proves it was committed.
+	where := `(outcome <> ? OR EXISTS (
+		SELECT 1 FROM request_log_metadata m LEFT JOIN probe_execution p ON p.id=m.execution_id
+		WHERE m.owner_id=request_log.id AND m.execution_id<>''
+		AND COALESCE(p.error_class,m.error_class) IN
+		('unreachable','auth_rejected','request_shape_rejected','config_error','unsupported','model_not_found','rate_limited','transient_error','fake_alive','partial_failure')
+		AND ((p.id IS NOT NULL AND p.trigger='real_traffic' AND p.success=0)
+		OR (p.id IS NULL AND m.capability_effect IN ('applied','config_stale','superseded','not_applicable')))))`
 	args := []any{model.OutcomeOK}
 	if f.UpstreamID > 0 {
 		where += ` AND upstream_id=?`

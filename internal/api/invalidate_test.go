@@ -1095,6 +1095,7 @@ func (r *recordingCaps) hasUpstream(upstreamID int64) bool {
 // request shape just changed.
 func TestInvalidate_TransformPublishClearsAliveRouteHealth(t *testing.T) {
 	s, _ := newTestServer(t)
+	seedConfig(t, s, 1, 1)
 	fs := &fakeSettingsForInvalidate{s: model.DefaultSettings()}
 	tr := health.NewTracker(fs)
 	gate := health.NewRecoveryGate()
@@ -1106,8 +1107,9 @@ func TestInvalidate_TransformPublishClearsAliveRouteHealth(t *testing.T) {
 		Semantic: sem,
 		Inner:    inner,
 	}).WithTransformRegistry(reg).Routes(testAdminPW)
+	h = freshTransformFixtureHandler(t, reg, h)
 
-	const routeID int64 = 77
+	const routeID int64 = 1
 	tr.Report(health.Report{RouteID: routeID, Verdict: health.VerdictOK, Source: health.SourceReal})
 	if tr.State(routeID) != model.StateAlive {
 		t.Fatalf("setup state=%s want alive", tr.State(routeID))

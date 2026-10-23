@@ -104,6 +104,12 @@ type Scheduler struct {
 
 	// p012 挂 P0-12 扩展（runstate / pending / jitter）。
 	p012 *schedulerP012
+
+	canary         *Service
+	canaryPolicies CanaryPolicySource
+	canaryReport   func(model.ProbeExecution)
+	canaryDue      map[int64]canarySchedule
+	canaryAfter    int64
 }
 
 // Tracker 是 Scheduler 需要的健康状态读写面，由 *health.Tracker 实现。
@@ -383,6 +389,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		}
 	}
 	s.finishResumeRamp(eligible)
+	s.tickCanaries(ctx, snap)
 }
 
 // maybeProbe 判断并发起一个 Route 的 L1/L2。

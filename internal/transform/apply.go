@@ -483,6 +483,16 @@ func (c *Compiled) ShadowDiff(phase string, req RequestInput, res ResponseInput)
 
 // ShadowDiffSecrets is ShadowDiff with secret resolution; summaries never include plaintext.
 func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res ResponseInput, secrets SecretMap) string {
+	return c.shadowDiff(phase, req, res, secrets, nil)
+}
+
+// Sensitive values only redact diagnostics; they are never SecretRef resolvers.
+func (c *Compiled) ShadowDiffSensitive(phase string, req RequestInput, res ResponseInput, values []string) string {
+	return c.shadowDiff(phase, req, res, nil, values)
+}
+func (c *Compiled) shadowDiff(phase string, req RequestInput, res ResponseInput, secrets SecretMap, values []string) string {
+	sensitive := func(body []byte) bool { text := string(body); return security.RedactSecrets(text, values) != text }
+
 	switch phase {
 	case "request":
 		r := c.ApplyRequestSecrets(req, secrets)
@@ -493,7 +503,7 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		if r.Taint != nil {
 			errMsg = r.Taint.Redact(errMsg)
 		}
-		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(req.Body, secrets) || shadowContainsSecret(r.Body, secrets) {
+		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(req.Body, secrets) || shadowContainsSecret(r.Body, secrets) || sensitive(req.Body) || sensitive(r.Body) {
 			if r.Err != nil {
 				return "request diff=omitted(secret_taint) err=transform_failed"
 			}
@@ -510,7 +520,7 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		if r.Taint != nil {
 			errMsg = r.Taint.Redact(errMsg)
 		}
-		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(res.Body, secrets) || shadowContainsSecret(r.Body, secrets) {
+		if (r.Taint != nil && len(r.Taint.Secrets()) > 0) || shadowContainsSecret(res.Body, secrets) || shadowContainsSecret(r.Body, secrets) || sensitive(res.Body) || sensitive(r.Body) {
 			if r.Err != nil {
 				return "response diff=omitted(secret_taint) err=transform_failed"
 			}
@@ -519,7 +529,7 @@ func (c *Compiled) ShadowDiffSecrets(phase string, req RequestInput, res Respons
 		return fmt.Sprintf("response changed=%v hits=%v status %d→%d in=%s out=%s err=%v",
 			r.Changed, r.HitRules, res.Status, r.Status, HashBytes(res.Body), HashBytes(r.Body), errMsg)
 	case "sse":
-		s := c.NewSSEShadow()
+		s := c.NewSSEShadow().WithSensitiveValues(values)
 		scanner := &SSEScanner{}
 		events, err := scanner.Feed(res.Body)
 		for _, ev := range events {

@@ -53,7 +53,9 @@ var auditActions = map[string]AuditAction{
 	"security_finding_review": {"security", "security_finding"},
 	"security_ignore_create":  {"security", "security_ignore_rule"}, "security_ignore_update": {"security", "security_ignore_rule"}, "security_ignore_delete": {"security", "security_ignore_rule"},
 	"smtp_update": {"configuration", "smtp"}, "smtp_test": {"configuration", "smtp"},
-	"transform_create": {"transform", "transform"}, "transform_draft_update": {"transform", "transform"}, "transform_publish": {"transform", "transform"},
+	"security_canary_policy_update": {"security", "canary_policy"},
+	"transform_create":              {"transform", "transform"}, "transform_draft_update": {"transform", "transform"}, "transform_publish": {"transform", "transform"},
+	"transform_disable": {"transform", "transform"}, "transform_enable": {"transform", "transform"}, "transform_archive": {"transform", "transform"},
 	"transform_shadow": {"transform", "transform"}, "transform_rollback": {"transform", "transform"}, "transform_budget_update": {"transform", "transform"},
 	"session_login": {"session", "session"}, "session_logout": {"session", "session"},
 }

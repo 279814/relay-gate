@@ -80,6 +80,14 @@ test('schema 15 persisted original and omitted views have explicit labels while 
  assert.equal(shell.attemptMetadata.attempts[0].responseView,'未知');
 });
 
+test('sample metadata exposes recorded response truncation without loading any body',async()=>{
+ const value=row();value.truncated=4;value.metadata.response_view='upstream_response';
+ const {shell,calls}=setup(async()=>({id:42,attempt_count:1,attempts:[value]}));
+ await shell.openSampleMetadata(42);
+ assert.deepEqual(calls,['/samples/42/metadata']);
+ assert.equal(shell.attemptMetadata.attempts[0].decisions.find(f=>f.label==='响应正文截断标记')?.value,'已标记');
+});
+
 test('missing exact detail distinguishes pending observation from unavailable retained disposition', () => {
   const {shell} = setup(); const value = row(); value.metadata.execution_stored = false; value.metadata.capability_effect = 'pending';
   shell.openAttemptMetadata(value); assert.match(shell.attemptMetadata.attempts[0].executionState, /待.*持久化/);

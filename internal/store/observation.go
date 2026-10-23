@@ -75,8 +75,23 @@ func scanProbeExecution(scanner interface{ Scan(...any) error }) (*model.ProbeEx
 }
 
 func (store *Store) GetProbeExecution(ctx context.Context, id string) (*model.ProbeExecution, error) {
-	return scanProbeExecution(store.db.QueryRowContext(ctx, `SELECT `+probeExecutionCols+
-		` FROM probe_execution WHERE id=?`, id))
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	execution, err := scanProbeExecution(tx.QueryRowContext(ctx, `SELECT `+probeExecutionCols+` FROM probe_execution WHERE id=?`, id))
+	if err != nil {
+		return nil, err
+	}
+	execution.Canary, err = loadCanaryExecution(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return execution, nil
 }
 
 // ListProbeExecutions 按 (sent_at_ms, id) 倒序翻页 —— 最近的先看，

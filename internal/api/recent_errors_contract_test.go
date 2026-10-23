@@ -20,6 +20,26 @@ type recentErrorResponse struct {
 	} `json:"logs"`
 }
 
+func TestRecentErrorsCanonicalFailureKeepsHTTP200Outcome(t *testing.T) {
+	s, h := newTestServer(t)
+	row := &model.RequestLog{ReqID: "canonical-retained", Outcome: model.OutcomeOK, RespStatus: 200,
+		Metadata: model.AttemptMetadata{Version: 1, ExecutionID: "retained-exact", CapabilityEffect: "applied", ErrorClass: model.ErrorPartial}}
+	if err := s.st.InsertRequestLog(row); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, h, "GET", "/admin/api/recent-errors?error_class=partial_failure", "", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var page recentErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.FailedCount != 1 || len(page.Logs) != 1 || page.Logs[0].Outcome != model.OutcomeOK || page.Logs[0].RespStatus != 200 || page.Logs[0].Metadata.ExecutionStored {
+		t.Fatalf("canonical failure changed client outcome or fabricated retained detail: %+v", page)
+	}
+}
+
 func TestRecentErrorsFiltersRecordedErrorClassWithoutOutcomeGuess(t *testing.T) {
 	s, h := newTestServer(t)
 	for i, class := range []model.ErrorClass{model.ErrorAuthRejected, model.ErrorRateLimited, "unknown"} {

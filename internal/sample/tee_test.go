@@ -26,6 +26,29 @@ func naiveTail(chunks [][]byte, n int) []byte {
 	return all
 }
 
+func TestFullSampleSpillWriteFailureStaysTruncatedAfterDetach(t *testing.T) {
+	tee := NewHeadTail(0, 0)
+	if !tee.openSpill() {
+		t.Fatal("could not open owned spill")
+	}
+	tee.Write([]byte("saved-prefix"))
+	if err := tee.spill.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tee.Write([]byte("lost-original-upstream-bytes")); err != nil || n != len("lost-original-upstream-bytes") {
+		t.Fatalf("side capture interrupted forwarding: %d %v", n, err)
+	}
+	_, path := tee.DetachBody()
+	defer model.RemoveSpillFile(path)
+	if !tee.Truncated() {
+		t.Fatal("partial spill was presented as a complete response after Detach")
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil || string(stored) != "saved-prefix" {
+		t.Fatalf("lost the available original prefix: %q %v", stored, err)
+	}
+}
+
 // 环形缓冲按段 copy 之后，绕回边界是最容易出错的地方：
 // 差一个字节就会让尾部错位，而错位的样本比没有样本更误导人
 // —— 它看起来是一份完整留档，实际字节顺序是错的。

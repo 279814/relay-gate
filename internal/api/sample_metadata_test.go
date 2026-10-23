@@ -13,7 +13,7 @@ func TestSampleMetadataReadsEveryAttemptWithoutHeadersOrCipherBodies(t *testing.
 	s, h := newTestServer(t)
 	smp := &model.Sample{ReqID: "exact-metadata-group", Endpoint: "/v1/messages", InBody: []byte("PRIVATE-IN"), Attempts: []*model.SampleAttempt{
 		{RouteID: 1, OutBody: []byte("PRIVATE-OUT"), RespBody: []byte("PRIVATE-RESP"), Metadata: model.AttemptMetadata{Version: 1, TransformVersionID: 7, Attempt: 1, Attempts: 2, Retried: true}},
-		{RouteID: 2, Metadata: model.AttemptMetadata{Version: 1, TransformVersionID: 8, Attempt: 2, Attempts: 2, SyntheticCompletion: true}},
+		{RouteID: 2, Truncated: model.TruncRespBody, Metadata: model.AttemptMetadata{Version: 1, TransformVersionID: 8, Attempt: 2, Attempts: 2, SyntheticCompletion: true}},
 	}}
 	if err := s.st.InsertSample(smp); err != nil {
 		t.Fatal(err)
@@ -34,8 +34,9 @@ func TestSampleMetadataReadsEveryAttemptWithoutHeadersOrCipherBodies(t *testing.
 	var got struct {
 		ReqID    string `json:"req_id"`
 		Attempts []struct {
-			RouteID  int64                 `json:"route_id"`
-			Metadata model.AttemptMetadata `json:"metadata"`
+			RouteID   int64                 `json:"route_id"`
+			Metadata  model.AttemptMetadata `json:"metadata"`
+			Truncated model.TruncFlags      `json:"truncated"`
 		} `json:"attempts"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
@@ -43,6 +44,9 @@ func TestSampleMetadataReadsEveryAttemptWithoutHeadersOrCipherBodies(t *testing.
 	}
 	if got.ReqID != smp.ReqID || len(got.Attempts) != 2 || got.Attempts[0].Metadata.TransformVersionID != 7 || !got.Attempts[0].Metadata.Retried || !got.Attempts[1].Metadata.SyntheticCompletion {
 		t.Fatalf("not actual per-attempt metadata: %+v", got)
+	}
+	if got.Attempts[1].Truncated != model.TruncRespBody {
+		t.Fatal("body-free metadata lost the actual stored truncation flag")
 	}
 	if rec := do(t, h, "GET", path, "", false); rec.Code != 401 {
 		t.Fatalf("metadata bypassed admin auth: %d", rec.Code)

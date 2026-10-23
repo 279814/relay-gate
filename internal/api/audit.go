@@ -333,6 +333,11 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 			}
 		} else if len(parts) == 2 && r.Method == "POST" {
 			action = map[string]string{"scan": "security_scan", "canary": "security_canary"}[parts[1]]
+		} else if len(parts) == 3 && parts[1] == "canary-policy" && r.Method == "PUT" {
+			action = "security_canary_policy_update"
+			if id, err := strconv.ParseInt(parts[2], 10, 64); err == nil && id > 0 {
+				resourceID = strconv.FormatInt(id, 10)
+			}
 		} else if parts[1] == "smtp" {
 			if len(parts) == 2 && r.Method == "PUT" {
 				action = "smtp_update"
@@ -363,7 +368,7 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 			if parts[2] == "draft" && r.Method == "PUT" {
 				action = "transform_draft_update"
 			} else if r.Method == "POST" {
-				action = map[string]string{"publish": "transform_publish", "shadow": "transform_shadow"}[parts[2]]
+				action = map[string]string{"publish": "transform_publish", "shadow": "transform_shadow", "disable": "transform_disable", "enable": "transform_enable", "archive": "transform_archive"}[parts[2]]
 			}
 		}
 	}

@@ -82,7 +82,7 @@
                   ? ((recentErrors.latest.error.length > 80
                       ? recentErrors.latest.error.slice(0, 80) + '…'
                       : recentErrors.latest.error))
-                  : '点击查看全部'"></div>
+                  : (recentErrors?.latest?.metadata?.error_class || '点击查看全部')"></div>
                 <div class="sub" x-text="fmtTime(recentErrors?.latest?.ts_recv)"></div>
                 <button type="button" @click.stop="openRecentErrors()">查看全部</button>
               </div>
@@ -878,12 +878,53 @@
               </div>
               <button class="primary" @click="runSecurityScan()">扫描</button>
             </div>
+            <p class="probe-statistics-note">Canary 会向模型发送一次最小诊断请求，以随机 nonce 和无副作用工具检查严格输出。工具不会执行，结果不自动修改健康；明确手动诊断允许 Lazy。</p>
             <div class="row" style="margin-bottom:12px">
               <div class="field" style="max-width:200px">
-                <label>手动 Canary Route ID（需 Active）</label>
-                <input x-model="security.canaryRouteId" placeholder="route id">
+                <label>手动 Canary Route ID</label>
+                <input type="number" min="1" x-model="security.canaryRouteId" @input="onCanaryRouteChange()" :disabled="canary.running" placeholder="route id">
               </div>
-              <button @click="runSecurityCanary()">运行 Canary</button>
+              <button @click="runSecurityCanary()" :disabled="canary.running" x-text="canary.running ? '诊断执行中…' : '明确发送一次诊断'"></button>
+              <button @click="viewCanaryCosts()">查看独立成本</button>
+            </div>
+            <p class="err-text" x-show="canary.runError" x-text="canary.runError"></p>
+            <template x-if="canary.result">
+              <div class="box" style="margin-bottom:12px">
+                <strong x-text="'Canary ' + canaryVerdictText(canary.result.canary.verdict)"></strong>
+                <div class="mono" x-text="'Execution：' + canary.result.execution_id"></div>
+                <div x-text="'来源：' + canary.result.canary.source + '；期望版本：' + canary.result.canary.expectation_version"></div>
+                <div x-text="'Nonce：' + canaryFlagText(canary.result.canary.nonce_matched) + '；唯一 inert tool：' + canaryFlagText(canary.result.canary.tool_matched)"></div>
+                <div class="probe-statistics-note" x-text="'Nonce SHA-256：' + canary.result.canary.nonce_sha256"></div>
+              </div>
+            </template>
+            <div class="box" style="margin-bottom:16px">
+              <strong>可选周期 Canary</strong>
+              <p class="probe-statistics-note">默认关闭，仅 Active Upstream 可启用。周期从执行结束起计算，共用探活并发与暂停控制；切换 Lazy 后不会发出新的周期请求。</p>
+              <div class="row">
+                <div class="field" style="max-width:180px">
+                  <label>Upstream ID</label>
+                  <input type="number" min="1" x-model="canary.upstreamId" @input="onCanaryUpstreamChange()" :disabled="canary.loading || canary.saving">
+                </div>
+                <button @click="loadCanaryPolicy()" :disabled="canary.loading || canary.saving">重新载入策略</button>
+              </div>
+              <template x-if="canary.policy">
+                <div>
+                  <div class="row">
+                    <div class="field" style="max-width:180px">
+                      <label>诊断 Route ID</label>
+                      <input type="number" min="1" x-model.number="canary.draft.route_id" :disabled="canary.loading || canary.saving">
+                    </div>
+                    <div class="field" style="max-width:180px">
+                      <label>周期（300–86400 秒）</label>
+                      <input type="number" min="300" max="86400" x-model.number="canary.draft.interval_sec" :disabled="canary.loading || canary.saving">
+                    </div>
+                    <label><input type="checkbox" x-model="canary.draft.enabled" :disabled="canary.loading || canary.saving">启用周期 Canary</label>
+                    <button @click="saveCanaryPolicy()" :disabled="canary.loading || canary.saving || canary.conflict">保存周期策略</button>
+                  </div>
+                  <p class="err-text" x-show="canary.conflict">策略已被其他操作修改，当前草稿已保留。请重新载入后再保存。</p>
+                </div>
+              </template>
+              <p class="err-text" x-show="canary.policyError" x-text="canary.policyError"></p>
             </div>
             <table>
               <thead><tr><th>时间</th><th>级别</th><th>规则 / 类别</th><th>上游 / Route</th><th>脱敏证据与扫描事实</th><th>审核与操作</th></tr></thead>
@@ -1023,6 +1064,8 @@
         <!-- ── 声明式转换（P4）─────────────────────────────── -->
         <template x-if="tab === 'transforms'">
           <div>
+            <p class="err" x-show="transforms.activationPending">修改已保存，配置激活待处理；请检查服务状态，勿重复提交。</p>
+            <fieldset :disabled="transforms.writeBusy" style="border:0;padding:0;margin:0;min-width:0">
             <div class="bar">
               <strong>声明式转换</strong>
               <span class="dim">无脚本 · 版本化 · 未绑定透传</span>
@@ -1034,7 +1077,7 @@
                 <label>新建转换集</label>
                 <input x-model="transforms.newName" placeholder="名称">
               </div>
-              <button class="primary" @click="createTransformSet()">创建</button>
+              <button class="primary" :disabled="transforms.activationPending" @click="createTransformSet()">创建</button>
             </div>
             <div class="row" style="margin-bottom:12px;gap:12px;align-items:flex-end">
               <div class="field" style="max-width:140px">
@@ -1045,7 +1088,8 @@
                 <label>SSE 事件预算 ms</label>
                 <input type="number" min="1" max="5000" x-model.number="transforms.budgetSSEMs">
               </div>
-              <button @click="saveTransformBudgets()">保存预算</button>
+              <button :disabled="transforms.activationPending" @click="saveTransformBudgets()">保存预算</button>
+              <button @click="reloadTransformBudgets()">重新加载预算（丢弃编辑）</button>
               <span class="dim">提高需二次确认并审计</span>
             </div>
             <div class="row" style="align-items:flex-start;gap:16px">
@@ -1062,8 +1106,15 @@
                     <tr x-show="!(transforms.sets || []).length"><td colspan="2" class="empty">暂无</td></tr>
                   </tbody>
                 </table>
+                <span class="dim" x-text="'共 ' + transforms.setTotal + ' 个转换集'"></span>
+                <button :disabled="transforms.loading || !transforms.setNextCursor" @click="nextTransformPage('sets')">下一页</button>
               </div>
               <div style="flex:1" x-show="transforms.selected">
+                <button @click="selectTransformSet({id: transforms.selectedId})">重新加载草稿（丢弃编辑）</button>
+                <span class="dim" x-text="'版本 ' + (transforms.selected?.revision || '未知') + ' · ' + (transforms.selected?.state || '未知')"></span>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="changeTransformLifecycle('disable')">停用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'disabled'" @click="changeTransformLifecycle('enable')">启用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state === 'archived'" @click="changeTransformLifecycle('archive')">归档（不可恢复）</button>
                 <div class="field">
                   <label>草稿规则（JSON 数组）</label>
                   <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
@@ -1093,7 +1144,7 @@
                   </div>
                 </div>
                 <div class="bar" style="margin:8px 0">
-                  <button class="primary" @click="saveTransformDraft()">保存草稿</button>
+                  <button class="primary" :disabled="transforms.activationPending || transforms.selected?.state === 'archived'" @click="saveTransformDraft()">保存草稿</button>
                 </div>
                 <div class="row">
                   <div class="field" style="max-width:120px">
@@ -1104,8 +1155,10 @@
                     <label>Endpoint ID</label>
                     <input x-model="transforms.endpointId">
                   </div>
-                  <button @click="publishTransform()">Publish</button>
-                  <button @click="shadowTransform()">Shadow</button>
+                  <button @click="loadTransformBinding()">加载目标绑定</button>
+                  <span class="dim" x-text="transforms.bindingTarget ? ('已读取 ' + transforms.bindingTarget + ' 版本 ' + transforms.bindingRevision) : '尚未读取目标绑定'"></span>
+                  <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="publishTransform()">Publish</button>
+                  <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="shadowTransform()">Shadow</button>
                 </div>
                 <div class="field" style="margin-top:12px">
                   <label>Preview phase / body</label>
@@ -1119,6 +1172,16 @@
                   </div>
                   <pre class="mono wrap" style="margin-top:8px;white-space:pre-wrap" x-text="transforms.previewResult"></pre>
                 </div>
+                <button @click="loadTransformVersions(false)">读取版本历史</button>
+                <span class="dim" x-text="'共 ' + transforms.versionTotal + ' 个历史版本'"></span>
+                <table>
+                  <thead><tr><th>版本</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead>
+                  <tbody><template x-for="version in transforms.versions" :key="version.id"><tr>
+                    <td x-text="version.id"></td><td x-text="fmtTime(version.created_at)"></td><td x-text="version.note + (version.note_truncated ? '…' : '')"></td>
+                    <td><button :disabled="transforms.activationPending || !transforms.bindingRevision" @click="rollbackTransform(version.id)">将目标绑定回滚到此版本</button></td>
+                  </tr></template></tbody>
+                </table>
+                <button :disabled="!transforms.versionNextCursor" @click="loadTransformVersions(true)">下一页版本</button>
               </div>
             </div>
             <h3 style="font-size:13px;margin:18px 0 8px">Bindings</h3>
@@ -1137,22 +1200,39 @@
                 <tr x-show="!(transforms.bindings || []).length"><td colspan="5" class="empty">暂无绑定</td></tr>
               </tbody>
             </table>
-            <h3 style="font-size:13px;margin:18px 0 8px">Executions（脱敏）</h3>
+            <span class="dim" x-text="'共 ' + transforms.bindingTotal + ' 个绑定'"></span>
+            <button :disabled="transforms.loading || !transforms.bindingNextCursor" @click="nextTransformPage('bindings')">下一页绑定</button>
+            <h3 style="font-size:13px;margin:18px 0 8px">执行诊断（脱敏，仅本次运行保留范围）</h3>
+            <p class="dim">每页 50 条；旧记录会被有限容量淘汰，重启后清空。总数只代表当前仍保留且匹配筛选的记录；游标失效时请重新查询。</p>
+            <div class="row" style="gap:8px;align-items:flex-end">
+              <div class="field"><label>诊断 Route ID</label><input type="number" min="1" x-model="transforms.executionFilter.route_id"></div>
+              <div class="field"><label>诊断 Endpoint ID</label><input type="number" min="1" x-model="transforms.executionFilter.endpoint_id"></div>
+              <div class="field"><label>诊断 Version ID</label><input type="number" min="1" x-model="transforms.executionFilter.version_id"></div>
+              <div class="field"><label>模式</label><select x-model="transforms.executionFilter.mode"><option value="">全部</option><option value="published">published</option><option value="shadow">shadow</option><option value="preview">preview</option></select></div>
+              <div class="field"><label>阶段</label><select x-model="transforms.executionFilter.phase"><option value="">全部</option><option value="request">request</option><option value="response">response</option><option value="sse">sse</option></select></div>
+              <div class="field"><label>结果</label><select x-model="transforms.executionFilter.ok"><option value="">全部</option><option value="true">成功</option><option value="false">失败</option></select></div>
+              <div class="field"><label>开始时间（Unix 毫秒）</label><input type="number" min="1" x-model="transforms.executionFilter.after_ms"></div>
+              <div class="field"><label>结束时间（Unix 毫秒）</label><input type="number" min="1" x-model="transforms.executionFilter.before_ms"></div>
+              <button :disabled="transforms.executionLoading" @click="loadTransformExecutions(false)">查询诊断</button>
+            </div>
             <table>
-              <thead><tr><th>时间</th><th>Phase</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
+              <thead><tr><th>时间</th><th>Route / Endpoint / Version</th><th>模式 / 阶段</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
               <tbody>
                 <template x-for="(ex, idx) in (transforms.executions || [])" :key="idx">
                   <tr>
                     <td class="mono" x-text="ex.at"></td>
-                    <td x-text="ex.phase"></td>
+                    <td class="mono" x-text="ex.route_id + ' / ' + ex.endpoint_id + ' / ' + ex.version_id"></td>
+                    <td x-text="ex.mode + ' / ' + ex.phase"></td>
                     <td x-text="ex.ok ? 'yes' : 'no'"></td>
                     <td class="wrap" x-text="(ex.hit_rules || []).join(', ')"></td>
                     <td class="wrap" x-text="ex.error || ''"></td>
                   </tr>
                 </template>
-                <tr x-show="!(transforms.executions || []).length"><td colspan="5" class="empty">暂无执行记录</td></tr>
+                <tr x-show="!(transforms.executions || []).length"><td colspan="6" class="empty">暂无执行记录</td></tr>
               </tbody>
             </table>
+            <span class="dim" x-text="'当前保留范围匹配 ' + transforms.executionTotal + ' 条'"></span>
+            <button :disabled="transforms.executionLoading || !transforms.executionNextCursor" @click="loadTransformExecutions(true)">下一页诊断</button>
             <h3 style="font-size:13px;margin:18px 0 8px">本次运行预算调整</h3>
             <p class="dim">这里保留本次运行的调整细节；完整持久审计历史见凭据页。</p>
             <table>
@@ -1169,6 +1249,7 @@
                 <tr x-show="!(transforms.budgetAudit || []).length"><td colspan="4" class="empty">暂无</td></tr>
               </tbody>
             </table>
+            </fieldset>
           </div>
         </template>
 
@@ -1771,6 +1852,108 @@
               </button>
             </div>
           </section>
+        </template>
+
+        <template x-if="tab === 'probe-statistics'">
+          <div class="panel" :aria-busy="probeStatistics.loading">
+            <div class="bar">
+              <strong>历史 Probe 统计</strong>
+              <label>统计依据
+                <select x-model="probeStatistics.basis" @change="onStatisticsFilterChange(); loadProbeStatistics()">
+                  <option value="executions">执行记录 · Recipe / 版本</option>
+                  <option value="daily">每日成本账本 · 来源</option>
+                    <option value="canary">Canary 独立成本 · 实际来源</option>
+                </select>
+              </label>
+              <label>分组范围
+                <select x-model="probeStatistics.scope" @change="onStatisticsFilterChange(); loadProbeStatistics()">
+                  <option value="route">Route / 日</option><option value="upstream">Upstream / 日</option>
+                </select>
+              </label>
+              <span class="grow"></span>
+              <label>每页
+                <select x-model.number="probeStatistics.limit" @change="onStatisticsFilterChange(); loadProbeStatistics()">
+                  <option :value="50">50</option><option :value="100">100</option><option :value="200">200</option>
+                </select>
+              </label>
+              <button @click="loadProbeStatistics()" :disabled="probeStatistics.loading">刷新首屏</button>
+            </div>
+            <p class="probe-statistics-note">Recipe 统计只使用执行时保存的身份与版本，并排除已明确记录的 Canary。每日账本和 Canary 独立成本不生成 Recipe 成功率。</p>
+            <div class="bar">
+              <template x-for="filterField in statisticsFilterFields()" :key="filterField.key">
+                <label>
+                  <span x-text="filterField.label"></span>
+                  <template x-if="filterField.options">
+                    <select x-model="probeStatistics.filter[filterField.key]" @change="onStatisticsFilterChange(); loadProbeStatistics()">
+                      <option value="">全部</option>
+                      <template x-for="choice in filterField.options" :key="choice"><option :value="choice" x-text="choice"></option></template>
+                    </select>
+                  </template>
+                  <template x-if="!filterField.options">
+                    <input :type="filterField.type || 'text'" :min="filterField.type === 'number' ? 1 : null" maxlength="128"
+                      x-model="probeStatistics.filter[filterField.key]" @change="onStatisticsFilterChange(); loadProbeStatistics()">
+                  </template>
+                </label>
+              </template>
+            </div>
+            <div class="probe-statistics-note">
+              <div>Token 是已记录的估算或观测，不是账单；unknown 不代表 0 Token 或 0 费用。</div>
+              <div x-show="probeStatistics.basis !== 'canary'">旧 Canary 来源：unknown（历史与手动混合记录）。Recipe 级 piggyback 节省：unknown（仅普通每日账本有计数）。</div>
+              <div x-show="probeStatistics.basis === 'canary'">Canary 仅使用明确记录的手动/周期来源与 usage presence；已观测的 0 保留为 0，未观测仍为 unknown，不包含旧 manual 的猜测。</div>
+              <template x-if="probeStatistics.coverage">
+                <div>
+                  <div x-text="probeStatistics.coverage.outcome_note"></div>
+                  <div x-text="probeStatistics.coverage.retention_note"></div>
+                  <div x-text="probeStatistics.coverage.first_day ? ('匹配的保留日：' + probeStatistics.coverage.first_day + ' 至 ' + probeStatistics.coverage.last_day) : '匹配的保留日：暂无记录'"></div>
+                  <div x-show="probeStatistics.coverage.cost_closed_through_day" x-text="'成本关闭水位（含当日）：' + probeStatistics.coverage.cost_closed_through_day"></div>
+                </div>
+              </template>
+            </div>
+            <p class="err-text" x-show="probeStatistics.error" x-text="probeStatistics.error"></p>
+            <div style="overflow:auto">
+              <table class="probe-statistics-table">
+                <thead><tr>
+                  <th>UTC 日</th><th>范围 / Upstream</th><th>来源 / 端点</th><th>执行身份</th>
+                  <th class="num">执行 / 发出</th><th class="num">/models / L2</th><th class="num">成功 / 失败 / 取消或忽略</th>
+                  <th x-show="probeStatistics.basis === 'executions'" class="num">Recipe 成功率</th>
+                  <th class="num">估算 input</th><th class="num">观测 output</th><th class="num">首语义后主动取消</th>
+                  <th x-show="probeStatistics.basis === 'daily'" class="num">Piggyback 节省</th>
+                </tr></thead>
+                <tbody>
+                  <template x-for="row in probeStatistics.items" :key="statisticsRowKey(row)">
+                    <tr>
+                      <td><div x-text="row.day_utc"></div><div class="probe-statistics-note" x-show="row.created_time_fallback_rows" x-text="'legacy 创建时间回退：' + statisticsNumber(row.created_time_fallback_rows)"></div></td>
+                      <td x-text="(probeStatistics.scope === 'route' ? (row.scope_id ? 'Route #' + row.scope_id : '无 Route') : 'Upstream #' + row.scope_id) + ' / Upstream #' + row.upstream_id"></td>
+                      <td><div x-text="statisticsTriggerText(row.trigger, row.canary_source)"></div><div class="mono" x-text="row.endpoint"></div></td>
+                      <td class="wrap"><div x-text="statisticsRecipeText(row)"></div><div class="probe-statistics-note" x-text="row.origin"></div></td>
+                      <td class="num" x-text="statisticsNumber(row.executions) + ' / ' + statisticsNumber(row.requests)"></td>
+                      <td class="num" x-text="statisticsNumber(row.models_requests) + ' / ' + statisticsNumber(row.l2_requests)"></td>
+                      <td class="num">
+                        <div x-text="statisticsNumber(row.succeeded) + ' / ' + statisticsNumber(row.failed) + ' / ' + statisticsNumber(row.canceled)"></div>
+                        <div x-show="probeStatistics.basis !== 'daily'" class="probe-statistics-note" x-text="'观察不完整：' + statisticsNumber(row.incomplete) + '；未发出：' + statisticsNumber(row.not_sent)"></div>
+                      </td>
+                      <td x-show="probeStatistics.basis === 'executions'" class="num">
+                        <strong x-text="statisticsRateText(row.recipe_success_rate)"></strong>
+                        <div class="probe-statistics-note" x-text="row.recipe_denominator == null ? '非 Recipe 执行' : ('成功 ' + row.succeeded + ' / 分母 ' + row.recipe_denominator)"></div>
+                      </td>
+                      <td class="num" x-text="statisticsTokenText(row.estimated_input_tokens, row.unknown_input_rows)"></td>
+                      <td class="num" x-text="statisticsTokenText(row.observed_output_tokens, row.unknown_output_rows)"></td>
+                      <td class="num" x-text="statisticsNumber(row.canceled_after_semantic)"></td>
+                      <td x-show="probeStatistics.basis === 'daily'" class="num" x-text="statisticsNumber(row.piggyback_l2_saved)"></td>
+                    </tr>
+                  </template>
+                  <tr x-show="!probeStatistics.items.length"><td colspan="12" class="empty" x-text="probeStatistics.loading ? '统计读取中…' : '没有匹配的保留记录；这不代表更早的历史没有发生'"></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="bar">
+              <span x-text="'匹配分组：' + statisticsNumber(probeStatistics.total_rows) + '；当前页：' + probeStatistics.items.length"></span>
+              <span class="grow"></span>
+              <button @click="loadProbeStatistics()" :disabled="probeStatistics.loading">首页</button>
+              <button @click="loadProbeStatistics('previous')" :disabled="probeStatistics.loading || !probeStatistics.previous_cursor">上一页</button>
+              <button @click="loadProbeStatistics('next')" :disabled="probeStatistics.loading || !probeStatistics.next_cursor">下一页</button>
+            </div>
+          </div>
         </template>
 
         <!-- ── 执行 / 成本 ─────────────────────────────────── -->
