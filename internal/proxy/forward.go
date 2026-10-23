@@ -119,6 +119,7 @@ func (r *Result) TTFT() time.Duration {
 // 需要在读 body 的循环里切换 deadline，ReverseProxy 的 io.Copy 拿不到这个控制点。
 // 逐跳头与 Host 由 PrepareOutboundHeaders 处理，不依赖 ReverseProxy 的实现。
 type Forwarder struct {
+	upstreamSample  *upstreamSampleCapture
 	CaptureMetadata bool
 	Protocol        model.Protocol
 	// Transport 是这次转发用的连接池。由 outbound.Manager 按网络身份提供 ——
@@ -503,6 +504,9 @@ func (at *Attempt) Commit(w http.ResponseWriter) *Result {
 	defer at.cancel()
 	defer at.resp.Body.Close()
 	if at.failBeforeCommit() {
+		if at.f.upstreamSample != nil && len(at.peeked) > 0 {
+			_, _ = at.f.upstreamSample.Write(at.peeked)
+		}
 		return at.res
 	}
 
@@ -573,7 +577,7 @@ func (at *Attempt) Discard() {
 
 	// Discarded attempts still deliver the original prefix/drain to the same
 	// bounded observer and sample sink. There is no second error-body parser.
-	if tee := at.respTee(); tee != nil && len(at.peeked) > 0 {
+	if tee := at.respTee(true); tee != nil && len(at.peeked) > 0 {
 		_, _ = tee.Write(at.peeked)
 	}
 	at.captureDrain()
@@ -587,24 +591,35 @@ const discardDrainLimit = 4 << 10
 
 // captureDrain reuses only the existing bounded connection-reuse drain.
 func (at *Attempt) captureDrain() {
-	var body io.Reader = observedUpstreamBody{ReadCloser: at.resp.Body, wire: at.wire, readError: &at.res.upstreamReadErr}
-	if tee := at.respTee(); tee != nil {
+	var source io.ReadCloser = observedUpstreamBody{ReadCloser: at.resp.Body, wire: at.wire, readError: &at.res.upstreamReadErr}
+	if at.f.upstreamSample != nil {
+		source = upstreamSampleBody{ReadCloser: source, capture: at.f.upstreamSample}
+	}
+	var body io.Reader = source
+	if tee := at.respTee(false); tee != nil {
 		body = io.TeeReader(body, lenientWriter{tee})
 	}
 	_, _ = io.CopyN(io.Discard, body, discardDrainLimit)
 }
 
-func (at *Attempt) respTee() io.Writer {
+func (at *Attempt) respTee(includeSample bool) io.Writer {
 	if at.f == nil {
 		return nil
 	}
-	if at.f.RespObserver != nil {
-		if at.f.RespTee == nil {
-			return observerTee{at.f.RespObserver}
-		}
-		return io.MultiWriter(at.f.RespTee, observerTee{at.f.RespObserver})
+	var writers []io.Writer
+	if includeSample && at.f.upstreamSample != nil {
+		writers = append(writers, at.f.upstreamSample)
 	}
-	return at.f.RespTee
+	if at.f.RespTee != nil {
+		writers = append(writers, at.f.RespTee)
+	}
+	if at.f.RespObserver != nil {
+		writers = append(writers, observerTee{at.f.RespObserver})
+	}
+	if len(writers) == 0 {
+		return nil
+	}
+	return io.MultiWriter(writers...)
 }
 
 // lenientWriter 吞掉旁路副本的写入错误：采集失败不得截断排水。
@@ -625,8 +640,14 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 	var total int64
 	for {
 		n, err := src.Read(buf)
+		if err == io.EOF && !inputObserved && f.upstreamSample != nil {
+			f.upstreamSample.complete = true
+		}
 		if n > 0 {
 			if at.clientCtx.Err() != nil || at.ctx.Err() != nil || at.stageTimeout.Load() != 0 {
+				if !inputObserved && f.upstreamSample != nil {
+					_, _ = f.upstreamSample.Write(buf[:n])
+				}
 				return total, at.readFailure(err, total)
 			}
 			if res.FirstByteAt.IsZero() {
@@ -642,6 +663,9 @@ func (at *Attempt) streamBody(w http.ResponseWriter, src io.Reader, inputObserve
 					_, _ = (observerTee{f.RespObserver}).Write(buf[:n])
 				}
 				at.wire.feed(buf[:n], time.Now())
+			}
+			if !inputObserved && f.upstreamSample != nil {
+				_, _ = f.upstreamSample.Write(buf[:n])
 			}
 			if f.RespTee != nil {
 				_, _ = f.RespTee.Write(buf[:n])

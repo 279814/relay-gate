@@ -40,6 +40,8 @@ function comparison(metadata, prefix, known) {
 function presentAttempt(row, kind, index) {
   const metadata = row.metadata || {};
   const known = metadata.version === 1;
+  const hasTruncation = kind === 'sample' && Number.isSafeInteger(row.truncated) && row.truncated >= 0;
+  const responseTruncated = hasTruncation ? (row.truncated & 4) !== 0 ? '已标记' : '未标记（不据此推断完整）' : unknown;
   const number = known && positive(metadata.attempt) ? metadata.attempt : positive(row.attempt) ? row.attempt : index + 1;
   const executionID = known && typeof metadata.execution_id === 'string' && /^[a-z0-9-]{1,64}$/.test(metadata.execution_id) ? metadata.execution_id : '';
   const canOpenExecution = !!executionID && metadata.execution_stored === true;
@@ -62,7 +64,13 @@ function presentAttempt(row, kind, index) {
     version: known ? '1' : positive(metadata.version) ? `暂不支持 ${metadata.version}` : '历史未知',
     notice: known ? '' : '历史或版本未知；以下缺失事实不会用当前配置补齐，也不推断为成功或无变化。',
     executionID, canOpenExecution, executionState, revisions,
-    responseView: known ? code(metadata.response_view, {unknown: '未知', not_sampled: '未保存样本响应', upstream_attempt_prefix: '已丢弃尝试：上游前缀 / 排空视图', client_response: '客户端写出视图（可能含响应 Transform）'}) : unknown,
+    responseView: known ? code(metadata.response_view, {
+      unknown: '未知', not_sampled: '未保存样本响应',
+      upstream_attempt_prefix: '上游响应前缀 / 有界排空（未完整读取）',
+      client_response: '客户端写出视图（可能含响应 Transform）',
+      upstream_response: '原始上游响应（仍受脱敏和截断限制）', no_response: '未收到上游 HTTP 响应',
+      omitted_secret: '因 Secret 污点省略原始响应正文', omitted_unverified: '无法有界确认安全，已省略原始响应正文',
+    }) : unknown,
     identity: [fact('Route ID', revision(row.route_id)), fact('Upstream ID', revision(row.upstream_id)), fact('ModelName ID', revision(row.model_name_id)),
       fact('出站模型', text(row.model_out) || absent), fact('HTTP 状态', positive(row.resp_status) ? String(row.resp_status) : absent), fact('Outcome', text(row.outcome) || unknown)],
     timings: [fact('排队', elapsed(row.ts_recv, row.ts_sent)), fact('响应头（发送起）', known ? elapsed(row.ts_sent, metadata.response_header_at_ms) : unknown),
@@ -74,7 +82,7 @@ function presentAttempt(row, kind, index) {
       fact('请求写入证据', known ? code(metadata.request_write_state, {not_written: '未写入', possibly_written: '可能已写入', written: '已写入'}) : unknown),
       fact('实际 Capability effect', known ? code(metadata.capability_effect, effects) : unknown), fact('细 ErrorClass', known ? code(metadata.error_class, errorClasses) : unknown),
       fact('已换站重试', boolean(metadata.retried, known)), fact('半开放行', boolean(metadata.half_open, known)), fact('潜在重复执行', boolean(metadata.duplicate_risk, known)),
-      fact('Synthetic completion', boolean(metadata.synthetic_completion, known))],
+      fact('Synthetic completion', boolean(metadata.synthetic_completion, known)), fact('响应正文截断标记', kind === 'sample' ? responseTruncated : absent)],
     diffs: [comparison(metadata, 'request', known), comparison(metadata, 'response', known)],
   };
 }

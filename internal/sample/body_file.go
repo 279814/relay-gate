@@ -55,7 +55,10 @@ func fileContainsAny(path string, keys []string, maxK int) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
+	return readerContainsAny(f, keys, maxK)
+}
 
+func readerContainsAny(reader io.Reader, keys []string, maxK int) (bool, error) {
 	overlap := maxK - 1
 	if overlap < 0 {
 		overlap = 0
@@ -63,7 +66,7 @@ func fileContainsAny(path string, keys []string, maxK int) (bool, error) {
 	buf := make([]byte, SpillMemLimit())
 	carry := make([]byte, 0, overlap)
 	for {
-		n, readErr := f.Read(buf)
+		n, readErr := reader.Read(buf)
 		if n > 0 {
 			work := append(carry, buf[:n]...)
 			// Same rules as rewrite: RedactBodyKeys → RedactSecrets covers

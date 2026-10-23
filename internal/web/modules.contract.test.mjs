@@ -41,7 +41,7 @@ await check('script order in index.html', () => {
 });
 
 await check('no x-html / innerHTML / storage in business modules', () => {
-  for (const name of ['api.mjs', 'probes.mjs', 'probe_statistics.mjs', 'modal.mjs', 'boot.mjs', 'errors.mjs', 'migration.mjs', 'credentials.mjs', 'security.mjs', 'canary.mjs', 'transforms.mjs', 'runtime.mjs', 'count_tokens.mjs', 'attempt_metadata.mjs']) {
+  for (const name of ['api.mjs', 'probes.mjs', 'modal.mjs', 'boot.mjs', 'errors.mjs', 'migration.mjs', 'credentials.mjs', 'security.mjs', 'transforms.mjs', 'runtime.mjs', 'count_tokens.mjs', 'attempt_metadata.mjs', 'probe_statistics.mjs', 'canary.mjs']) {
     const src = fs.readFileSync(path.join(jsDir, name), 'utf8');
     assert.ok(!/x-html/.test(src), name + ' x-html');
     assert.ok(!/\binnerHTML\b/.test(src), name + ' innerHTML');

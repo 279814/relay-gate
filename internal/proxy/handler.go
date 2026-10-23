@@ -716,14 +716,10 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	// 按发送顺序排列，最终尝试在最后。route-local 跳过从未出网，不在其中。
 	attempts := make([]*model.SampleAttempt, 0, len(oc.trail)+1)
 	for i, la := range oc.trail {
-		attempts = append(attempts, h.sampleAttempt(la.cand, la.body, la.header, la.url,
-			la.tee, la.at.Result(), keys, inModel, recvAt, settings))
-		attempts[len(attempts)-1].Metadata = oc.logs[i].Metadata
+		attempts = append(attempts, h.rawSampleAttempt(la, oc.logs[i].Metadata, keys, inModel, recvAt, settings))
 		la.tee = nil
 	}
-	final := h.sampleAttempt(oc.cand, oc.outBody, oc.outHeader, oc.outURL,
-		oc.respTee, oc.res, keys, inModel, recvAt, settings)
-	final.Metadata = oc.logs[len(oc.logs)-1].Metadata
+	final := h.rawSampleAttempt(oc.finalAttempt, oc.logs[len(oc.logs)-1].Metadata, keys, inModel, recvAt, settings)
 	attempts = append(attempts, final)
 
 	var flags model.TruncFlags
@@ -732,7 +728,8 @@ func (h *Handler) recordSample(r *http.Request, proto model.Protocol,
 	}
 
 	smp := &model.Sample{
-		Metadata: final.Metadata,
+		ResponsePrivacyKeys: append([]string(nil), keys...),
+		Metadata:            final.Metadata,
 		// 与这次请求的多行日志同组（M6），便于在「发了哪些字节」与
 		// 「试过哪几个站」之间互跳。
 		ReqID:  oc.reqID,
@@ -789,23 +786,34 @@ func (h *Handler) sampleAttempt(cand *router.Candidate, outBody []byte, outHeade
 	var respSafe []byte
 	var respSpill string
 	var flags model.TruncFlags
+	// Encoded original bytes must reach the existing background validation
+	// intact. Replacing a visible key inside gzip would corrupt its checksum.
+	encodedResponse := normalizeContentEncoding(res.RespHeaders.Get("Content-Encoding")) != ""
 	if outCut {
 		flags |= model.TruncOutBody
 	}
 	if tee != nil {
 		if tee.SpillBytes() > 0 {
 			_, respSpill = tee.DetachBody()
-			if err := sample.RedactBodyFile(respSpill, keys); err != nil {
-				h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
-					"err", err, "route", cand.Route.ID)
-				model.RemoveSpillFile(respSpill)
-				respSpill = ""
+			if !encodedResponse {
+				if err := sample.RedactBodyFile(respSpill, keys); err != nil {
+					h.log.Warn("样本响应 spill 脱敏失败，丢弃临时文件",
+						"err", err, "route", cand.Route.ID)
+					model.RemoveSpillFile(respSpill)
+					respSpill = ""
+				}
 			}
 		} else {
-			respSafe = sample.RedactBodyKeys(tee.Bytes(), keys)
+			respSafe = tee.Bytes()
+			if !encodedResponse {
+				respSafe = sample.RedactBodyKeys(respSafe, keys)
+			}
 		}
 		if tee.Truncated() {
 			flags |= model.TruncRespBody
+		}
+		if tee.WriteIncomplete() {
+			h.log.Warn("样本响应写盘失败，已保存的响应不完整", "route", cand.Route.ID)
 		}
 		if tee.QuotaOverflow() {
 			// §5.4：单响应超过剩余总配额时改留头尾并高优先级告警。

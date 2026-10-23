@@ -191,17 +191,30 @@ def verify(binary):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
         try:
             runtime.start()
-            assert runtime.sql("SELECT version FROM schema_version") == [(14,)]
+            assert runtime.sql("SELECT version FROM schema_version") == [(15,)]
             assert runtime.request("GET", "/admin/api/upstreams", auth=False)[0] == 401
             upstream, body = runtime.seed(remote.server_port)
-            for mode, expected in (("complete", SEMANTIC + END), ("partial", SEMANTIC), ("gzip", gzip.compress(SEMANTIC + END, mtime=0))):
+            learned = 0
+            cases = (("complete", SEMANTIC + END), ("partial", SEMANTIC),
+                     ("gzip", gzip.compress(SEMANTIC + END, mtime=0)))
+            for observed, (mode, expected) in enumerate(cases, 1):
                 MockUpstream.mode = mode
                 status, wire, _ = runtime.request("POST", "/v1/messages", body, proxy=True)
                 assert status == 200 and wire == expected, "proxy changed original response bytes"
-            eventually(lambda: runtime.sql("SELECT COUNT(*) FROM probe_execution WHERE trigger='real_traffic'")[0][0] == 3)
+                # Response EOF does not join the asynchronous observer. A newer
+                # committed observation can supersede an older success before
+                # learning, so finish each lifecycle case before the next one.
+                if mode != "partial":
+                    learned += 1
+                try:
+                    eventually(lambda: runtime.sql("SELECT COUNT(*) FROM probe_execution WHERE trigger='real_traffic'") == [(observed,)])
+                    eventually(lambda: runtime.sql("SELECT seen_count FROM client_probe_profile") == [(learned,)])
+                except AssertionError as error:
+                    facts = runtime.sql("SELECT observation_order,success,partial,normal_end_seen FROM probe_execution ORDER BY observation_order")
+                    profiles = runtime.sql("SELECT revision,seen_count FROM client_probe_profile")
+                    raise AssertionError(f"{mode}: executions={facts}, profile_counts={profiles}") from error
             rows = runtime.sql("SELECT success,partial,normal_end_seen FROM probe_execution WHERE trigger='real_traffic' ORDER BY observation_order")
             assert rows == [(1, 0, 1), (0, 1, 0), (1, 0, 1)], "wire completeness was not persisted correctly"
-            eventually(lambda: runtime.sql("SELECT seen_count FROM client_probe_profile") == [(2,)])
             profiles = runtime.sql("SELECT safe_headers_json,fixed_raw_query,body_template,body_shape_json,revision FROM client_probe_profile")
             assert PRIVATE not in repr(profiles) and profiles[0][-1] == 1, "private content or telemetry changed profile identity"
             eventually(lambda: runtime.sql("SELECT COUNT(*) FROM sample_request") == [(3,)])

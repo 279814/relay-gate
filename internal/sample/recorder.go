@@ -180,6 +180,7 @@ func (r *Recorder) loop() {
 }
 
 func (r *Recorder) write(s *model.Sample) {
+	validateOriginalResponsePrivacy(s)
 	if qw, ok := r.w.(quotaWriter); ok {
 		inserted, err := qw.InsertSampleWithinQuota(s, r.diskQuotaBytes())
 		if err != nil {
