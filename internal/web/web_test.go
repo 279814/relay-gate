@@ -124,6 +124,7 @@ func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 		"static/js/count_tokens.mjs":     true,
 		"static/js/recipe_admin.mjs":     true,
 		"static/js/settings.mjs":         true,
+		"static/js/attempt_metadata.mjs": true,
 	}
 	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
