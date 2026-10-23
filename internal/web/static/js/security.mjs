@@ -1,5 +1,7 @@
 /* security.mjs — P3 Security Center UI (§14.5). Pure text (x-text). */
 
+import { createCanaryFeature } from './canary.mjs';
+
 const initialState = () => ({
   findings: [],
   total: 0,
@@ -47,24 +49,11 @@ export function createSecurityFeature(shell, api) {
     }
   };
 
-  shell.runSecurityCanary = async function runSecurityCanary() {
-    const state = this.security;
-    try {
-      const routeId = Number(this.security.canaryRouteId);
-      const data = await api.post('/security/canary', { route_id: routeId });
-      if (this.security !== state) return;
-      this.msg = 'Canary 已提交：' + (data.execution_id || data.mode || 'ok');
-      await this.loadSecurityFindings();
-    } catch (e) {
-      if (this.security !== state) return;
-      this.err = e && e.message ? e.message : String(e);
-    }
-  };
-
   shell.loadSMTP = async function loadSMTP(force = false) {
     const state = this.security;
     if (state.smtpSaving || state.smtpLoading || (state.smtp && !force)) return;
     state.smtpLoading = true;
+    if (force) { this.err = ''; this.msg = ''; }
     try {
       const smtp = await api.get('/security/smtp');
       if (this.security !== state) return;
@@ -82,6 +71,8 @@ export function createSecurityFeature(shell, api) {
   shell.saveSMTP = async function saveSMTP() {
     const state = this.security;
     if (state.smtpSaving || state.smtpLoading || state.smtpConflict) return;
+    this.err = '';
+    this.msg = '';
     const config = state.smtp;
     const modeCount = Number(config?.use_starttls === true) + Number(config?.use_smtps === true);
     if (!config || modeCount > 1 || (config.enabled === true && modeCount !== 1)) {
@@ -150,6 +141,7 @@ export function createSecurityFeature(shell, api) {
     this.security = initialState();
     return originalReset?.call(this);
   };
+  createCanaryFeature(shell, api);
 }
 
 export function mergeSecurityTab(shell) {

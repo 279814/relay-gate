@@ -107,7 +107,8 @@ func (p *requestPreparer) prepareExplicit(ctx context.Context, req ExecutionRequ
 	if err := identity.Validate(); err != nil {
 		return nil, ResolvedRecipe{}, err
 	}
-	if identity.Storage != model.RecipeStorageDB && (identity.Storage != model.RecipeStorageProfile || req.ExplicitRecipe.Facts.Use != model.BindingExplicitProfileTest) {
+	canary := req.canary != nil && identity.Storage == model.RecipeStorageEmbedded && identity.TemplateID == canaryTemplateID
+	if !canary && identity.Storage != model.RecipeStorageDB && (identity.Storage != model.RecipeStorageProfile || req.ExplicitRecipe.Facts.Use != model.BindingExplicitProfileTest) {
 		return nil, ResolvedRecipe{}, errors.New("explicit prepare 要求 DB 版本或明确绑定的 Profile 测试")
 	}
 	facts := req.ExplicitRecipe.Facts

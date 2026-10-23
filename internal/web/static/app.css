@@ -417,3 +417,6 @@ details.blk > summary:hover { color: var(--fg); }
 .recipe-stage pre.body { max-height: 300px; }
 .candidate-result { margin-top: 14px; border-left: 3px solid var(--line); padding: 10px 14px; background: var(--bg-2); }
 @media (max-width: 720px) { .recipe-columns { grid-template-columns: 1fr; } .recipe-versions { border-right: 0; border-bottom: 1px solid var(--line); padding-bottom: 10px; } }
+
+.probe-statistics-note { font-size: 12px; color: var(--fg-dim); line-height: 1.6; }
+.probe-statistics-table { min-width: 1180px; }

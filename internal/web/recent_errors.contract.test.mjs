@@ -12,6 +12,17 @@ const setup=handler=>{
   return {shell,calls};
 };
 
+test('canonical HTTP 200 failures retain their Outcome and exact execution link',async()=>{
+  const row={id:1,outcome:'ok',resp_status:200,metadata:{error_class:'partial_failure',execution_id:'exact-failed',execution_stored:true}};
+  const {shell,calls}=setup(()=>({logs:[row],latest:row,failed_count:1}));
+  await shell.openRecentErrors();
+  assert.equal(shell.recentErrors.logs[0].outcome,'ok');
+  assert.equal(shell.recentErrors.latest.metadata.error_class,'partial_failure');
+  let execution;shell.openExecution=async id=>{execution=id;};
+  await shell.openRecentErrorExecutions(shell.recentErrors.logs[0]);
+  assert.equal(execution,'exact-failed');assert.equal(calls.length,1);
+});
+
 test('recent error filters and cursor are sent to the API and filter changes restart the page',async()=>{
   const {shell,calls}=setup(path=>({failed_count:205,logs:[{id:calls.length,error:'plain'}],next_cursor:calls.length===1?'stable-cursor':''}));
   Object.assign(shell.recentErrors,{upstream_id:'20',route_id:'10',protocol:'anthropic',outcome:'timeout',from_time:'2026-10-18T01:00',to_time:'2026-10-18T02:00'});

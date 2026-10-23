@@ -314,6 +314,7 @@ const (
 )
 
 type ProbeExecution struct {
+	Canary                            *CanaryExecution `json:"canary,omitempty"`
 	ID                                string
 	Trigger                           ProbeTrigger
 	UpstreamID                        int64
