@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-23",
+  "command": "go test ./internal/store -run '^TestSchemaTwoBackfillRollsBackAfterEveryExecutedDML$' -count=3",
+  "local_platform": "Windows, pure-Go modernc SQLite",
+  "result": "passed",
+  "executed_backfill_dml_failure_points": 34,
+  "fixture": ["canonical upstream", "exact URL upstream", "Anthropic", "OpenAI Responses", "OpenAI Chat"],
+  "assertions": ["error injected after each real SQL write", "all expansion DDL and DML roll back to exact schema1 fingerprint", "original encrypted keys unchanged", "production Store.Open can restart and migrate source successfully", "only supported endpoint protocols materialized"],
+  "not_claimed": ["full migration orchestrator instruction-level injection", "all historical source variants", "schema2 to 3 cutover DML", "commit failure", "WAL switch failure", "power loss"]
+}
