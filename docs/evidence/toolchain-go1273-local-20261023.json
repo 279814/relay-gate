@@ -1,0 +1,42 @@
+{
+  "date_asia_shanghai": "2026-10-23",
+  "source_commit": "0a82c7a293ee77d49b9f4812eea37f5c5a8f3697",
+  "pull_request": "https://github.com/279814/relay-gate/pull/413",
+  "go_version": "go1.27.3 windows/amd64",
+  "go_mod_verify": "passed",
+  "go_build": "passed",
+  "go_vet": "passed",
+  "go_test_all": {
+    "passed": true,
+    "api_seconds": 104.567,
+    "probe_seconds": 127.864,
+    "store_seconds": 148.825
+  },
+  "govulncheck": {
+    "version": "v1.9.0",
+    "exit_code": 0,
+    "reachable_vulnerabilities": 0,
+    "imported_package_vulnerabilities": 0,
+    "required_module_only_advisory": "GO-2026-5932: unimported golang.org/x/crypto/openpgp; no fixed version; no ignore added"
+  },
+  "committed_history_and_scanner_selftest": "passed",
+  "binary_runtime": {
+    "passed": true,
+    "scope": "disposable SQLite and loopback upstream only",
+    "binary_sha256": "50e98e11abac505cf829c0ac98fd28bf4c5286c393a7578c9a2a9a97e13aef67",
+    "original_response_bytes": "passed",
+    "real_inflight_drain": "passed",
+    "paired_backup_and_cold_restart": "passed"
+  },
+  "ci_checkpoint": {
+    "run": 39914542842,
+    "public_edge": "success",
+    "image_security": "failure",
+    "image_job": 120285002575,
+    "image_failure_reason": "awaiting completed-workflow logs; not yet established",
+    "full_test": "in_progress_at_checkpoint",
+    "docker_available_locally": false,
+    "both_production_image_scan_pass_claimed": false
+  },
+  "release_acceptance_claimed": false
+}
