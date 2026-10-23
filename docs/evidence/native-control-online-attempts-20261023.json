@@ -1,0 +1,197 @@
+{
+  "scope": "bounded_live_control_attempts",
+  "candidate_commit": "0dca59eab7fdcbd3fbb47c8bab2d3c922b6c8302",
+  "profile": "claude-code-2.1.220-windows-isolated-v1",
+  "original_private_input_sites": 7,
+  "attempted_sites": 5,
+  "maximum_requests": 20,
+  "reserved_requests": 20,
+  "maximum_token_budget": 100000,
+  "reserved_token_upper": 50000,
+  "known_completed_round_trips": 16,
+  "incomplete_run_request_upper": 4,
+  "billing_tokens": "unknown; no successful model generation observed",
+  "compatibility_matrix_passed": false,
+  "user_decision": "skip further online controls; do not append requests",
+  "private_inputs_captures_and_reports_committed": false,
+  "results": [
+    {
+      "alias": "live-site-01",
+      "reserved_requests": 4,
+      "reserved_token_upper": 10000,
+      "report_complete": false,
+      "last_completed_result": {
+        "endpoint": "models",
+        "http_status": 522,
+        "error_class": "transient_error"
+      },
+      "remaining_attempts": "not observable from incomplete CLI report; conservatively retain full reservation"
+    },
+    {
+      "alias": "live-site-02",
+      "reserved_requests": 4,
+      "reserved_token_upper": 10000,
+      "report_complete": true,
+      "round_trips": 4,
+      "endpoints": [
+        {
+          "endpoint": "models",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "not_applicable",
+          "compat_ok": false
+        },
+        {
+          "endpoint": "messages",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "control_failed",
+          "compat_ok": false,
+          "control": {
+            "success": false,
+            "status": 401,
+            "error_class": "auth_rejected"
+          },
+          "control_start_after_capture_ms": 2219,
+          "probe_start_after_capture_ms": 2521
+        },
+        {
+          "endpoint": "count_tokens",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "control_missing",
+          "compat_ok": false
+        }
+      ]
+    },
+    {
+      "alias": "live-site-03",
+      "reserved_requests": 4,
+      "reserved_token_upper": 10000,
+      "report_complete": true,
+      "round_trips": 4,
+      "endpoints": [
+        {
+          "endpoint": "models",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "not_applicable",
+          "compat_ok": false
+        },
+        {
+          "endpoint": "messages",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "control_failed",
+          "compat_ok": false,
+          "control": {
+            "success": false,
+            "status": 401,
+            "error_class": "auth_rejected"
+          },
+          "control_start_after_capture_ms": 4832,
+          "probe_start_after_capture_ms": 6359
+        },
+        {
+          "endpoint": "count_tokens",
+          "http_status": 401,
+          "decision_success": false,
+          "error_class": "auth_rejected",
+          "control_status": "control_missing",
+          "compat_ok": false
+        }
+      ]
+    },
+    {
+      "alias": "live-site-04",
+      "reserved_requests": 4,
+      "reserved_token_upper": 10000,
+      "report_complete": true,
+      "round_trips": 4,
+      "endpoints": [
+        {
+          "endpoint": "models",
+          "http_status": 200,
+          "decision_success": true,
+          "error_class": "none",
+          "control_status": "not_applicable",
+          "compat_ok": false
+        },
+        {
+          "endpoint": "messages",
+          "http_status": 503,
+          "decision_success": false,
+          "error_class": "transient_error",
+          "control_status": "control_failed",
+          "compat_ok": false,
+          "control": {
+            "success": false,
+            "status": 503,
+            "error_class": "transient_error"
+          },
+          "control_start_after_capture_ms": 2632,
+          "probe_start_after_capture_ms": 3051
+        },
+        {
+          "endpoint": "count_tokens",
+          "http_status": 404,
+          "decision_success": false,
+          "error_class": "unsupported",
+          "control_status": "control_missing",
+          "compat_ok": false
+        }
+      ]
+    },
+    {
+      "alias": "live-site-05",
+      "reserved_requests": 4,
+      "reserved_token_upper": 10000,
+      "report_complete": true,
+      "round_trips": 4,
+      "endpoints": [
+        {
+          "endpoint": "models",
+          "http_status": 200,
+          "decision_success": true,
+          "error_class": "none",
+          "control_status": "not_applicable",
+          "compat_ok": false
+        },
+        {
+          "endpoint": "messages",
+          "http_status": 400,
+          "decision_success": false,
+          "error_class": "transient_error",
+          "control_status": "control_failed",
+          "compat_ok": false,
+          "control": {
+            "success": false,
+            "status": 400,
+            "error_class": "transient_error"
+          },
+          "control_start_after_capture_ms": 2675,
+          "probe_start_after_capture_ms": 3170
+        },
+        {
+          "endpoint": "count_tokens",
+          "http_status": 404,
+          "decision_success": false,
+          "error_class": "unsupported",
+          "control_status": "control_missing",
+          "compat_ok": false
+        }
+      ]
+    }
+  ],
+  "not_covered": [
+    "remaining sites and models",
+    "isolated CC Switch responses/chat",
+    "successful native-control/probe equivalence",
+    "final release ACME/duration gates"
+  ]
+}
