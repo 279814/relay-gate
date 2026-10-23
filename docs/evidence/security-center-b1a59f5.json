@@ -1,0 +1,60 @@
+{
+  "source_commit": "b1a59f5953c82ed9da3e846dd9c21832c33a54d2",
+  "verified_on": "2026-10-23",
+  "platform": "windows/amd64",
+  "toolchain": "go1.27.3",
+  "main_binary_sha256": "7b35bd35569965399db9c07cb953d85f02616fc59caa05a47a0e849fd8bbd487",
+  "browser_fixture_binary_sha256": "48d3c48850009995253c90f9375e9600e0a0e761e827a3d7f351143d81f384e6",
+  "fixture_only": true,
+  "fixture_storage": "disposable temporary database, generated local identities and seeded typed Canary facts; no private inputs",
+  "checks": {
+    "go_test_all": "passed",
+    "go_vet_all": "passed",
+    "node_contracts": 117,
+    "alpine_bindings": 1428,
+    "native_runtime_gate": "passed",
+    "browser": {
+      "engine": "Chromium via playwright-cli",
+      "findings": 36,
+      "pages": [
+        25,
+        11
+      ],
+      "review_save_http": 200,
+      "stale_review_http": 409,
+      "conflict_draft_retained": true,
+      "ignore_create_http": 201,
+      "ignore_delete_cas_http": 204,
+      "raw_original_upstream_status": 202,
+      "metadata_before_reauth_had_no_body": true,
+      "password_cleared_per_call": true,
+      "script_payload_rendered_as_text": true,
+      "diagnostics_only_typed_canary": true,
+      "diagnostic_exact_id_http": 200,
+      "manual_route_disable_cas_http": 200
+    },
+    "http_sql": {
+      "raw_cookie_and_password_required": true,
+      "audit_completion_failure_returns_zero_plaintext": true,
+      "encoded_slash_finding_id_obeys_audit": true,
+      "unknown_or_incomplete_or_ambiguous_raw_unavailable": true,
+      "same_transaction_diagnostic_count_page_and_facts": true
+    },
+    "mailer": {
+      "policy_failure_retains_new_and_existing_pending": true,
+      "failed_send_does_not_consume_success_window": true,
+      "successful_critical_covers_pending_same_identity": true,
+      "concurrent_digest_and_critical_deliver_once": true,
+      "bounded_identities": 1024,
+      "policy_and_smtp_outside_mutex": true,
+      "explicit_send_test_bypasses_ignore": true
+    }
+  },
+  "limits": {
+    "real_model_requests": 0,
+    "external_smtp_deliveries": 0,
+    "public_acme_issuance": false,
+    "linux_race": "requires final PR CI",
+    "multi_day_acceptance": "not completed"
+  }
+}
