@@ -68,13 +68,8 @@ func TestSchemaTenInspectionRejectsPartialChangedAndUnknownObjects(t *testing.T)
 }
 
 func TestSchemaTenRotationBackupPinsReaderAndRestoresMetadata(t *testing.T) {
-	st, cipher := schemaNineSecurityFixture(t)
-	path := st.path
-	st.Close()
-	current, err := Open(path, cipher)
-	if err != nil {
-		t.Fatal(err)
-	}
+	current, cipher := schemaTenAuditFixture(t)
+	path := current.path
 	f := security.Finding{ID: "metadata-backup", AtMS: 1, Severity: security.SeverityInfo, Category: "incomplete", Summary: "bounded", Source: "passive", Truncated: true, DecodeDepth: 2, EvidenceHash: "finite-redacted-evidence"}
 	if err := current.InsertSecurityFinding(f); err != nil {
 		t.Fatal(err)
@@ -148,8 +143,8 @@ func TestSchemaNineSecurityMigrationPairsHistoricalReader(t *testing.T) {
 	}
 	defer current.Close()
 	state, err := inspectSchemaState(context.Background(), current.db)
-	if err != nil || state.Version != 10 {
-		t.Fatalf("schema10=%+v err=%v", state, err)
+	if err != nil || state.Version != developmentSchemaVersion {
+		t.Fatalf("current schema=%+v err=%v", state, err)
 	}
 	rows, err := current.ListSecurityFindings("", 1)
 	if err != nil || len(rows) != 1 {

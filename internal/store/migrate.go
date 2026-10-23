@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-const developmentSchemaVersion = 10
+const developmentSchemaVersion = 11
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
@@ -104,7 +104,8 @@ func inspectSchemaState(ctx context.Context, db schemaQuerier) (inspectedSchemaS
 		if !schemaVersionFingerprintKnown(version, fingerprint) &&
 			!(version == 8 && knownSchemaEightWithRetentionIndexes(catalog)) &&
 			!(version == 9 && knownSchemaNine(catalog)) &&
-			!(version == 10 && knownSchemaTen(catalog)) {
+			!(version == 10 && knownSchemaTen(catalog)) &&
+			!(version == 11 && knownSchemaEleven(catalog)) {
 			return inspectedSchemaState{}, fmt.Errorf("%w: version=%d fingerprint=%s", ErrUnknownSchema, version, fingerprint)
 		}
 		return inspectedSchemaState{Version: version, Fingerprint: fingerprint}, nil

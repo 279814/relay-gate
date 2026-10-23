@@ -205,8 +205,8 @@ func TestKnownLegacyVariantsReachCurrentSchema(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(manifests) != 10 {
-				t.Fatalf("backup manifests = %d, want one per boundary through 9→10", len(manifests))
+			if len(manifests) != developmentSchemaVersion {
+				t.Fatalf("backup manifests = %d, want one per boundary through schema %d", len(manifests), developmentSchemaVersion)
 			}
 		})
 	}

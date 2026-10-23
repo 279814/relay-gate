@@ -181,6 +181,10 @@ func openLocked(dsn string, c *Cipher, lock *instanceLock, readerBuildID string)
 		db.Close()
 		return nil, fmt.Errorf("初始化分阶段设置: %w", err)
 	}
+	if err := st.interruptPendingAuditEvents(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("标记未完成审计: %w", err)
+	}
 	return st, nil
 }
 
@@ -226,7 +230,7 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaTen(ctx, db, cipher)
+			return initializeEmptySchemaEleven(ctx, db, cipher)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
@@ -265,6 +269,10 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 			}
 		case state.Version == 9:
 			if _, err := migrateSchemaNineToTen(ctx, db, databasePath, cipher, identity, readerBuildID); err != nil {
+				return err
+			}
+		case state.Version == 10:
+			if _, err := migrateSchemaTenToEleven(ctx, db, databasePath, cipher, identity, readerBuildID); err != nil {
 				return err
 			}
 		case state.Version == developmentSchemaVersion:

@@ -66,23 +66,13 @@ type Service struct {
 	// process restart (§12.6). Empty keeps in-memory-only behavior (unit tests).
 	dataDir string
 
-	audit []AuditEvent
-	max   int
-	now   func() time.Time
-}
-
-// AuditEvent is a pure-text credential audit row (§12.6).
-type AuditEvent struct {
-	At     string `json:"at"`
-	Action string `json:"action"`
-	Detail string `json:"detail"`
+	now func() time.Time
 }
 
 // New constructs a Service with default 10-minute relay grace.
 func New() *Service {
 	return &Service{
 		graceSec: 600,
-		max:      200,
 		now:      time.Now,
 	}
 }
@@ -173,7 +163,6 @@ func (s *Service) Status() map[string]any {
 		"relay_grace_fingerprint":  fingerprint(s.relayGrace),
 		"relay_grace_seconds_left": graceLeft,
 		"master_reveal_active":     s.now().Before(s.revealUntil),
-		"audit":                    append([]AuditEvent(nil), s.audit...),
 	}
 }
 
@@ -254,7 +243,6 @@ func (s *Service) RotateRelayKey() (newKey string, graceSeconds int, err error) 
 	s.graceUntil = nextUntil
 	s.relayActive = digestRelayKey(newKey)
 	s.relayActiveEnc = enc
-	s.noteLocked("relay_rotate", "new active; old in grace")
 	return newKey, s.graceSec, nil
 }
 
@@ -274,7 +262,6 @@ func (s *Service) RevealActiveRelayKey() (string, error) {
 	if digestRelayKey(plain) != s.relayActive {
 		return "", errors.New("Relay Key 密文与摘要不一致")
 	}
-	s.noteLocked("relay_reveal", "active key revealed after reauth")
 	return plain, nil
 }
 
@@ -311,7 +298,6 @@ func (s *Service) ResealActiveRelayUnder(sealUnder func(plain string) (string, e
 		}
 	}
 	s.relayActiveEnc = enc
-	s.noteLocked("relay_reseal", "envelope rewrapped under pending master")
 	return nil
 }
 
@@ -327,7 +313,6 @@ func (s *Service) RevokeGrace() error {
 	}
 	s.relayGrace = ""
 	s.graceUntil = time.Time{}
-	s.noteLocked("relay_revoke_grace", "old key revoked")
 	return nil
 }
 
@@ -381,7 +366,6 @@ func (s *Service) BeginMasterReveal(plain string, ttl time.Duration) {
 	}
 	s.revealValue = plain
 	s.revealUntil = s.now().Add(ttl)
-	s.noteLocked("master_reveal", "short-lived reveal started")
 }
 
 // TakeMasterReveal returns plaintext once if still within the reveal window.
@@ -409,25 +393,6 @@ func (s *Service) expireGraceLocked() {
 	if !s.graceUntil.IsZero() && !s.now().Before(s.graceUntil) {
 		s.relayGrace = ""
 		s.graceUntil = time.Time{}
-	}
-}
-
-// Note appends an admin audit row for sensitive actions outside this package
-// (§5.4 unredacted sample view / pin / bulk delete). detail must hold only
-// ids and flags, never sample bodies or secrets.
-func (s *Service) Note(action, detail string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.noteLocked(action, detail)
-}
-
-func (s *Service) noteLocked(action, detail string) {
-	ev := AuditEvent{
-		At: s.now().UTC().Format(time.RFC3339Nano), Action: action, Detail: detail,
-	}
-	s.audit = append([]AuditEvent{ev}, s.audit...)
-	if len(s.audit) > s.max {
-		s.audit = s.audit[:s.max]
 	}
 }
 

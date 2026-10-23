@@ -2,10 +2,11 @@ package main
 
 import (
 	"bytes"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/279814/relay-gate/internal/store"
 )
 
 func TestCredentialsBootstrapCLI(t *testing.T) {
@@ -35,9 +36,15 @@ func TestCredentialsBootstrapCLI(t *testing.T) {
 func TestCredentialsMigrateAndResetAdminCLI(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "relay-gate.db")
-	if err := os.WriteFile(dbPath, []byte("sqlite-placeholder"), 0o600); err != nil {
+	cipher, err := store.NewCipher("legacy-encryption-key-32bytes!!")
+	if err != nil {
 		t.Fatal(err)
 	}
+	st, err := store.Open(dbPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
 	t.Setenv("ENCRYPTION_KEY", "legacy-encryption-key-32bytes!!")
 	t.Setenv("ADMIN_PASSWORD", "legacy-admin-password")
 	t.Setenv("RELAY_KEYS", "rk-legacy-cli-key")

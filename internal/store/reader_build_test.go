@@ -86,7 +86,7 @@ func TestRotationBackupCarriesStartupIdentityAndOldMarkerRemainsReadable(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if backup.Manifest.PairedBuildID != identity || backup.Manifest.ReaderContract != "schema-10-security-scan-v1-reader" {
+	if backup.Manifest.PairedBuildID != identity || backup.Manifest.ReaderContract != "schema-11-audit-v1-reader" {
 		t.Fatalf("startup identity lost: %+v", backup.Manifest)
 	}
 	checked, err := CheckBackup(context.Background(), path, backup.ManifestPath, cipher)

@@ -91,10 +91,17 @@ func (s *Server) updateRoute(w http.ResponseWriter, r *http.Request) {
 	in := struct {
 		*model.Route
 		ExpectedRevision int64 `json:"expected_revision"`
+		Enabled          *bool `json:"enabled"`
 	}{Route: cur}
 	if err := decodeJSON(r, &in); err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	if in.Enabled != nil {
+		cur.Enabled = *in.Enabled
+		if !*in.Enabled {
+			setAuditAction(r, "route_disable")
+		}
 	}
 	if err := requireRevision(in.ExpectedRevision); err != nil {
 		s.writeErr(w, err)
