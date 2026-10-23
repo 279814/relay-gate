@@ -17,7 +17,7 @@ function initialStatistics() {
   return {
     basis: 'executions', scope: 'route', limit: 50,
     filter: { day_from: start.toISOString().slice(0, 10), day_to: end.toISOString().slice(0, 10),
-      endpoint: '', trigger: '', origin: '', route_id: '', upstream_id: '',
+      endpoint: '', trigger: '', origin: '', route_id: '', upstream_id: '', canary_source: '',
       ...Object.fromEntries(IDENTITY_FIELDS.map(field => [field.key, ''])) },
     items: [], total_rows: 0, next_cursor: '', previous_cursor: '',
     loading: false, error: '', coverage: null, request: 0,
@@ -29,16 +29,17 @@ export function createProbeStatisticsFeature(shell, api) {
     probeStatistics: initialStatistics(),
 
     statisticsFilterFields() {
-      const daily = this.probeStatistics.basis === 'daily';
+      const basis = this.probeStatistics.basis;
+      const canary = basis === 'canary';
       return [
         { key: 'day_from', label: 'UTC 起始日', type: 'date' },
         { key: 'day_to', label: 'UTC 截止日', type: 'date' },
         { key: 'upstream_id', label: 'Upstream ID', type: 'number' },
         { key: 'route_id', label: 'Route ID', type: 'number' },
-        { key: 'endpoint', label: '端点', options: ENDPOINTS },
-        { key: 'trigger', label: '触发来源', options: daily ? TRIGGERS.filter(value => value !== 'real_traffic') : TRIGGERS },
-        { key: 'origin', label: '配方来源', options: ORIGINS },
-        ...(daily ? [] : IDENTITY_FIELDS),
+        { key: 'endpoint', label: '端点', options: canary ? ENDPOINTS.filter(value => !['models', 'count_tokens'].includes(value)) : ENDPOINTS },
+        { key: 'trigger', label: '触发来源', options: canary ? ['manual', 'scheduled'] : basis === 'daily' ? TRIGGERS.filter(value => value !== 'real_traffic') : TRIGGERS },
+        ...(canary ? [{ key: 'canary_source', label: 'Canary 来源', options: ['manual', 'periodic'] }] : [{ key: 'origin', label: '配方来源', options: ORIGINS }]),
+        ...(basis === 'executions' ? IDENTITY_FIELDS : []),
       ];
     },
 
@@ -48,10 +49,15 @@ export function createProbeStatisticsFeature(shell, api) {
       state.items = []; state.total_rows = 0;
       state.next_cursor = ''; state.previous_cursor = '';
       state.loading = false; state.error = ''; state.coverage = null;
-      if (state.basis === 'daily') {
+      if (state.basis !== 'executions') {
         for (const field of IDENTITY_FIELDS) state.filter[field.key] = '';
         if (state.filter.trigger === 'real_traffic') state.filter.trigger = '';
       }
+      if (state.basis === 'canary') {
+        state.filter.origin = '';
+        if (!['manual', 'scheduled'].includes(state.filter.trigger)) state.filter.trigger = '';
+        if (['models', 'count_tokens'].includes(state.filter.endpoint)) state.filter.endpoint = '';
+      } else { state.filter.canary_source = ''; }
     },
 
     async loadProbeStatistics(direction = 'first') {
@@ -93,10 +99,13 @@ export function createProbeStatisticsFeature(shell, api) {
       if (unknownRows == null) return this.statisticsNumber(value) + '（覆盖 unknown）';
       return this.statisticsNumber(value) + (unknownRows > 0 ? `（另 ${this.statisticsNumber(unknownRows)} 次 unknown）` : '');
     },
-    statisticsTriggerText(value) {
+    statisticsTriggerText(value, canarySource) {
+      if (canarySource === 'manual') return 'Canary · 手动';
+      if (canarySource === 'periodic') return 'Canary · 周期';
       return ({ scheduled: '周期', manual: '手动（canary 未区分）', recovery: '恢复', calibration: '校准', real_traffic: '真实流量观察' })[value] || 'unknown';
     },
     statisticsRecipeText(row) {
+      if (this.probeStatistics.basis === 'canary') return 'Canary 诊断（独立成本，非 Recipe）';
       if (this.probeStatistics.basis === 'daily') return '未记录 Recipe 身份';
       if (row.binding_use === 'real_traffic_context') return '真实流量上下文（非 Recipe 执行）';
       const legacy = row.origin === 'legacy_migration' ? ' · legacy' : '';

@@ -118,6 +118,7 @@ func TestEmbed_OnlyShipsWhatTheBrowserNeeds(t *testing.T) {
 		"static/js/migration.mjs":        true,
 		"static/js/credentials.mjs":      true,
 		"static/js/security.mjs":         true,
+		"static/js/canary.mjs":           true,
 		"static/js/transforms.mjs":       true,
 		"static/js/runtime.mjs":          true,
 		"static/js/count_tokens.mjs":     true,

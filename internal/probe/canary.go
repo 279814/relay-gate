@@ -42,7 +42,11 @@ func canaryRecipe(endpoint model.EndpointKind, nonce string) (*ResolvedRecipe, e
 	if err != nil {
 		return nil, err
 	}
-	compiled, err := probetemplate.CompileContent(endpoint, probetemplate.TemplateContent{Method: "POST", Body: raw, Headers: []model.HeaderTemplate{{Name: "Content-Type", Values: []string{"application/json"}}}})
+	headers := []model.HeaderTemplate{{Name: "Content-Type", Values: []string{"application/json"}}}
+	if endpoint == model.EndpointMessages {
+		headers = append(headers, model.HeaderTemplate{Name: "Anthropic-Version", Values: []string{"2023-06-01"}})
+	}
+	compiled, err := probetemplate.CompileContent(endpoint, probetemplate.TemplateContent{Method: "POST", Body: raw, Headers: headers})
 	if err != nil {
 		return nil, err
 	}

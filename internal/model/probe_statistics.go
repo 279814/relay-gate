@@ -1,6 +1,7 @@
 package model
 
 type ProbeStatisticsFilter struct {
+	CanarySource CanarySource
 	PageRequest
 	Basis, Scope                                     string
 	DayFrom, DayTo                                   string
@@ -14,6 +15,7 @@ type ProbeStatisticsFilter struct {
 }
 
 type ProbeStatistic struct {
+	CanarySource            CanarySource      `json:"canary_source,omitempty"`
 	DayUTC                  string            `json:"day_utc"`
 	ScopeID                 int64             `json:"scope_id"`
 	UpstreamID              int64             `json:"upstream_id"`

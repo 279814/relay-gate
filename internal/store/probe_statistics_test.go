@@ -302,3 +302,65 @@ func TestProbeStatisticsUTCAndDailyRetentionHaveDifferentCoverage(t *testing.T) 
 		t.Fatal("unrecorded daily recipe filter silently accepted")
 	}
 }
+
+func TestProbeStatisticsCanaryUsesRecordedSourceAndNeverRecipeDenominator(t *testing.T) {
+	s := testStore(t)
+	route := mkRoute(t, s)
+	statisticExecution(t, s, model.ProbeExecution{ID: "ordinary-looking-canary", UpstreamID: route.UpstreamID, RouteID: route.ID, Trigger: model.TriggerManual, RecipeStorage: model.RecipeStorageEmbedded, TemplateID: "builtin:canary-v1", RecipeIdentityRevision: 1, ObservationOrder: 1, SentAtMS: statisticDay.UnixMilli(), Success: true})
+	for _, periodic := range []bool{false, true} {
+		id := "statistics-canary-manual"
+		if periodic {
+			id = "statistics-canary-periodic"
+		}
+		e := canaryCostFixture(t, s, route, id, true, !periodic)
+		if periodic {
+			e.Trigger = model.TriggerScheduled
+			if _, err := s.db.Exec(`UPDATE probe_execution SET trigger='scheduled' WHERE id=?; UPDATE canary_execution SET source='periodic',policy_revision=2 WHERE execution_id=?`, e.ID, e.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := s.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recordExecutionCostTx(context.Background(), tx, e); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	filter := statisticFilter()
+	ordinary, err := s.ListProbeStatistics(context.Background(), filter)
+	if err != nil || ordinary.TotalRows != 1 || *ordinary.Items[0].Executions != 1 {
+		t.Fatalf("actual Canary entered Recipe denominator (or template name guessed source): %+v %v", ordinary, err)
+	}
+	filter.Basis = "canary"
+	page, err := s.ListProbeStatistics(context.Background(), filter)
+	if err != nil || page.TotalRows != 2 || len(page.Items) != 2 {
+		t.Fatalf("actual Canary source statistics=%+v %v", page, err)
+	}
+	for _, row := range page.Items {
+		if row.CanarySource != model.CanaryManual && row.CanarySource != model.CanaryPeriodic {
+			t.Fatalf("missing recorded Canary source: %+v", row)
+		}
+		if row.RecipeDenominator != nil || row.RecipeSuccessRate != nil || row.Requests != 1 || row.Succeeded != 1 {
+			t.Fatalf("Canary became Recipe rate: %+v", row)
+		}
+		if row.Trigger == model.TriggerManual && (row.ObservedOutputTokens == nil || *row.ObservedOutputTokens != 0 || *row.UnknownOutputRows != 0) {
+			t.Fatalf("known zero Canary usage lost: %+v", row)
+		}
+		if row.Trigger == model.TriggerScheduled && (row.ObservedOutputTokens != nil || *row.UnknownOutputRows != 1) {
+			t.Fatalf("unknown Canary usage became zero: %+v", row)
+		}
+	}
+	filter.CanarySource = model.CanaryPeriodic
+	filtered, err := s.ListProbeStatistics(context.Background(), filter)
+	if err != nil || filtered.TotalRows != 1 || filtered.Items[0].CanarySource != model.CanaryPeriodic {
+		t.Fatalf("Canary source filter ignored: %+v %v", filtered, err)
+	}
+	filter.RecipeID = 1
+	if _, err := s.ListProbeStatistics(context.Background(), filter); err == nil {
+		t.Fatal("Canary silently accepted an irrelevant Recipe filter")
+	}
+}

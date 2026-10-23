@@ -12,7 +12,7 @@ daily 视图读取持久化账本的请求、成功/失败/取消、Token 和 pi
 
 ## 已确认的历史限制
 
-- Trigger 只有 scheduled/manual/calibration/recovery/real_traffic；现 canary 调用 RunManual。canary 来源未独立记录，API/UI 明确 unavailable，不按时间或 Route 猜关联，不把 unknown 当成零。
+- 历史 Trigger 只有 scheduled/manual/calibration/recovery/real_traffic，旧 Canary 来源无法恢复，保持 unavailable，不按时间、Route 或 template 名字猜测。schema14 的新增事实和独立 `basis=canary` 视图见 [Canary 设计](2026-10-19-canary-design.md)；已明确记录的 Canary 从 Recipe 执行分母排除。
 - Token 列为 NOT NULL DEFAULT 0，缺少 presence 位。非零值是已记录值，零值按 unknown 展示；执行视图另外显示未知覆盖数，daily 明示无法恢复逐次覆盖。数值不是计费账单。
 - daily 的 piggyback counter 无 Recipe identity，不能分摊给 Recipe/版本；Recipe 视图对应值为 unknown。
 - 执行统计仅覆盖仍保留记录；保留政策和筛选结果的最早/最晚日期均可见，不宣称窗口内完整历史。

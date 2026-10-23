@@ -32,23 +32,3 @@ type CanaryExecution struct {
 	OutputUsagePresent bool         `json:"output_usage_present"`
 	EvidenceHash       string       `json:"evidence_hash"`
 }
-
-type CanaryCostDaily struct {
-	DayUTC               string       `json:"day_utc"`
-	Source               CanarySource `json:"source"`
-	Endpoint             EndpointKind `json:"endpoint"`
-	RouteID              int64        `json:"route_id"`
-	UpstreamID           int64        `json:"upstream_id"`
-	Executions           int64        `json:"executions"`
-	Requests             int64        `json:"requests"`
-	Passed               int64        `json:"passed"`
-	Violated             int64        `json:"violated"`
-	Incomplete           int64        `json:"incomplete"`
-	Canceled             int64        `json:"canceled"`
-	ExecutionFailed      int64        `json:"execution_failed"`
-	NotSent              int64        `json:"not_sent"`
-	EstimatedInputTokens int64        `json:"estimated_input_tokens"`
-	ObservedOutputTokens int64        `json:"observed_output_tokens"`
-	UnknownInputRows     int64        `json:"unknown_input_rows"`
-	UnknownOutputRows    int64        `json:"unknown_output_rows"`
-}

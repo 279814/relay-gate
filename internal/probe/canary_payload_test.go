@@ -92,3 +92,20 @@ func TestCanaryPayloadRetainsOnlyBoundedToolDataAfterViolation(t *testing.T) {
 		t.Fatalf("unbounded retained diagnostic data: name=%d args=%d", len(check.name), len(check.args))
 	}
 }
+
+func TestCanaryChatRejectsADeclaredNonFunctionTool(t *testing.T) {
+	nonce := "00112233445566778899aabbccddeeff"
+	check := newCanaryCheck(model.EndpointChatCompletions, nonce, model.CanaryManual, 0)
+	decoder, _ := protocol.NewDecoderWithPayloadSink(protocol.DecoderSpec{Endpoint: model.EndpointChatCompletions, Protocol: model.ProtoOpenAIChat}, protocol.WireJSON, 256<<10, 1<<20, check.observe)
+	body := `{"choices":[{"message":{"tool_calls":[{"type":"command","function":{"name":"relay_canary_noop","arguments":"{\"nonce\":\"` + nonce + `\"}"}}]},"finish_reason":"tool_calls"}]}`
+	if _, err := decoder.Feed([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	result := check.finalize(model.ProbeExecution{ID: "synthetic-canary", SentAtMS: 1, Success: true, NormalEndSeen: true})
+	if result.Verdict != "violation" {
+		t.Fatalf("non-function tool passed strict Canary: %+v", result)
+	}
+}

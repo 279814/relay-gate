@@ -426,6 +426,7 @@ func (e *Executor) send(ctx context.Context, req ExecutionRequest, prepared *pre
 	timing.responseHeaderAtMS = headerAt.UnixMilli()
 
 	classifier := NewResponseClassifier(req.Mode, req.Endpoint, resp.StatusCode, resp.Header, headerAt)
+	classifier.waitForEOF = req.canary != nil
 
 	protocol := model.Protocol("")
 	if req.ModelName != nil {

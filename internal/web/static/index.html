@@ -844,12 +844,53 @@
               </div>
               <button class="primary" @click="runSecurityScan()">扫描</button>
             </div>
+            <p class="probe-statistics-note">Canary 会向模型发送一次最小诊断请求，以随机 nonce 和无副作用工具检查严格输出。工具不会执行，结果不自动修改健康；明确手动诊断允许 Lazy。</p>
             <div class="row" style="margin-bottom:12px">
               <div class="field" style="max-width:200px">
-                <label>手动 Canary Route ID（需 Active）</label>
-                <input x-model="security.canaryRouteId" placeholder="route id">
+                <label>手动 Canary Route ID</label>
+                <input type="number" min="1" x-model="security.canaryRouteId" @input="onCanaryRouteChange()" :disabled="canary.running" placeholder="route id">
               </div>
-              <button @click="runSecurityCanary()">运行 Canary</button>
+              <button @click="runSecurityCanary()" :disabled="canary.running" x-text="canary.running ? '诊断执行中…' : '明确发送一次诊断'"></button>
+              <button @click="viewCanaryCosts()">查看独立成本</button>
+            </div>
+            <p class="err-text" x-show="canary.runError" x-text="canary.runError"></p>
+            <template x-if="canary.result">
+              <div class="box" style="margin-bottom:12px">
+                <strong x-text="'Canary ' + canaryVerdictText(canary.result.canary.verdict)"></strong>
+                <div class="mono" x-text="'Execution：' + canary.result.execution_id"></div>
+                <div x-text="'来源：' + canary.result.canary.source + '；期望版本：' + canary.result.canary.expectation_version"></div>
+                <div x-text="'Nonce：' + canaryFlagText(canary.result.canary.nonce_matched) + '；唯一 inert tool：' + canaryFlagText(canary.result.canary.tool_matched)"></div>
+                <div class="probe-statistics-note" x-text="'Nonce SHA-256：' + canary.result.canary.nonce_sha256"></div>
+              </div>
+            </template>
+            <div class="box" style="margin-bottom:16px">
+              <strong>可选周期 Canary</strong>
+              <p class="probe-statistics-note">默认关闭，仅 Active Upstream 可启用。周期从执行结束起计算，共用探活并发与暂停控制；切换 Lazy 后不会发出新的周期请求。</p>
+              <div class="row">
+                <div class="field" style="max-width:180px">
+                  <label>Upstream ID</label>
+                  <input type="number" min="1" x-model="canary.upstreamId" @input="onCanaryUpstreamChange()" :disabled="canary.loading || canary.saving">
+                </div>
+                <button @click="loadCanaryPolicy()" :disabled="canary.loading || canary.saving">重新载入策略</button>
+              </div>
+              <template x-if="canary.policy">
+                <div>
+                  <div class="row">
+                    <div class="field" style="max-width:180px">
+                      <label>诊断 Route ID</label>
+                      <input type="number" min="1" x-model.number="canary.draft.route_id" :disabled="canary.loading || canary.saving">
+                    </div>
+                    <div class="field" style="max-width:180px">
+                      <label>周期（300–86400 秒）</label>
+                      <input type="number" min="300" max="86400" x-model.number="canary.draft.interval_sec" :disabled="canary.loading || canary.saving">
+                    </div>
+                    <label><input type="checkbox" x-model="canary.draft.enabled" :disabled="canary.loading || canary.saving">启用周期 Canary</label>
+                    <button @click="saveCanaryPolicy()" :disabled="canary.loading || canary.saving || canary.conflict">保存周期策略</button>
+                  </div>
+                  <p class="err-text" x-show="canary.conflict">策略已被其他操作修改，当前草稿已保留。请重新载入后再保存。</p>
+                </div>
+              </template>
+              <p class="err-text" x-show="canary.policyError" x-text="canary.policyError"></p>
             </div>
             <table>
               <thead><tr><th>时间</th><th>级别</th><th>类别</th><th>摘要</th><th>来源</th></tr></thead>
@@ -1667,6 +1708,7 @@
                 <select x-model="probeStatistics.basis" @change="onStatisticsFilterChange(); loadProbeStatistics()">
                   <option value="executions">执行记录 · Recipe / 版本</option>
                   <option value="daily">每日成本账本 · 来源</option>
+                    <option value="canary">Canary 独立成本 · 实际来源</option>
                 </select>
               </label>
               <label>分组范围
@@ -1682,7 +1724,7 @@
               </label>
               <button @click="loadProbeStatistics()" :disabled="probeStatistics.loading">刷新首屏</button>
             </div>
-            <p class="probe-statistics-note">Recipe 统计只使用执行时保存的身份与版本。每日成本账本不含 Recipe 身份，不能用来源合计代替 Recipe 成功率。</p>
+            <p class="probe-statistics-note">Recipe 统计只使用执行时保存的身份与版本，并排除已明确记录的 Canary。每日账本和 Canary 独立成本不生成 Recipe 成功率。</p>
             <div class="bar">
               <template x-for="filterField in statisticsFilterFields()" :key="filterField.key">
                 <label>
@@ -1702,7 +1744,8 @@
             </div>
             <div class="probe-statistics-note">
               <div>Token 是已记录的估算或观测，不是账单；unknown 不代表 0 Token 或 0 费用。</div>
-              <div>Canary 来源：unknown（历史与手动混合记录）。Recipe 级 piggyback 节省：unknown（仅每日账本有计数）。</div>
+              <div x-show="probeStatistics.basis !== 'canary'">旧 Canary 来源：unknown（历史与手动混合记录）。Recipe 级 piggyback 节省：unknown（仅普通每日账本有计数）。</div>
+              <div x-show="probeStatistics.basis === 'canary'">Canary 仅使用明确记录的手动/周期来源与 usage presence；已观测的 0 保留为 0，未观测仍为 unknown，不包含旧 manual 的猜测。</div>
               <template x-if="probeStatistics.coverage">
                 <div>
                   <div x-text="probeStatistics.coverage.outcome_note"></div>
@@ -1727,13 +1770,13 @@
                     <tr>
                       <td><div x-text="row.day_utc"></div><div class="probe-statistics-note" x-show="row.created_time_fallback_rows" x-text="'legacy 创建时间回退：' + statisticsNumber(row.created_time_fallback_rows)"></div></td>
                       <td x-text="(probeStatistics.scope === 'route' ? (row.scope_id ? 'Route #' + row.scope_id : '无 Route') : 'Upstream #' + row.scope_id) + ' / Upstream #' + row.upstream_id"></td>
-                      <td><div x-text="statisticsTriggerText(row.trigger)"></div><div class="mono" x-text="row.endpoint"></div></td>
+                      <td><div x-text="statisticsTriggerText(row.trigger, row.canary_source)"></div><div class="mono" x-text="row.endpoint"></div></td>
                       <td class="wrap"><div x-text="statisticsRecipeText(row)"></div><div class="probe-statistics-note" x-text="row.origin"></div></td>
                       <td class="num" x-text="statisticsNumber(row.executions) + ' / ' + statisticsNumber(row.requests)"></td>
                       <td class="num" x-text="statisticsNumber(row.models_requests) + ' / ' + statisticsNumber(row.l2_requests)"></td>
                       <td class="num">
                         <div x-text="statisticsNumber(row.succeeded) + ' / ' + statisticsNumber(row.failed) + ' / ' + statisticsNumber(row.canceled)"></div>
-                        <div x-show="probeStatistics.basis === 'executions'" class="probe-statistics-note" x-text="'观察不完整：' + statisticsNumber(row.incomplete) + '；未发出：' + statisticsNumber(row.not_sent)"></div>
+                        <div x-show="probeStatistics.basis !== 'daily'" class="probe-statistics-note" x-text="'观察不完整：' + statisticsNumber(row.incomplete) + '；未发出：' + statisticsNumber(row.not_sent)"></div>
                       </td>
                       <td x-show="probeStatistics.basis === 'executions'" class="num">
                         <strong x-text="statisticsRateText(row.recipe_success_rate)"></strong>

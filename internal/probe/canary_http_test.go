@@ -60,6 +60,9 @@ func TestCanaryManualLazyRealHTTPUsesOneExecutorAndSeparateCost(t *testing.T) {
 				if r.URL.Path != kind.CanonicalPath() || strings.Contains(string(body), "1+1") {
 					t.Error("Canary reused ordinary Recipe or another endpoint")
 				}
+				if kind == model.EndpointMessages && r.Header.Get("Anthropic-Version") != "2023-06-01" {
+					t.Error("Canary omitted the native messages protocol version")
+				}
 				nonce := canaryRequestNonce(t, body, kind)
 				if nonce == previous {
 					t.Error("Canary reused a nonce")
@@ -69,11 +72,11 @@ func TestCanaryManualLazyRealHTTPUsesOneExecutorAndSeparateCost(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				switch kind {
 				case model.EndpointMessages:
-					_, _ = fmt.Fprintf(w, `{"content":[{"type":"tool_use","id":"one","name":"relay_canary_noop","input":%s}],"stop_reason":"tool_use","usage":{"input_tokens":0,"output_tokens":0}}`, args)
+					_, _ = fmt.Fprintf(w, `{"content":[{"type":"tool_use","id":"one","name":"relay_canary_noop","input":%s}],"stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":7}}`, args)
 				case model.EndpointResponses:
-					_, _ = fmt.Fprintf(w, `{"status":"completed","output":[{"id":"one","type":"function_call","name":"relay_canary_noop","arguments":%q}],"usage":{"input_tokens":0,"output_tokens":0}}`, args)
+					_, _ = fmt.Fprintf(w, `{"status":"completed","output":[{"id":"one","type":"function_call","name":"relay_canary_noop","arguments":%q}],"usage":{"input_tokens":12,"output_tokens":7}}`, args)
 				case model.EndpointChatCompletions:
-					_, _ = fmt.Fprintf(w, `{"choices":[{"index":0,"message":{"tool_calls":[{"id":"one","type":"function","function":{"name":"relay_canary_noop","arguments":%q}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":0,"completion_tokens":0}}`, args)
+					_, _ = fmt.Fprintf(w, `{"choices":[{"index":0,"message":{"tool_calls":[{"id":"one","type":"function","function":{"name":"relay_canary_noop","arguments":%q}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":7}}`, args)
 				}
 			})
 			h.up.ProbeMode = model.ProbeModeLazy
@@ -106,6 +109,9 @@ func TestCanaryManualLazyRealHTTPUsesOneExecutorAndSeparateCost(t *testing.T) {
 				if execution.Canary == nil || execution.Canary.Verdict != "passed" || execution.Canary.Source != model.CanaryManual || execution.ExpectedCancel || !execution.NormalEndSeen || execution.CapabilityDisposition != model.ApplyNotApplicable || execution.ReachabilityDisposition != model.ApplyNotApplicable {
 					t.Fatalf("manual Lazy Canary round=%d: %+v", round, execution)
 				}
+				if execution.ObservedOutputTokens != 7 {
+					t.Fatalf("Canary lost native positive output usage: %d", execution.ObservedOutputTokens)
+				}
 				loaded, err := h.store.GetProbeExecution(context.Background(), execution.ID)
 				if err != nil || loaded.Canary == nil || loaded.Canary.EvidenceHash != execution.Canary.EvidenceHash {
 					t.Fatalf("missing durable exact result: %+v %v", loaded, err)
@@ -114,9 +120,9 @@ func TestCanaryManualLazyRealHTTPUsesOneExecutorAndSeparateCost(t *testing.T) {
 			if calls.Load() != 2 {
 				t.Fatalf("Canary sent %d requests, want exactly one per click", calls.Load())
 			}
-			var requests, unknown, ordinary int
-			if err := h.store.DB().QueryRow(`SELECT SUM(requests),SUM(unknown_output_rows) FROM canary_cost_daily`).Scan(&requests, &unknown); err != nil || requests != 2 || unknown != 0 {
-				t.Fatalf("separate known-zero Canary cost=%d/%d %v", requests, unknown, err)
+			var requests, unknown, output, ordinary int
+			if err := h.store.DB().QueryRow(`SELECT SUM(requests),SUM(unknown_output_rows),SUM(observed_output_tokens) FROM canary_cost_daily`).Scan(&requests, &unknown, &output); err != nil || requests != 2 || unknown != 0 || output != 14 {
+				t.Fatalf("separate native Canary cost=%d/%d/%d %v", requests, unknown, output, err)
 			}
 			if err := h.store.DB().QueryRow(`SELECT COUNT(*) FROM probe_cost_daily`).Scan(&ordinary); err != nil || ordinary != 0 {
 				t.Fatalf("Canary polluted Recipe daily: %d %v", ordinary, err)

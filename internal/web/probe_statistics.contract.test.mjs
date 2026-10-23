@@ -80,3 +80,32 @@ test('unknown usage and real context are never rendered as zero cost or a Recipe
   assert.match(shell.statisticsRecipeText({}), /未记录/);
   assert.match(shell.statisticsTriggerText('manual'), /canary/);
 });
+
+test('Canary basis uses recorded sources and clears unrelated Recipe filters', async () => {
+  const calls = [];
+  const shell = shellFor({ async get(path) { calls.push(path); return { items: [], total_rows: 0, coverage: {} }; } });
+  const state = shell.probeStatistics;
+  state.filter.recipe_id = '12'; state.filter.version_id = '5'; state.filter.origin = 'manual';
+  state.filter.endpoint = 'models'; state.filter.trigger = 'recovery';
+  state.basis = 'canary';
+  shell.onStatisticsFilterChange();
+  assert.equal(state.filter.recipe_id, '');
+  assert.equal(state.filter.version_id, '');
+  assert.equal(state.filter.origin, '');
+  assert.equal(state.filter.endpoint, '');
+  assert.equal(state.filter.trigger, '');
+  const fields = shell.statisticsFilterFields();
+  assert.deepEqual(fields.find(field => field.key === 'canary_source').options, ['manual', 'periodic']);
+  assert.ok(!fields.some(field => field.key === 'recipe_id' || field.key === 'origin'));
+  state.filter.canary_source = 'periodic';
+  await shell.loadProbeStatistics();
+  const query = new URL(calls[0], 'http://localhost').searchParams;
+  assert.equal(query.get('basis'), 'canary');
+  assert.equal(query.get('canary_source'), 'periodic');
+  assert.equal(query.has('recipe_id'), false);
+  assert.match(shell.statisticsRecipeText({ canary_source: 'periodic' }), /Canary.*非 Recipe/);
+  assert.equal(shell.statisticsTriggerText('scheduled', 'periodic'), 'Canary · 周期');
+  state.basis = 'executions';
+  shell.onStatisticsFilterChange();
+  assert.equal(state.filter.canary_source, '');
+});

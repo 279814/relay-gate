@@ -87,3 +87,35 @@ func TestProbeStatisticsRealHTTPFiltersAndBoundedProjection(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeStatisticsRealHTTPCanarySourcesKeepZeroAndUnknownDistinct(t *testing.T) {
+	s, _ := newTestServer(t)
+	route := canaryAPIRoute(t, s)
+	if _, err := s.st.DB().Exec(`INSERT INTO canary_cost_daily(day_utc,source,endpoint,route_id,upstream_id,executions,requests,passed,estimated_input_tokens,unknown_input_rows,unknown_output_rows)
+		VALUES('2026-10-19','manual','messages',?,?,2,2,2,10,0,0),('2026-10-19','periodic','messages',?,?,2,2,1,0,2,2)`, route.ID, route.UpstreamID, route.ID, route.UpstreamID); err != nil {
+		t.Fatal(err)
+	}
+	h := s.Routes(testAdminPW)
+	base := "/admin/api/probe-statistics?basis=canary&day_from=2026-10-19&day_to=2026-10-19"
+	response := do(t, h, "GET", base+"&canary_source=manual", "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("Canary statistics HTTP=%d %s", response.Code, response.Body.String())
+	}
+	page := decodeBody[model.ProbeStatisticsPage](t, response)
+	if page.TotalRows != 1 || page.Items[0].CanarySource != model.CanaryManual || page.Items[0].ObservedOutputTokens == nil || *page.Items[0].ObservedOutputTokens != 0 || page.Items[0].RecipeDenominator != nil || page.Coverage.TokenPresence != "recorded_with_presence" {
+		t.Fatalf("typed known-zero Canary contract=%+v", page)
+	}
+	response = do(t, h, "GET", base+"&canary_source=periodic", "", true)
+	page = decodeBody[model.ProbeStatisticsPage](t, response)
+	if page.TotalRows != 1 || page.Items[0].CanarySource != model.CanaryPeriodic || page.Items[0].ObservedOutputTokens != nil || page.Items[0].EstimatedInputTokens != nil || *page.Items[0].UnknownOutputRows != 2 {
+		t.Fatalf("unknown Canary usage became false zero=%+v", page)
+	}
+	for _, suffix := range []string{"&recipe_id=1", "&origin=manual", "&storage=embedded", "&trigger=recovery", "&endpoint=models", "&canary_source=guessed"} {
+		if response := do(t, h, "GET", base+suffix, "", true); response.Code != http.StatusBadRequest {
+			t.Fatalf("irrelevant Canary filter silently accepted: %s status=%d", suffix, response.Code)
+		}
+	}
+	if response := do(t, h, "GET", "/admin/api/probe-statistics?basis=executions&canary_source=manual", "", true); response.Code != http.StatusBadRequest {
+		t.Fatalf("Recipe view silently ignored Canary filter: %d", response.Code)
+	}
+}

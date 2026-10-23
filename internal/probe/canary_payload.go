@@ -230,6 +230,10 @@ func (c *canaryCheck) chat(object map[string]json.RawMessage) {
 			return
 		}
 		for _, call := range calls {
+			if raw, present := call["type"]; present && canaryString(raw) != "function" {
+				c.violation = true
+				return
+			}
 			if !c.index(call["index"]) {
 				return
 			}
