@@ -1,0 +1,185 @@
+{
+  "note": "Synthetic parser fixture from reviewed public literals and fixed test identities; not a native capture or provenance evidence. Content-Length is filled by the test.",
+  "nonce": "0123456789abcdef01234567",
+  "body": {
+    "model": "captured-model",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-10-23.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n\n"
+          },
+          {
+            "type": "text",
+            "text": "1+1=? control:0123456789abcdef01234567",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ],
+    "system": [
+      {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.220.360; cc_entrypoint=sdk-cli;"
+      },
+      {
+        "type": "text",
+        "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "text",
+        "text": "Reply with 2 only.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "tools": [],
+    "metadata": {
+      "user_id": "{\"device_id\":\"30c874ff7dfd1d0cbcde4d70c234643354924ab6fecb0bca15ff8074cb1528a2\",\"account_uuid\":\"\",\"session_id\":\"67754998-5c84-4a6c-ab53-7b37488390fb\"}"
+    },
+    "max_tokens": 64,
+    "thinking": {
+      "type": "disabled"
+    },
+    "output_config": {
+      "effort": "low"
+    },
+    "stream": true
+  },
+  "headers": [
+    {
+      "name": "Accept",
+      "values": [
+        "application/json"
+      ]
+    },
+    {
+      "name": "Accept-Encoding",
+      "values": [
+        "identity"
+      ]
+    },
+    {
+      "name": "Content-Type",
+      "values": [
+        "application/json"
+      ]
+    },
+    {
+      "name": "User-Agent",
+      "values": [
+        "claude-cli/2.1.220 (external, sdk-cli)"
+      ]
+    },
+    {
+      "name": "X-Claude-Code-Session-Id",
+      "values": [
+        "67754998-5c84-4a6c-ab53-7b37488390fb"
+      ]
+    },
+    {
+      "name": "X-Stainless-Arch",
+      "values": [
+        "x64"
+      ]
+    },
+    {
+      "name": "X-Stainless-Lang",
+      "values": [
+        "js"
+      ]
+    },
+    {
+      "name": "X-Stainless-OS",
+      "values": [
+        "Windows"
+      ]
+    },
+    {
+      "name": "X-Stainless-Package-Version",
+      "values": [
+        "0.94.0"
+      ]
+    },
+    {
+      "name": "X-Stainless-Retry-Count",
+      "values": [
+        "0"
+      ]
+    },
+    {
+      "name": "X-Stainless-Runtime",
+      "values": [
+        "node"
+      ]
+    },
+    {
+      "name": "X-Stainless-Runtime-Version",
+      "values": [
+        "v26.3.0"
+      ]
+    },
+    {
+      "name": "X-Stainless-Timeout",
+      "values": [
+        "600"
+      ]
+    },
+    {
+      "name": "anthropic-beta",
+      "values": [
+        "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+      ]
+    },
+    {
+      "name": "anthropic-dangerous-direct-browser-access",
+      "values": [
+        "true"
+      ]
+    },
+    {
+      "name": "anthropic-version",
+      "values": [
+        "2023-06-01"
+      ]
+    },
+    {
+      "name": "x-api-key",
+      "values": [
+        "{{UPSTREAM_API_KEY}}"
+      ]
+    },
+    {
+      "name": "x-app",
+      "values": [
+        "cli"
+      ]
+    },
+    {
+      "name": "Connection",
+      "values": [
+        "keep-alive"
+      ]
+    },
+    {
+      "name": "Host",
+      "values": [
+        "127.0.0.1:1"
+      ]
+    },
+    {
+      "name": "Content-Length",
+      "values": [
+        "0"
+      ]
+    }
+  ]
+}

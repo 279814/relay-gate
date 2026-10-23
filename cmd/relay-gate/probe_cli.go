@@ -55,8 +55,9 @@ type tsvRow struct {
 }
 
 type controlEntry struct {
-	Alias  string `json:"alias"`
-	loaded *validatedControl
+	Alias   string `json:"alias"`
+	loaded  *validatedControl
+	Profile json.RawMessage `json:"profile,omitempty"`
 
 	Protocol     string `json:"protocol"`
 	Endpoint     string `json:"endpoint"`

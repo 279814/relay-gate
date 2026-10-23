@@ -32,6 +32,8 @@ type controlIsolation struct {
 
 type controlCapture struct {
 	FormatVersion          int              `json:"format_version"`
+	Profile                json.RawMessage  `json:"profile,omitempty"`
+	SourceExecutableSHA256 json.RawMessage  `json:"source_executable_sha256,omitempty"`
 	Protocol               string           `json:"protocol"`
 	Endpoint               string           `json:"endpoint"`
 	Source                 string           `json:"source"`
@@ -160,12 +162,16 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 	if err := decodeControlJSON(data, &manifest); err != nil {
 		return nil, err
 	}
-	if manifest.Version != "1" || len(manifest.Entries) == 0 || len(manifest.Entries) > 128 {
+	if (manifest.Version != "1" && manifest.Version != "2") || len(manifest.Entries) == 0 || len(manifest.Entries) > 128 {
 		return nil, errCLIPrivateInput
 	}
 	seen := map[string]bool{}
 	for index := range manifest.Entries {
 		entry := &manifest.Entries[index]
+		selectedProfile, err := selectControlProfile(manifest.Version, entry.Profile)
+		if err != nil {
+			return nil, err
+		}
 		endpoint := model.EndpointKind(entry.Endpoint)
 		if !endpoint.Valid() || endpoint == model.EndpointModels || entry.Alias == "" || !controlNoncePattern.MatchString(entry.Nonce) || entry.ControlID == "" || len(entry.ControlID) > 128 ||
 			entry.Truncated || entry.SecretScan != "1" || !controlFresh(*entry, now) || entry.BodyBytes < 0 || entry.BodyBytes > maxControlBytes {
@@ -204,7 +210,7 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 		if err := decodeControlJSON(fixtureData, &capture); err != nil {
 			return nil, err
 		}
-		if capture.FormatVersion != 2 || capture.TestMode || capture.Protocol != entry.Protocol || capture.Endpoint != entry.Endpoint || capture.Source != entry.Source ||
+		if !captureMatchesControlProfile(selectedProfile, capture) || capture.TestMode || capture.Protocol != entry.Protocol || capture.Endpoint != entry.Endpoint || capture.Source != entry.Source ||
 			capture.ControlID != entry.ControlID || capture.Nonce != entry.Nonce || capture.CapturedAt != entry.CapturedAt || capture.CompletedAt != entry.CompletedAt ||
 			capture.Truncated || !capture.AuthenticationVerified || capture.Isolation != (controlIsolation{true, true, true, true, true, true}) {
 			return nil, errCLIPrivateInput
@@ -224,6 +230,9 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 			return nil, err
 		}
 		if len(headers) > 128 {
+			return nil, errCLIPrivateInput
+		}
+		if selectedProfile == controlProfile220 && !validControl220Headers(headers, entry.Nonce, len(body)) {
 			return nil, errCLIPrivateInput
 		}
 		loaded := &validatedControl{entry: *entry, body: body}
@@ -256,7 +265,7 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 				}
 				continue
 			}
-			if !validControlHeader(header, len(body)) {
+			if selectedProfile != controlProfile220 && !validControlHeader(header, len(body)) {
 				return nil, errCLIPrivateInput
 			}
 			// Reuse the production forwarding protection, including headers named
@@ -277,7 +286,12 @@ func loadControlManifest(path, root string, now time.Time, knownSecrets ...strin
 		if err := validateControlQuery(loaded.rawQuery, knownSecrets...); err != nil {
 			return nil, err
 		}
-		if err := validateControlPrompt(endpoint, body, entry.Nonce); err != nil {
+		if selectedProfile == controlProfile220 {
+			err = validateControl220Body(body, entry.Nonce, entry.CapturedAt)
+		} else {
+			err = validateControlPrompt(endpoint, body, entry.Nonce)
+		}
+		if err != nil {
 			return nil, err
 		}
 		profile := model.TimeoutL2Standard
