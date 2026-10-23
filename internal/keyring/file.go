@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -90,6 +91,31 @@ func (f *File) LoadActive() (keyID, master string, err error) {
 	}
 	if doc.Active == "" || doc.KeyID == "" {
 		return "", "", fmt.Errorf("%w: empty active key", ErrNotInitialized)
+	}
+	return doc.KeyID, doc.Active, nil
+}
+
+// LoadStableActive reads the current keyring once without recovery or writes.
+// Offline backup checks must not guess a previous/pending generation or advance
+// rotation state. Normal service recovery continues to use LoadActive.
+func (f *File) LoadStableActive() (keyID, master string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	doc, err := f.parseKeyringFile(f.path)
+	if err != nil {
+		return "", "", errors.New("当前 keyring 缺失或无法解析；离线操作不会恢复 previous 文件")
+	}
+	if doc.FormatVersion != 1 {
+		return "", "", errors.New("当前 keyring 格式版本不支持")
+	}
+	if doc.Pending != "" || doc.Phase == PhasePrepared || doc.Phase == PhaseDBCommitted || doc.Phase == PhaseKeyActivated {
+		return "", "", errors.New("当前 keyring 轮换未完成；离线操作不会激活 pending Master")
+	}
+	if doc.Phase != PhaseIdle && doc.Phase != PhaseCleaned || doc.Phase == PhaseIdle && doc.RotationID != "" {
+		return "", "", errors.New("当前 keyring 状态无效或未知")
+	}
+	if strings.TrimSpace(doc.KeyID) == "" || strings.TrimSpace(doc.Active) == "" {
+		return "", "", errors.New("当前 keyring 缺少有效 active Master")
 	}
 	return doc.KeyID, doc.Active, nil
 }
