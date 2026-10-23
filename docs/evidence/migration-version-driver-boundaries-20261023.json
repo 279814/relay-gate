@@ -123,7 +123,6 @@
   "global_sql_driver_replaced": false,
   "local_result": "passed",
   "local_package_elapsed_seconds": 71.234,
-  "full_ci_status": "pending",
   "not_covered": [
     "all data-dependent migration branches and row loops",
     "individual SQLite-internal DDL statements inside a script Exec",
@@ -132,5 +131,6 @@
     "filesystem write, rename and fsync failures",
     "physical commit and WAL failures",
     "power loss"
-  ]
+  ],
+  "full_ci_checks": "https://github.com/279814/relay-gate/pull/423/checks"
 }
