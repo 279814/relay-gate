@@ -213,12 +213,14 @@ jobs:
           gh release download v0.76.0 --repo aquasecurity/trivy --pattern trivy_0.76.0_Linux-64bit.tar.gz --dir "$RUNNER_TEMP"
           echo "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7  $RUNNER_TEMP/trivy_0.76.0_Linux-64bit.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/trivy_0.76.0_Linux-64bit.tar.gz" -C "$RUNNER_TEMP" trivy
-      - name: Build and inspect both production images
+      - name: Build both production images
         run: |
           docker build -t relay-gate-security .
           docker build -f deploy/Dockerfile.public --target production -t relay-public-edge-security .
-          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 relay-gate-security
-          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 relay-public-edge-security
+      - name: Scan backend production image
+        run: '"$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 relay-gate-security'
+      - name: Scan public TLS edge production image
+        run: '"$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 relay-public-edge-security'
 
   public-edge:
     runs-on: ubuntu-latest
