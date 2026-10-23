@@ -65,6 +65,9 @@ export function createCanaryFeature(shell, api) {
       if (this.authed === false || state.loading || state.saving || state.conflict || !state.policy) return false;
       const upstream = String(state.upstreamId);
       const interval = Number(state.draft.interval_sec);
+      if (state.policy.upstream_id !== Number(upstream)) {
+        state.policyError = '目标已改变，请重新载入该 Upstream 的策略'; return false;
+      }
       if (!positiveID(upstream) || !positiveID(state.draft.route_id) || !Number.isInteger(interval) || interval < 300 || interval > 86400) {
         state.policyError = '请填写有效 Route ID 和 300–86400 秒周期'; return false;
       }
