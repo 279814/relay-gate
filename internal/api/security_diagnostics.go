@@ -1,9 +1,10 @@
 package api
 
 import (
+	"net/http"
+
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/store"
-	"net/http"
 )
 
 func (s *Server) listSecurityDiagnostics(w http.ResponseWriter, r *http.Request) {

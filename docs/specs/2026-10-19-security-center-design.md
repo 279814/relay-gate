@@ -1,6 +1,6 @@
 # Security Center 管理合同收口
 
-依据 docs01 §14.5、§17、docs04 的 Probe 单一执行器和管理权限合同。独立分支从元数据 UI405 与 SMTP13 稳定检查点集成；schema14 Canary、15 原始留样、16 Transform 由各 owner 冻结，本 lane 等16稳定后才实现17迁移。旧 reader、备份和已冻结 DDL 形状保持其各自版本合同。
+依据 docs01 §14.5、§17、docs04 的 Probe 单一执行器和管理权限合同。独立分支从元数据 UI405 与 SMTP13 稳定检查点集成；schema14 Canary、15原始留样、16 Transform 分别冻结后，本分支固定了17迁移；原旧版形状保持不变。旧 reader、备份和已冻结 DDL 形状保持其各自版本合同。
 
 ## 方案与边界
 
@@ -18,7 +18,7 @@
 - `security_finding` 增加 `upstream_id`、`rule_id`：新真实采集携带已固定的身份；旧行默认0/空表示未知，不能用当前配置重构。内置规则为 `builtin:<category>`，自定义规则为 `custom:<原 Rule.ID>`，命名空间避免同名碰撞；聚合使用完整 RuleID，自定义 ID 不可重复，类别仍是类别。
 - `security_finding_review(finding_id, status, revision, updated_at)`：只保存管理决定，关联 finding；未标记的逻辑默认是 open/revision1。
 - `security_ignore_rule(id, scope, rule_id, route_id, expires_at, enabled, revision, created_at, updated_at)`：有限匹配元数据，不保存 Secret、原请求、自由错误或证据。
-- 必要的固定分页/匹配索引及17精确 fingerprint、16→17配对 backup/reader、partial拒绝与恢复合同。DDL 需等16冻结后再固定，当前设计不先造迁移文件。
+- 必要的固定分页/匹配索引及17精确 fingerprint、16→17配对 backup/reader、partial拒绝与恢复合同。16已在d9f5ec5固定；17随后在8b1fdae冻结，精确reader、16预备份和17还原合同保持不变。
 
 ## 实施顺序与真实验证
 
