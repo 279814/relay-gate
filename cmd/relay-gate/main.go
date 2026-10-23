@@ -66,6 +66,9 @@ func runMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runDBCLI(args[2:], stdout, stderr)
 		case "credentials":
 			return runCredentialsCLI(args[2:], stdout, stderr)
+		default:
+			fmt.Fprintln(stderr, "用法: relay-gate [probe-one|probe-matrix|db|credentials] ...")
+			return exitUsage
 		}
 	}
 	if err := runServer(); err != nil {
