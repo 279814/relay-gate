@@ -81,3 +81,17 @@ test('late Canary policy reads cannot replace a different Upstream draft', async
  assert.equal(shell.canary.loading,false);
 });
 
+test('a policy revision captured for one Upstream cannot write another target', async()=>{
+ let writes=0;
+ const shell=feature({
+  async get(){return {upstream_id:3,route_id:7,enabled:false,interval_sec:900,revision:2};},
+  async put(){writes++; return {};}
+ });
+ shell.canary.upstreamId='3';
+ await shell.loadCanaryPolicy();
+ // The save guard must also hold before an input change callback is delivered.
+ shell.canary.upstreamId='4';
+ assert.equal(await shell.saveCanaryPolicy(),false);
+ assert.equal(writes,0);
+});
+
