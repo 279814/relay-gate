@@ -155,3 +155,34 @@ func TestAlertDigestFailureRetainsPendingAndConcurrentFlushSendsOnce(t *testing.
 		t.Fatal("inflight digest duplicated delivery or lost later arrival")
 	}
 }
+
+func TestAlertDigestAndImmediateShareOneInflightIdentity(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	deliveries := 0
+	m := NewAlertMailer().WithNowForTest(func() time.Time { return time.Unix(100, 0) }).WithSendForTest(func(string, smtp.Auth, string, []string, []byte) error {
+		deliveries++
+		if deliveries == 1 {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	m.SetConfig(smtpPolicyFixture(t))
+	f := Finding{Severity: SeverityMedium, RuleID: "custom:a", UpstreamID: 1, RouteID: 1}
+	m.MaybeNotify(f, "")
+	done := make(chan error, 1)
+	go func() { done <- m.FlushDigest() }()
+	<-entered
+	f.Severity = SeverityCritical
+	if err := m.MaybeNotify(f, ""); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 {
+		t.Fatalf("same in-flight identity delivered twice: %d", deliveries)
+	}
+}

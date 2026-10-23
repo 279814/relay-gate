@@ -383,8 +383,18 @@ func (m *AlertMailer) flushDigestLocked(now time.Time) error {
 	captured := make(map[string]digestItem, len(m.pending))
 	keys := make([]string, 0, len(m.pending))
 	for k, v := range m.pending {
+		if m.inFlight[k] {
+			continue
+		}
+		m.inFlight[k] = true
 		captured[k] = v
 		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		m.flushing = false
+		m.digestStarted = m.now()
+		m.armDigestTimerLocked()
+		return nil
 	}
 	sort.Strings(keys)
 	m.mu.Unlock()
@@ -410,6 +420,9 @@ func (m *AlertMailer) flushDigestLocked(now time.Time) error {
 	}
 	m.mu.Lock()
 	m.flushing = false
+	for _, k := range keys {
+		delete(m.inFlight, k)
+	}
 	if err == nil {
 		for _, k := range keys {
 			v := m.pending[k]
