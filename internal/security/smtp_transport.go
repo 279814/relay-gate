@@ -17,6 +17,13 @@ import (
 // Validate checks the persisted settings and is repeated immediately before
 // sending so historical or non-HTTP callers cannot select plaintext delivery.
 func (c MailConfig) Validate() error {
+	// Zero is accepted only by legacy internal callers as the documented
+	// default; persisted/API values are always positive after schema 13.
+	for _, seconds := range []int{c.AggregationWindowSec, c.RateLimitWindowSec} {
+		if seconds < 0 || seconds > MaxSMTPWindowSec {
+			return model.WrapValidation("SMTP 聚合窗口与同类告警间隔必须在1–86400秒之间")
+		}
+	}
 	if c.UseSTARTTLS && c.UseSMTPS {
 		return model.WrapValidation("SMTP 只能选择 STARTTLS 或 SMTPS 中的一种")
 	}

@@ -407,6 +407,7 @@ func TestAPI_SMTPTestDoesNotEchoRawSendError(t *testing.T) {
 
 	s, _ := newTestServer(t)
 	if err := s.st.SaveSMTPConfig(store.SMTPConfig{
+		Revision: 1, AggregationWindowSec: 300, RateLimitWindowSec: 300,
 		Enabled:     true,
 		Host:        "smtp.evil",
 		Port:        587,

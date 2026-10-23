@@ -29,6 +29,9 @@ func (s *Server) WithSecurityCenter(c SecurityCenter) *Server {
 // WithAlertMailer injects SMTP alert sender.
 func (s *Server) WithAlertMailer(m *security.AlertMailer) *Server {
 	s.mailer = m
+	if err := s.reloadMailer(); err != nil {
+		s.log.Error("SMTP 配置未加载，邮件告警保持停用")
+	}
 	return s
 }
 
@@ -299,24 +302,67 @@ func (s *Server) putSMTPConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		store.SMTPConfig
-		Password string `json:"password"`
+		ExpectedRevision     *int64 `json:"expected_revision"`
+		Enabled              bool   `json:"enabled"`
+		Host                 string `json:"host"`
+		Port                 int    `json:"port"`
+		UseSTARTTLS          bool   `json:"use_starttls"`
+		UseSMTPS             bool   `json:"use_smtps"`
+		From                 string `json:"from"`
+		Recipients           string `json:"recipients"`
+		Username             string `json:"username"`
+		MinSeverity          string `json:"min_severity"`
+		AggregationWindowSec *int   `json:"aggregation_window_sec"`
+		RateLimitWindowSec   *int   `json:"rate_limit_window_sec"`
+		Password             string `json:"password"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if err := s.st.SaveSMTPConfig(body.SMTPConfig, body.Password); err != nil {
+	if body.ExpectedRevision == nil || *body.ExpectedRevision < 1 {
+		s.writeErr(w, fmt.Errorf("%w: expected_revision 必须为正整数", model.ErrValidation))
+		return
+	}
+	current, err := s.st.GetSMTPConfig()
+	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	s.reloadMailer()
-	cfg, _ := s.st.GetSMTPConfig()
+	cfg := store.SMTPConfig{
+		Enabled: body.Enabled, Host: body.Host, Port: body.Port, UseSTARTTLS: body.UseSTARTTLS, UseSMTPS: body.UseSMTPS,
+		From: body.From, Recipients: body.Recipients, Username: body.Username, MinSeverity: body.MinSeverity,
+		Revision: *body.ExpectedRevision, AggregationWindowSec: current.AggregationWindowSec, RateLimitWindowSec: current.RateLimitWindowSec,
+	}
+	if body.AggregationWindowSec != nil {
+		cfg.AggregationWindowSec = *body.AggregationWindowSec
+	}
+	if body.RateLimitWindowSec != nil {
+		cfg.RateLimitWindowSec = *body.RateLimitWindowSec
+	}
+	if err := s.st.SaveSMTPConfig(cfg, body.Password); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.reloadMailer(); err != nil {
+		// The mutation committed. Keep its success distinct from activation so a
+		// client never retries the password/configuration mutation blindly.
+		writeJSON(w, http.StatusOK, map[string]any{"persisted": true, "config_activation_pending": true})
+		return
+	}
+	cfg, err = s.st.GetSMTPConfig()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"persisted": true, "config_activation_pending": true})
+		return
+	}
 	writeJSON(w, http.StatusOK, cfg)
 }
 
 func (s *Server) postSMTPTest(w http.ResponseWriter, r *http.Request) {
-	s.reloadMailer()
+	if err := s.reloadMailer(); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	if s.mailer == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"mailer unavailable"})
 		return
@@ -338,38 +384,13 @@ func (s *Server) postSMTPTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sent": true})
 }
 
-func (s *Server) reloadMailer() {
+func (s *Server) reloadMailer() error {
 	if s.mailer == nil || s.st == nil {
-		return
+		return nil
 	}
-	cfg, err := s.st.GetSMTPConfig()
+	cfg, err := s.st.SMTPMailerConfig()
 	if err != nil {
-		return
+		return err
 	}
-	pw, _ := s.st.SMTPPasswordDecrypt()
-	recips := strings.Split(cfg.Recipients, ",")
-	clean := make([]string, 0, len(recips))
-	for _, r := range recips {
-		r = strings.TrimSpace(r)
-		if r != "" {
-			clean = append(clean, r)
-		}
-	}
-	port := cfg.Port
-	if port == 0 {
-		port = 587
-	}
-	s.mailer.SetConfig(security.MailConfig{
-		Enabled:     cfg.Enabled,
-		Host:        cfg.Host,
-		Port:        port,
-		UseSTARTTLS: cfg.UseSTARTTLS,
-		UseSMTPS:    cfg.UseSMTPS,
-		From:        cfg.From,
-		Recipients:  clean,
-		Username:    cfg.Username,
-		Password:    pw,
-		MinSeverity: security.Severity(cfg.MinSeverity),
-	})
-	_ = strconv.Itoa(port)
+	return s.mailer.SetConfig(cfg)
 }
