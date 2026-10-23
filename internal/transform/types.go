@@ -129,6 +129,7 @@ type Binding struct {
 
 // ExecutionRecord is a redacted apply/shadow diagnostic (§15.7 / §16.3).
 type ExecutionRecord struct {
+	sequence       uint64    // existing process-local insertion order, never a durable history ID
 	ID             string    `json:"id"`
 	At             time.Time `json:"at"`
 	RouteID        int64     `json:"route_id"`

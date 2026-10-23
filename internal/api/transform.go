@@ -324,24 +324,6 @@ func (s *Server) listTransformBindings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"bindings": page.Items, "total": page.Total, "next_cursor": page.NextCursor, "limit": page.Limit})
 }
 
-func (s *Server) listTransformExecutions(w http.ResponseWriter, r *http.Request) {
-	if s.transforms == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"executions": []any{}})
-		return
-	}
-	limit, err := queryInt64(r.URL.Query().Get("limit"))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: limit", model.ErrValidation))
-		return
-	}
-	pageLimit, err := store.NormalizePageLimit(int(limit))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": s.transforms.ListExecutions(pageLimit)})
-}
-
 func (s *Server) getTransformBudgets(w http.ResponseWriter, r *http.Request) {
 	if s.transforms == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody{"transform registry unavailable"})

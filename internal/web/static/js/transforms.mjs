@@ -20,6 +20,15 @@ const initialState = () => ({
   previewBody: '',
   previewResult: '',
   loading: false,
+  writeBusy: false,
+  listRead: 0,
+  budgetRead: 0,
+  executionRead: 0,
+  executionLoading: false,
+  executionFilter: {route_id:'',endpoint_id:'',version_id:'',mode:'',phase:'',ok:'',after_ms:'',before_ms:''},
+  executionFilterKey: '',
+  executionNextCursor: '',
+  executionTotal: 0,
   selectedRead: 0,
   bindingRead: 0,
   bindingTarget: '',
@@ -43,6 +52,27 @@ const initialState = () => ({
 
 export function createTransformsFeature(shell, api) {
   shell.transforms = initialState();
+
+  shell.loadTransformExecutions = async function loadTransformExecutions(next = false) {
+    const state = this.transforms;
+    const query = new URLSearchParams();
+    for (const [key,value] of Object.entries(state.executionFilter)) if (value !== '') query.set(key,String(value));
+    const filter = query.toString();
+    if (next && (!state.executionNextCursor || filter !== state.executionFilterKey)) {
+      this.err = '筛选已改变，请重新查询执行诊断'; return;
+    }
+    const read = ++state.executionRead;
+    query.set('limit','50'); if (next) query.set('cursor',state.executionNextCursor);
+    state.executionLoading = true;
+    try {
+      const data = await api.get('/transform-executions?' + query);
+      if (this.transforms !== state || state.executionRead !== read) return;
+      state.executions = data.executions || []; state.executionNextCursor = data.next_cursor || '';
+      state.executionTotal = data.total || 0; state.executionFilterKey = filter;
+    } catch (error) {
+      if (this.transforms === state && state.executionRead === read) { state.executionNextCursor = ''; this.err = error.message || String(error); }
+    } finally { if (state.executionRead === read) state.executionLoading = false; }
+  };
 
   shell.changeTransformLifecycle = async function changeTransformLifecycle(action) {
     const state = this.transforms, selected = state.selected;
@@ -106,47 +136,50 @@ export function createTransformsFeature(shell, api) {
   };
   shell.reloadTransformBudgets = async function reloadTransformBudgets() {
     const state = this.transforms;
+    const read = ++state.budgetRead;
     try {
       const data = await api.get('/transforms/budgets');
-      if (this.transforms !== state) return;
+      if (this.transforms !== state || state.budgetRead !== read) return;
       Object.assign(state, {budgetRevision:data.revision,budgetRequestMs:data.budgets.request_ms,budgetSSEMs:data.budgets.sse_event_ms,
         budgetBaselineRequestMs:data.budgets.request_ms,budgetBaselineSSEMs:data.budgets.sse_event_ms,budgetAudit:data.audit || []});
-    } catch (error) { if (this.transforms === state) this.err = error.message || String(error); }
+    } catch (error) { if (this.transforms === state && state.budgetRead === read) this.err = error.message || String(error); }
   };
   shell.nextTransformPage = async function nextTransformPage(kind) {
     const state = this.transforms;
     const sets = kind === 'sets';
     const cursor = sets ? state.setNextCursor : state.bindingNextCursor;
     if (!cursor || state.loading) return;
+    const read = ++state.listRead;
     state.loading = true;
     try {
       const data = await api.get((sets ? '/transforms' : '/transform-bindings') + '?limit=50&cursor=' + encodeURIComponent(cursor));
-      if (this.transforms !== state) return;
+      if (this.transforms !== state || state.listRead !== read) return;
       if (sets) { state.sets = data.sets || []; state.setNextCursor = data.next_cursor || ''; state.setTotal = data.total || 0; }
       else { state.bindings = data.bindings || []; state.bindingNextCursor = data.next_cursor || ''; state.bindingTotal = data.total || 0; }
-    } catch (error) { if (this.transforms === state) this.err = error.message || String(error); }
-    finally { state.loading = false; }
+    } catch (error) { if (this.transforms === state && state.listRead === read) this.err = error.message || String(error); }
+    finally { if (state.listRead === read) state.loading = false; }
   };
 
   shell.loadTransforms = async function loadTransforms() {
     const state = this.transforms;
+    const read = ++state.listRead;
+    const budgetRead = state.budgetRead;
     try {
       this.transforms.loading = true;
-      const [sets, bindings, executions, budgets] = await Promise.all([
+      const [sets, bindings, budgets] = await Promise.all([
         api.get('/transforms'),
         api.get('/transform-bindings'),
-        api.get('/transform-executions?limit=50'),
         api.get('/transforms/budgets'),
+        this.loadTransformExecutions(),
       ]);
-      if (this.transforms !== state) return;
+      if (this.transforms !== state || state.listRead !== read) return;
       this.transforms.sets = sets.sets || [];
       state.setNextCursor = sets.next_cursor || '';
       state.setTotal = sets.total || 0;
       this.transforms.bindings = bindings.bindings || [];
       state.bindingNextCursor = bindings.next_cursor || '';
       state.bindingTotal = bindings.total || 0;
-      this.transforms.executions = executions.executions || [];
-      if (budgets && budgets.budgets && !state.budgetRevision) {
+      if (budgets && budgets.budgets && !state.budgetRevision && state.budgetRead === budgetRead) {
         state.budgetRevision = budgets.revision;
         state.budgetBaselineRequestMs = budgets.budgets.request_ms;
         state.budgetBaselineSSEMs = budgets.budgets.sse_event_ms;
@@ -155,20 +188,21 @@ export function createTransformsFeature(shell, api) {
         this.transforms.budgetAudit = budgets.audit || [];
       }
     } catch (e) {
-      if (this.transforms !== state) return;
+      if (this.transforms !== state || state.listRead !== read) return;
       this.err = e && e.message ? e.message : String(e);
     } finally {
-      state.loading = false;
+      if (state.listRead === read) state.loading = false;
     }
   };
 
   shell.selectTransformSet = async function selectTransformSet(set) {
     const state = this.transforms;
+    if (state.writeBusy && !set.draft) return;
     const read = ++state.selectedRead;
     if (!set.draft) {
       try { set = await api.get('/transforms/' + set.id); }
       catch (error) { if (this.transforms === state && read === state.selectedRead) this.err = error.message || String(error); return; }
-      if (this.transforms !== state || read !== state.selectedRead) return;
+      if (this.transforms !== state || read !== state.selectedRead || state.writeBusy) return;
     }
     this.transforms.selectedId = set.id;
     this.transforms.selected = set;
@@ -282,7 +316,8 @@ export function createTransformsFeature(shell, api) {
       if (state.selectedRead !== selectedRead) return;
       this.msg = '已发布 version=' + (data.version && data.version.id);
       state.selected.revision = data.set_revision;
-      state.bindingRevision = data.binding.revision;
+      if (Number(state.routeId) === routeId && Number(state.endpointId) === endpointId && state.bindingTarget === routeId + ':' + endpointId) state.bindingRevision = data.binding.revision;
+      else { state.bindingTarget = ''; state.bindingRevision = null; }
       await this.loadTransforms();
     } catch (e) {
       if (this.transforms !== state) return;
@@ -314,14 +349,15 @@ export function createTransformsFeature(shell, api) {
       if (state.selectedRead !== selectedRead) return;
       this.msg = '已 shadow version=' + (data.version && data.version.id);
       state.selected.revision = data.set_revision;
-      state.bindingRevision = data.binding.revision;
+      if (Number(state.routeId) === routeId && Number(state.endpointId) === endpointId && state.bindingTarget === routeId + ':' + endpointId) state.bindingRevision = data.binding.revision;
+      else { state.bindingTarget = ''; state.bindingRevision = null; }
       await this.loadTransforms();
     } catch (e) {
       if (this.transforms !== state) return;
+      if (e.data?.persisted) state.activationPending = true;
       this.err = e && e.message ? e.message : String(e);
     }
   };
-
   shell.saveTransformBudgets = async function saveTransformBudgets() {
     const state = this.transforms;
     try {
@@ -362,6 +398,21 @@ export function createTransformsFeature(shell, api) {
       this.err = e && e.message ? e.message : String(e);
     }
   };
+  // One visible admin write at a time. A committed-but-not-activated response
+  // needs operator investigation; it must never authorize a blind replay.
+  for (const action of ['createTransformSet','saveTransformDraft','publishTransform','shadowTransform','rollbackTransform','changeTransformLifecycle','saveTransformBudgets']) {
+    const write = shell[action];
+    shell[action] = async function guardedTransformWrite(...args) {
+      const state = this.transforms;
+      if (state.writeBusy || state.activationPending) return;
+      ++state.bindingRead;
+      if (action === 'saveTransformBudgets') ++state.budgetRead;
+      state.writeBusy = true; this.err = ''; this.msg = '';
+      try { return await write.apply(this,args); }
+      finally { state.writeBusy = false; }
+    };
+  }
+
   const originalReset = shell.reset;
   shell.reset = function resetTransforms() {
     this.transforms = initialState();

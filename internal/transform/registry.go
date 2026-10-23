@@ -247,6 +247,7 @@ func (r *Registry) record(rec ExecutionRecord) ExecutionRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	seq := r.execSeq.Add(1)
+	rec.sequence = seq
 	if rec.ID == "" {
 		rec.ID = time.Now().UTC().Format("20060102T150405") + "-" + strconv.FormatUint(seq, 10)
 	}

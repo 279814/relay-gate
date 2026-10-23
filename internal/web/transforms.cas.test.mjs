@@ -42,3 +42,50 @@ test('late draft save cannot replace a newly selected set',async()=>{
  shell.selectTransformSet({...set(),id:8});finish({...set(),revision:4});await save;
  assert.equal(shell.transforms.selectedId,8);
 });
+
+test('concurrent write is suppressed and persisted failure blocks every replay',async()=>{
+ let finish;const calls=[];const shell={};createTransformsFeature(shell,{post:(path,body)=>{calls.push({path,body});if(calls.length===1)return new Promise((resolve,reject)=>{finish=reject;});return {};}});
+ shell.selectTransformSet(set());Object.assign(shell.transforms,{routeId:'10',endpointId:'20',bindingTarget:'10:20',bindingRevision:0});
+ const first=shell.publishTransform();await shell.shadowTransform();assert.equal(calls.length,1);
+ finish(Object.assign(new Error('activation pending'),{data:{persisted:true}}));await first;
+ assert.equal(shell.transforms.activationPending,true);await shell.publishTransform();await shell.shadowTransform();await shell.changeTransformLifecycle('disable');assert.equal(calls.length,1);
+});
+
+test('late list and budget reload cannot overwrite newer reads',async()=>{
+ const pending=[];const shell={};createTransformsFeature(shell,{get:path=>new Promise(resolve=>pending.push({path,resolve}))});
+ const older=shell.loadTransforms(), newer=shell.loadTransforms();
+ for(const item of pending.slice(4))item.resolve(item.path==='/transforms'?{sets:[{id:2}]}:{});
+ await newer;for(const item of pending.slice(0,4))item.resolve(item.path==='/transforms'?{sets:[{id:1}]}:{});await older;
+ assert.equal(shell.transforms.sets[0].id,2);
+ const a=shell.reloadTransformBudgets(),b=shell.reloadTransformBudgets();const response=n=>({revision:n,budgets:{request_ms:n,sse_event_ms:1}});
+ pending.at(-1).resolve(response(5));await b;pending.at(-2).resolve(response(4));await a;assert.equal(shell.transforms.budgetRevision,5);
+});
+
+test('late publication does not attribute the old binding to edited target',async()=>{
+ let finish;const shell={};createTransformsFeature(shell,{post:()=>new Promise(resolve=>{finish=resolve;})});shell.loadTransforms=async()=>{};
+ shell.selectTransformSet(set());Object.assign(shell.transforms,{routeId:'10',endpointId:'20',bindingTarget:'10:20',bindingRevision:0});
+ const pending=shell.publishTransform();shell.transforms.endpointId='21';await shell.loadTransformBinding();
+ finish({set_revision:4,binding:{revision:1},version:{id:9}});await pending;
+ assert.notEqual(shell.transforms.bindingTarget,'10:21');assert.equal(shell.transforms.bindingRevision,null);assert.equal(shell.transforms.selected.revision,4);
+});
+
+test('execution page binds filter, replaces page, and ignores late selection',async()=>{
+ const pending=[];const shell={};createTransformsFeature(shell,{get:path=>new Promise(resolve=>pending.push({path,resolve}))});
+ shell.transforms.executionFilter.route_id='7';const old=shell.loadTransformExecutions();shell.transforms.executionFilter.route_id='8';const current=shell.loadTransformExecutions();
+ pending[1].resolve({executions:[{id:'current'}],next_cursor:'c',total:3});await current;pending[0].resolve({executions:[{id:'stale'}]});await old;
+ assert.equal(shell.transforms.executions[0].id,'current');assert.match(pending[1].path,/route_id=8/);
+ const next=shell.loadTransformExecutions(true);assert.match(pending[2].path,/cursor=c/);pending[2].resolve({executions:[{id:'next'}],total:3});await next;assert.deepEqual(shell.transforms.executions,[{id:'next'}]);
+});
+
+test('budget write supersedes an earlier reload and cannot be double submitted',async()=>{
+ let read,write;let writes=0;const shell={};createTransformsFeature(shell,{get:()=>new Promise(resolve=>{read=resolve;}),put:()=>{writes++;if(writes>1)return {};return new Promise(resolve=>{write=resolve;});}});
+ Object.assign(shell.transforms,{budgetRevision:4,budgetRequestMs:20,budgetSSEMs:5});const reload=shell.reloadTransformBudgets(),save=shell.saveTransformBudgets();await shell.saveTransformBudgets();assert.equal(writes,1);
+ write({revision:5,budgets:{request_ms:20,sse_event_ms:5}});await save;read({revision:4,budgets:{request_ms:50,sse_event_ms:10}});await reload;assert.equal(shell.transforms.budgetRevision,5);
+});
+
+test('selection read started before a write cannot move the editor mid-write',async()=>{
+ let read,write;const shell={};createTransformsFeature(shell,{get:()=>new Promise(resolve=>{read=resolve;}),post:()=>new Promise(resolve=>{write=resolve;})});shell.loadTransforms=async()=>{};
+ shell.selectTransformSet(set());Object.assign(shell.transforms,{routeId:'10',endpointId:'20',bindingTarget:'10:20',bindingRevision:0});
+ const selection=shell.selectTransformSet({id:8}),publish=shell.publishTransform();read({...set(),id:8,revision:20});await selection;
+ write({set_revision:4,binding:{revision:1},version:{id:9}});await publish;assert.equal(shell.transforms.selectedId,7);assert.equal(shell.transforms.selected.revision,4);
+});
