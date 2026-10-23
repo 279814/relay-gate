@@ -840,6 +840,38 @@
                   <option value="info">info</option>
                 </select>
               </div>
+              <div class="field" style="max-width:140px">
+                <label>Route ID</label>
+                <input type="number" min="1" step="1" x-model="security.routeID" @change="loadSecurityFindings()" placeholder="全部 Route">
+              </div>
+              <div class="field" style="max-width:220px">
+                <label>类别</label>
+                <input maxlength="64" x-model="security.category" @change="loadSecurityFindings()" placeholder="全部类别">
+              </div>
+              <div class="field">
+                <label>发现时间从</label>
+                <input type="datetime-local" x-model="security.fromTime" @change="loadSecurityFindings()">
+              </div>
+              <div class="field">
+                <label>发现时间至</label>
+                <input type="datetime-local" x-model="security.toTime" @change="loadSecurityFindings()">
+              </div>
+            </div>
+            <div class="row">
+              <div class="field"><label>Upstream ID</label><input type="number" min="1" x-model="security.upstreamID" @change="loadSecurityFindings()"></div>
+              <div class="field"><label>规则身份（unknown 查询历史未知）</label><input maxlength="128" x-model="security.ruleID" @change="loadSecurityFindings()" placeholder="builtin:prompt_injection"></div>
+              <div class="field"><label>审核</label><select x-model="security.reviewStatus" @change="loadSecurityFindings()"><option value="">全部</option><option value="open">待处理</option><option value="false_positive">误报</option></select></div>
+              <div class="field"><label>忽略策略</label><select x-model="security.ignored" @change="loadSecurityFindings()"><option value="">全部</option><option value="true">当前命中</option><option value="false">未命中</option></select></div>
+            </div>
+            <div class="bar">
+              <span class="dim" x-show="security.loading">正在读取筛选后的发现…</span>
+              <span class="dim" x-show="!security.loading && !security.findingsError" x-text="'本页 ' + security.findings.length + ' 条；筛选总计 ' + security.total + ' 条'"></span>
+              <span class="grow"></span>
+              <button :disabled="security.loading || !security.pageCursor" @click="loadSecurityFindings()">回到首页</button>
+              <button :disabled="security.loading || !security.nextCursor" @click="nextSecurityFindings()">下一页</button>
+            </div>
+            <p role="alert" x-show="security.findingsError" x-text="security.findingsError"></p>
+            <div class="row" style="margin-bottom:12px">
               <div class="field" style="flex:1">
                 <label>诊断扫描文本</label>
                 <input x-model="security.scanText" placeholder="粘贴响应片段（仅本地规则）">
@@ -895,20 +927,117 @@
               <p class="err-text" x-show="canary.policyError" x-text="canary.policyError"></p>
             </div>
             <table>
-              <thead><tr><th>时间</th><th>级别</th><th>类别</th><th>摘要</th><th>来源</th></tr></thead>
+              <thead><tr><th>时间</th><th>级别</th><th>规则 / 类别</th><th>上游 / Route</th><th>脱敏证据与扫描事实</th><th>审核与操作</th></tr></thead>
               <tbody>
                 <template x-for="f in (security.findings || [])" :key="f.id">
                   <tr>
-                    <td class="mono" x-text="f.at_ms"></td>
+                    <td class="nowrap dim" x-text="fmtTime(f.at_ms)"></td>
                     <td x-text="f.severity"></td>
-                    <td x-text="f.category"></td>
-                    <td class="wrap" x-text="f.summary"></td>
-                    <td x-text="f.source"></td>
+                    <td><div x-text="f.rule_id || '历史规则身份未知'"></div><span class="dim" x-text="f.category"></span></td>
+                    <td><div x-text="f.upstream || '未记录上游'"></div><span class="dim" x-text="f.route_id ? 'Route ' + f.route_id : '未记录 Route'"></span></td>
+                    <td class="wrap">
+                      <details>
+                        <summary x-text="f.summary"></summary>
+                        <pre class="wrap" x-text="f.detail || '未保留脱敏片段'"></pre>
+                        <div class="dim" x-text="'Scanner ' + (f.scanner_version || '未知') + ' · Rules ' + (f.rule_version || '未知')"></div>
+                        <div class="dim" x-text="'扫描字节 ' + (f.scanner_version ? (f.bytes_scanned ?? '未知') : '未知') + ' · 解码深度 ' + (f.scanner_version ? (f.decode_depth ?? '未知') : '未知')"></div>
+                        <div class="dim" x-text="f.truncated ? '扫描已截断；缺失部分没有安全结论' : '未标记扫描截断'"></div>
+                        <div class="dim" x-show="f.incomplete_reason" x-text="f.incomplete_reason"></div>
+                        <div class="mono wrap dim" x-text="f.evidence_hash ? '脱敏证据 SHA-256 ' + f.evidence_hash : '未记录证据指纹'"></div>
+                      </details>
+                    </td>
+                    <td>
+                      <div class="dim" x-text="f.source"></div>
+                      <div x-text="f.review?.status === 'false_positive' ? '误报' : '待处理'"></div>
+                      <div class="dim" x-text="f.ignored ? '当前忽略规则 #' + f.ignore_rule_id : '未命中忽略'"></div>
+                      <button @click="editSecurityReview(f)">审核</button>
+                      <button :disabled="!f.rule_id" @click="newSecurityIgnore(f, 'rule')">忽略规则</button>
+                      <button :disabled="!f.route_id" @click="newSecurityIgnore(f, 'route')">忽略 Route</button>
+                      <button @click="openSecurityEvidence(f)">原始证据</button>
+<button :disabled="!f.route_id" @click="inspectSecurityRoute(f)">核对当前 Route</button>
+                    </td>
                   </tr>
                 </template>
-                <tr x-show="!(security.findings || []).length"><td colspan="5" class="empty">暂无 finding</td></tr>
+                <tr x-show="!security.loading && !security.findingsError && !security.findings.length"><td colspan="6" class="empty">当前筛选暂无 finding</td></tr>
               </tbody>
             </table>
+            <p role="alert" x-show="security.management.error" x-text="security.management.error"></p>
+            <template x-if="security.management.routeTarget"><div class="card">
+              <strong x-text="'当前 Route ' + security.management.routeTarget.id + ' · revision ' + security.management.routeTarget.revision"></strong>
+              <p class="dim">手动停用将阻止后续选路，已有发现和证据仍然保留。</p>
+              <button @click="disableSecurityRoute()" :disabled="security.management.busy || security.management.conflict || !security.management.routeTarget.enabled">手动停用 Route</button>
+            </div></template>
+            <template x-if="security.management.review">
+              <fieldset class="card" :disabled="security.management.busy">
+                <legend>审核决定</legend>
+                <p class="dim" x-text="'finding ' + security.management.review.findingID + ' · revision ' + security.management.review.revision"></p>
+                <select x-model="security.management.review.status"><option value="open">待处理</option><option value="false_positive">误报</option></select>
+                <button @click="saveSecurityReview()" :disabled="security.management.conflict">保存审核</button>
+                <button @click="closeSecurityManagement()">关闭编辑</button>
+              </fieldset>
+            </template>
+            <template x-if="security.management.ignoreDraft">
+              <fieldset class="card" :disabled="security.management.busy">
+                <legend>告警忽略策略</legend>
+                <p class="dim">扫描和证据仍然保留；只抑制命中的邮件告警。</p>
+                <p x-text="security.management.ignoreDraft.scope === 'rule' ? security.management.ignoreDraft.rule_id : 'Route ' + security.management.ignoreDraft.route_id"></p>
+                <label><input type="checkbox" x-model="security.management.ignoreDraft.enabled"> 启用策略</label>
+                <label><input type="checkbox" x-model="security.management.ignoreDraft.permanent"> 不过期</label>
+                <div class="field" x-show="!security.management.ignoreDraft.permanent"><label>到期时间</label><input type="datetime-local" x-model="security.management.ignoreDraft.expires"></div>
+                <button @click="saveSecurityIgnore()" :disabled="security.management.conflict">保存策略</button>
+                <button @click="closeSecurityManagement()">关闭编辑</button>
+              </fieldset>
+            </template>
+            <h3>安全诊断记录</h3>
+            <p class="dim">只展示已持久保存 Canary 事实的执行；Route / Upstream 使用上方筛选。旧普通手动探活不会被推断为 Canary。</p>
+            <div class="bar">
+              <select aria-label="诊断来源" x-model="security.management.diagnosticSource" @change="loadSecurityDiagnostics()"><option value="">全部来源</option><option value="manual">手动</option><option value="periodic">周期</option></select>
+              <select aria-label="诊断结论" x-model="security.management.diagnosticVerdict" @change="loadSecurityDiagnostics()"><option value="">全部结论</option><option value="passed">passed</option><option value="violation">violation</option><option value="incomplete">incomplete</option><option value="canceled">canceled</option><option value="execution_failed">execution_failed</option><option value="not_sent">not_sent</option></select>
+              <button @click="loadSecurityDiagnostics()" :disabled="security.management.diagnosticLoading">刷新诊断记录</button>
+              <span class="dim" x-text="'本页 ' + security.management.diagnostics.length + ' 条；筛选总计 ' + security.management.diagnosticTotal + ' 条'"></span>
+              <button @click="loadSecurityDiagnostics(security.management.diagnosticNext)" :disabled="security.management.diagnosticLoading || !security.management.diagnosticNext">下一页诊断</button>
+            </div>
+            <table><thead><tr><th>执行</th><th>来源 / 结论</th><th>关联</th><th>诊断事实</th></tr></thead><tbody>
+              <template x-for="row in security.management.diagnostics" :key="row.ID"><tr>
+                <td><button @click="inspectSecurityDiagnostic(row)" x-text="row.ID"></button></td>
+                <td x-text="row.canary.source + ' · ' + row.canary.verdict"></td>
+                <td x-text="'Upstream ' + row.UpstreamID + ' / Route ' + row.RouteID"></td>
+                <td x-text="'nonce ' + (row.canary.nonce_matched === null ? '未知' : row.canary.nonce_matched) + ' · tool ' + (row.canary.tool_matched === null ? '未知' : row.canary.tool_matched)"></td>
+              </tr></template>
+            </tbody></table>
+            <h3>忽略策略</h3>
+            <div class="bar">
+              <select aria-label="忽略范围" x-model="security.management.ruleScope" @change="loadSecurityIgnoreRules()"><option value="">全部范围</option><option value="rule">规则</option><option value="route">Route</option></select>
+              <select aria-label="忽略生效状态" x-model="security.management.ruleActive" @change="loadSecurityIgnoreRules()"><option value="">全部状态</option><option value="true">当前有效</option><option value="false">未启用或已到期</option></select>
+              <button @click="loadSecurityIgnoreRules()">刷新策略</button>
+              <span class="dim" x-text="'本页 ' + security.management.rules.length + ' 条；筛选总计 ' + security.management.ruleTotal + ' 条（总表最多1024条）'"></span>
+              <button @click="loadSecurityIgnoreRules(security.management.ruleNext)" :disabled="!security.management.ruleNext">下一页策略</button>
+            </div>
+            <table><thead><tr><th>范围 / 目标</th><th>状态 / 到期</th><th>版本</th><th>操作</th></tr></thead><tbody>
+              <template x-for="row in security.management.rules" :key="row.id"><tr>
+                <td x-text="row.scope === 'rule' ? row.rule_id : 'Route ' + row.route_id"></td>
+                <td><span x-text="row.enabled ? '启用' : '停用'"></span> · <span x-text="row.expires_at_ms ? fmtTime(row.expires_at_ms) : '不过期'"></span></td>
+                <td x-text="row.revision"></td>
+                <td><button @click="editSecurityIgnore(row)" :disabled="security.management.busy">编辑</button><button @click="deleteSecurityIgnore(row)" :disabled="security.management.busy || security.management.conflict">删除策略</button></td>
+              </tr></template>
+            </tbody></table>
+            <template x-if="security.management.evidence">
+              <div class="mask" @click.self="closeSecurityEvidence()"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="security-evidence-title">
+                <h3 id="security-evidence-title">原始上游响应</h3>
+                <p x-text="security.management.evidence.reason"></p>
+                <p role="alert" x-text="security.management.evidence.error"></p>
+                <form @submit.prevent="readSecurityEvidence()" x-show="security.management.evidence.available">
+                  <div class="field"><label>本次读取的管理员口令</label><input type="password" autocomplete="off" x-model="security.management.evidence.password" :disabled="security.management.evidence.busy"></div>
+                  <button type="submit" :disabled="security.management.evidence.busy || !security.management.evidence.password">认证并读取</button>
+                </form>
+                <p class="dim" x-text="security.management.evidence.format"></p>
+                <p class="dim" x-show="security.management.evidence.status" x-text="'原上游 HTTP ' + security.management.evidence.status"></p>
+                <pre class="wrap" x-text="security.management.evidence.body"></pre>
+                <button @click="closeSecurityEvidence()">关闭并清除证据</button>
+              </div></div>
+            </template>
+            <div class="bar"><h3>邮件告警状态</h3><button @click="loadSecurityAlertStatus()">刷新告警状态</button></div>
+            <template x-if="security.management.alertStatus"><p class="dim" x-text="'待聚合 ' + security.management.alertStatus.pending + ' · 策略读取失败 ' + security.management.alertStatus.policy_failures + ' · 投递失败 ' + security.management.alertStatus.delivery_failures + ' · 容量丢弃 ' + security.management.alertStatus.capacity_drops + ' · 命中忽略 ' + security.management.alertStatus.suppressed"></p></template>
             <h3 style="font-size:13px;margin:18px 0 8px">SMTP 告警</h3>
             <template x-if="security.smtp">
             <div class="cards">

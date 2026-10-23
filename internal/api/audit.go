@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -266,10 +267,24 @@ func (w *auditResponseWriter) auditPayload(payload any) {
 // Match only fixed management routes. Raw path text, query values and bodies
 // never become action codes, resource types, actor identity or audit details.
 func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRead bool) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/"), "/")
-	if len(parts) == 0 {
+	// ServeMux unescapes each segment independently. Split before unescaping
+	// so an encoded slash inside a string ID cannot change route structure and
+	// bypass the audit action (or the sensitive first-byte completion gate).
+	parts := strings.Split(strings.TrimPrefix(r.URL.EscapedPath(), "/"), "/")
+	if len(parts) < 3 {
 		return
 	}
+	for i, part := range parts {
+		decoded, err := url.PathUnescape(part)
+		if err != nil {
+			return
+		}
+		parts[i] = decoded
+	}
+	if parts[0] != "admin" || parts[1] != "api" {
+		return
+	}
+	parts = parts[2:]
 	if len(parts) > 1 {
 		if id, err := strconv.ParseInt(parts[1], 10, 64); err == nil && id > 0 {
 			resourceID = strconv.FormatInt(id, 10)
@@ -318,7 +333,20 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 		}
 	}
 	if len(parts) >= 2 && parts[0] == "security" {
-		if len(parts) == 2 && r.Method == "POST" {
+		if len(parts) == 4 && parts[1] == "findings" && parts[3] == "review" && r.Method == "PUT" {
+			action = "security_finding_review"
+			sum := sha256.Sum256([]byte("security-finding:" + parts[2]))
+			resourceID = "finding-" + hex.EncodeToString(sum[:])
+		} else if parts[1] == "ignore-rules" {
+			if len(parts) == 2 && r.Method == "POST" {
+				action = "security_ignore_create"
+			} else if len(parts) == 3 {
+				action = map[string]string{"PUT": "security_ignore_update", "DELETE": "security_ignore_delete"}[r.Method]
+				if id, err := strconv.ParseInt(parts[2], 10, 64); err == nil && id > 0 {
+					resourceID = strconv.FormatInt(id, 10)
+				}
+			}
+		} else if len(parts) == 2 && r.Method == "POST" {
 			action = map[string]string{"scan": "security_scan", "canary": "security_canary"}[parts[1]]
 		} else if len(parts) == 3 && parts[1] == "canary-policy" && r.Method == "PUT" {
 			action = "security_canary_policy_update"
@@ -331,7 +359,9 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 			} else if len(parts) == 3 && parts[2] == "test" && r.Method == "POST" {
 				action = "smtp_test"
 			}
-		} else if len(parts) == 4 && parts[1] == "findings" && parts[3] == "evidence" {
+		} else if len(parts) == 4 && parts[1] == "findings" && parts[3] == "evidence" && r.Method == "POST" {
+			sum := sha256.Sum256([]byte("security-finding:" + parts[2]))
+			resourceID = "finding-" + hex.EncodeToString(sum[:])
 			action, sensitiveRead = "security_evidence_view", true
 		}
 	}

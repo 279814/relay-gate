@@ -1,0 +1,19 @@
+{
+  "date": "2026-10-23",
+  "source_commit": "01ad85428db4fe7de7e5acbf8ad24ef8da136cc6",
+  "binary_sha256": "f78454d122d074c8134fd63f11c18cb3a875be8aa09c26242e895fe84bef2059",
+  "toolchain": "go1.27.3 linux/amd64 CGO_ENABLED=0 vcs.modified=false",
+  "kernel": "3.10.0-1062.18.1.el7.x86_64",
+  "fixture_only": true,
+  "result": "passed",
+  "read_endpoints": {"/security/diagnostics": 200, "/security/ignore-rules": 200, "/transforms": 200},
+  "cold_restart": true,
+  "transform_draft_revision_persisted": true,
+  "budget_revision_persisted": true,
+  "paused_persisted": true,
+  "real_model_requests": 0,
+  "deployed_service_modified": false,
+  "isolation": "separate directory, synthetic database and credentials, temporary loopback port, no deployed environment or database read",
+  "cleanup": "both candidate processes terminated successfully; fixture retained in its dedicated root-only directory",
+  "not_claimed": ["deployed data migration", "public ACME issuance", "real upstream compatibility", "final duration acceptance", "final release commit acceptance"]
+}

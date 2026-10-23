@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
@@ -29,6 +30,13 @@ func (s *Server) WithSecurityCenter(c SecurityCenter) *Server {
 // WithAlertMailer injects SMTP alert sender.
 func (s *Server) WithAlertMailer(m *security.AlertMailer) *Server {
 	s.mailer = m
+	if m != nil && s.st != nil {
+		m.SetIgnorePolicy(func(f security.Finding, atMS int64) (bool, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			return s.st.SecurityFindingIgnored(ctx, f, atMS)
+		})
+	}
 	if err := s.reloadMailer(); err != nil {
 		s.log.Error("SMTP 配置未加载，邮件告警保持停用")
 	}
@@ -36,38 +44,36 @@ func (s *Server) WithAlertMailer(m *security.AlertMailer) *Server {
 }
 
 func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
-	sev := security.Severity(r.URL.Query().Get("severity"))
-	limit, err := queryInt64(r.URL.Query().Get("limit"))
+	filter, err := securityFindingFilter(r)
 	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: limit", model.ErrValidation))
+		s.writeErr(w, err)
 		return
 	}
-	pageLimit, err := store.NormalizePageLimit(int(limit))
-	if err != nil {
-		s.writeErr(w, fmt.Errorf("%w: %v", model.ErrValidation, err))
-		return
-	}
-	// Prefer durable store when available; fall back to in-memory center.
 	if s.st != nil {
-		list, err := s.st.ListSecurityFindings(string(sev), pageLimit)
-		if err == nil {
-			total, _ := s.st.CountSecurityFindings()
-			keys, ok := s.diagnosticKeys(w, r)
-			if !ok {
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"findings": redactFindingsForAPI(list, keys),
-				"total":    total,
-			})
+		page, err := s.st.ListSecurityFindingsPage(r.Context(), filter)
+		if err != nil {
+			s.writeErr(w, err)
 			return
 		}
+		keys, ok := s.diagnosticKeys(w, r)
+		if !ok {
+			return
+		}
+		page.Findings = redactFindingsForAPI(page.Findings, keys)
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
+	// Preserve the limited ring-only diagnostic adapter, but never silently
+	// ignore a filter or cursor that requires the durable authority.
+	if filter.UpstreamID != 0 || filter.RouteID != 0 || filter.RuleID != "" || filter.ReviewStatus != "" || filter.Ignored != nil || filter.Category != "" || filter.FromMS != 0 || filter.ToMS != 0 || filter.Cursor != "" {
+		writeJSON(w, http.StatusServiceUnavailable, errBody{"persistent security findings unavailable"})
+		return
 	}
 	if s.security == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"findings": []any{}, "total": 0})
 		return
 	}
-	list := s.security.List(sev, pageLimit)
+	list := s.security.List(filter.Severity, filter.Limit)
 	keys, ok := s.diagnosticKeys(w, r)
 	if !ok {
 		return
@@ -76,6 +82,53 @@ func (s *Server) listSecurityFindings(w http.ResponseWriter, r *http.Request) {
 		"findings": redactFindingsForAPI(list, keys),
 		"total":    s.security.Count(),
 	})
+}
+
+func securityFindingFilter(r *http.Request) (store.SecurityFindingFilter, error) {
+	var f store.SecurityFindingFilter
+	q := r.URL.Query()
+	for key, values := range q {
+		switch key {
+		case "severity", "upstream_id", "route_id", "rule_id", "review_status", "ignored", "category", "from_ms", "to_ms", "limit", "cursor":
+		default:
+			return f, model.WrapValidation("未知的安全发现筛选字段")
+		}
+		if len(values) != 1 {
+			return f, model.WrapValidation("安全发现筛选字段不可重复")
+		}
+	}
+	f.Severity = security.Severity(q.Get("severity"))
+	f.Category = q.Get("category")
+	f.RuleID = q.Get("rule_id")
+	f.ReviewStatus = q.Get("review_status")
+	var err error
+	f.Ignored, err = securityBooleanFilter(q.Get("ignored"))
+	if err != nil {
+		return f, err
+	}
+	f.Cursor = q.Get("cursor")
+	if len(f.Cursor) > 4096 {
+		return f, model.WrapValidation("安全发现游标无效")
+	}
+	for _, item := range []struct {
+		name   string
+		target *int64
+	}{{"upstream_id", &f.UpstreamID}, {"route_id", &f.RouteID}, {"from_ms", &f.FromMS}, {"to_ms", &f.ToMS}} {
+		n, err := queryInt64(q.Get(item.name))
+		if err != nil {
+			return f, model.WrapValidation("安全发现数字筛选无效")
+		}
+		*item.target = n
+	}
+	limit, err := queryInt64(q.Get("limit"))
+	if err != nil || limit < 0 || limit > store.MaximumPageLimit {
+		return f, model.WrapValidation("安全发现分页大小无效")
+	}
+	f.Limit, err = store.NormalizePageLimit(int(limit))
+	if err != nil {
+		return f, err
+	}
+	return f, f.Validate()
 }
 
 // redactFindingsForAPI masks known upstream credentials in free-text finding
@@ -115,7 +168,7 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	// only a resolved row supplies an API key for ScanText redaction. Unknown
 	// / empty refs leave Upstream empty — never persist the raw client string
 	// (it can be nearly the whole 1MiB body).
-	upLabel, upKey, lookupErr := s.resolveUpstreamForScan(r.Context(), body.Upstream)
+	upstream, lookupErr := s.resolveUpstreamForScan(r.Context(), body.Upstream)
 	if lookupErr != nil {
 		// No raw text may become a finding when the selected site's known
 		// credential cannot be read. Do not log the input or driver error.
@@ -123,8 +176,8 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var keys []string
-	if upKey != "" {
-		keys = append(keys, upKey)
+	if upstream != nil && upstream.APIKey != "" {
+		keys = append(keys, upstream.APIKey)
 	}
 	reqID := body.ReqID
 	if len(reqID) > maxFindingClientField {
@@ -133,8 +186,12 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	found := security.ScanText(body.Text, "admin_scan", keys...)
 	out := make([]security.Finding, 0, len(found))
 	for _, f := range found {
-		f.Upstream = upLabel
+		if upstream != nil {
+			f.Upstream = upstreamScanLabel(upstream)
+			f.UpstreamID = upstream.ID
+		}
 		f.ReqID = reqID
+		f.Source = "admin_scan" // caller-provided ReqID is never a trusted raw-sample relation
 		f.ScannerVersion = security.ScannerVersion
 		f.RuleVersion = security.RuleVersion
 		f.BytesScanned = int64(len(body.Text))
@@ -143,32 +200,30 @@ func (s *Server) postSecurityScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"findings": out, "count": len(out)})
 }
 
-// resolveUpstreamForScan resolves body.upstream as id or name. On hit it
-// returns a canonical label (name, else decimal id) and the decrypted API key.
-// Empty / missing store / unknown has no identity (never store the raw ref).
-// A selected credential read failure makes the caller reject before recording.
-func (s *Server) resolveUpstreamForScan(ctx context.Context, ref string) (label, apiKey string, lookupErr error) {
+// resolveUpstreamForScan returns only a canonical stored identity and credential.
+// Empty/unknown refs return nil; a credential read failure rejects the scan.
+func (s *Server) resolveUpstreamForScan(ctx context.Context, ref string) (*model.Upstream, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" || s.st == nil {
-		return "", "", nil
+		return nil, nil
 	}
 	if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 {
 		up, err := s.configAdmin.GetUpstream(ctx, id)
 		if err == nil {
-			return upstreamScanLabel(&up), up.APIKey, nil
+			return &up, nil
 		}
 		if !errors.Is(err, store.ErrNotFound) {
-			return "", "", err
+			return nil, err
 		}
 	}
 	up, err := s.configAdmin.GetUpstreamByName(ctx, ref)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return "", "", nil
+			return nil, nil
 		}
-		return "", "", err
+		return nil, err
 	}
-	return upstreamScanLabel(&up), up.APIKey, nil
+	return &up, nil
 }
 
 func upstreamScanLabel(up *model.Upstream) string {

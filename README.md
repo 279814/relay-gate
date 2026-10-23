@@ -194,6 +194,8 @@ relay-gate db check-backup --database /abs/path/data/relay.db \
   --manifest /abs/path/data/backups/<backup>/manifest.json
 ```
 
+离线命令默认只读取 `--database` 所在目录的 `secrets/keyring.json` 稳定 active Master，不依赖当前工作目录、`RELAY_DB`、管理员口令或 Relay Key。非空 `ENCRYPTION_KEY` 显式覆盖该选择；错误的覆盖值会拒绝检查，不会静默回退。目标 Keyring 缺失、格式/状态未知或轮换未完成时拒绝，不恢复 `keyring.previous`、不激活 pending Master，也不启动服务。
+
 核对检查输出的 `ReaderContract` / `PairedBuildID` 与配对程序后，再显式接受数据替换：
 
 ```bash

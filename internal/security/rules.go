@@ -68,11 +68,16 @@ func NewScanner(rules []Rule) (*Scanner, error) {
 	}
 	h := sha256.New()
 	compiled := make([]Rule, 0, len(rules))
+	seen := make(map[string]bool, len(rules))
 	for _, rule := range rules {
 		validated, err := CompileRule(rule.ID, rule.pattern, rule.Literal, rule.Category, rule.Severity)
 		if err != nil {
 			return nil, err
 		}
+		if seen[validated.ID] {
+			return nil, errors.New("duplicate security rule ID")
+		}
+		seen[validated.ID] = true
 		compiled = append(compiled, validated)
 		h.Write([]byte(rule.ID + "\x00" + rule.Category + "\x00" + string(rule.Severity) + "\x00" + rule.pattern + "\x00" + rule.Literal + "\x00"))
 	}
@@ -142,7 +147,7 @@ func (r *scanRun) inspectTextVisible(text, evidence string, depth int, visible s
 			continue
 		}
 		if rule.re != nil && rule.re.MatchString(text) || rule.Literal != "" && strings.Contains(text, rule.Literal) {
-			r.add(rule.Severity, rule.Category, rule.Summary, evidence)
+			r.addRule("custom:"+rule.ID, rule.Severity, rule.Category, rule.Summary, evidence)
 		}
 	}
 	for _, value := range decodedVariants(text) {

@@ -1,11 +1,21 @@
+import {createSecurityManagement, securityManagementState} from './security_management.mjs';
 /* security.mjs — P3 Security Center UI (§14.5). Pure text (x-text). */
 
 import { createCanaryFeature } from './canary.mjs';
 
 const initialState = () => ({
   findings: [],
+  management: securityManagementState(),
+  upstreamID: '', ruleID: '', reviewStatus: '', ignored: '',
   total: 0,
   severity: '',
+  routeID: '',
+  category: '',
+  fromTime: '',
+  toTime: '',
+  pageCursor: '',
+  nextCursor: '',
+  findingsError: '',
   scanText: '',
   canaryRouteId: '',
   smtp: null,
@@ -18,22 +28,51 @@ const initialState = () => ({
 
 export function createSecurityFeature(shell, api) {
   shell.security = initialState();
+  createSecurityManagement(shell, api);
+  let findingsRead = {};
 
-  shell.loadSecurityFindings = async function loadSecurityFindings() {
+  shell.loadSecurityFindings = async function loadSecurityFindings(cursor = '') {
     const state = this.security;
+    const request = {}; findingsRead = request;
+    const current = () => this.security === state && findingsRead === request;
+    state.findings = []; state.total = 0; state.nextCursor = ''; state.findingsError = '';
+    state.loading = true; state.pageCursor = cursor;
     try {
-      this.security.loading = true;
-      const q = this.security.severity ? ('?severity=' + encodeURIComponent(this.security.severity)) : '';
-      const data = await api.get('/security/findings' + q);
-      if (this.security !== state) return;
-      this.security.findings = data.findings || [];
-      this.security.total = data.total || 0;
+      const routeID = Number(state.routeID);
+      const upstreamID = Number(state.upstreamID);
+      const fromMS = state.fromTime ? new Date(state.fromTime).getTime() : 0;
+      const toMS = state.toTime ? new Date(state.toTime).getTime() : 0;
+      if (!Number.isSafeInteger(upstreamID) || upstreamID < 0 || !Number.isSafeInteger(routeID) || routeID < 0 || !Number.isSafeInteger(fromMS) || fromMS < 0 || !Number.isSafeInteger(toMS) || toMS < 0 ||
+          (toMS && fromMS > toMS) || !/^[a-zA-Z0-9_.:-]{0,64}$/.test(state.category) ||
+          !['', 'critical', 'high', 'medium', 'low', 'info'].includes(state.severity)) throw new Error('安全发现筛选无效，请检查 Route、类别和发现时间');
+      const q = new URLSearchParams({limit: '25'});
+      if (state.severity) q.set('severity', state.severity);
+      if (routeID) q.set('route_id', String(routeID));
+      if (state.category) q.set('category', state.category);
+      if (upstreamID) q.set('upstream_id', String(upstreamID));
+      if (state.ruleID) q.set('rule_id', state.ruleID);
+      if (state.reviewStatus) q.set('review_status', state.reviewStatus);
+      if (state.ignored) q.set('ignored', state.ignored);
+      if (fromMS) q.set('from_ms', String(fromMS));
+      if (toMS) q.set('to_ms', String(toMS));
+      if (cursor) q.set('cursor', cursor);
+      const data = await api.get('/security/findings?' + q);
+      if (!current()) return;
+      if (!Array.isArray(data?.findings) || data.findings.length > 25 || !Number.isSafeInteger(data.total) || data.total < 0) throw new Error('安全发现分页响应无效');
+      state.findings = data.findings;
+      state.total = data.total;
+      state.nextCursor = typeof data.next_cursor === 'string' ? data.next_cursor : '';
     } catch (e) {
-      if (this.security !== state) return;
-      this.err = e && e.message ? e.message : String(e);
+      if (!current()) return;
+      state.findingsError = e?.message || '安全发现读取失败';
     } finally {
-      state.loading = false;
+      if (current()) state.loading = false;
     }
+  };
+
+  shell.nextSecurityFindings = async function nextSecurityFindings() {
+    if (this.security.loading || !this.security.nextCursor) return;
+    await this.loadSecurityFindings(this.security.nextCursor);
   };
 
   shell.runSecurityScan = async function runSecurityScan() {
@@ -138,6 +177,7 @@ export function createSecurityFeature(shell, api) {
   };
   const originalReset = shell.reset;
   shell.reset = function resetSecurity() {
+    findingsRead = {};
     this.security = initialState();
     return originalReset?.call(this);
   };

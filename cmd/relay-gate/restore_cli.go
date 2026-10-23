@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/279814/relay-gate/internal/config"
+	"github.com/279814/relay-gate/internal/keyring"
 	"github.com/279814/relay-gate/internal/store"
 )
 
@@ -78,12 +80,13 @@ func runDBCLI(args []string, stdout, stderr io.Writer) int {
 	if f.useBackupKeyring {
 		cipher, err = store.CipherFromBackupKeyring(f.database, f.manifest)
 	} else {
-		cfg, loadErr := config.Load()
-		if loadErr != nil {
-			fmt.Fprintf(stderr, "加载配置: %v\n", loadErr)
-			return exitFail
+		master := strings.TrimSpace(os.Getenv("ENCRYPTION_KEY"))
+		if master == "" {
+			_, master, err = keyring.Open(filepath.Dir(f.database)).LoadStableActive()
 		}
-		cipher, err = store.NewCipher(cfg.EncKey)
+		if err == nil {
+			cipher, err = store.NewCipher(master)
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "打开加密: %v\n", err)

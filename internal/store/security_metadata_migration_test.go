@@ -71,7 +71,9 @@ func TestSchemaTenRotationBackupPinsReaderAndRestoresMetadata(t *testing.T) {
 	current, cipher := schemaTenAuditFixture(t)
 	path := current.path
 	f := security.Finding{ID: "metadata-backup", AtMS: 1, Severity: security.SeverityInfo, Category: "incomplete", Summary: "bounded", Source: "passive", Truncated: true, DecodeDepth: 2, EvidenceHash: "finite-redacted-evidence"}
-	if err := current.InsertSecurityFinding(f); err != nil {
+	// Exercise the frozen schema10 reader with its own columns; current runtime
+	// InsertSecurityFinding intentionally requires schema17 identity columns.
+	if _, err := current.db.Exec(`INSERT INTO security_finding(id,at_ms,severity,category,summary,source,truncated,decode_depth,evidence_hash) VALUES(?,?,?,?,?,?,?,?,?)`, f.ID, f.AtMS, f.Severity, f.Category, f.Summary, f.Source, f.Truncated, f.DecodeDepth, f.EvidenceHash); err != nil {
 		t.Fatal(err)
 	}
 	backup, err := current.CreateRotationBackup(context.Background())

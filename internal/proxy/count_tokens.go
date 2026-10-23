@@ -251,7 +251,7 @@ func (h *Handler) proxyCountTokens(w http.ResponseWriter, r *http.Request,
 	}
 	var capture *security.Capture
 	if h.security != nil {
-		capture = h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: model.EndpointCountTokens, Protocol: model.ProtoAnthropic}})
+		capture = h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: model.EndpointCountTokens, Protocol: model.ProtoAnthropic}})
 		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
 		capture.TryRequest(outBody, false)
 		defer capture.Complete(false)
