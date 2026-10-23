@@ -1,0 +1,45 @@
+{
+  "source_commit": "bce5bc2866920d8fff7aa60f522ec830c0719937",
+  "binary_sha256": "91b44c27588eebd3ab1b7147d707115f20b3fce8b44516a2abe08899d231433e",
+  "embedded_vcs_modified": false,
+  "date": "2026-10-23",
+  "environment": "Windows Chromium, disposable empty SQLite, paused service, disabled Lazy upstream and Route, loopback only, synthetic credentials",
+  "publication": {
+    "statuses": [200, 200],
+    "versions": [3, 5],
+    "shadow_status": 200,
+    "shadow_version": 6,
+    "shadow_preserves_published_version": true
+  },
+  "rollback": {
+    "status": 200,
+    "published_version": 3,
+    "shadow_version": 6,
+    "binding_revision": 4,
+    "sql_pointer_matches_response": true,
+    "immutable_history_count_before_and_after": 3,
+    "target_binding_requires_explicit_reload_after_rollback": true
+  },
+  "execution_diagnostics": {
+    "scope": "current_run_retained",
+    "source": "55 in-process synthetic previews; no upstream execution",
+    "mode": "preview",
+    "phase": "request",
+    "total": 55,
+    "page_sizes": [50, 5],
+    "last_page_has_no_cursor": true,
+    "changed_phase_response_total": 0
+  },
+  "local_combined_checks": {
+    "go_test_all": "passed, uncached: API146.939s, Probe174.570s, Store260.205s, Proxy104.561s",
+    "go_vet_all": "passed",
+    "node_tests": 107,
+    "binding_expressions": 1309,
+    "followup_14505ac": "Canary frontend guard only; 19 related Node contracts and 1309 bindings passed"
+  },
+  "startup_observation": "The first fixture reached its 20-second driver deadline. The repeated empty-database fixture started with healthz200 and completed the flows above; no product startup fix was made.",
+  "console_errors": "favicon.ico404 only; no Alpine or application exception",
+  "real_model_requests": 0,
+  "external_mail_deliveries": 0,
+  "not_covered": ["final schema17 integration", "current-head Linux CI and race completion", "public ACME", "real model compatibility", "final duration acceptance"]
+}
