@@ -137,6 +137,7 @@ func TestConfigAdminHTTP_DeleteSQLFailureRestoresTransformAndEmptyDraft(t *testi
 	registry := transform.NewRegistry(20).WithPersist(s.st)
 	pub := &recordingPublisher{}
 	h := s.WithTransformRegistry(registry).WithConfigPublisher(pub).Routes(testAdminPW)
+	h = freshTransformFixtureHandler(t, registry, h)
 	response := do(t, h, "POST", "/admin/api/transforms", `{"name":"rollback-current-binding"}`, true)
 	if response.Code != http.StatusCreated {
 		t.Fatal("cannot create Transform fixture")

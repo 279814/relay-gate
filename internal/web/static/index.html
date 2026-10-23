@@ -952,6 +952,8 @@
         <!-- ── 声明式转换（P4）─────────────────────────────── -->
         <template x-if="tab === 'transforms'">
           <div>
+            <p class="err" x-show="transforms.activationPending">修改已保存，配置激活待处理；请检查服务状态，勿重复提交。</p>
+            <fieldset :disabled="transforms.writeBusy" style="border:0;padding:0;margin:0;min-width:0">
             <div class="bar">
               <strong>声明式转换</strong>
               <span class="dim">无脚本 · 版本化 · 未绑定透传</span>
@@ -963,7 +965,7 @@
                 <label>新建转换集</label>
                 <input x-model="transforms.newName" placeholder="名称">
               </div>
-              <button class="primary" @click="createTransformSet()">创建</button>
+              <button class="primary" :disabled="transforms.activationPending" @click="createTransformSet()">创建</button>
             </div>
             <div class="row" style="margin-bottom:12px;gap:12px;align-items:flex-end">
               <div class="field" style="max-width:140px">
@@ -974,7 +976,8 @@
                 <label>SSE 事件预算 ms</label>
                 <input type="number" min="1" max="5000" x-model.number="transforms.budgetSSEMs">
               </div>
-              <button @click="saveTransformBudgets()">保存预算</button>
+              <button :disabled="transforms.activationPending" @click="saveTransformBudgets()">保存预算</button>
+              <button @click="reloadTransformBudgets()">重新加载预算（丢弃编辑）</button>
               <span class="dim">提高需二次确认并审计</span>
             </div>
             <div class="row" style="align-items:flex-start;gap:16px">
@@ -991,8 +994,15 @@
                     <tr x-show="!(transforms.sets || []).length"><td colspan="2" class="empty">暂无</td></tr>
                   </tbody>
                 </table>
+                <span class="dim" x-text="'共 ' + transforms.setTotal + ' 个转换集'"></span>
+                <button :disabled="transforms.loading || !transforms.setNextCursor" @click="nextTransformPage('sets')">下一页</button>
               </div>
               <div style="flex:1" x-show="transforms.selected">
+                <button @click="selectTransformSet({id: transforms.selectedId})">重新加载草稿（丢弃编辑）</button>
+                <span class="dim" x-text="'版本 ' + (transforms.selected?.revision || '未知') + ' · ' + (transforms.selected?.state || '未知')"></span>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="changeTransformLifecycle('disable')">停用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state !== 'disabled'" @click="changeTransformLifecycle('enable')">启用</button>
+                <button :disabled="transforms.activationPending || transforms.selected?.state === 'archived'" @click="changeTransformLifecycle('archive')">归档（不可恢复）</button>
                 <div class="field">
                   <label>草稿规则（JSON 数组）</label>
                   <textarea rows="10" class="mono" x-model="transforms.draftRulesJSON" style="width:100%"></textarea>
@@ -1022,7 +1032,7 @@
                   </div>
                 </div>
                 <div class="bar" style="margin:8px 0">
-                  <button class="primary" @click="saveTransformDraft()">保存草稿</button>
+                  <button class="primary" :disabled="transforms.activationPending || transforms.selected?.state === 'archived'" @click="saveTransformDraft()">保存草稿</button>
                 </div>
                 <div class="row">
                   <div class="field" style="max-width:120px">
@@ -1033,8 +1043,10 @@
                     <label>Endpoint ID</label>
                     <input x-model="transforms.endpointId">
                   </div>
-                  <button @click="publishTransform()">Publish</button>
-                  <button @click="shadowTransform()">Shadow</button>
+                  <button @click="loadTransformBinding()">加载目标绑定</button>
+                  <span class="dim" x-text="transforms.bindingTarget ? ('已读取 ' + transforms.bindingTarget + ' 版本 ' + transforms.bindingRevision) : '尚未读取目标绑定'"></span>
+                  <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="publishTransform()">Publish</button>
+                  <button :disabled="transforms.activationPending || transforms.selected?.state !== 'active'" @click="shadowTransform()">Shadow</button>
                 </div>
                 <div class="field" style="margin-top:12px">
                   <label>Preview phase / body</label>
@@ -1048,6 +1060,16 @@
                   </div>
                   <pre class="mono wrap" style="margin-top:8px;white-space:pre-wrap" x-text="transforms.previewResult"></pre>
                 </div>
+                <button @click="loadTransformVersions(false)">读取版本历史</button>
+                <span class="dim" x-text="'共 ' + transforms.versionTotal + ' 个历史版本'"></span>
+                <table>
+                  <thead><tr><th>版本</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead>
+                  <tbody><template x-for="version in transforms.versions" :key="version.id"><tr>
+                    <td x-text="version.id"></td><td x-text="fmtTime(version.created_at)"></td><td x-text="version.note + (version.note_truncated ? '…' : '')"></td>
+                    <td><button :disabled="transforms.activationPending || !transforms.bindingRevision" @click="rollbackTransform(version.id)">将目标绑定回滚到此版本</button></td>
+                  </tr></template></tbody>
+                </table>
+                <button :disabled="!transforms.versionNextCursor" @click="loadTransformVersions(true)">下一页版本</button>
               </div>
             </div>
             <h3 style="font-size:13px;margin:18px 0 8px">Bindings</h3>
@@ -1066,22 +1088,39 @@
                 <tr x-show="!(transforms.bindings || []).length"><td colspan="5" class="empty">暂无绑定</td></tr>
               </tbody>
             </table>
-            <h3 style="font-size:13px;margin:18px 0 8px">Executions（脱敏）</h3>
+            <span class="dim" x-text="'共 ' + transforms.bindingTotal + ' 个绑定'"></span>
+            <button :disabled="transforms.loading || !transforms.bindingNextCursor" @click="nextTransformPage('bindings')">下一页绑定</button>
+            <h3 style="font-size:13px;margin:18px 0 8px">执行诊断（脱敏，仅本次运行保留范围）</h3>
+            <p class="dim">每页 50 条；旧记录会被有限容量淘汰，重启后清空。总数只代表当前仍保留且匹配筛选的记录；游标失效时请重新查询。</p>
+            <div class="row" style="gap:8px;align-items:flex-end">
+              <div class="field"><label>诊断 Route ID</label><input type="number" min="1" x-model="transforms.executionFilter.route_id"></div>
+              <div class="field"><label>诊断 Endpoint ID</label><input type="number" min="1" x-model="transforms.executionFilter.endpoint_id"></div>
+              <div class="field"><label>诊断 Version ID</label><input type="number" min="1" x-model="transforms.executionFilter.version_id"></div>
+              <div class="field"><label>模式</label><select x-model="transforms.executionFilter.mode"><option value="">全部</option><option value="published">published</option><option value="shadow">shadow</option><option value="preview">preview</option></select></div>
+              <div class="field"><label>阶段</label><select x-model="transforms.executionFilter.phase"><option value="">全部</option><option value="request">request</option><option value="response">response</option><option value="sse">sse</option></select></div>
+              <div class="field"><label>结果</label><select x-model="transforms.executionFilter.ok"><option value="">全部</option><option value="true">成功</option><option value="false">失败</option></select></div>
+              <div class="field"><label>开始时间（Unix 毫秒）</label><input type="number" min="1" x-model="transforms.executionFilter.after_ms"></div>
+              <div class="field"><label>结束时间（Unix 毫秒）</label><input type="number" min="1" x-model="transforms.executionFilter.before_ms"></div>
+              <button :disabled="transforms.executionLoading" @click="loadTransformExecutions(false)">查询诊断</button>
+            </div>
             <table>
-              <thead><tr><th>时间</th><th>Phase</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
+              <thead><tr><th>时间</th><th>Route / Endpoint / Version</th><th>模式 / 阶段</th><th>OK</th><th>Hits</th><th>Error</th></tr></thead>
               <tbody>
                 <template x-for="(ex, idx) in (transforms.executions || [])" :key="idx">
                   <tr>
                     <td class="mono" x-text="ex.at"></td>
-                    <td x-text="ex.phase"></td>
+                    <td class="mono" x-text="ex.route_id + ' / ' + ex.endpoint_id + ' / ' + ex.version_id"></td>
+                    <td x-text="ex.mode + ' / ' + ex.phase"></td>
                     <td x-text="ex.ok ? 'yes' : 'no'"></td>
                     <td class="wrap" x-text="(ex.hit_rules || []).join(', ')"></td>
                     <td class="wrap" x-text="ex.error || ''"></td>
                   </tr>
                 </template>
-                <tr x-show="!(transforms.executions || []).length"><td colspan="5" class="empty">暂无执行记录</td></tr>
+                <tr x-show="!(transforms.executions || []).length"><td colspan="6" class="empty">暂无执行记录</td></tr>
               </tbody>
             </table>
+            <span class="dim" x-text="'当前保留范围匹配 ' + transforms.executionTotal + ' 条'"></span>
+            <button :disabled="transforms.executionLoading || !transforms.executionNextCursor" @click="loadTransformExecutions(true)">下一页诊断</button>
             <h3 style="font-size:13px;margin:18px 0 8px">本次运行预算调整</h3>
             <p class="dim">这里保留本次运行的调整细节；完整持久审计历史见凭据页。</p>
             <table>
@@ -1098,6 +1137,7 @@
                 <tr x-show="!(transforms.budgetAudit || []).length"><td colspan="4" class="empty">暂无</td></tr>
               </tbody>
             </table>
+            </fieldset>
           </div>
         </template>
 

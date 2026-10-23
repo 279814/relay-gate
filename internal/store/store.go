@@ -230,7 +230,7 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 		}
 		switch {
 		case state.Empty:
-			return initializeEmptySchemaFifteen(ctx, db, cipher)
+			return initializeEmptySchemaSixteen(ctx, db, cipher)
 		case state.Version == 0 && state.Variant != "":
 			if _, err := normalizeLegacyToSchemaOne(ctx, db, databasePath, cipher, identity); err != nil {
 				return err
@@ -289,6 +289,10 @@ func migrateToDevelopmentSchema(ctx context.Context, db *sql.DB, databasePath st
 			}
 		case state.Version == 14:
 			if _, err := migrateSchemaFourteenToFifteen(ctx, db, databasePath, cipher, identity, readerBuildID); err != nil {
+				return err
+			}
+		case state.Version == 15:
+			if _, err := migrateSchemaFifteenToSixteen(ctx, db, databasePath, cipher, identity, readerBuildID); err != nil {
 				return err
 			}
 		case state.Version == developmentSchemaVersion:

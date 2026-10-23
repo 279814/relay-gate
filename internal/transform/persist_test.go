@@ -3,7 +3,9 @@ package transform_test
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/279814/relay-gate/internal/store"
 	"github.com/279814/relay-gate/internal/transform"
@@ -223,5 +225,185 @@ func TestCreateSetSurfacesPersistError(t *testing.T) {
 	}
 	if len(reg.ListSets()) != 0 {
 		t.Fatal("failed CreateSet must not leave set in memory")
+	}
+}
+
+func TestDraftRestoredOnPersistError(t *testing.T) {
+	sink := &togglePersist{}
+	registry := transform.NewRegistry(4).WithPersist(sink)
+	set, err := registry.CreateSet("draft atomicity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Before", Value: "saved"}}, transform.FailClosed, transform.FailOpen, "saved note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink.fail = true
+	if _, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-After", Value: "rejected"}}, transform.FailOpen, transform.FailClosed, "rejected note"); !errors.Is(err, transform.ErrPersist) {
+		t.Fatalf("expected persistence failure: %v", err)
+	}
+	after, err := registry.GetSet(set.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("failed persistence replaced the in-memory draft")
+	}
+	sink.fail = false
+	if _, err := registry.CreateSet("later successful mutation"); err != nil {
+		t.Fatal(err)
+	}
+	after, err = registry.GetSet(set.ID)
+	if err != nil || !reflect.DeepEqual(after, before) {
+		t.Fatal("failed draft leaked through a later save")
+	}
+}
+
+func TestBindingConflictDoesNotAppendUnpublishedHistory(t *testing.T) {
+	registry := transform.NewRegistry(4)
+	first, err := registry.CreateSet("existing owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := registry.CreateSet("rejected owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, set := range []*transform.Set{first, second} {
+		if _, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Test", Value: "saved"}}, transform.FailClosed, transform.FailOpen, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const route, endpoint = 31, 7
+	if _, _, err := registry.PublishSnapshot(first.ID, route, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	binding, _ := registry.GetBinding(route, endpoint)
+	for _, action := range []func(int64, int64, int64) (*transform.Binding, *transform.Version, error){registry.PublishSnapshot, registry.ShadowSnapshot} {
+		if _, _, err := action(second.ID, route, endpoint); err == nil {
+			t.Fatal("occupied binding accepted another set")
+		}
+		rejected, err := registry.GetSet(second.ID)
+		if err != nil || len(rejected.History) != 0 {
+			t.Fatal("rejected bind appended an immutable history version")
+		}
+		after, _ := registry.GetBinding(route, endpoint)
+		if !reflect.DeepEqual(after, binding) {
+			t.Fatal("rejected bind changed the existing owner")
+		}
+	}
+}
+
+func TestRejectedDraftNeverLeaksIntoLaterSQLiteSnapshot(t *testing.T) {
+	cipher, err := store.NewCipher("transform-draft-rollback-fixture-master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "relay.db"), cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	registry := transform.NewRegistry(4).WithPersist(db)
+	set, err := registry.CreateSet("saved draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Saved", Value: "original"}}, transform.FailClosed, transform.FailOpen, "saved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec(`CREATE TRIGGER reject_transform_snapshot BEFORE INSERT ON transform_set BEGIN SELECT RAISE(ABORT,'fixture SQL rejection'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Rejected", Value: "failed"}}, transform.FailOpen, transform.FailClosed, "rejected"); !errors.Is(err, transform.ErrPersist) {
+		t.Fatalf("SQL rejection not reported: %v", err)
+	}
+	if _, err := db.DB().Exec(`DROP TRIGGER reject_transform_snapshot`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.CreateSet("later save"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := transform.NewRegistry(4).WithPersist(db)
+	if err := restarted.LoadFromPersist(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restarted.GetSet(set.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != before.ID || got.Name != before.Name || !reflect.DeepEqual(got.Draft, before.Draft) {
+		t.Fatal("a rejected draft entered the database during a later successful mutation")
+	}
+}
+
+type waitingPersist struct {
+	block            bool
+	entered, release chan struct{}
+}
+
+func (p *waitingPersist) SaveTransformSnapshot([]transform.Set, []transform.Binding) error {
+	if p.block {
+		close(p.entered)
+		<-p.release
+	}
+	return nil
+}
+func (*waitingPersist) LoadTransformSnapshot() ([]transform.Set, []transform.Binding, error) {
+	return nil, nil, nil
+}
+
+func TestRequestSnapshotUsesPublishedStateWithoutWaitingForDraftSQL(t *testing.T) {
+	sink := &waitingPersist{entered: make(chan struct{}), release: make(chan struct{})}
+	registry := transform.NewRegistry(4).WithPersist(sink)
+	set, err := registry.CreateSet("nonblocking publication")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Version", Value: "old"}}
+	if _, err := registry.UpdateDraft(set.ID, rules, transform.FailClosed, transform.FailOpen, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, published, err := registry.PublishSnapshot(set.ID, 3, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink.block = true
+	written := make(chan error, 1)
+	go func() {
+		_, err := registry.UpdateDraft(set.ID, []transform.Rule{{Kind: transform.KindSetHeader, Name: "X-Version", Value: "new"}}, transform.FailClosed, transform.FailOpen, "")
+		written <- err
+	}()
+	<-sink.entered
+	snapshots := make(chan *transform.RequestView, 1)
+	go func() { snapshots <- registry.CaptureRoutes([]int64{3}) }()
+	select {
+	case view := <-snapshots:
+		_, id, err := view.PublishedCompiled(3, 7)
+		if err != nil || id != published.ID {
+			close(sink.release)
+			<-written
+			t.Fatal("read observed an uncommitted publication")
+		}
+		current, err := registry.GetSet(set.ID)
+		if err != nil || current.Draft.Rules[0].Value != "old" {
+			close(sink.release)
+			<-written
+			t.Fatal("read observed a draft whose SQL had not committed")
+		}
+	case <-time.After(time.Second):
+		close(sink.release)
+		<-written
+		t.Fatal("request-start transform snapshot waited for draft SQL")
+	}
+	close(sink.release)
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	current, err := registry.GetSet(set.ID)
+	if err != nil || current.Draft.Rules[0].Value != "new" {
+		t.Fatal("committed draft was not published")
 	}
 }

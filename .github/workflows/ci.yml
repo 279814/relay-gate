@@ -93,7 +93,7 @@ jobs:
         run: node --test internal/web/endpoint.contract.test.mjs
 
       - name: Explicit request reencoding contract
-        run: node --test internal/web/transforms.reencode.test.mjs
+        run: node --test internal/web/transforms.reencode.test.mjs internal/web/transforms.cas.test.mjs
 
       - name: SMTP TLS configuration contract
         run: node --test internal/web/smtp.contract.test.mjs
