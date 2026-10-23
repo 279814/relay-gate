@@ -1,0 +1,12 @@
+{
+  "date": "2026-10-23",
+  "command": "go test ./internal/store -run '^TestRestoreProcessCrash' -count=1",
+  "local_platform": "Windows, pure-Go modernc SQLite",
+  "result": "passed",
+  "cases": 17,
+  "schema2_exit_points": ["prepared", "isolate-db", "isolate-wal", "isolate-shm", "isolated", "install-db", "installed", "directory-synced", "complete", "intent-removed"],
+  "schema9_database_secret_pair_exit_points": ["prepared", "isolate-secrets", "isolated", "install-db", "install-secrets", "installed", "complete"],
+  "assertions": ["restored database matches verified backup hash before reopening", "real old WAL and SHM preserved in isolation", "no old sidecars at live database path", "resume is idempotent", "Store.Open retains restored business generation", "integrity and foreign keys valid", "restored secret archive matches backup generation", "restored sample decrypts with paired key material"],
+  "method": "test child reconstructs production restore file operations and exits without deferred cleanup; production resume and open validate recovery",
+  "not_claimed": ["every instruction in production RestoreDatabase killed", "power loss or disk cache loss", "directory fsync failure", "all migration DML commit and WAL boundaries", "all historical schema0 variants", "Linux race acceptance before CI finishes"]
+}
