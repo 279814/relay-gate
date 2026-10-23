@@ -1,0 +1,29 @@
+{
+  "scope": "actual schema1-to-2 migration entry with a test-owned SQL connector",
+  "test": "TestMigrationRunnerRecoversAfterEverySQLiteDriverBoundary",
+  "source_schema": 1,
+  "source_fingerprint": "cef6c9e40b9fe61f3faf3bb3b4c3262713c5d74482ecff6d85a634725efebc8c",
+  "source_fixture": "synthetic base/exact URL upstreams and three model protocols",
+  "driver_boundaries": 48,
+  "exec_after_success_boundaries": 38,
+  "query_after_cursor_open_boundaries": 10,
+  "normal_startup_representatives": 3,
+  "representative_final_schema": 17,
+  "precommit_reopened_schema": 1,
+  "postcommit_reopened_schema": 2,
+  "source_ciphertext_preserved": true,
+  "recovered_endpoint_count": 8,
+  "backup_validated_with_production_checker": true,
+  "retry_preserves_earlier_backup_hash": true,
+  "production_fault_hook_added": false,
+  "global_sql_driver_replaced": false,
+  "local_result": "passed",
+  "local_package_elapsed_seconds": 7.234,
+  "not_covered": [
+    "other migration versions and historical source variants",
+    "individual SQLite-internal DDL statements inside a script Exec",
+    "errors while consuming query result rows",
+    "physical commit, WAL and fsync failures",
+    "power loss"
+  ]
+}
