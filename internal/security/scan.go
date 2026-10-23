@@ -28,24 +28,28 @@ const (
 
 // Finding is one passive observation.
 type Finding struct {
-	ID               string   `json:"id"`
-	AtMS             int64    `json:"at_ms"`
-	Severity         Severity `json:"severity"`
-	Category         string   `json:"category"`
-	RuleID           string   `json:"rule_id,omitempty"` // builtin:<category> | custom:<literal Rule.ID>; legacy empty means unknown
-	Summary          string   `json:"summary"`
-	Detail           string   `json:"detail"`
-	Upstream         string   `json:"upstream,omitempty"`
-	RouteID          int64    `json:"route_id,omitempty"`
-	ReqID            string   `json:"req_id,omitempty"`
-	Source           string   `json:"source"` // passive | canary | smtp_test
-	ScannerVersion   string   `json:"scanner_version"`
-	RuleVersion      string   `json:"rule_version"`
-	BytesScanned     int64    `json:"bytes_scanned"`
-	Truncated        bool     `json:"truncated"`
-	DecodeDepth      int      `json:"decode_depth"`
-	EvidenceHash     string   `json:"evidence_hash"` // SHA-256 of finite redacted Detail, not the response body
-	IncompleteReason string   `json:"incomplete_reason"`
+	ID               string         `json:"id"`
+	AtMS             int64          `json:"at_ms"`
+	Severity         Severity       `json:"severity"`
+	Category         string         `json:"category"`
+	RuleID           string         `json:"rule_id,omitempty"` // builtin:<category> | custom:<literal Rule.ID>; legacy empty means unknown
+	Summary          string         `json:"summary"`
+	Detail           string         `json:"detail"`
+	Upstream         string         `json:"upstream,omitempty"`
+	UpstreamID       int64          `json:"upstream_id,omitempty"`
+	RouteID          int64          `json:"route_id,omitempty"`
+	ReqID            string         `json:"req_id,omitempty"`
+	Source           string         `json:"source"` // passive | canary | smtp_test
+	ScannerVersion   string         `json:"scanner_version"`
+	RuleVersion      string         `json:"rule_version"`
+	BytesScanned     int64          `json:"bytes_scanned"`
+	Truncated        bool           `json:"truncated"`
+	DecodeDepth      int            `json:"decode_depth"`
+	EvidenceHash     string         `json:"evidence_hash"` // SHA-256 of finite redacted Detail, not the response body
+	IncompleteReason string         `json:"incomplete_reason"`
+	Review           *FindingReview `json:"review,omitempty"` // current management projection; never part of scanner evidence
+	Ignored          bool           `json:"ignored"`
+	IgnoreRuleID     int64          `json:"ignore_rule_id,omitempty"`
 }
 
 // Center is the in-process Security Center store (bounded ring).
@@ -159,6 +163,9 @@ func RedactFindingForRead(f Finding, keys []string) Finding {
 	f.IncompleteReason = RedactSecrets(f.IncompleteReason, keys)
 	f.ReqID = RedactSecrets(f.ReqID, keys)
 	f.Upstream = RedactSecrets(f.Upstream, keys)
+	if RedactSecrets(f.RuleID, keys) != f.RuleID {
+		f.RuleID = "" // a masked credential cannot act as a stable rule identity
+	}
 	return f
 }
 

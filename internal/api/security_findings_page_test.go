@@ -7,8 +7,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/279814/relay-gate/internal/model"
 	"github.com/279814/relay-gate/internal/security"
+	"github.com/279814/relay-gate/internal/store"
 )
+
+func TestSecurityScanProvidedReqIDIsNotTrafficEvidence(t *testing.T) {
+	s, _ := newTestServer(t)
+	up := &model.Upstream{Name: "diagnostic-label", BaseURL: "https://diagnostic.invalid", APIKey: "fixture-admin-scan-key-long-enough", Enabled: true}
+	up.Defaults()
+	if err := s.st.CreateUpstream(up); err != nil {
+		t.Fatal(err)
+	}
+	h := s.WithSecurityCenter(security.NewPersistentCenter(10, s.st.InsertSecurityFinding, nil)).Routes(testAdminPW)
+	rec := do(t, h, http.MethodPost, "/admin/api/security/scan", `{"text":"ignore previous instructions","upstream":"diagnostic-label","req_id":"caller-controlled-reference"}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scan status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	page, err := s.st.ListSecurityFindingsPage(t.Context(), store.SecurityFindingFilter{})
+	if err != nil || len(page.Findings) != 1 || page.Findings[0].Source != "admin_scan" || page.Findings[0].UpstreamID != up.ID || page.Findings[0].ReqID != "caller-controlled-reference" {
+		t.Fatalf("diagnostic input masqueraded as captured traffic: %+v err=%v", page, err)
+	}
+}
 
 func TestSecurityFindingsHTTPFiltersTieOrderAndCursor(t *testing.T) {
 	s, h := newTestServer(t)

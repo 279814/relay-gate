@@ -2,8 +2,29 @@ package security
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestRuleIdentityThatContainsAKnownCredentialRemainsUnknown(t *testing.T) {
+	const key = "fixture-rule-identity-credential-value"
+	rule, err := CompileRule(key, "", "sentinel", "custom", SeverityLow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := NewScanner([]Rule{rule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := scanner.Scan(ScanInput{Segments: []Segment{{Body: []byte("sentinel")}}, TotalBytes: 8, Keys: []string{key}})
+	if len(found) != 1 || found[0].RuleID != "" {
+		t.Fatalf("a known credential was exposed as rule identity: %+v", found)
+	}
+	data, _ := json.Marshal(found)
+	if strings.Contains(string(data), key) {
+		t.Fatal("finding retained a known credential in metadata")
+	}
+}
 
 func TestDifferentRuleIDsWithTheSameCategoryRemainIndependentFindings(t *testing.T) {
 	first, err := CompileRule("site-one", "", "sentinel-one", "shared", SeverityLow)

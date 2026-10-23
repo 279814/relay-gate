@@ -78,7 +78,7 @@ jobs:
           node --test internal/web/recipe_admin.contract.test.mjs
 
       - name: 前端模块契约测试
-        run: node --test internal/web/modules.contract.test.mjs internal/web/credentials.contract.test.mjs internal/web/recent_errors.contract.test.mjs internal/web/audit.contract.test.mjs internal/web/attempt_metadata.contract.test.mjs internal/web/security_center.contract.test.mjs
+        run: node --test internal/web/modules.contract.test.mjs internal/web/credentials.contract.test.mjs internal/web/recent_errors.contract.test.mjs internal/web/audit.contract.test.mjs internal/web/attempt_metadata.contract.test.mjs internal/web/security_center.contract.test.mjs internal/web/security_management.contract.test.mjs
 
       - name: Settings and service-state revision contracts
         run: node --test internal/web/settings.contract.test.mjs internal/web/state.contract.test.mjs internal/web/privacy.contract.test.mjs

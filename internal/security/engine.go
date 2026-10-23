@@ -310,7 +310,11 @@ func (r *scanRun) addRule(ruleID string, severity Severity, category, summary, d
 	if _, ok := r.found[ruleID]; ok {
 		return
 	}
-	r.found[ruleID] = Finding{RuleID: ruleID, Severity: severity, Category: category, Summary: safeEvidence(summary, r.input.Keys), Detail: safeEvidence(detail, r.input.Keys), Source: "passive"}
+	publicRuleID := ruleID
+	if RedactSecrets(ruleID, r.input.Keys) != ruleID {
+		publicRuleID = ""
+	}
+	r.found[ruleID] = Finding{RuleID: publicRuleID, Severity: severity, Category: category, Summary: safeEvidence(summary, r.input.Keys), Detail: safeEvidence(detail, r.input.Keys), Source: "passive"}
 	r.order = append(r.order, ruleID)
 }
 

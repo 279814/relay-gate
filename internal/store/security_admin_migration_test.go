@@ -30,7 +30,11 @@ func schemaSixteenFixture(t *testing.T) (*Store, *Cipher) {
 
 func TestSecurityAdminMigrationPairsSixteenAndPreservesEvidence(t *testing.T) {
 	st, cipher := schemaSixteenFixture(t)
-	if err := st.InsertSecurityFinding(security.Finding{ID: "legacy-finding", AtMS: 1, Detail: "finite encrypted evidence", Upstream: "old label", RouteID: 7}); err != nil {
+	legacyDetail, err := st.cipher.encryptDataBlob(securityKeyPurpose, []byte("finite encrypted evidence"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`INSERT INTO security_finding(id,at_ms,severity,category,summary,detail,upstream,route_id) VALUES('legacy-finding',1,'high','fixture','finite evidence',?,'old label',7)`, legacyDetail); err != nil {
 		t.Fatal(err)
 	}
 	before, err := inspectSchemaState(context.Background(), st.db)

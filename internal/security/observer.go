@@ -25,6 +25,7 @@ type FindingSink interface {
 type ObserveJob struct {
 	Body             []byte
 	Upstream         string
+	UpstreamID       int64
 	RouteID          int64
 	ReqID            string
 	Keys             []string // upstream/relay secrets for Detail redaction (§14.5)
@@ -216,7 +217,7 @@ func (o *Observer) scan(job ObserveJob) {
 	}
 	found := defaultScanner.Scan(input)
 	for _, f := range found {
-		f.Upstream, f.RouteID, f.ReqID = job.Upstream, job.RouteID, job.ReqID
+		f.Upstream, f.UpstreamID, f.RouteID, f.ReqID = job.Upstream, job.UpstreamID, job.RouteID, job.ReqID
 		f.Source = "passive"
 		if o.sink != nil {
 			o.sink.Record(f)

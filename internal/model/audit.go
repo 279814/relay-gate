@@ -50,6 +50,8 @@ var auditActions = map[string]AuditAction{
 	"calibration_publish": {"probe", "calibration"},
 	"settings_update":     {"configuration", "settings"}, "state_change": {"configuration", "state"}, "request_logs_clear": {"configuration", "request_log"},
 	"security_scan": {"security", "security_scan"}, "security_canary": {"security", "security_scan"}, "security_evidence_view": {"security", "security_finding"},
+	"security_finding_review": {"security", "security_finding"},
+	"security_ignore_create":  {"security", "security_ignore_rule"}, "security_ignore_update": {"security", "security_ignore_rule"}, "security_ignore_delete": {"security", "security_ignore_rule"},
 	"smtp_update": {"configuration", "smtp"}, "smtp_test": {"configuration", "smtp"},
 	"transform_create": {"transform", "transform"}, "transform_draft_update": {"transform", "transform"}, "transform_publish": {"transform", "transform"},
 	"transform_shadow": {"transform", "transform"}, "transform_rollback": {"transform", "transform"}, "transform_budget_update": {"transform", "transform"},

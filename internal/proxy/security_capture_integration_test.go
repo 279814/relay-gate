@@ -117,6 +117,9 @@ func TestPassiveCaptureReadsOriginalEncodingWithSamplesOffAndNoHealth(t *testing
 			if len(fs) != 1 || fs[0].BytesScanned != int64(len(plain)) || fs[0].IncompleteReason != "" {
 				t.Fatalf("original encoded response not scanned completely: %+v", center.List("", 100))
 			}
+			if fs[0].UpstreamID <= 0 || fs[0].RouteID <= 0 || fs[0].ReqID == "" || fs[0].Source != "passive" || fs[0].RuleID != "builtin:data_exfiltration" {
+				t.Fatalf("real capture lost trusted source identity: %+v", fs[0])
+			}
 		})
 	}
 }

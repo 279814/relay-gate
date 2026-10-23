@@ -581,7 +581,7 @@ func (h *Handler) dispatch(r *http.Request,
 		fwd.upstreamSample = upstreamCapture
 	}
 	if h.security != nil {
-		capture := h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: kind, Protocol: proto}})
+		capture := h.security.Wrap(security.ObserveJob{Upstream: cand.Upstream.Name, UpstreamID: cand.Upstream.ID, RouteID: cand.Route.ID, ReqID: reqID, Keys: redactKeys, Spec: protocol.DecoderSpec{Endpoint: kind, Protocol: proto}})
 		instr.Observer = wrapSecurityObserver(instr.Observer, capture)
 	}
 	fwd.RespObserver = instr.Observer

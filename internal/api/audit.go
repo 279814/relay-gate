@@ -318,7 +318,20 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 		}
 	}
 	if len(parts) >= 2 && parts[0] == "security" {
-		if len(parts) == 2 && r.Method == "POST" {
+		if len(parts) == 4 && parts[1] == "findings" && parts[3] == "review" && r.Method == "PUT" {
+			action = "security_finding_review"
+			sum := sha256.Sum256([]byte("security-finding:" + parts[2]))
+			resourceID = "finding-" + hex.EncodeToString(sum[:])
+		} else if parts[1] == "ignore-rules" {
+			if len(parts) == 2 && r.Method == "POST" {
+				action = "security_ignore_create"
+			} else if len(parts) == 3 {
+				action = map[string]string{"PUT": "security_ignore_update", "DELETE": "security_ignore_delete"}[r.Method]
+				if id, err := strconv.ParseInt(parts[2], 10, 64); err == nil && id > 0 {
+					resourceID = strconv.FormatInt(id, 10)
+				}
+			}
+		} else if len(parts) == 2 && r.Method == "POST" {
 			action = map[string]string{"scan": "security_scan", "canary": "security_canary"}[parts[1]]
 		} else if parts[1] == "smtp" {
 			if len(parts) == 2 && r.Method == "PUT" {
@@ -326,7 +339,9 @@ func auditRequestAction(r *http.Request) (action, resourceID string, sensitiveRe
 			} else if len(parts) == 3 && parts[2] == "test" && r.Method == "POST" {
 				action = "smtp_test"
 			}
-		} else if len(parts) == 4 && parts[1] == "findings" && parts[3] == "evidence" {
+		} else if len(parts) == 4 && parts[1] == "findings" && parts[3] == "evidence" && r.Method == "POST" {
+			sum := sha256.Sum256([]byte("security-finding:" + parts[2]))
+			resourceID = "finding-" + hex.EncodeToString(sum[:])
 			action, sensitiveRead = "security_evidence_view", true
 		}
 	}

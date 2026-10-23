@@ -2,9 +2,11 @@ package security
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/smtp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,11 +58,15 @@ type digestItem struct {
 // Critical findings may send immediately; other severities default to an
 // aggregated digest (§14.6). Same finding identity is deduped and rate-limited.
 type AlertMailer struct {
-	mu     sync.Mutex
-	cfg    MailConfig
-	dial   func(addr string) (net.Conn, error)
-	send   func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
-	lastAt map[string]time.Time // finding identity → last notify/digest
+	mu       sync.Mutex
+	cfg      MailConfig
+	dial     func(addr string) (net.Conn, error)
+	send     func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
+	lastAt   map[string]time.Time // zero reserves an unsent identity
+	inFlight map[string]bool
+	flushing bool
+	ignore   func(Finding, int64) (bool, error)
+	status   MailStatus
 
 	pending       map[string]digestItem
 	digestStarted time.Time
@@ -74,12 +80,13 @@ type AlertMailer struct {
 // NewAlertMailer constructs a mailer with bounded, certificate-verified TLS.
 func NewAlertMailer() *AlertMailer {
 	return &AlertMailer{
-		cfg:     (MailConfig{}).withDefaults(),
-		dial:    func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) },
-		lastAt:  map[string]time.Time{},
-		pending: map[string]digestItem{},
-		now:     time.Now,
-		timeout: 10 * time.Second,
+		cfg:      (MailConfig{}).withDefaults(),
+		dial:     func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) },
+		lastAt:   map[string]time.Time{},
+		inFlight: map[string]bool{},
+		pending:  map[string]digestItem{},
+		now:      time.Now,
+		timeout:  10 * time.Second,
 	}
 }
 
@@ -196,66 +203,113 @@ func buildMIME(from string, to []string, subj, body string) []byte {
 	return []byte(msg.String())
 }
 
-// findingKey is the existing-style dedupe identity: category|upstream.
-// It must not include raw body, Detail, or secrets.
-func findingKey(f Finding) string {
-	return f.Category + "|" + f.Upstream
+// MailStatus contains operational counters only, with no evidence or driver errors.
+type MailStatus struct {
+	PolicyFailures   uint64 `json:"policy_failures"`
+	DeliveryFailures uint64 `json:"delivery_failures"`
+	CapacityDrops    uint64 `json:"capacity_drops"`
+	Suppressed       uint64 `json:"suppressed"`
+	Pending          int    `json:"pending"`
 }
 
-// MaybeNotify sends if enabled, severity >= min, and not rate-limited.
-// Critical may send immediately; other severities queue into a digest (§14.6).
-// Failures are returned but must never affect forwarding.
+var errAlertPolicy = errors.New("安全告警忽略策略暂不可读")
+var errAlertCapacity = errors.New("安全告警身份容量已满")
+
+const maxAlertIdentities = 1024
+
+// SetIgnorePolicy runs a direct persistent reader in the background worker.
+// Policy SQL and SMTP delivery never run under the mailer mutex.
+func (m *AlertMailer) SetIgnorePolicy(fn func(Finding, int64) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ignore = fn
+}
+func (m *AlertMailer) Status() MailStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.status
+	s.Pending = len(m.pending)
+	return s
+}
+func (m *AlertMailer) ignored(f Finding, now time.Time) (bool, error) {
+	m.mu.Lock()
+	fn := m.ignore
+	m.mu.Unlock()
+	if fn == nil {
+		return false, nil
+	}
+	ignored, err := fn(f, now.UnixMilli())
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err != nil {
+		m.status.PolicyFailures++
+		return false, errAlertPolicy
+	}
+	if ignored {
+		m.status.Suppressed++
+	}
+	return ignored, nil
+}
+func findingKey(f Finding) string {
+	if f.RuleID != "" && f.UpstreamID > 0 && f.RouteID > 0 {
+		return fmt.Sprintf("captured:%q:%d:%d", f.RuleID, f.UpstreamID, f.RouteID)
+	}
+	return fmt.Sprintf("legacy:%q:%q:%q:%d:%d", f.RuleID, f.Category, f.Upstream, f.UpstreamID, f.RouteID)
+}
+func mailEnabled(c MailConfig) bool {
+	return c.Enabled && c.Host != "" && len(c.Recipients) > 0 && c.From != ""
+}
+func (m *AlertMailer) admitLocked(key string, now time.Time) bool {
+	for id, at := range m.lastAt {
+		if !m.inFlight[id] && m.pending[id].count == 0 && (at.IsZero() || now.Sub(at) >= time.Duration(m.cfg.RateLimitWindowSec)*time.Second) {
+			delete(m.lastAt, id)
+		}
+	}
+	if _, ok := m.lastAt[key]; ok {
+		return true
+	}
+	if len(m.lastAt) >= maxAlertIdentities {
+		m.status.CapacityDrops++
+		return false
+	}
+	m.lastAt[key] = time.Time{}
+	return true
+}
 func (m *AlertMailer) MaybeNotify(f Finding, adminURL string) error {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
-	cfg := m.cfg
 	now := m.now()
-	if err := m.flushDigestIfDueLocked(now); err != nil {
-		m.mu.Unlock()
+	err := m.flushDigestIfDueLocked(now)
+	cfg := m.cfg
+	m.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	m.mu.Unlock()
-
-	if !cfg.Enabled || cfg.Host == "" || len(cfg.Recipients) == 0 || cfg.From == "" {
+	if !mailEnabled(cfg) || !severityAtLeast(f.Severity, cfg.MinSeverity) {
 		return nil
 	}
-	if !severityAtLeast(f.Severity, cfg.MinSeverity) {
-		return nil
+	ignored, err := m.ignored(f, now)
+	if err != nil || ignored {
+		return err
 	}
-
 	key := findingKey(f)
 	if f.Severity == SeverityCritical {
 		return m.notifyImmediate(cfg, f, adminURL, key)
 	}
-	return m.queueDigest(f, adminURL, key)
-}
-
-func (m *AlertMailer) notifyImmediate(cfg MailConfig, f Finding, adminURL, key string) error {
-	m.mu.Lock()
-	now := m.now()
-	if t, ok := m.lastAt[key]; ok && now.Sub(t) < time.Duration(cfg.RateLimitWindowSec)*time.Second {
-		m.mu.Unlock()
-		return nil
-	}
-	m.lastAt[key] = now
-	m.mu.Unlock()
-
-	return m.doSend(cfg, BuildAlertMessage(cfg.From, cfg.Recipients, f, adminURL))
-}
-
-func (m *AlertMailer) queueDigest(f Finding, adminURL, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := m.now()
-
+	now = m.now()
+	if !m.admitLocked(key, now) {
+		return errAlertCapacity
+	}
+	if !m.lastAt[key].IsZero() && now.Sub(m.lastAt[key]) < time.Duration(m.cfg.RateLimitWindowSec)*time.Second {
+		return nil
+	}
 	if item, ok := m.pending[key]; ok {
 		item.count++
 		m.pending[key] = item
-		return nil
-	}
-	if t, ok := m.lastAt[key]; ok && now.Sub(t) < time.Duration(m.cfg.RateLimitWindowSec)*time.Second {
 		return nil
 	}
 	m.pending[key] = digestItem{finding: f, count: 1, adminURL: adminURL}
@@ -265,24 +319,44 @@ func (m *AlertMailer) queueDigest(f Finding, adminURL, key string) error {
 	}
 	return nil
 }
-
+func (m *AlertMailer) notifyImmediate(cfg MailConfig, f Finding, adminURL, key string) error {
+	m.mu.Lock()
+	now := m.now()
+	if !m.admitLocked(key, now) {
+		m.mu.Unlock()
+		return errAlertCapacity
+	}
+	if m.inFlight[key] || !m.lastAt[key].IsZero() && now.Sub(m.lastAt[key]) < time.Duration(cfg.RateLimitWindowSec)*time.Second {
+		m.mu.Unlock()
+		return nil
+	}
+	m.inFlight[key] = true
+	m.mu.Unlock()
+	err := m.doSend(cfg, BuildAlertMessage(cfg.From, cfg.Recipients, f, adminURL))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.inFlight, key)
+	if err != nil {
+		m.status.DeliveryFailures++
+		if m.lastAt[key].IsZero() && m.pending[key].count == 0 {
+			delete(m.lastAt, key)
+		}
+		return err
+	}
+	m.lastAt[key] = m.now()
+	return nil
+}
 func (m *AlertMailer) armDigestTimerLocked() {
 	if m.digestTimer != nil {
 		m.digestTimer.Stop()
 		m.digestTimer = nil
 	}
-	if m.testClock {
+	if m.testClock || m.digestStarted.IsZero() {
 		return
 	}
 	delay := max(time.Duration(0), m.digestStarted.Add(time.Duration(m.cfg.AggregationWindowSec)*time.Second).Sub(m.now()))
-	m.digestTimer = time.AfterFunc(delay, func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		_ = m.flushDigestIfDueLocked(m.now())
-	})
+	m.digestTimer = time.AfterFunc(delay, func() { m.mu.Lock(); defer m.mu.Unlock(); _ = m.flushDigestIfDueLocked(m.now()) })
 }
-
-// FlushDigest sends any pending aggregated digest immediately (tests / shutdown).
 func (m *AlertMailer) FlushDigest() error {
 	if m == nil {
 		return nil
@@ -291,48 +365,75 @@ func (m *AlertMailer) FlushDigest() error {
 	defer m.mu.Unlock()
 	return m.flushDigestLocked(m.now())
 }
-
 func (m *AlertMailer) flushDigestIfDueLocked(now time.Time) error {
-	if len(m.pending) == 0 || m.digestStarted.IsZero() {
-		return nil
-	}
-	if now.Sub(m.digestStarted) < time.Duration(m.cfg.AggregationWindowSec)*time.Second {
+	if len(m.pending) == 0 || m.digestStarted.IsZero() || now.Sub(m.digestStarted) < time.Duration(m.cfg.AggregationWindowSec)*time.Second {
 		return nil
 	}
 	return m.flushDigestLocked(now)
 }
 
+// Snapshot counts, perform I/O outside the lock, subtract only that snapshot.
+// Later arrivals stay pending; failed delivery leaves all captured items intact.
 func (m *AlertMailer) flushDigestLocked(now time.Time) error {
-	if len(m.pending) == 0 {
-		m.digestStarted = time.Time{}
-		if m.digestTimer != nil {
-			m.digestTimer.Stop()
-			m.digestTimer = nil
-		}
+	if m.flushing || len(m.pending) == 0 {
 		return nil
 	}
+	m.flushing = true
 	cfg := m.cfg
-	items := make([]digestItem, 0, len(m.pending))
-	adminURL := ""
-	for key, item := range m.pending {
-		items = append(items, item)
-		m.lastAt[key] = now
-		if adminURL == "" {
-			adminURL = item.adminURL
+	captured := make(map[string]digestItem, len(m.pending))
+	keys := make([]string, 0, len(m.pending))
+	for k, v := range m.pending {
+		captured[k] = v
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	m.mu.Unlock()
+	items := make([]digestItem, 0, len(keys))
+	ignoredKeys := map[string]bool{}
+	var err error
+	if mailEnabled(cfg) {
+		for _, k := range keys {
+			ignored, policyErr := m.ignored(captured[k].finding, now)
+			if policyErr != nil {
+				err = policyErr
+				break
+			}
+			if ignored || !severityAtLeast(captured[k].finding.Severity, cfg.MinSeverity) {
+				ignoredKeys[k] = true
+			} else {
+				items = append(items, captured[k])
+			}
 		}
 	}
-	m.pending = map[string]digestItem{}
-	m.digestStarted = time.Time{}
-	if m.digestTimer != nil {
-		m.digestTimer.Stop()
-		m.digestTimer = nil
+	if err == nil && len(items) > 0 {
+		err = m.doSend(cfg, BuildDigestMessage(cfg.From, cfg.Recipients, items, items[0].adminURL))
 	}
-	if !cfg.Enabled || cfg.Host == "" || len(cfg.Recipients) == 0 || cfg.From == "" {
-		return nil
-	}
-	m.mu.Unlock()
-	err := m.doSend(cfg, BuildDigestMessage(cfg.From, cfg.Recipients, items, adminURL))
 	m.mu.Lock()
+	m.flushing = false
+	if err == nil {
+		for _, k := range keys {
+			v := m.pending[k]
+			v.count -= captured[k].count
+			if v.count <= 0 {
+				delete(m.pending, k)
+			} else {
+				m.pending[k] = v
+			}
+			if mailEnabled(cfg) && !ignoredKeys[k] {
+				m.lastAt[k] = m.now()
+			} else if m.lastAt[k].IsZero() && v.count <= 0 {
+				delete(m.lastAt, k)
+			}
+		}
+	} else if !errors.Is(err, errAlertPolicy) {
+		m.status.DeliveryFailures++
+	}
+	if len(m.pending) > 0 {
+		m.digestStarted = m.now()
+	} else {
+		m.digestStarted = time.Time{}
+	}
+	m.armDigestTimerLocked()
 	return err
 }
 
