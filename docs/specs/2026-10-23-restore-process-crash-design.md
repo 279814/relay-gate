@@ -9,3 +9,5 @@ schema2 矩阵覆盖 prepared、分别移动 DB/WAL/SHM、isolated、正式数�
 本次覆盖 17 个进程退出节点；不据此关闭迁移每个 DML/校验/commit/WAL 边界、schema0全部历史变体和CLI全部故障注入的剩余验收。保留这些缺口直到有对应证据。
 
 另补 schema1→2 Backfill 的逐 DML 失败验证：通过现有执行器接口包装真实 SQL 事务，在第 N 条写入实际执行后返回固定错误，覆盖基准URL/完整URL和三种模型协议。发现并逐个验证 34 条 DML，确保扩展 DDL、全部此前写入及密文在回滚后保持原 source fingerprint；随后生产 Store.Open 可完整重新迁移。这里只验证 Backfill 组件的写后错误与回滚，不把测试包装器当成生产完整迁移链的崩溃注入。
+
+另补生产 `migrateSchemaOneToTwo` 的真实 SQLite 容量失败：依据同一合成来源成功迁移的95页，分别将新建测试数据库的 `max_page_count` 限为28、61、94页，三次均验证驱动返回类型化 `SQLITE_FULL`。不是把宿主磁盘写满，也不向生产加错误开关。失败后完整 source fingerprint、原密文和 integrity_check 保持，预先发布的备份通过生产 CheckBackup；关闭数据库后用生产 Open 无修补地迁移至 schema17，并核对旧备份 hash 未被重试覆盖。`TestMigrationStorageFullKeepsSourceAndBackupRecoverable` 三个容量边界实跑通过。该结果只覆盖这些实际容量错误，不代替每条 DML、commit/WAL/fsync 的完整错误矩阵。
