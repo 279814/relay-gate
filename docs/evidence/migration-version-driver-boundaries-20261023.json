@@ -1,0 +1,136 @@
+{
+  "scope": "test-owned SQL connector around all current migration entries except schema1, whose richer matrix is recorded separately",
+  "test": "TestAllMigrationVersionsRecoverAfterSQLiteDriverErrors",
+  "synthetic_sources": [
+    {
+      "source": "m2",
+      "target_schema": 1,
+      "driver_boundaries": 16
+    },
+    {
+      "source": "m6_precolumn",
+      "target_schema": 1,
+      "driver_boundaries": 11
+    },
+    {
+      "source": "m6_preindex",
+      "target_schema": 1,
+      "driver_boundaries": 10
+    },
+    {
+      "source": "m6_current",
+      "target_schema": 1,
+      "driver_boundaries": 9
+    },
+    {
+      "source": "m6_preindex_fresh",
+      "target_schema": 1,
+      "driver_boundaries": 10
+    },
+    {
+      "source": "m6_current_fresh",
+      "target_schema": 1,
+      "driver_boundaries": 9
+    },
+    {
+      "source": "schema2",
+      "target_schema": 3,
+      "driver_boundaries": 18
+    },
+    {
+      "source": "schema3",
+      "target_schema": 4,
+      "driver_boundaries": 8
+    },
+    {
+      "source": "schema4",
+      "target_schema": 5,
+      "driver_boundaries": 8
+    },
+    {
+      "source": "schema5",
+      "target_schema": 6,
+      "driver_boundaries": 8
+    },
+    {
+      "source": "schema6",
+      "target_schema": 7,
+      "driver_boundaries": 11
+    },
+    {
+      "source": "schema7",
+      "target_schema": 8,
+      "driver_boundaries": 42
+    },
+    {
+      "source": "schema8",
+      "target_schema": 9,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema9",
+      "target_schema": 10,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema10",
+      "target_schema": 11,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema11",
+      "target_schema": 12,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema12",
+      "target_schema": 13,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema13",
+      "target_schema": 14,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema14",
+      "target_schema": 15,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema15",
+      "target_schema": 16,
+      "driver_boundaries": 22
+    },
+    {
+      "source": "schema16",
+      "target_schema": 17,
+      "driver_boundaries": 22
+    }
+  ],
+  "driver_boundaries": 358,
+  "exec_after_success_boundaries": 98,
+  "query_after_cursor_open_boundaries": 260,
+  "normal_startup_representatives": 21,
+  "representative_final_schema": 17,
+  "source_setting_and_ciphertext_preserved_before_and_after_retry": true,
+  "reopened_source_or_committed_target_fingerprint_exact": true,
+  "retry_target_fingerprint_exact": true,
+  "backup_validated_with_production_checker": true,
+  "retry_preserves_earlier_backup_hash": true,
+  "postcommit_startup_uses_fresh_master_cipher": true,
+  "production_fault_hook_added": false,
+  "global_sql_driver_replaced": false,
+  "local_result": "passed",
+  "local_package_elapsed_seconds": 71.234,
+  "not_covered": [
+    "all data-dependent migration branches and row loops",
+    "individual SQLite-internal DDL statements inside a script Exec",
+    "errors while consuming query result rows",
+    "native backup Step/Commit failures",
+    "filesystem write, rename and fsync failures",
+    "physical commit and WAL failures",
+    "power loss"
+  ],
+  "full_ci_checks": "https://github.com/279814/relay-gate/pull/423/checks"
+}

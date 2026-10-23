@@ -15,3 +15,7 @@ schema2 矩阵覆盖 prepared、分别移动 DB/WAL/SHM、isolated、正式数�
 另以每个测试数据库独有的 `database/sql.Connector` 包装真实 modernc 连接，直接调用生产 `migrateSchemaOneToTwo`，不替换全局 sqlite driver，不改变生产入口或增加故障开关。基准URL/完整URL、三协议夹具共测得48个应用侧驱动边界：38次成功Exec后返回错误、10次Query成功打开游标后关闭并返回错误；备份仍转发真实NewBackup句柄。逐点失败后关闭连接，以普通注册driver重开物理文件，核对结构、完整性、密文、8个Endpoint、生产备份验证及重试不覆盖旧备份。提交前失败保持完整schema1；实际COMMIT已完成但调用报错时允许完整schema2，不能伪称已回滚。首段、中段、提交后三个代表状态另经正常Store.Open到schema17。见[48边界运行记录](../evidence/migration-runner-driver-boundaries-20261023.json)。
 
 这48个位置是应用侧真实驱动调用，不等于SQLite内部每条指令：冻结DDL脚本仍由一次Exec执行，Query故障发生在游标已打开但结果未消费时。此记录不涵盖其他迁移版本/历史来源、内部逐DDL切点、物理commit/WAL/fsync故障或断电，完整P0故障矩阵仍保留未关闭范围。
+
+后续 `TestAllMigrationVersionsRecoverAfterSQLiteDriverErrors` 复用同一测试专用连接包装器，将范围扩展到六种已知schema0来源（四种升级来源及两种历史新建来源）和schema2→3至16→17的全部生产入口。每个来源都保留合成设置与真实加密凭据，schema2还使用完整URL触发生产cutover。每个成功驱动调用后分别注入一次错误，物理重开后必须匹配完整source或实际已提交的完整target；逐点核对设置、原密文、integrity_check、已生成备份的生产校验，以及普通driver重试后的完整目标指纹和原备份hash。每个来源的提交后不确定状态还使用全新的Master Cipher经过正常Store.Open到schema17，核对原数据，避免内存Data Key掩盖持久化问题。
+
+这补齐了当前冻结版本入口与已知schema0来源的应用侧边界范围，不声称覆盖所有业务数据分支。样本正文迁移等有数据相关循环，仍须另行逐行故障验证；查询结果消费、SQLite内部逐DDL、备份API的Step/Commit、文件系统写入/fsync、WAL与断电边界也未由这个包装器覆盖。具体数量与本地运行结果见[全版本驱动验证记录](../evidence/migration-version-driver-boundaries-20261023.json)。
